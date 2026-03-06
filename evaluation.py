@@ -5,15 +5,17 @@ import subprocess
 import tempfile
 from config import temperature, top_p
 import argparse
-def eval_all(out_dir, language, categories, op_tested=dataset.keys()):
+def eval_all(out_dir, language, categories, op_tested=dataset.keys(), skip_existing: bool = False):
     result = {}
     if categories == ['all']:
         output_file = os.path.join(out_dir,'result.json')
     else:
         output_file = os.path.join(out_dir, f'result_{"_".join(categories)}.json')
-    if os.path.exists(output_file):
-        print(f"[INFO] Already evaluated, please see {output_file}")
+    if os.path.exists(output_file) and skip_existing:
+        print(f"[INFO] Already evaluated, please see {output_file} (skip_existing=True)")
         return
+    if os.path.exists(output_file):
+        print(f"[INFO] Result file exists and will be overwritten: {output_file}")
     for op in op_tested:
         print(f"[INFO] Evaluating op {op}")
         with open(os.path.join(out_dir, f'{op}.txt'), 'r') as saved_log:
@@ -80,6 +82,11 @@ if __name__ == '__main__':
     parser.add_argument('--language', type=str, default='cuda', help='Programming language')
     parser.add_argument('--strategy', type=str, default='add_shot', help='Strategy type.')
     parser.add_argument('--categories', nargs='+', default=['activation'], help='List of categories.')
+    parser.add_argument(
+        '--skip_existing',
+        action='store_true',
+        help='If set, skip evaluation when the result_*.json already exists (default: overwrite).',
+    )
 
     args = parser.parse_args()
 
@@ -88,6 +95,7 @@ if __name__ == '__main__':
     language = args.language
     strategy = args.strategy
     categories = args.categories
+    skip_existing = args.skip_existing
 
     print(f"Runs: {runs}")
     print(f"Model: {model}")
@@ -107,4 +115,4 @@ if __name__ == '__main__':
 
     for run in range(runs):
         out_dir = f'output/{language}/{strategy}/{temperature}-{top_p}/{model_name}/run{run}'
-        eval_all(out_dir, language, categories, op_tested)  
+        eval_all(out_dir, language, categories, op_tested, skip_existing=skip_existing)
