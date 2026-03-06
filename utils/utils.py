@@ -4,6 +4,7 @@ import re
 from openai import OpenAI
 from dataset import dataset
 import torch
+from test import api_key as _test_api_key, api_base as _test_api_base
 
 def get_client(model):
     #client 
@@ -24,10 +25,9 @@ def get_client(model):
             max_retries=3,
         ) 
     elif model.startswith('gpt'):
-        api_key = os.environ.get("OPENAI_API_KEY")
         client = OpenAI(
-            api_key=api_key,
-            base_url="https://api-2.xi-ai.cn/v1",
+            api_key=_test_api_key,
+            base_url=_test_api_base,
             timeout=10000000,
             max_retries=3,
         )
