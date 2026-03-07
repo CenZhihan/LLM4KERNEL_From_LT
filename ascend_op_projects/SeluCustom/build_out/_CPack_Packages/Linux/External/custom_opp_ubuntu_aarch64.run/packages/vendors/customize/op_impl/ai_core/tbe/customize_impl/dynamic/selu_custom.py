@@ -121,7 +121,7 @@ def get_kernel_source(src_file, dir_snake, dir_ex):
         return src
     return src_ex
 
-def _build_args(x_in__, y_out_):
+def _build_args(x_in__, y_out_, alpha, scale):
     __inputs__ = []
     for arg in [x_in__]:
         if arg != None:
@@ -145,15 +145,27 @@ def _build_args(x_in__, y_out_):
         else:
             __outputs__.append(arg)
     __attrs__ = []
+    if alpha != None:
+        attr = {}
+        attr["name"] = "alpha"
+        attr["dtype"] = "float"
+        attr["value"] = alpha
+        __attrs__.append(attr)
+    if scale != None:
+        attr = {}
+        attr["name"] = "scale"
+        attr["dtype"] = "float"
+        attr["value"] = scale
+        __attrs__.append(attr)
     return __inputs__, __outputs__, __attrs__
 
 @tbe_register.register_operator("SeluCustom", trans_bool_to_s8=False)
-@para_check.check_op_params(para_check.REQUIRED_INPUT, para_check.REQUIRED_OUTPUT, para_check.KERNEL_NAME)
-def selu_custom(x_in__, y_out_, kernel_name="selu_custom", impl_mode=""):
+@para_check.check_op_params(para_check.REQUIRED_INPUT, para_check.REQUIRED_OUTPUT, para_check.OPTION_ATTR_FLOAT, para_check.OPTION_ATTR_FLOAT, para_check.KERNEL_NAME)
+def selu_custom(x_in__, y_out_, alpha=1.67326, scale=1.0507, kernel_name="selu_custom", impl_mode=""):
     # do ascendc build step
     if get_current_build_config("enable_op_prebuild"):
         return
-    __inputs__, __outputs__, __attrs__ = _build_args(x_in__, y_out_)
+    __inputs__, __outputs__, __attrs__ = _build_args(x_in__, y_out_, alpha, scale)
     options = get_dtype_fmt_options(__inputs__, __outputs__)
     options += ["-x", "cce"]
     bisheng = os.environ.get('BISHENG_REAL_PATH')
@@ -204,12 +216,12 @@ def selu_custom(x_in__, y_out_, kernel_name="selu_custom", impl_mode=""):
                 output_shape_depend_on_compute = [])
     compile_op(src, origin_func_name, op_info, options, code_channel, '{}')
 
-def op_select_format(x_in__, y_out_, impl_mode=""):
-    __inputs__, __outputs__, __attrs__ = _build_args(x_in__, y_out_)
+def op_select_format(x_in__, y_out_, alpha=1.67326, scale=1.0507, impl_mode=""):
+    __inputs__, __outputs__, __attrs__ = _build_args(x_in__, y_out_, alpha, scale)
     result = check_op_cap("op_select_format", "SeluCustom", __inputs__, __outputs__, __attrs__)
     return result.decode("utf-8")
 
-def get_op_specific_info(x_in__, y_out_, impl_mode=""):
-    __inputs__, __outputs__, __attrs__ = _build_args(x_in__, y_out_)
+def get_op_specific_info(x_in__, y_out_, alpha=1.67326, scale=1.0507, impl_mode=""):
+    __inputs__, __outputs__, __attrs__ = _build_args(x_in__, y_out_, alpha, scale)
     result = check_op_cap("get_op_specific_info", "SeluCustom", __inputs__, __outputs__, __attrs__)
     return result.decode("utf-8")

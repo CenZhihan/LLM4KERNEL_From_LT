@@ -3,9 +3,9 @@
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(LeakyReluCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(float, negativeSlope);
+TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+TILING_DATA_FIELD_DEF(float, negativeSlope);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(LeakyReluCustom, LeakyReluCustomTilingData)

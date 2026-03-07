@@ -8,9 +8,10 @@
 
 #pragma pack(1)
 struct SoftmaxCustomTilingData {
-    uint32_t totalLength = 0;
+    uint32_t totalRows = 0;
+    uint32_t cols = 0;
     uint32_t tileNum = 0;
-    uint32_t feature = 0;
+    int32_t axis = 0;
 };
 #pragma pack()
 

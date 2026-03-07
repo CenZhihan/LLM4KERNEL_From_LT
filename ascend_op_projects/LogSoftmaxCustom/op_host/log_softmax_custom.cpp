@@ -1,49 +1,77 @@
 
 #include "log_softmax_custom_tiling.h"
 #include "register/op_def_registry.h"
+#include <algorithm>
 
+namespace {
+inline uint32_t CeilDiv(uint64_t a, uint64_t b) {
+    return static_cast<uint32_t>((a + b - 1) / b);
+}
+}
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 1;
-static ge::graphStatus TilingFunc(gert::TilingContext* context)
+static const uint32_t DEFAULT_BLOCK_DIM = 32;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
     LogSoftmaxCustomTilingData tiling;
-    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
-    // attempt to read second dimension (dim), default to 1 if not present
-    uint32_t dim = 1;
-    if (context->GetInputShape(0)->GetOriginShape().GetDimNum() > 1) {
-        dim = context->GetInputShape(0)->GetOriginShape().GetDim(1);
+
+    const gert::Shape *in_shape = context->GetInputShape(0);
+    int64_t rank = static_cast<int64_t>(in_shape->GetOriginShape().GetDimNum());
+    int64_t dim = 1;
+    if (const gert::RuntimeAttrs *attrs = context->GetAttrs()) {
+        const int32_t *dim_ptr = attrs->GetAttrPointer<int32_t>(0);
+        if (dim_ptr != nullptr) {
+            dim = static_cast<int64_t>(*dim_ptr);
+        }
     }
-    context->SetBlockDim(BLOCK_DIM);
-    tiling.set_totalLength(totalLength);
-    tiling.set_dim(dim);
-    tiling.set_tileNum(TILE_NUM);
+    if (dim < 0) dim += rank;
+    if (dim < 0) dim = 0;
+    if (dim >= rank) dim = rank - 1;
+
+    uint64_t totalLength = in_shape->GetOriginShape().GetShapeSize();
+    uint64_t reduceLen = static_cast<uint64_t>(in_shape->GetOriginShape().GetDim(static_cast<uint32_t>(dim)));
+    if (reduceLen == 0) reduceLen = 1;
+    uint64_t rows = totalLength / reduceLen;
+
+    // Choose a reasonable tile along reduction dimension
+    uint32_t tileCols = static_cast<uint32_t>(std::min<uint64_t>(reduceLen, 4096));
+
+    // Block dim limited by rows
+    uint32_t blockDim = static_cast<uint32_t>(std::min<uint64_t>(DEFAULT_BLOCK_DIM, rows == 0 ? 1ULL : rows));
+
+    context->SetBlockDim(blockDim);
+
+    tiling.set_rows(static_cast<uint32_t>(rows));
+    tiling.set_cols(static_cast<uint32_t>(reduceLen));
+    tiling.set_tileCols(tileCols);
+    tiling.set_dim(static_cast<int32_t>(dim));
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
-}
-
+} // namespace optiling
 
 namespace ge {
-static ge::graphStatus InferShape(gert::InferShapeContext* context)
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
 {
-    const gert::Shape* x1_shape = context->GetInputShape(0);
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    *y_shape = *x1_shape;
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const auto inputDataType = context->GetInputDataType(0);
-    context->SetOutputDataType(0, inputDataType);
-    return ge::GRAPH_SUCCESS;
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
 }
-}
-
+} // namespace ge
 
 namespace ops {
 class LogSoftmaxCustom : public OpDef {
@@ -55,18 +83,16 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("z")
+        this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Attr("dim").AttrType(OPTIONAL).Int(1);
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
-
     }
 };
 

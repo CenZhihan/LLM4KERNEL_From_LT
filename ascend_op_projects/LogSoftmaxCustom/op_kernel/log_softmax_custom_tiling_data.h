@@ -8,9 +8,10 @@
 
 #pragma pack(1)
 struct LogSoftmaxCustomTilingData {
-    uint32_t totalLength = 0;
-    uint32_t dim = 0;
-    uint32_t tileNum = 0;
+    uint32_t rows = 0;
+    uint32_t cols = 0;
+    uint32_t tileCols = 0;
+    int32_t dim = 0;
 };
 #pragma pack()
 

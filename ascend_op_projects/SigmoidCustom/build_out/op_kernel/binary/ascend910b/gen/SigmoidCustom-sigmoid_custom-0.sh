@@ -1,5 +1,5 @@
 #!/bin/bash
-echo "[Ascend910B1] Generating SigmoidCustom_b5759723af3cbf5ab485da7b6a1d7fbb ..."
+echo "[Ascend910B1] Generating SigmoidCustom_4404db5924972bdce81669f91b662475 ..."
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export ASCEND_SLOG_PRINT_TO_STDOUT=1
 
@@ -17,17 +17,17 @@ while true; do
       ;;
   esac
 done
-res=$(opc $1 --main_func=sigmoid_custom --input_param=/workspace/LLM4KERNEL_From_LT/ascend_op_projects/SigmoidCustom/build_out/op_kernel/binary/ascend910b/gen/SigmoidCustom_b5759723af3cbf5ab485da7b6a1d7fbb_param.json --soc_version=Ascend910B1                 --output=$2 --impl_mode=high_performance,optional --simplified_key_mode=0 --op_mode=dynamic )
+res=$(opc $1 --main_func=sigmoid_custom --input_param=/workspace/LLM4KERNEL_From_LT/ascend_op_projects/SigmoidCustom/build_out/op_kernel/binary/ascend910b/gen/SigmoidCustom_4404db5924972bdce81669f91b662475_param.json --soc_version=Ascend910B1                 --output=$2 --impl_mode=high_performance,optional --simplified_key_mode=0 --op_mode=dynamic )
 
 echo "${res}"
 
-if ! test -f $2/SigmoidCustom_b5759723af3cbf5ab485da7b6a1d7fbb.json ; then
-  echo "$2/SigmoidCustom_b5759723af3cbf5ab485da7b6a1d7fbb.json not generated!"
+if ! test -f $2/SigmoidCustom_4404db5924972bdce81669f91b662475.json ; then
+  echo "$2/SigmoidCustom_4404db5924972bdce81669f91b662475.json not generated!"
   exit 1
 fi
 
-if ! test -f $2/SigmoidCustom_b5759723af3cbf5ab485da7b6a1d7fbb.o ; then
-  echo "$2/SigmoidCustom_b5759723af3cbf5ab485da7b6a1d7fbb.o not generated!"
+if ! test -f $2/SigmoidCustom_4404db5924972bdce81669f91b662475.o ; then
+  echo "$2/SigmoidCustom_4404db5924972bdce81669f91b662475.o not generated!"
   exit 1
 fi
-echo "[Ascend910B1] Generating SigmoidCustom_b5759723af3cbf5ab485da7b6a1d7fbb Done"
+echo "[Ascend910B1] Generating SigmoidCustom_4404db5924972bdce81669f91b662475 Done"

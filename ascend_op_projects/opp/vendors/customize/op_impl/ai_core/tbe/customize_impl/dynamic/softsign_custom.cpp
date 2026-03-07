@@ -1,9 +1,9 @@
 
 #include "kernel_operator.h"
-
 #define __NPU_TILING__
 #include "softsign_custom_tiling_data.h"
-constexpr int32_t BUFFER_NUM = 2; // buffering factor
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
 class KernelSoftsign {
 public:
@@ -14,12 +14,13 @@ public:
         this->tileNum = tileNum;
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
-        // temporary queues for intermediate values if needed
-        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpBuffer2, this->tileLength * sizeof(float));
     }
     __aicore__ inline void Process()
     {
@@ -34,46 +35,40 @@ public:
 private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
     }
-    __aicore__ inline void Compute(int32_t progress)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        // Dequeue input
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        AscendC::LocalTensor<float> tmpAbs = tmpBuffer1.Get<float>();
+        AscendC::LocalTensor<float> tmpDenom = tmpBuffer2.Get<float>();
 
-        // Allocate temporary and output
-        AscendC::LocalTensor<DTYPE_X> absLocal = tmpQueue.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        // tmpAbs = |x|
+        AscendC::Abs(tmpAbs, xLocal, this->tileLength);
+        // tmpDenom = |x| + 1.0
+        AscendC::Adds(tmpDenom, tmpAbs, 1.0f, this->tileLength);
+        // y = x / (|x| + 1.0)
+        AscendC::Div(yLocal, xLocal, tmpDenom, this->tileLength);
 
-        // abs(x)
-        AscendC::Abs(absLocal, xLocal, this->tileLength);
-        // tmp = 1 + abs(x)  (add scalar 1.0)
-        AscendC::AddScalar(absLocal, absLocal, (DTYPE_X)1.0, this->tileLength);
-        // y = x / tmp
-        AscendC::Div(yLocal, xLocal, absLocal, this->tileLength);
-
-        outQueueY.EnQue<DTYPE_Y>(yLocal);
-
-        // free temporaries and input
-        tmpQueue.FreeTensor(absLocal);
+        outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
     }
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
         AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> tmpQueue;
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<float> xGm, yGm;
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;

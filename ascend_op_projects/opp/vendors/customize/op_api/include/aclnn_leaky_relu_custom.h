@@ -15,6 +15,7 @@ extern "C" {
 /* funtion: aclnnLeakyReluCustomGetWorkspaceSize
  * parameters :
  * x : required
+ * negativeSlope : optional
  * out : required
  * workspaceSize : size of workspace(output).
  * executor : executor context(output).
@@ -22,6 +23,7 @@ extern "C" {
 __attribute__((visibility("default")))
 aclnnStatus aclnnLeakyReluCustomGetWorkspaceSize(
     const aclTensor *x,
+    double negativeSlope,
     const aclTensor *out,
     uint64_t *workspaceSize,
     aclOpExecutor **executor);

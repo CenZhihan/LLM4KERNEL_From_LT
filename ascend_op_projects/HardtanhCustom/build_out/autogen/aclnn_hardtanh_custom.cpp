@@ -119,6 +119,8 @@ extern aclnnStatus __attribute__((weak)) NnopbaseSetFormatMatchMode(void *execut
 
 aclnnStatus aclnnHardtanhCustomGetWorkspaceSize(
     const aclTensor *x,
+    double minVal,
+    double maxVal,
     const aclTensor *out,
     uint64_t *workspaceSize,
     aclOpExecutor **executor)
@@ -131,7 +133,7 @@ aclnnStatus aclnnHardtanhCustomGetWorkspaceSize(
     const char *opType = "HardtanhCustom";
     char inputDesc[] = {1};
     char outputDesc[] = {1};
-    char attrDesc[] = {};
+    char attrDesc[] = {0, 0};
 
     NNOPBASE_ASSERT_NOTNULL_RETVAL(x);
     NNOPBASE_ASSERT_NOTNULL_RETVAL(out);
@@ -146,6 +148,10 @@ aclnnStatus aclnnHardtanhCustomGetWorkspaceSize(
     *executor = reinterpret_cast<aclOpExecutor *>(nnopExecutor);
     NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddTilingId(*executor, &tilingId));
     NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddInput(*executor, x, 0));
+    float tmp0 = static_cast<float>(minVal);
+    NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddAttrWithDtype(*executor, static_cast<void*>(&tmp0), sizeof(float), 0, kNnopbaseFloat));
+    float tmp1 = static_cast<float>(maxVal);
+    NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddAttrWithDtype(*executor, static_cast<void*>(&tmp1), sizeof(float), 1, kNnopbaseFloat));
     NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddOutput(*executor, out, 0));
     if (NnopbaseAddParamName != NULL) {
         NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddParamName(*executor, 0, "x", true));

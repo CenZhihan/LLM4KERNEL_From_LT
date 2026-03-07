@@ -9,6 +9,7 @@ namespace ge {
 REG_OP(EluCustom)
     .INPUT(x, ge::TensorType::ALL())
     .OUTPUT(y, ge::TensorType::ALL())
+    .ATTR(alpha, Float, 1)
     .OP_END_FACTORY_REG(EluCustom);
 
 }

@@ -1,5 +1,5 @@
 #!/bin/bash
-echo "[Ascend910B1] Generating TanhCustom_193430a07c8edd21bf3d221ddf45bea0 ..."
+echo "[Ascend910B1] Generating TanhCustom_c2ca9ba84061e7bdbe58233270bf7443 ..."
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export ASCEND_SLOG_PRINT_TO_STDOUT=1
 
@@ -17,17 +17,17 @@ while true; do
       ;;
   esac
 done
-res=$(opc $1 --main_func=tanh_custom --input_param=/workspace/LLM4KERNEL_From_LT/ascend_op_projects/TanhCustom/build_out/op_kernel/binary/ascend910b/gen/TanhCustom_193430a07c8edd21bf3d221ddf45bea0_param.json --soc_version=Ascend910B1                 --output=$2 --impl_mode=high_performance,optional --simplified_key_mode=0 --op_mode=dynamic )
+res=$(opc $1 --main_func=tanh_custom --input_param=/workspace/LLM4KERNEL_From_LT/ascend_op_projects/TanhCustom/build_out/op_kernel/binary/ascend910b/gen/TanhCustom_c2ca9ba84061e7bdbe58233270bf7443_param.json --soc_version=Ascend910B1                 --output=$2 --impl_mode=high_performance,optional --simplified_key_mode=0 --op_mode=dynamic )
 
 echo "${res}"
 
-if ! test -f $2/TanhCustom_193430a07c8edd21bf3d221ddf45bea0.json ; then
-  echo "$2/TanhCustom_193430a07c8edd21bf3d221ddf45bea0.json not generated!"
+if ! test -f $2/TanhCustom_c2ca9ba84061e7bdbe58233270bf7443.json ; then
+  echo "$2/TanhCustom_c2ca9ba84061e7bdbe58233270bf7443.json not generated!"
   exit 1
 fi
 
-if ! test -f $2/TanhCustom_193430a07c8edd21bf3d221ddf45bea0.o ; then
-  echo "$2/TanhCustom_193430a07c8edd21bf3d221ddf45bea0.o not generated!"
+if ! test -f $2/TanhCustom_c2ca9ba84061e7bdbe58233270bf7443.o ; then
+  echo "$2/TanhCustom_c2ca9ba84061e7bdbe58233270bf7443.o not generated!"
   exit 1
 fi
-echo "[Ascend910B1] Generating TanhCustom_193430a07c8edd21bf3d221ddf45bea0 Done"
+echo "[Ascend910B1] Generating TanhCustom_c2ca9ba84061e7bdbe58233270bf7443 Done"

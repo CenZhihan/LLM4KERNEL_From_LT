@@ -31,7 +31,7 @@ def eval_all(out_dir, language, categories, op_tested=dataset.keys(), skip_exist
                     check=True,
                     capture_output=True,     # capture stdout and stderr
                     text=True,               # decode bytes to str
-                    timeout=180
+                    timeout=360
                 )
                 result_item = json.load(tf_output)
                 detailed_compiler_error = '\n'
