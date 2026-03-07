@@ -134,6 +134,9 @@ OP_ADD(LeakyReluCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
+#define __NPU_TILING__
+#include "leaky_relu_custom_tiling_data.h"
+
 constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
 class KernelLeakyRelu {

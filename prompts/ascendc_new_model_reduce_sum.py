@@ -128,6 +128,9 @@ OP_ADD(ReduceSumCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
+#define __NPU_TILING__
+#include "reduce_sum_custom_tiling_data.h"
+
 #define REDUCE_TILING_0 1
 #define REDUCE_TILING_1 2
 #define REDUCE_TILING_2 3

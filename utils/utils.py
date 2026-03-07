@@ -1,13 +1,12 @@
 import os
 import config
 import re
-from openai import OpenAI
 from dataset import dataset
 import torch
-from test import api_key as _test_api_key, api_base as _test_api_base
 
 def get_client(model):
     #client 
+    from openai import OPENAI
     if model.startswith('deepseek'):
         DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY")
         client = OpenAI(
@@ -25,9 +24,11 @@ def get_client(model):
             max_retries=3,
         ) 
     elif model.startswith('gpt'):
+        api_key = os.environ.get("OPENAI_API_KEY")
+        base_url = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
         client = OpenAI(
-            api_key=_test_api_key,
-            base_url=_test_api_base,
+            api_key=api_key,
+            base_url=base_url,
             timeout=10000000,
             max_retries=3,
         )
