@@ -4,9 +4,31 @@ import re
 from dataset import dataset
 import torch
 
+def _load_api_config():
+    """若设置 USE_API_CONFIG=1 且存在 api_config.py，则返回 (api_key, base_url, model)；否则返回 None。"""
+    if os.environ.get("USE_API_CONFIG", "").strip().lower() not in ("1", "true"):
+        return None
+    try:
+        import api_config as ac
+        if getattr(ac, "OPENAI_API_KEY", "").strip():
+            return (
+                ac.OPENAI_API_KEY.strip(),
+                (getattr(ac, "OPENAI_API_BASE", None) or "").strip() or "https://api.openai.com/v1",
+                (getattr(ac, "MODEL", None) or "").strip() or "gpt-5",
+            )
+    except ImportError:
+        pass
+    return None
+
+
+def get_default_model_from_config():
+    """当使用 api_config 时返回其中的 MODEL，否则返回 None。"""
+    cfg = _load_api_config()
+    return cfg[2] if cfg else None
+
+
 def get_client(model):
-    #client 
-    from openai import OPENAI
+    from openai import OpenAI
     if model.startswith('deepseek'):
         DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY")
         client = OpenAI(
@@ -22,16 +44,26 @@ def get_client(model):
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
             timeout=10000000,
             max_retries=3,
-        ) 
-    elif model.startswith('gpt'):
-        api_key = os.environ.get("OPENAI_API_KEY")
-        base_url = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
-        client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            timeout=10000000,
-            max_retries=3,
         )
+    elif model.startswith('gpt'):
+        cfg = _load_api_config()
+        if cfg is not None:
+            api_key, base_url, _ = cfg
+            client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=10000000,
+                max_retries=3,
+            )
+        else:
+            api_key = os.environ.get("OPENAI_API_KEY")
+            base_url = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+            client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=10000000,
+                max_retries=3,
+            )
     else:
         api_key = os.environ.get("OPEN_ROUNTER_KEY")
         client = OpenAI(

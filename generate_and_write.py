@@ -1,5 +1,5 @@
 # Using LLM to generate code and output it to file
-from utils.utils import get_client
+from utils.utils import get_client, get_default_model_from_config
 from config import temperature, num_completions, max_tokens, top_p
 from dataset import dataset, category2exampleop
 import os
@@ -68,7 +68,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run model evaluation with specified parameters.")
 
     parser.add_argument('--runs', type=int, default=1, help='Number of runs.')
-    parser.add_argument('--model', type=str, default='deepseek-chat', help='Model name.')
+    _default_model = get_default_model_from_config() or 'deepseek-chat'
+    parser.add_argument('--model', type=str, default=_default_model, help='Model name (default: from api_config if USE_API_CONFIG=1, else deepseek-chat).')
     parser.add_argument('--language', type=str, default='cuda', help='Language to use.')
     parser.add_argument('--strategy', type=str, default='add_shot', help='Strategy type.')
     parser.add_argument('--categories', nargs='+', default=['activation'], help='List of categories.')
