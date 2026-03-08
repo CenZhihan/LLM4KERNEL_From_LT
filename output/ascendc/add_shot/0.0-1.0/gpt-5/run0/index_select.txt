@@ -1,0 +1,345 @@
+project_json_src='''
+[
+    {
+        "op": "IndexSelectCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "indices",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32",
+                    "int64"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(IndexSelectCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNumJ);
+  TILING_DATA_FIELD_DEF(uint32_t, rowsPerBlock);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(IndexSelectCustom, IndexSelectCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "index_select_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <algorithm>
+
+namespace {
+inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (a + b - 1) / b;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM_J = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    IndexSelectCustomTilingData tiling;
+
+    auto* x_shape = context->GetInputShape(0);
+    auto* idx_shape = context->GetInputShape(1);
+
+    // Expect x as [N, C], indices as [K]
+    uint32_t N = (x_shape->GetOriginShape().GetDimNum() >= 1) ? static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0)) : 1;
+    uint32_t C = (x_shape->GetOriginShape().GetDimNum() >= 2) ? static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1)) : 1;
+    uint32_t K = (idx_shape->GetOriginShape().GetDimNum() >= 1) ? static_cast<uint32_t>(idx_shape->GetOriginShape().GetDim(0)) : 1;
+
+    uint32_t rowsPerBlock = CeilDiv(N, BLOCK_DIM);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_N(N);
+    tiling.set_C(C);
+    tiling.set_K(K);
+    tiling.set_tileNumJ(TILE_NUM_J);
+    tiling.set_rowsPerBlock(rowsPerBlock);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* idx_shape = context->GetInputShape(1);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    int64_t N = (x_shape->GetOriginShape().GetDimNum() >= 1) ? x_shape->GetOriginShape().GetDim(0) : 1;
+    int64_t K = (idx_shape->GetOriginShape().GetDimNum() >= 1) ? idx_shape->GetOriginShape().GetDim(0) : 1;
+
+    gert::Shape out;
+    out.SetDimNum(2);
+    out.SetDim(0, N);
+    out.SetDim(1, K);
+    *y_shape = out;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+
+namespace ops {
+class IndexSelectCustom : public OpDef {
+public:
+    explicit IndexSelectCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("indices")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32, ge::DT_INT64})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(IndexSelectCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "index_select_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+template <typename T>
+__aicore__ inline T min_aicore(T a, T b) { return a < b ? a : b; }
+
+class KernelIndexSelect {
+public:
+    __aicore__ inline KernelIndexSelect() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR indices, GM_ADDR y,
+                                uint32_t N, uint32_t C, uint32_t K,
+                                uint32_t tileNumJ, uint32_t rowsPerBlock)
+    {
+        this->N = N;
+        this->C = C;
+        this->K = K;
+        this->tileNumJ = tileNumJ;
+        this->rowsPerBlock = rowsPerBlock;
+
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockStartRow = blockIdx * rowsPerBlock;
+        uint32_t actualRows = (blockStartRow < N) ? (N - blockStartRow) : 0;
+        if (actualRows > rowsPerBlock) actualRows = rowsPerBlock;
+        this->actualRows = actualRows;
+
+        // per-tile length along K
+        this->tileLenJ = (tileNumJ == 0) ? K : ( (K + tileNumJ * BUFFER_NUM - 1) / (tileNumJ * BUFFER_NUM) );
+
+        xGm.SetGlobalBuffer((__gm__ float *)x + static_cast<uint64_t>(blockStartRow) * C, static_cast<uint64_t>(actualRows) * C);
+        idxGm.SetGlobalBuffer((__gm__ int32_t *)indices, K);
+        yGm.SetGlobalBuffer((__gm__ float *)y + static_cast<uint64_t>(blockStartRow) * K, static_cast<uint64_t>(actualRows) * K);
+
+        pipe.InitBuffer(inQueueIdx, BUFFER_NUM, this->tileLenJ * sizeof(int32_t));
+        pipe.InitBuffer(inQueueX,  BUFFER_NUM, this->C * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLenJ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (this->actualRows == 0) {
+            return;
+        }
+        int32_t loopCount = this->tileNumJ * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            uint32_t baseJ = i * this->tileLenJ;
+            if (baseJ >= this->K) {
+                break;
+            }
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        // copy indices tile
+        AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.AllocTensor<int32_t>();
+        uint32_t baseJ = progress * this->tileLenJ;
+        uint32_t validJ = min_aicore<uint32_t>(this->tileLenJ, this->K - baseJ);
+        AscendC::DataCopy(idxLocal, idxGm[baseJ], validJ);
+        inQueueIdx.EnQue(idxLocal);
+
+        // copy each row of x
+        for (uint32_t r = 0; r < this->actualRows; ++r) {
+            AscendC::LocalTensor<float> xRow = inQueueX.AllocTensor<float>();
+            AscendC::DataCopy(xRow, xGm[r * this->C], this->C);
+            inQueueX.EnQue(xRow);
+        }
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.DeQue<int32_t>();
+
+        for (uint32_t r = 0; r < this->actualRows; ++r) {
+            AscendC::LocalTensor<float> xRow = inQueueX.DeQue<float>();
+            AscendC::LocalTensor<float> yTile = outQueueY.AllocTensor<float>();
+
+            // gather: yTile[j] = xRow[idxLocal[j]]
+            uint32_t validJ = min_aicore<uint32_t>(this->tileLenJ, this->K - currentBaseJ);
+            for (uint32_t j = 0; j < validJ; ++j) {
+                int32_t col = idxLocal.GetValue(j); // assumed API to read scalar from local tensor
+                if (col < 0) col += static_cast<int32_t>(this->C);
+                col = (col < 0) ? 0 : ((col >= static_cast<int32_t>(this->C)) ? (static_cast<int32_t>(this->C) - 1) : col);
+                float v = xRow.GetValue(static_cast<uint32_t>(col));
+                yTile.SetValue(j, v);
+            }
+
+            outQueueY.EnQue<float>(yTile);
+            inQueueX.FreeTensor(xRow);
+        }
+
+        inQueueIdx.FreeTensor(idxLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        uint32_t baseJ = progress * this->tileLenJ;
+        uint32_t validJ = min_aicore<uint32_t>(this->tileLenJ, this->K - baseJ);
+        for (uint32_t r = 0; r < this->actualRows; ++r) {
+            AscendC::LocalTensor<float> yTile = outQueueY.DeQue<float>();
+            AscendC::DataCopy(yGm[r * this->K + baseJ], yTile, validJ);
+            outQueueY.FreeTensor(yTile);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueIdx;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<float>   xGm;
+    AscendC::GlobalTensor<int32_t> idxGm;
+    AscendC::GlobalTensor<float>   yGm;
+
+    uint32_t N;
+    uint32_t C;
+    uint32_t K;
+    uint32_t tileNumJ;
+    uint32_t rowsPerBlock;
+    uint32_t actualRows;
+    uint32_t tileLenJ;
+    uint32_t currentBaseJ;
+};
+
+extern "C" __global__ __aicore__ void index_select_custom(GM_ADDR x, GM_ADDR indices, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelIndexSelect op;
+    op.Init(x, indices, y,
+            tiling_data.N, tiling_data.C, tiling_data.K,
+            tiling_data.tileNumJ, tiling_data.rowsPerBlock);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor index_select_custom_impl_npu(const at::Tensor& self, const at::Tensor& indices) {
+    at::Tensor idx = indices;
+    if (indices.scalar_type() == at::kLong) {
+        idx = indices.to(at::kInt);
+    }
+    at::Tensor result = at::empty({self.size(0), idx.size(0)}, self.options());
+    EXEC_NPU_CMD(aclnnIndexSelectCustom, self, idx, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("index_select_custom", &index_select_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("index_select_custom", &index_select_custom_impl_npu, "index_select along dim=1");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, indices):
+        return custom_ops_lib.index_select_custom(x, indices)
+'''

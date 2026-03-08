@@ -1,0 +1,401 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulDivideGeluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "d",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulDivideGeluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, inK);
+  TILING_DATA_FIELD_DEF(uint32_t, outN);
+  TILING_DATA_FIELD_DEF(uint32_t, rowsPerBlock);
+  TILING_DATA_FIELD_DEF(uint32_t, tileN);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulDivideGeluCustom, MatmulDivideGeluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "matmul_divide_gelu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t CeilDiv(uint32_t x, uint32_t y) { return (x + y - 1) / y; }
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t DEFAULT_TILE_N = 256;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MatmulDivideGeluCustomTilingData tiling;
+
+    // x: [B, K], w: [K, N] (weight transposed), b: [N], d: [1]
+    const gert::Shape* xShape = context->GetInputShape(0);
+    const gert::Shape* wShape = context->GetInputShape(1);
+
+    uint32_t B = static_cast<uint32_t>(xShape->GetOriginShape().GetDim(0));
+    uint32_t K = static_cast<uint32_t>(xShape->GetOriginShape().GetDim(1));
+    uint32_t N = static_cast<uint32_t>(wShape->GetOriginShape().GetDim(1));
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    uint32_t rowsPerBlock = CeilDiv(B, BLOCK_DIM);
+    uint32_t tileN = DEFAULT_TILE_N;
+
+    tiling.set_batch(B);
+    tiling.set_inK(K);
+    tiling.set_outN(N);
+    tiling.set_rowsPerBlock(rowsPerBlock);
+    tiling.set_tileN(tileN);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* xShape = context->GetInputShape(0); // [B, K]
+    const gert::Shape* wShape = context->GetInputShape(1); // [K, N]
+    gert::Shape* yShape = context->GetOutputShape(0);
+
+    std::vector<int64_t> outDims(2);
+    outDims[0] = xShape->GetShape(0);
+    outDims[1] = wShape->GetShape(1);
+    yShape->SetDimNum(2);
+    yShape->SetDim(0, outDims[0]);
+    yShape->SetDim(1, outDims[1]);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MatmulDivideGeluCustom : public OpDef {
+public:
+    explicit MatmulDivideGeluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("d")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulDivideGeluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "matmul_divide_gelu_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelMatmulDivGelu {
+public:
+    __aicore__ inline KernelMatmulDivGelu() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR d, GM_ADDR y,
+                                uint32_t B, uint32_t K, uint32_t N,
+                                uint32_t rowsPerBlock, uint32_t tileN)
+    {
+        this->B = B;
+        this->K = K;
+        this->N = N;
+        this->rowsPerBlock = rowsPerBlock;
+        this->tileN = tileN;
+
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        startRow = blockIdx * rowsPerBlock;
+        endRow = AscendC::Min(startRow + rowsPerBlock, B);
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + startRow * K, (endRow - startRow) * K);
+        // w: [K, N] laid out row-major
+        wGm.SetGlobalBuffer((__gm__ DTYPE_W*)w, K * N);
+        bGm.SetGlobalBuffer((__gm__ DTYPE_B*)b, N);
+        dGm.SetGlobalBuffer((__gm__ DTYPE_D*)d, 1);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + startRow * N, (endRow - startRow) * N);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, K * sizeof(DTYPE_X));            // one row of x
+        pipe.InitBuffer(inQueueW, BUFFER_NUM, tileN * sizeof(DTYPE_W));        // tile of w along N
+        pipe.InitBuffer(inQueueB, BUFFER_NUM, tileN * sizeof(DTYPE_B));        // tile of bias
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, tileN * sizeof(DTYPE_Y));       // tile of y
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, tileN * sizeof(DTYPE_W));        // temporary for mul/add
+
+        // Load divisor once
+        AscendC::LocalTensor<DTYPE_D> dLocal = tmpScalar.AllocTensor<DTYPE_D>();
+        AscendC::DataCopy(dLocal, dGm[0], 1);
+        tmpScalar.EnQue(dLocal);
+        dLocal = tmpScalar.DeQue<DTYPE_D>();
+        // read scalar value
+        divisor = static_cast<float>(dLocal.GetValue(0));
+        invDiv = 1.0f / divisor;
+        tmpScalar.FreeTensor(dLocal);
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = 0; r < (endRow - startRow); ++r) {
+            // Load x row
+            AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+            AscendC::DataCopy(xLocal, xGm[r * K], K);
+            inQueueX.EnQue(xLocal);
+            xLocal = inQueueX.DeQue<DTYPE_X>();
+
+            for (uint32_t nStart = 0; nStart < N; nStart += tileN) {
+                uint32_t curTile = AscendC::Min(tileN, N - nStart);
+
+                // accumulator init to 0
+                AscendC::LocalTensor<DTYPE_Y> acc = outQueueY.AllocTensor<DTYPE_Y>();
+                AscendC::Dup(acc, 0.0f, curTile);
+
+                // GEMM accumulate: acc += x[r, k] * w[k, nStart:nStart+curTile]
+                for (uint32_t k = 0; k < K; ++k) {
+                    // load w tile (row k, columns nStart..)
+                    AscendC::LocalTensor<DTYPE_W> wTile = inQueueW.AllocTensor<DTYPE_W>();
+                    AscendC::DataCopy(wTile, wGm[k * N + nStart], curTile);
+
+                    // multiply by scalar x[r, k] in place
+                    float xk = static_cast<float>(xLocal.GetValue(k));
+                    AscendC::Muls(wTile, wTile, xk, curTile);
+
+                    // acc += wTile
+                    AscendC::Add(acc, acc, wTile, curTile);
+
+                    inQueueW.FreeTensor(wTile);
+                }
+
+                // add bias
+                AscendC::LocalTensor<DTYPE_B> bTile = inQueueB.AllocTensor<DTYPE_B>();
+                AscendC::DataCopy(bTile, bGm[nStart], curTile);
+                AscendC::Add(acc, acc, bTile, curTile);
+                inQueueB.FreeTensor(bTile);
+
+                // divide by scalar
+                AscendC::Muls(acc, acc, invDiv, curTile);
+
+                // GELU activation (vector)
+                AscendC::Gelu(acc, acc, curTile);
+
+                // write back
+                AscendC::DataCopy(yGm[r * N + nStart], acc, curTile);
+                outQueueY.FreeTensor(acc);
+            }
+
+            inQueueX.FreeTensor(xLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueW;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueB;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> tmpScalar;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_W> wGm;
+    AscendC::GlobalTensor<DTYPE_B> bGm;
+    AscendC::GlobalTensor<DTYPE_D> dGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t B;
+    uint32_t K;
+    uint32_t N;
+    uint32_t rowsPerBlock;
+    uint32_t tileN;
+    uint32_t startRow;
+    uint32_t endRow;
+    float divisor;
+    float invDiv;
+};
+
+extern "C" __global__ __aicore__ void matmul_divide_gelu_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR d, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulDivGelu op;
+    op.Init(x, w, b, d, y,
+            tiling_data.batch, tiling_data.inK, tiling_data.outN,
+            tiling_data.rowsPerBlock, tiling_data.tileN);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_divide_gelu_custom_impl_npu(const at::Tensor& x,
+                                              const at::Tensor& w_t,
+                                              const at::Tensor& b,
+                                              double divisor) {
+    TORCH_CHECK(x.is_cuda() || x.device().type() == c10::DeviceType::PrivateUse1, \"x must be on NPU\");
+    auto x_c = x.contiguous();
+    auto w_c = w_t.contiguous();
+    auto b_c = b.contiguous();
+    auto d_tensor = at::empty({1}, x_c.options());
+    d_tensor.fill_(divisor);
+
+    std::vector<int64_t> out_sizes = {x_c.size(0), w_c.size(1)};
+    at::Tensor result = at::empty(out_sizes, x_c.options());
+    EXEC_NPU_CMD(aclnnMatmulDivideGeluCustom, x_c, w_c, b_c, d_tensor, result);
+    return result;
+}
+
+// Optional dispatcher registration (when called via torch.ops.myops.matmul_divide_gelu_custom)
+at::Tensor matmul_divide_gelu_custom_impl_npu_all_tensors(const at::Tensor& x,
+                                                          const at::Tensor& w_t,
+                                                          const at::Tensor& b,
+                                                          const at::Tensor& d_tensor) {
+    auto x_c = x.contiguous();
+    auto w_c = w_t.contiguous();
+    auto b_c = b.contiguous();
+    auto d_c = d_tensor.contiguous();
+    std::vector<int64_t> out_sizes = {x_c.size(0), w_c.size(1)};
+    at::Tensor result = at::empty(out_sizes, x_c.options());
+    EXEC_NPU_CMD(aclnnMatmulDivideGeluCustom, x_c, w_c, b_c, d_c, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"matmul_divide_gelu_custom\", &matmul_divide_gelu_custom_impl_npu_all_tensors);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"matmul_divide_gelu_custom\", &matmul_divide_gelu_custom_impl_npu, \"(x @ w_t + b)/divisor -> GELU\");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    """
+    Fused NPU op: y = GELU( (x @ W^T + b) / divisor )
+    We pass W^T (i.e., weight transposed) as [K, N] to the custom kernel.
+    """
+    def __init__(self, input_size, output_size, divisor):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(input_size, output_size)
+        self.divisor = float(divisor)
+
+    def forward(self, x):
+        # Prepare operands for fused custom kernel:
+        # x: [B, K], w_t: [K, N], b: [N]
+        w_t = self.linear.weight.t().contiguous()
+        b = self.linear.bias.contiguous()
+        return custom_ops_lib.matmul_divide_gelu_custom(x, w_t, b, self.divisor)
+'''

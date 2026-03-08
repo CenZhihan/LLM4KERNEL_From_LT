@@ -1,0 +1,292 @@
+project_json_src='''
+[
+    {
+        "op": "Conv2dScalingMinCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv2dScalingMinCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv2dScalingMinCustom, Conv2dScalingMinCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv2d_scaling_min_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv2dScalingMinCustomTilingData tiling;
+
+    auto inShape = context->GetInputShape(0);
+    auto origin = inShape->GetOriginShape();
+
+    uint32_t n = static_cast<uint32_t>(origin.GetDim(0));
+    uint32_t c = static_cast<uint32_t>(origin.GetDim(1));
+    uint32_t h = static_cast<uint32_t>(origin.GetDim(2));
+    uint32_t w = static_cast<uint32_t>(origin.GetDim(3));
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_N(n);
+    tiling.set_C(c);
+    tiling.set_H(h);
+    tiling.set_W(w);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const auto& x_origin = x_shape->GetOriginShape();
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    std::vector<int64_t> out_dims(4);
+    out_dims[0] = x_origin.GetDim(0); // N
+    out_dims[1] = 1;                  // reduced C
+    out_dims[2] = x_origin.GetDim(2); // H
+    out_dims[3] = x_origin.GetDim(3); // W
+
+    y_shape->SetDimNum(4);
+    for (int i = 0; i < 4; ++i) {
+        y_shape->SetDim(i, out_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv2dScalingMinCustom : public OpDef {
+public:
+    explicit Conv2dScalingMinCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv2dScalingMinCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv2d_scaling_min_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelChannelMin {
+public:
+    __aicore__ inline KernelChannelMin() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t N, uint32_t C, uint32_t H, uint32_t W, uint32_t tileNum)
+    {
+        this->N = N;
+        this->C = C;
+        this->H = H;
+        this->W = W;
+        this->planeSize = H * W;
+        this->tileNum = tileNum;
+        if (this->tileNum == 0) { this->tileNum = 1; }
+        this->tileLen = (this->planeSize + this->tileNum - 1) / this->tileNum;
+
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t nPerBlock = (N + blocks - 1) / blocks;
+        this->nStart = AscendC::GetBlockIdx() * nPerBlock;
+        if (this->nStart > N) this->nStart = N;
+        this->nEnd = this->nStart + nPerBlock;
+        if (this->nEnd > N) this->nEnd = N;
+
+        // Set GM buffers to the slice this block handles
+        xGm.SetGlobalBuffer((__gm__ float *)x + (uint64_t)this->nStart * C * this->planeSize,
+                            (uint64_t)(this->nEnd - this->nStart) * C * this->planeSize);
+        yGm.SetGlobalBuffer((__gm__ float *)y + (uint64_t)this->nStart * this->planeSize,
+                            (uint64_t)(this->nEnd - this->nStart) * this->planeSize);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLen * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLen * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (this->nStart >= this->nEnd) { return; }
+        for (uint32_t n = this->nStart; n < this->nEnd; ++n) {
+            for (uint32_t t = 0; t < this->tileNum; ++t) {
+                uint32_t tileOffset = t * this->tileLen;
+                uint32_t curLen = this->planeSize > tileOffset ? AscendC::Min((uint32_t)this->tileLen, (uint32_t)(this->planeSize - tileOffset)) : 0;
+                if (curLen == 0) { continue; }
+
+                // Accumulator buffer for current tile
+                AscendC::LocalTensor<float> acc = outQueueY.AllocTensor<float>();
+
+                for (uint32_t c = 0; c < this->C; ++c) {
+                    AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+                    // Offset inside the local GM window
+                    uint64_t gmOffsetX = ((uint64_t)(n - this->nStart) * this->C + c) * this->planeSize + tileOffset;
+                    AscendC::DataCopy(xLocal, xGm[gmOffsetX], curLen);
+
+                    if (c == 0) {
+                        AscendC::DataCopy(acc, xLocal, curLen);
+                    } else {
+                        AscendC::Min(acc, acc, xLocal, curLen);
+                    }
+
+                    inQueueX.EnQue(xLocal);
+                    AscendC::LocalTensor<float> xUsed = inQueueX.DeQue<float>();
+                    inQueueX.FreeTensor(xUsed);
+                }
+
+                outQueueY.EnQue(acc);
+                AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+                uint64_t gmOffsetY = ((uint64_t)(n - this->nStart)) * this->planeSize + tileOffset;
+                AscendC::DataCopy(yGm[gmOffsetY], yLocal, curLen);
+                outQueueY.FreeTensor(yLocal);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t N, C, H, W;
+    uint32_t planeSize;
+    uint32_t tileNum;
+    uint32_t tileLen;
+    uint32_t nStart;
+    uint32_t nEnd;
+};
+
+extern "C" __global__ __aicore__ void conv2d_scaling_min_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelChannelMin op;
+    op.Init(x, y,
+            tiling_data.N,
+            tiling_data.C,
+            tiling_data.H,
+            tiling_data.W,
+            tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv2d_scaling_min_custom_impl_npu(const at::Tensor& self) {
+    TORCH_CHECK(self.dim() == 4, \"Input must be NCHW 4D tensor\");
+    auto sizes = self.sizes();
+    std::vector<int64_t> out_sizes = {sizes[0], 1, sizes[2], sizes[3]};
+    at::Tensor result = at::empty(out_sizes, self.options());
+    EXEC_NPU_CMD(aclnnConv2dScalingMinCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"conv2d_scaling_min_custom\", &conv2d_scaling_min_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"conv2d_scaling_min_custom\", &conv2d_scaling_min_custom_impl_npu, \"min over channels after conv+scale (NCHW->N1HW)\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model that keeps convolution and scaling in PyTorch,
+    and replaces channel-wise min reduction with a custom AscendC op.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x * self.scale_factor
+        # Replace torch.min(x, dim=1, keepdim=True)[0]
+        x = custom_ops_lib.conv2d_scaling_min_custom(x)
+        return x
+'''

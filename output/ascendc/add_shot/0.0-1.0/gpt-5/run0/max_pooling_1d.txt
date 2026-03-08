@@ -1,0 +1,299 @@
+project_json_src='''
+[
+    {
+        "op": "MaxPooling1dCustom",
+        "language": "cpp",
+        "attr": [
+            { "name": "kernel_size", "type": "int" },
+            { "name": "stride", "type": "int" },
+            { "name": "padding", "type": "int" },
+            { "name": "return_indices", "type": "bool" }
+        ],
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MaxPooling1dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, L);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, S);
+  TILING_DATA_FIELD_DEF(uint32_t, P);
+  TILING_DATA_FIELD_DEF(uint32_t, OutL);
+  TILING_DATA_FIELD_DEF(uint32_t, totalUnits);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MaxPooling1dCustom, MaxPooling1dCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "max_pooling_1d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline int64_t DivFloor(int64_t a, int64_t b) {
+    return a / b;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 1;
+const uint32_t TILE_NUM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MaxPooling1dCustomTilingData tiling;
+
+    // Input shape expected: [N, C, L]
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto dims = in_shape->GetOriginShape().GetDims();
+    if (dims.size() != 3) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t N  = static_cast<uint32_t>(dims[0]);
+    uint32_t C  = static_cast<uint32_t>(dims[1]);
+    uint32_t L  = static_cast<uint32_t>(dims[2]);
+
+    // Get attributes
+    int64_t k_attr = 1;
+    int64_t s_attr = 1;
+    int64_t p_attr = 0;
+    bool ret_idx = false;
+
+    // The following helpers are commonly available in GERT; use fallback if not.
+    if (context->HasAttr("kernel_size")) { k_attr = context->GetAttrInt("kernel_size"); }
+    if (context->HasAttr("stride"))      { s_attr = context->GetAttrInt("stride"); }
+    if (context->HasAttr("padding"))     { p_attr = context->GetAttrInt("padding"); }
+    if (context->HasAttr("return_indices")) { ret_idx = context->GetAttrBool("return_indices"); }
+    (void)ret_idx; // indices not produced by this custom kernel
+
+    if (s_attr <= 0) s_attr = k_attr;
+    int64_t outL64 = DivFloor(static_cast<int64_t>(L) + 2 * p_attr - k_attr, s_attr) + 1;
+    if (outL64 < 0) outL64 = 0;
+
+    uint32_t OutL = static_cast<uint32_t>(outL64);
+    uint32_t totalUnits = N * C;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_N(N);
+    tiling.set_C(C);
+    tiling.set_L(L);
+    tiling.set_K(static_cast<uint32_t>(k_attr));
+    tiling.set_S(static_cast<uint32_t>(s_attr));
+    tiling.set_P(static_cast<uint32_t>(p_attr));
+    tiling.set_OutL(OutL);
+    tiling.set_totalUnits(totalUnits);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const auto* in_shape = context->GetInputShape(0);
+    auto dims = in_shape->GetOriginShape().GetDims();
+    if (dims.size() != 3) {
+        return GRAPH_FAILED;
+    }
+
+    // Attributes
+    int64_t k = 1, s = 1, p = 0;
+    if (context->HasAttr("kernel_size")) { k = context->GetAttrInt("kernel_size"); }
+    if (context->HasAttr("stride"))      { s = context->GetAttrInt("stride"); }
+    if (context->HasAttr("padding"))     { p = context->GetAttrInt("padding"); }
+    if (s <= 0) s = k;
+
+    int64_t L  = static_cast<int64_t>(dims[2]);
+    int64_t OutL = (L + 2 * p - k) / s + 1;
+    if (OutL < 0) OutL = 0;
+
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    std::vector<int64_t> out_dims = {dims[0], dims[1], OutL};
+    out_shape->SetDimNum(out_dims.size());
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        out_shape->SetDim(i, out_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MaxPooling1dCustom : public OpDef {
+public:
+    explicit MaxPooling1dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("kernel_size").Int();
+        this->Attr("stride").Int();
+        this->Attr("padding").Int();
+        this->Attr("return_indices").Bool();
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MaxPooling1dCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "max_pooling_1d_custom_tiling_data.h"
+
+extern "C" __global__ __aicore__ void max_pooling_1d_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+
+    const uint32_t N       = tiling_data.N;
+    const uint32_t C       = tiling_data.C;
+    const uint32_t L       = tiling_data.L;
+    const uint32_t K       = tiling_data.K;
+    const uint32_t S       = tiling_data.S;
+    const uint32_t P       = tiling_data.P;
+    const uint32_t OutL    = tiling_data.OutL;
+    const uint32_t units   = tiling_data.totalUnits; // N*C
+
+    // Map blocks over units (here BLOCK_DIM is 1 in tiling, but keep generic)
+    const uint32_t blockNum = AscendC::GetBlockNum();
+    const uint32_t blockIdx = AscendC::GetBlockIdx();
+    uint32_t unitsPerBlock = (units + blockNum - 1) / blockNum;
+    uint32_t unitStart = unitsPerBlock * blockIdx;
+    uint32_t unitEnd = AscendC::Min(unitStart + unitsPerBlock, units);
+
+    // Raw GM pointers
+    __gm__ const float* xPtr = reinterpret_cast<__gm__ const float*>(x);
+    __gm__ float*       yPtr = reinterpret_cast<__gm__ float*>(y);
+
+    // For each unit (N*C pair), perform 1D max pooling over L -> OutL
+    for (uint32_t u = unitStart; u < unitEnd; ++u) {
+        uint64_t inBase  = static_cast<uint64_t>(u) * static_cast<uint64_t>(L);
+        uint64_t outBase = static_cast<uint64_t>(u) * static_cast<uint64_t>(OutL);
+
+        for (uint32_t outIdx = 0; outIdx < OutL; ++outIdx) {
+            int64_t start = static_cast<int64_t>(outIdx) * static_cast<int64_t>(S) - static_cast<int64_t>(P);
+            float maxv = -std::numeric_limits<float>::infinity();
+
+            for (uint32_t k = 0; k < K; ++k) {
+                int64_t idx = start + static_cast<int64_t>(k);
+                float val = 0.0f; // implicit zero padding
+                if (idx >= 0 && idx < static_cast<int64_t>(L)) {
+                    val = xPtr[inBase + static_cast<uint64_t>(idx)];
+                }
+                maxv = (val > maxv) ? val : maxv;
+            }
+            yPtr[outBase + outIdx] = maxv;
+        }
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline int64_t compute_out_len(int64_t L, int64_t kernel_size, int64_t stride, int64_t padding) {
+    if (stride <= 0) stride = kernel_size;
+    return (L + 2 * padding - kernel_size) / stride + 1;
+}
+
+at::Tensor max_pooling_1d_custom_impl_npu(const at::Tensor& x,
+                                          int64_t kernel_size,
+                                          int64_t stride,
+                                          int64_t padding,
+                                          bool return_indices) {
+    TORCH_CHECK(x.dim() == 3, "Input must be 3D tensor [N, C, L]");
+    auto N = x.size(0);
+    auto C = x.size(1);
+    auto L = x.size(2);
+    if (stride <= 0) stride = kernel_size;
+    int64_t OutL = compute_out_len(L, kernel_size, stride, padding);
+    TORCH_CHECK(OutL >= 0, "Invalid output length computed for MaxPool1d");
+
+    at::Tensor result = at::empty({N, C, OutL}, x.options());
+
+    // call custom acl op, attributes are forwarded as scalars
+    EXEC_NPU_CMD(aclnnMaxPooling1dCustom, x, kernel_size, stride, padding, return_indices, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("max_pooling_1d_custom", &max_pooling_1d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("max_pooling_1d_custom", &max_pooling_1d_custom_impl_npu, "MaxPool1d custom AscendC");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Custom MaxPooling1d using AscendC kernel.
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0, return_indices: bool = False):
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.stride = int(stride) if stride is not None else int(kernel_size)
+        self.padding = int(padding)
+        self.return_indices = bool(return_indices)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.max_pooling_1d_custom(x, self.kernel_size, self.stride, self.padding, self.return_indices)
+'''

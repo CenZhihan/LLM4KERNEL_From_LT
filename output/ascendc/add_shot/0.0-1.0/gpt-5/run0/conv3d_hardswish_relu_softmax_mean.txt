@@ -1,0 +1,315 @@
+project_json_src='''
+[
+    {
+        "op": "Conv3dHardswishReluSoftmaxMeanCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv3dHardswishReluSoftmaxMeanCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, b);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, d);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv3dHardswishReluSoftmaxMeanCustom, Conv3dHardswishReluSoftmaxMeanCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv3d_hardswish_relu_softmax_mean_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv3dHardswishReluSoftmaxMeanCustomTilingData tiling;
+
+    auto inShape = context->GetInputShape(0)->GetOriginShape();
+    uint32_t dimNum = inShape.GetDimNum();
+    if (dimNum < 5) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t b = static_cast<uint32_t>(inShape.GetDim(0));
+    uint32_t c = static_cast<uint32_t>(inShape.GetDim(1));
+    uint32_t d = static_cast<uint32_t>(inShape.GetDim(2));
+    uint32_t h = static_cast<uint32_t>(inShape.GetDim(3));
+    uint32_t w = static_cast<uint32_t>(inShape.GetDim(4));
+
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_b(b);
+    tiling.set_c(c);
+    tiling.set_d(d);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    auto x_origin = x_shape->GetOriginShape();
+    if (x_origin.GetDimNum() < 2) {
+        return GRAPH_FAILED;
+    }
+    int64_t b = x_origin.GetDim(0);
+    int64_t c = x_origin.GetDim(1);
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, b);
+    y_shape->SetDim(1, c);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv3dHardswishReluSoftmaxMeanCustom : public OpDef {
+public:
+    explicit Conv3dHardswishReluSoftmaxMeanCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv3dHardswishReluSoftmaxMeanCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv3d_hardswish_relu_softmax_mean_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelMeanReduce {
+public:
+    __aicore__ inline KernelMeanReduce() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength,
+                                uint32_t b, uint32_t c, uint32_t d, uint32_t h, uint32_t w,
+                                uint32_t tileNum)
+    {
+        this->b = b;
+        this->c = c;
+        this->d = d;
+        this->h = h;
+        this->w = w;
+        this->dhw = d * h * w;
+        this->outSize = b * c;
+        this->tileNum = tileNum;
+
+        // Partition work across blocks by (b*c) outputs
+        this->outPerBlock = (this->outSize + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
+        this->outStart = AscendC::GetBlockIdx() * this->outPerBlock;
+        this->outEnd = AscendC::Min(this->outStart + this->outPerBlock, this->outSize);
+
+        // Set GM buffers
+        xGm.SetGlobalBuffer((__gm__ float *)x, totalLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y, this->outSize);
+
+        // Tile chunk along DHW for local buffering
+        // Ensure at least length 1
+        this->tileLen = AscendC::Max((uint32_t)1, (uint32_t)((this->dhw + (tileNum * BUFFER_NUM) - 1) / (tileNum * BUFFER_NUM)));
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLen * sizeof(float));
+        pipe.InitBuffer(scalarQueue, BUFFER_NUM, sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t oc = this->outStart; oc < this->outEnd; ++oc) {
+            // base offset for this (b,c)
+            uint64_t base = (uint64_t)oc * (uint64_t)this->dhw;
+
+            // running sum in a scalar local tensor
+            AscendC::LocalTensor<float> sumLocal = scalarQueue.AllocTensor<float>();
+            // initialize sum to 0
+            for (int i = 0; i < 1; ++i) {
+                sumLocal.SetValue(i, 0.f);
+            }
+
+            uint32_t loops = (this->dhw + this->tileLen - 1) / this->tileLen;
+            for (uint32_t i = 0; i < loops; ++i) {
+                uint32_t len = (i != loops - 1) ? this->tileLen : (this->dhw - i * this->tileLen);
+
+                AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+                AscendC::DataCopy(xLocal, xGm[base + (uint64_t)i * this->tileLen], len);
+                inQueueX.EnQue(xLocal);
+
+                xLocal = inQueueX.DeQue<float>();
+
+                // Reduce sum over tile
+                float partial = 0.f;
+                for (uint32_t t = 0; t < len; ++t) {
+                    partial += xLocal.GetValue(t);
+                }
+                float oldSum = sumLocal.GetValue(0);
+                sumLocal.SetValue(0, oldSum + partial);
+
+                inQueueX.FreeTensor(xLocal);
+            }
+
+            float mean = sumLocal.GetValue(0) / static_cast<float>(this->dhw);
+
+            // write mean to GM
+            AscendC::LocalTensor<float> outLocal = scalarQueue.AllocTensor<float>();
+            outLocal.SetValue(0, mean);
+            AscendC::DataCopy(yGm[oc], outLocal, 1);
+
+            scalarQueue.FreeTensor(sumLocal);
+            scalarQueue.FreeTensor(outLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> scalarQueue;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t b;
+    uint32_t c;
+    uint32_t d;
+    uint32_t h;
+    uint32_t w;
+    uint32_t dhw;
+    uint32_t outSize;
+
+    uint32_t tileNum;
+    uint32_t tileLen;
+
+    uint32_t outPerBlock;
+    uint32_t outStart;
+    uint32_t outEnd;
+};
+
+extern "C" __global__ __aicore__ void conv3d_hardswish_relu_softmax_mean_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMeanReduce op;
+    op.Init(x, y,
+            tiling_data.totalLength,
+            tiling_data.b, tiling_data.c, tiling_data.d, tiling_data.h, tiling_data.w,
+            tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv3d_hardswish_relu_softmax_mean_custom_impl_npu(const at::Tensor& x) {
+    TORCH_CHECK(x.is_npu(), "Input must be on NPU");
+    auto sizes = x.sizes();
+    TORCH_CHECK(sizes.size() == 5, "Expected NCDHW input");
+    // Output shape: (B, C)
+    at::Tensor result = at::empty({sizes[0], sizes[1]}, x.options());
+    EXEC_NPU_CMD(aclnnConv3dHardswishReluSoftmaxMeanCustom, x, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv3d_hardswish_relu_softmax_mean_custom", &conv3d_hardswish_relu_softmax_mean_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv3d_hardswish_relu_softmax_mean_custom", &conv3d_hardswish_relu_softmax_mean_custom_impl_npu, "Mean over D,H,W after ops");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn.functional as F
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model that offloads the final mean reduction over spatial dims to a custom AscendC kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups=4, bias=True):
+        super(ModelNew, self).__init__()
+        self.conv = torch.nn.Conv3d(in_channels, out_channels, kernel_size, bias=bias)
+        self.group_norm = torch.nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)                 # (B, C, D, H, W)
+        x = F.hardswish(x)               # Nonlinear activation
+        x = self.group_norm(x)           # Normalization over channels
+        # Custom kernel computes mean over spatial dims (D, H, W) -> (B, C)
+        x = custom_ops_lib.conv3d_hardswish_relu_softmax_mean_custom(x)
+        return x
+'''

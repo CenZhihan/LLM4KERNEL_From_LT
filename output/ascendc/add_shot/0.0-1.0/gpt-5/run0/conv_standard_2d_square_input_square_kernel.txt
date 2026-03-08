@@ -1,0 +1,381 @@
+project_json_src='''
+[
+    {
+        "op": "ConvStandard2dSquareInputSquareKernelCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "optional",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvStandard2dSquareInputSquareKernelCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, kernel);
+  TILING_DATA_FIELD_DEF(uint32_t, stride);
+  TILING_DATA_FIELD_DEF(uint32_t, pad);
+  TILING_DATA_FIELD_DEF(uint32_t, outH);
+  TILING_DATA_FIELD_DEF(uint32_t, outW);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint64_t, totalOutLength);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvStandard2dSquareInputSquareKernelCustom, ConvStandard2dSquareInputSquareKernelCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_standard_2d_square_input_square_kernel_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline int64_t DivUp(int64_t x, int64_t y) { return (x + y - 1) / y; }
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvStandard2dSquareInputSquareKernelCustomTilingData tiling;
+
+    auto* in_shape = context->GetInputShape(0);
+    auto* w_shape  = context->GetInputShape(1);
+
+    // Expect x: [N,C,H,W], w: [K,C,kH,kW]
+    uint32_t N = in_shape->GetOriginShape().GetDim(0);
+    uint32_t C = in_shape->GetOriginShape().GetDim(1);
+    uint32_t H = in_shape->GetOriginShape().GetDim(2);
+    uint32_t W = in_shape->GetOriginShape().GetDim(3);
+
+    uint32_t K  = w_shape->GetOriginShape().GetDim(0);
+    uint32_t kH = w_shape->GetOriginShape().GetDim(2);
+    uint32_t kW = w_shape->GetOriginShape().GetDim(3);
+
+    // This custom kernel is specialized for square kernel and input spatial dims are equal; use kH==kW.
+    uint32_t kernel = kH;
+
+    // Fixed stride/pad as in the model definition
+    uint32_t stride = 4;
+    uint32_t pad = 2;
+
+    uint32_t outH = (H + 2 * pad - kernel) / stride + 1;
+    uint32_t outW = (W + 2 * pad - kernel) / stride + 1;
+
+    tiling.set_N(N);
+    tiling.set_C(C);
+    tiling.set_H(H);
+    tiling.set_W(W);
+    tiling.set_K(K);
+    tiling.set_kernel(kernel);
+    tiling.set_stride(stride);
+    tiling.set_pad(pad);
+    tiling.set_outH(outH);
+    tiling.set_outW(outW);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_totalOutLength(static_cast<uint64_t>(N) * K * outH * outW);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+
+    int64_t N = x_shape->GetDim(0);
+    int64_t H = x_shape->GetDim(2);
+    int64_t W = x_shape->GetDim(3);
+
+    int64_t K = w_shape->GetDim(0);
+    int64_t kH = w_shape->GetDim(2);
+    // int64_t kW = w_shape->GetDim(3);
+
+    int64_t stride = 4;
+    int64_t pad = 2;
+
+    int64_t outH = (H + 2 * pad - kH) / stride + 1;
+    int64_t outW = (W + 2 * pad - kH) / stride + 1;
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(4);
+    y_shape->SetDim(0, N);
+    y_shape->SetDim(1, K);
+    y_shape->SetDim(2, outH);
+    y_shape->SetDim(3, outW);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvStandard2dSquareInputSquareKernelCustom : public OpDef {
+public:
+    explicit ConvStandard2dSquareInputSquareKernelCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvStandard2dSquareInputSquareKernelCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv_standard_2d_square_input_square_kernel_custom_tiling_data.h"
+
+// This is a simplified illustrative Conv2D kernel specialized to square inputs/kernels and fixed stride/padding.
+// It partitions output channels across blocks and iterates directly on GM.
+// For demonstration purposes.
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelConv2D {
+public:
+    __aicore__ inline KernelConv2D() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                uint32_t N, uint32_t C, uint32_t H, uint32_t W,
+                                uint32_t K, uint32_t kernel, uint32_t stride, uint32_t pad,
+                                uint32_t outH, uint32_t outW)
+    {
+        // Bind global buffers
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x, (uint64_t)N * C * H * W);
+        wGm.SetGlobalBuffer((__gm__ DTYPE_W*)w, (uint64_t)K * C * kernel * kernel);
+        if (b != nullptr) {
+            bGm.SetGlobalBuffer((__gm__ DTYPE_B*)b, (uint64_t)K);
+            hasBias = true;
+        } else {
+            hasBias = false;
+        }
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y, (uint64_t)N * K * outH * outW);
+
+        this->N = N; this->C = C; this->H = H; this->W = W;
+        this->K = K; this->k = kernel; this->s = stride; this->p = pad;
+        this->outH = outH; this->outW = outW;
+
+        // Partition output channels across blocks
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t idx = AscendC::GetBlockIdx();
+        ocStart = (K / blocks) * idx + ((idx < (K % blocks)) ? idx : (K % blocks));
+        ocLen   = (K / blocks) + ((idx < (K % blocks)) ? 1 : 0);
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Local scalar buffers
+        for (uint32_t n = 0; n < N; ++n) {
+            for (uint32_t oc = 0; oc < ocLen; ++oc) {
+                uint32_t outC = ocStart + oc;
+                for (uint32_t oh = 0; oh < outH; ++oh) {
+                    for (uint32_t ow = 0; ow < outW; ++ow) {
+                        float acc = 0.0f;
+                        if (hasBias) {
+                            // Load bias[ outC ]
+                            // DataCopy a single value to local buffer
+                            AscendC::LocalTensor<DTYPE_B> bLocal;
+                            bLocal.SetSize(1);
+                            AscendC::DataCopy(bLocal, bGm[outC], 1);
+                            acc = static_cast<float>(bLocal.GetValue(0));
+                        }
+                        for (uint32_t ic = 0; ic < C; ++ic) {
+                            for (uint32_t kh = 0; kh < k; ++kh) {
+                                int32_t ih = (int32_t)oh * (int32_t)s - (int32_t)p + (int32_t)kh;
+                                if (ih < 0 || ih >= (int32_t)H) continue;
+                                for (uint32_t kw = 0; kw < k; ++kw) {
+                                    int32_t iw = (int32_t)ow * (int32_t)s - (int32_t)p + (int32_t)kw;
+                                    if (iw < 0 || iw >= (int32_t)W) continue;
+
+                                    uint64_t xIndex = (((uint64_t)n * C + ic) * H + (uint32_t)ih) * W + (uint32_t)iw;
+                                    uint64_t wIndex = ((((uint64_t)outC) * C + ic) * k + kh) * k + kw;
+
+                                    AscendC::LocalTensor<DTYPE_X> xLocal;
+                                    AscendC::LocalTensor<DTYPE_W> wLocal;
+                                    xLocal.SetSize(1);
+                                    wLocal.SetSize(1);
+                                    AscendC::DataCopy(xLocal, xGm[xIndex], 1);
+                                    AscendC::DataCopy(wLocal, wGm[wIndex], 1);
+
+                                    float xv = static_cast<float>(xLocal.GetValue(0));
+                                    float wv = static_cast<float>(wLocal.GetValue(0));
+                                    acc += xv * wv;
+                                }
+                            }
+                        }
+                        uint64_t yIndex = (((uint64_t)n * K + outC) * outH + oh) * outW + ow;
+                        AscendC::LocalTensor<DTYPE_Y> yLocal;
+                        yLocal.SetSize(1);
+                        yLocal.SetValue(0, static_cast<DTYPE_Y>(acc));
+                        AscendC::DataCopy(yGm[yIndex], yLocal, 1);
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_W> wGm;
+    AscendC::GlobalTensor<DTYPE_B> bGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t N, C, H, W;
+    uint32_t K, k, s, p;
+    uint32_t outH, outW;
+    uint32_t ocStart, ocLen;
+    bool hasBias;
+};
+
+extern "C" __global__ __aicore__ void conv_standard_2d_square_input_square_kernel_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv2D op;
+    op.Init(x, w, b, y,
+            tiling_data.N, tiling_data.C, tiling_data.H, tiling_data.W,
+            tiling_data.K, tiling_data.kernel, tiling_data.stride, tiling_data.pad,
+            tiling_data.outH, tiling_data.outW);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_standard_2d_square_input_square_kernel_custom_impl_npu(const at::Tensor& x,
+                                                                       const at::Tensor& w,
+                                                                       c10::optional<at::Tensor> b_opt) {
+    at::Tensor y = at::empty({x.size(0), w.size(0),
+                              (x.size(2) + 2 * 2 - w.size(2)) / 4 + 1,
+                              (x.size(3) + 2 * 2 - w.size(3)) / 4 + 1},
+                              x.options());
+    if (b_opt.has_value()) {
+        auto b = b_opt.value();
+        EXEC_NPU_CMD(aclnnConvStandard2dSquareInputSquareKernelCustom, x, w, b, y);
+    } else {
+        // Pass an empty tensor as bias if not provided
+        at::Tensor empty_bias;
+        EXEC_NPU_CMD(aclnnConvStandard2dSquareInputSquareKernelCustom, x, w, empty_bias, y);
+    }
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_standard_2d_square_input_square_kernel_custom", &conv_standard_2d_square_input_square_kernel_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_standard_2d_square_input_square_kernel_custom",
+          &conv_standard_2d_square_input_square_kernel_custom_impl_npu,
+          "Custom 2D convolution (square input/kernel; stride=4, pad=2)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, num_classes=1000):
+        super(ModelNew, self).__init__()
+        # Keep the original Conv2d to store weights/bias; forward will call custom op.
+        self.conv1 = torch.nn.Conv2d(in_channels=3, out_channels=96, kernel_size=11, stride=4, padding=2)
+
+    def forward(self, x):
+        return custom_ops_lib.conv_standard_2d_square_input_square_kernel_custom(x, self.conv1.weight, self.conv1.bias)
+'''

@@ -1,0 +1,301 @@
+project_json_src='''
+[
+    {
+        "op": "TakeAlongDimCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "idx",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32",
+                    "int64"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(TakeAlongDimCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength); // B * M
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, nStride); // N (width of x)
+  TILING_DATA_FIELD_DEF(uint32_t, mStride); // M (width of idx/output)
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(TakeAlongDimCustom, TakeAlongDimCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "take_along_dim_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t GetDimSafe(const gert::Shape& s, uint32_t i) {
+    if (s.GetDimNum() > i) {
+        return static_cast<uint32_t>(s.GetDim(i));
+    }
+    return 1;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    TakeAlongDimCustomTilingData tiling;
+
+    const auto* x_shape_ptr = context->GetInputShape(0);
+    const auto* idx_shape_ptr = context->GetInputShape(1);
+
+    auto x_shape = x_shape_ptr->GetOriginShape();
+    auto idx_shape = idx_shape_ptr->GetOriginShape();
+
+    uint32_t B = GetDimSafe(x_shape, 0);
+    uint32_t N = GetDimSafe(x_shape, 1);
+    uint32_t M = GetDimSafe(idx_shape, 1);
+
+    uint32_t totalLength = B * M;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_nStride(N);
+    tiling.set_mStride(M);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* idx_shape = context->GetInputShape(1);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    *z_shape = *idx_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class TakeAlongDimCustom : public OpDef {
+public:
+    explicit TakeAlongDimCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("idx")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32, ge::DT_INT64})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(TakeAlongDimCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "take_along_dim_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelTakeAlongDim {
+public:
+    __aicore__ inline KernelTakeAlongDim() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR idx, GM_ADDR z,
+                                uint32_t totalLength, uint32_t tileNum,
+                                uint32_t nStride, uint32_t mStride)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->nStride = nStride;
+        this->mStride = mStride;
+
+        // x is the full [B, N] tensor
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, nStride * (totalLength / mStride));
+        // idx and z are flattened [B*M] tensors; offset block-wise
+        auto baseOffset = this->blockLength * AscendC::GetBlockIdx();
+        idxGm.SetGlobalBuffer((__gm__ DTYPE_Y *)idx + baseOffset, this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + baseOffset, this->blockLength);
+
+        pipe.InitBuffer(inQueueIdx, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Y> idxLocal = inQueueIdx.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(idxLocal, idxGm[progress * this->tileLength], this->tileLength);
+        inQueueIdx.EnQue(idxLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Y> idxLocal = inQueueIdx.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+
+        // Flattened position within [B, M]
+        uint32_t gBase = progress * this->tileLength;
+
+        // For each element in the tile, gather from x[b, idx[b,j]]
+        for (uint32_t i = 0; i < this->tileLength; ++i) {
+            uint32_t pos = gBase + i;
+            uint32_t b = pos / this->mStride;      // row index
+            uint32_t base = b * this->nStride;     // base offset in x
+            // read index value
+            DTYPE_Y indexVal = idxLocal.GetValue(i);
+            uint32_t j = static_cast<uint32_t>(indexVal);
+            // load from x and store to local z
+            // Note: conceptual scalar access from GM; actual implementation may vectorize/gather
+            DTYPE_Z val = static_cast<DTYPE_Z>(xGm[base + j].GetValue(0));
+            zLocal.SetValue(i, val);
+        }
+
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        inQueueIdx.FreeTensor(idxLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueIdx;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> idxGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+    uint32_t nStride;
+    uint32_t mStride;
+};
+
+extern "C" __global__ __aicore__ void take_along_dim_custom(GM_ADDR x, GM_ADDR idx, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelTakeAlongDim op;
+    op.Init(x, idx, z,
+            tiling_data.totalLength, tiling_data.tileNum,
+            tiling_data.nStride, tiling_data.mStride);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor take_along_dim_custom_impl_npu(const at::Tensor& x, const at::Tensor& idx) {
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(idx.dim() == 2, "idx must be 2D");
+    TORCH_CHECK(x.size(0) == idx.size(0), "batch dimension must match");
+    at::Tensor result = at::empty(idx.sizes(), x.options());
+    EXEC_NPU_CMD(aclnnTakeAlongDimCustom, x, idx, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("take_along_dim_custom", &take_along_dim_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("take_along_dim_custom", &take_along_dim_custom_impl_npu, "take_along_dim on dim=1");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, idx):
+        return custom_ops_lib.take_along_dim_custom(x, idx)
+'''

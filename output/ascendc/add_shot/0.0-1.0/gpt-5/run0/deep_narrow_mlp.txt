@@ -1,0 +1,315 @@
+project_json_src='''
+[
+    {
+        "op": "DeepNarrowMlpCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(DeepNarrowMlpCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, innerSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(DeepNarrowMlpCustom, DeepNarrowMlpCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "deep_narrow_mlp_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t GetLastDim(const gert::Shape& s) {
+    auto dimNum = s.GetDimNum();
+    if (dimNum == 0) return 1;
+    return static_cast<uint32_t>(s.GetDim(dimNum - 1));
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    DeepNarrowMlpCustomTilingData tiling;
+    auto origin = context->GetInputShape(0)->GetOriginShape();
+    uint32_t totalLength = static_cast<uint32_t>(origin.GetShapeSize());
+    uint32_t innerSize = GetLastDim(origin);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_innerSize(innerSize);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class DeepNarrowMlpCustom : public OpDef {
+public:
+    explicit DeepNarrowMlpCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(DeepNarrowMlpCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "deep_narrow_mlp_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+// Fused BiasAdd + ReLU: z = relu(x + b), with b broadcast over the last dim
+class KernelBiasAddRelu {
+public:
+    __aicore__ inline KernelBiasAddRelu() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR b, GM_ADDR z, uint32_t totalLength, uint32_t tileNum, uint32_t innerSize)
+    {
+        this->innerSize = innerSize;
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        // Ensure tileLength aligns to innerSize to simplify broadcast add
+        this->tileLength = (this->tileLength / this->innerSize) * this->innerSize;
+        if (this->tileLength == 0) {
+            this->tileLength = this->innerSize; // fallback minimal tile is one row
+        }
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        bGm.SetGlobalBuffer((__gm__ DTYPE_Y *)b, this->innerSize);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        // keep a local copy of bias per tile
+        pipe.InitBuffer(inQueueB, 1, this->innerSize * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        // Copy input tile
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+
+        // Copy bias vector
+        AscendC::LocalTensor<DTYPE_Y> bLocal = inQueueB.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(bLocal, bGm, this->innerSize);
+        inQueueB.EnQue(bLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> bLocal = inQueueB.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+
+        uint32_t rows = this->tileLength / this->innerSize;
+        for (uint32_t r = 0; r < rows; ++r) {
+            uint32_t offset = r * this->innerSize;
+            AscendC::Add(zLocal[offset], xLocal[offset], bLocal, this->innerSize);
+            // Apply ReLU in-place to the current row
+            AscendC::Relu(zLocal[offset], zLocal[offset], this->innerSize);
+        }
+
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueB.FreeTensor(bLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueB;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> bGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+    uint32_t innerSize;
+};
+
+extern "C" __global__ __aicore__ void deep_narrow_mlp_custom(GM_ADDR x, GM_ADDR b, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelBiasAddRelu op;
+    op.Init(x, b, z, tiling_data.totalLength, tiling_data.tileNum, tiling_data.innerSize);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor deep_narrow_mlp_custom_impl_npu(const at::Tensor& preact, const at::Tensor& bias) {
+    TORCH_CHECK(preact.dim() >= 1, "preact must have at least 1 dimension");
+    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+    TORCH_CHECK(preact.size(-1) == bias.size(0), "bias last dim must match preact's last dimension");
+    at::Tensor result = at::empty_like(preact);
+    EXEC_NPU_CMD(aclnnDeepNarrowMlpCustom, preact, bias, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("deep_narrow_mlp_custom", &deep_narrow_mlp_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("deep_narrow_mlp_custom", &deep_narrow_mlp_custom_impl_npu, "BiasAdd + ReLU over last dim");
+}
+"""
+
+model_src='''
+import math
+import torch
+import torch.nn.functional as F
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        super().__init__()
+        self.hidden_sizes = list(hidden_layer_sizes)
+
+        self.hidden_weights = torch.nn.ParameterList()
+        self.hidden_biases = torch.nn.ParameterList()
+
+        in_features = input_size
+        for h in self.hidden_sizes:
+            w = torch.nn.Parameter(torch.empty(h, in_features))
+            b = torch.nn.Parameter(torch.empty(h))
+            torch.nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+            fan_in = in_features
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            torch.nn.init.uniform_(b, -bound, bound)
+            self.hidden_weights.append(w)
+            self.hidden_biases.append(b)
+            in_features = h
+
+        # output projection (no ReLU here)
+        self.out_weight = torch.nn.Parameter(torch.empty(output_size, in_features))
+        self.out_bias = torch.nn.Parameter(torch.empty(output_size))
+        torch.nn.init.kaiming_uniform_(self.out_weight, a=math.sqrt(5))
+        fan_in = in_features
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        torch.nn.init.uniform_(self.out_bias, -bound, bound)
+
+    def forward(self, x):
+        for w, b in zip(self.hidden_weights, self.hidden_biases):
+            x = torch.matmul(x, w.t())
+            x = custom_ops_lib.deep_narrow_mlp_custom(x, b)
+        x = F.linear(x, self.out_weight, self.out_bias)
+        return x
+'''

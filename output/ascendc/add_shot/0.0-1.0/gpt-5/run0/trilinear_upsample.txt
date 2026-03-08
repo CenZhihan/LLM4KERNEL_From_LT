@@ -1,0 +1,322 @@
+project_json_src='''
+[
+    {
+        "op": "TrilinearUpsampleCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(TrilinearUpsampleCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, d_in);
+  TILING_DATA_FIELD_DEF(uint32_t, h_in);
+  TILING_DATA_FIELD_DEF(uint32_t, w_in);
+  TILING_DATA_FIELD_DEF(uint32_t, d_out);
+  TILING_DATA_FIELD_DEF(uint32_t, h_out);
+  TILING_DATA_FIELD_DEF(uint32_t, w_out);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(TrilinearUpsampleCustom, TrilinearUpsampleCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "trilinear_upsample_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    TrilinearUpsampleCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    // Expect shape: [N, C, D, H, W]
+    uint32_t n = origin.GetDim(0);
+    uint32_t c = origin.GetDim(1);
+    uint32_t d_in = origin.GetDim(2);
+    uint32_t h_in = origin.GetDim(3);
+    uint32_t w_in = origin.GetDim(4);
+
+    // align_corners=True with scale_factor=2 => out = (in - 1) * 2 + 1
+    uint32_t d_out = (d_in > 0) ? ((d_in - 1) * 2 + 1) : 0;
+    uint32_t h_out = (h_in > 0) ? ((h_in - 1) * 2 + 1) : 0;
+    uint32_t w_out = (w_in > 0) ? ((w_in - 1) * 2 + 1) : 0;
+
+    uint64_t totalLength64 = static_cast<uint64_t>(n) * c * d_out * h_out * w_out;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(static_cast<uint32_t>(totalLength64)); // truncated for demo; kernels use 64-bit internally
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_d_in(d_in);
+    tiling.set_h_in(h_in);
+    tiling.set_w_in(w_in);
+    tiling.set_d_out(d_out);
+    tiling.set_h_out(h_out);
+    tiling.set_w_out(w_out);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const auto& in = x_shape->GetStorageShape(); // [N, C, D, H, W]
+    uint64_t n = in.GetDim(0);
+    uint64_t c = in.GetDim(1);
+    uint64_t d_in = in.GetDim(2);
+    uint64_t h_in = in.GetDim(3);
+    uint64_t w_in = in.GetDim(4);
+
+    uint64_t d_out = (d_in > 0) ? ((d_in - 1) * 2 + 1) : 0;
+    uint64_t h_out = (h_in > 0) ? ((h_in - 1) * 2 + 1) : 0;
+    uint64_t w_out = (w_in > 0) ? ((w_in - 1) * 2 + 1) : 0;
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDim(0, n);
+    y_shape->SetDim(1, c);
+    y_shape->SetDim(2, d_out);
+    y_shape->SetDim(3, h_out);
+    y_shape->SetDim(4, w_out);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class TrilinearUpsampleCustom : public OpDef {
+public:
+    explicit TrilinearUpsampleCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(TrilinearUpsampleCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "trilinear_upsample_custom_tiling_data.h"
+
+#ifndef DTYPE_X
+using DTYPE_X = float;
+#endif
+#ifndef DTYPE_Z
+using DTYPE_Z = float;
+#endif
+
+extern "C" __global__ __aicore__ void trilinear_upsample_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+
+    const uint32_t n = tiling_data.n;
+    const uint32_t c = tiling_data.c;
+    const uint32_t d_in = tiling_data.d_in;
+    const uint32_t h_in = tiling_data.h_in;
+    const uint32_t w_in = tiling_data.w_in;
+    const uint32_t d_out = tiling_data.d_out;
+    const uint32_t h_out = tiling_data.h_out;
+    const uint32_t w_out = tiling_data.w_out;
+
+    // Strides for input (N, C, D, H, W)
+    const uint64_t in_sw = 1ULL;
+    const uint64_t in_sh = static_cast<uint64_t>(w_in);
+    const uint64_t in_sd = static_cast<uint64_t>(h_in) * w_in;
+    const uint64_t in_sc = static_cast<uint64_t>(d_in) * in_sd;
+    const uint64_t in_sn = static_cast<uint64_t>(c) * in_sc;
+
+    // Strides for output (N, C, D, H, W)
+    const uint64_t out_sw = 1ULL;
+    const uint64_t out_sh = static_cast<uint64_t>(w_out);
+    const uint64_t out_sd = static_cast<uint64_t>(h_out) * w_out;
+    const uint64_t out_sc = static_cast<uint64_t>(d_out) * out_sd;
+    const uint64_t out_sn = static_cast<uint64_t>(c) * out_sc;
+
+    // align_corners = true scale computation
+    const float scale_d = (d_out > 1) ? static_cast<float>(d_in - 1) / static_cast<float>(d_out - 1) : 0.0f;
+    const float scale_h = (h_out > 1) ? static_cast<float>(h_in - 1) / static_cast<float>(h_out - 1) : 0.0f;
+    const float scale_w = (w_out > 1) ? static_cast<float>(w_in - 1) / static_cast<float>(w_out - 1) : 0.0f;
+
+    __gm__ DTYPE_X* in = reinterpret_cast<__gm__ DTYPE_X*>(x);
+    __gm__ DTYPE_Z* out = reinterpret_cast<__gm__ DTYPE_Z*>(y);
+
+    const uint64_t total = static_cast<uint64_t>(n) * c * d_out * h_out * w_out;
+    const uint32_t block_num = AscendC::GetBlockNum();
+    const uint32_t block_idx = AscendC::GetBlockIdx();
+
+    uint64_t block_len = (total + block_num - 1) / block_num;
+    uint64_t start = static_cast<uint64_t>(block_idx) * block_len;
+    uint64_t end = start + block_len;
+    if (end > total) end = total;
+
+    for (uint64_t out_idx = start; out_idx < end; ++out_idx) {
+        // Unflatten output index to (n, c, d, h, w)
+        uint64_t t = out_idx;
+        uint32_t n_idx = static_cast<uint32_t>(t / out_sn); t %= out_sn;
+        uint32_t c_idx = static_cast<uint32_t>(t / out_sc); t %= out_sc;
+        uint32_t d_idx = static_cast<uint32_t>(t / out_sd); t %= out_sd;
+        uint32_t h_idx = static_cast<uint32_t>(t / out_sh);
+        uint32_t w_idx = static_cast<uint32_t>(t % out_sh);
+
+        // Compute source positions with align_corners=True
+        float fd = (d_out > 1) ? (static_cast<float>(d_idx) * scale_d) : 0.0f;
+        float fh = (h_out > 1) ? (static_cast<float>(h_idx) * scale_h) : 0.0f;
+        float fw = (w_out > 1) ? (static_cast<float>(w_idx) * scale_w) : 0.0f;
+
+        int d0 = static_cast<int>(fd);
+        int h0 = static_cast<int>(fh);
+        int w0 = static_cast<int>(fw);
+
+        int d1 = (d0 + 1 < static_cast<int>(d_in)) ? (d0 + 1) : (static_cast<int>(d_in) - 1);
+        int h1 = (h0 + 1 < static_cast<int>(h_in)) ? (h0 + 1) : (static_cast<int>(h_in) - 1);
+        int w1 = (w0 + 1 < static_cast<int>(w_in)) ? (w0 + 1) : (static_cast<int>(w_in) - 1);
+
+        float td = fd - static_cast<float>(d0);
+        float th = fh - static_cast<float>(h0);
+        float tw = fw - static_cast<float>(w0);
+
+        float wd0 = 1.0f - td, wd1 = td;
+        float wh0 = 1.0f - th, wh1 = th;
+        float ww0 = 1.0f - tw, ww1 = tw;
+
+        // Base offsets
+        uint64_t base_nc = static_cast<uint64_t>(n_idx) * in_sn + static_cast<uint64_t>(c_idx) * in_sc;
+
+        uint64_t o000 = base_nc + static_cast<uint64_t>(d0) * in_sd + static_cast<uint64_t>(h0) * in_sh + static_cast<uint64_t>(w0);
+        uint64_t o001 = base_nc + static_cast<uint64_t>(d0) * in_sd + static_cast<uint64_t>(h0) * in_sh + static_cast<uint64_t>(w1);
+        uint64_t o010 = base_nc + static_cast<uint64_t>(d0) * in_sd + static_cast<uint64_t>(h1) * in_sh + static_cast<uint64_t>(w0);
+        uint64_t o011 = base_nc + static_cast<uint64_t>(d0) * in_sd + static_cast<uint64_t>(h1) * in_sh + static_cast<uint64_t>(w1);
+        uint64_t o100 = base_nc + static_cast<uint64_t>(d1) * in_sd + static_cast<uint64_t>(h0) * in_sh + static_cast<uint64_t>(w0);
+        uint64_t o101 = base_nc + static_cast<uint64_t>(d1) * in_sd + static_cast<uint64_t>(h0) * in_sh + static_cast<uint64_t>(w1);
+        uint64_t o110 = base_nc + static_cast<uint64_t>(d1) * in_sd + static_cast<uint64_t>(h1) * in_sh + static_cast<uint64_t>(w0);
+        uint64_t o111 = base_nc + static_cast<uint64_t>(d1) * in_sd + static_cast<uint64_t>(h1) * in_sh + static_cast<uint64_t>(w1);
+
+        float v000 = static_cast<float>(in[o000]);
+        float v001 = static_cast<float>(in[o001]);
+        float v010 = static_cast<float>(in[o010]);
+        float v011 = static_cast<float>(in[o011]);
+        float v100 = static_cast<float>(in[o100]);
+        float v101 = static_cast<float>(in[o101]);
+        float v110 = static_cast<float>(in[o110]);
+        float v111 = static_cast<float>(in[o111]);
+
+        // Trilinear interpolation
+        float v00 = v000 * ww0 + v001 * ww1;
+        float v01 = v010 * ww0 + v011 * ww1;
+        float v10 = v100 * ww0 + v101 * ww1;
+        float v11 = v110 * ww0 + v111 * ww1;
+
+        float v0 = v00 * wh0 + v01 * wh1;
+        float v1 = v10 * wh0 + v11 * wh1;
+
+        float v = v0 * wd0 + v1 * wd1;
+
+        out[out_idx] = static_cast<DTYPE_Z>(v);
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor trilinear_upsample_custom_impl_npu(const at::Tensor& input) {
+    TORCH_CHECK(input.dim() == 5, "Input must be 5D (N, C, D, H, W)");
+    auto sizes = input.sizes();
+    int64_t N = sizes[0], C = sizes[1], D = sizes[2], H = sizes[3], W = sizes[4];
+    TORCH_CHECK(D > 0 && H > 0 && W > 0, "Input spatial dims must be > 0");
+
+    // align_corners=True, scale_factor=2 => out = (in - 1) * 2 + 1
+    int64_t Do = (D - 1) * 2 + 1;
+    int64_t Ho = (H - 1) * 2 + 1;
+    int64_t Wo = (W - 1) * 2 + 1;
+
+    at::Tensor output = at::empty({N, C, Do, Ho, Wo}, input.options());
+    EXEC_NPU_CMD(aclnnTrilinearUpsampleCustom, input, output);
+    return output;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("trilinear_upsample_custom", &trilinear_upsample_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("trilinear_upsample_custom", &trilinear_upsample_custom_impl_npu, "Trilinear upsample (scale=2, align_corners=True)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x):
+        return custom_ops_lib.trilinear_upsample_custom(x)
+'''

@@ -1,0 +1,50 @@
+I'm thinking about producing six Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, and model_src. The target operation, FrobeniusNormCustom, needs to keep the kernel function name as frobenius_norm_custom.
+
+It’s crucial that the operator definitions in project_json_src and host_operator_src match the kernel name using PascalCase. The model has one input tensor x, with the output being x divided by the Frobenius norm. I need to ensure the implementation correctly calculates the global sum of squares for normalization, following a complex two-phase kernel pattern typical in AscendC.
+
+I'm considering approximating the process with a single kernel that loads tiles and computes local partial sums, though AscendC on the 910B has limitations for inter-block reductions. In a custom operator, I can first accumulate the norm in one block and then broadcast it.
+
+Another option is to run two kernels: one for the reduction to compute the norm and a second for division. The goal is to use a custom kernel named frobenius_norm_custom, potentially implementing Frobenius norm normalization per block with a hardware-wide reduction. I'm contemplating whether to compute the norm within each block using a phi pattern, but I'm still uncertain.
+
+I see that the tiling interface provides a workspace pointer, allowing us to use workspace for an atomic add to accumulate sum squares across blocks, provided the hardware supports it. Ascend C might support AscendC::AtomicAdd on GM, and possibly gAtomicAdd for half, but I'm unsure.
+
+To simplify things, we could shift some logic to the host. In that case, we could compute the norm using built-in ACL operations like ReduceSum and Sqrt, then pass that as a secondary input. 
+
+However, I need to ensure the operator definition includes inputs. I'll set up the operator with input "x" and "norm" of shape [1]. The model passes "x," but I could use a bridging library Python function to compute the norm using PyTorch operations and then pass it to the custom kernel. But wait, the instructions say to replace relevant PyTorch operators—our model uses torch.norm and division. I believe we can replace both operations with a single call that only takes "x."
+
+I'm considering if we implement the function to take two inputs, "x" and "scale," then the model would need to provide a precomputed scale using a built-in norm. That seems counterproductive, though it would still replace the division. 
+
+In the previous example, we only replaced addition with a kernel, so I think it's better to create a custom operation that computes normalization internally. As an alternative, I could run a kernel to compute the normalized "x" using two passes over it per block: the first pass could calculate the global norm with cooperative all-reduce using AscendC SyncAll, which might be a bit complex. 
+
+Maybe we could simplify things by calculating the norm per sample? The input shape involves batch, features, dim1, and dim2, and we need to apply the Frobenius norm across the entire tensor.
+
+I’m exploring an approach that moves the reduction to the host operator function using runtime APIs to set a single block tiling, which means one block processes the entire tensor. By setting context->SetBlockDim(1), I can compute the sum of squares using loops in the kernel before dividing. 
+
+This could be feasible, even with larger inputs, and I’d like to use the normal techniques for tiling with BLOCK_DIM set to 1. In my kernel, I can read chunks of x, compute partial sums, and write to local variables before executing the division.
+
+For processing, I'll work in tiles, focusing on just the x input and y output. My operator spec will include input x and output y while defining the project in the JSON.
+
+The challenge is ensuring the tiling handles non-divisible lengths without errors. I should utilize APIs like AscendC::Mul and AscendC::ReduceSum effectively for squaring and accumulating. There’s potential to perform the reduction in various ways, but it might be more straightforward to compute the L2 norm and sum with specific calls. 
+
+Given the complexity and potential issues with memory access in AscendC, it's tempting to offload some of the processing to the CPU side, especially since the user expects a custom kernel to implement these norms and replacements for PyTorch operators. It might even be better to chain two custom kernels, although that's not typically available. Overall, I want to ensure I can compute everything reliably and efficiently.
+
+I’m considering an alternative approach where I can pass both x and a precomputed norm as inputs to the kernel for division. The model can calculate the norm using torch.norm, but I have to replace relevant PyTorch operators, which might mean directly replacing the entire x/norm computation. 
+
+I'd like to implement a kernel that calculates the norm by summing the squares of x values in a simple loop, utilizing AscendC APIs. I’ll explore AscendC::ReduceSum for my local buffers and think about potential issues with memory management, especially given the constraints.
+
+Since I’m dealing with multiple operations such as reductions and divisions, I want to ensure that I correctly implement them despite some uncertainties. I might need to rely on local calculations and handle various tensor operations for reduction effectively. But, I think for the sake of simplicity, I'll focus on creating a straightforward implementation that divides by the scaling factor and sets a clear function spec for the project. 
+
+Ultimately, I want to ensure that my kernel aligns with user requirements while maintaining efficient tensor processing. So, incorporating inputs for both x and scale will be essential for the final implementation.
+
+I’m exploring how to efficiently manage the scale input for my operations. One option is to copy the scalar value from `scaleGm[0]` into a 1-length local tensor, then use `AscendC::Muls` for replication. However, I could read the scale into a local vector for easier broadcasting. 
+
+I can compute the Frobenius norm using torch functions and then use that to derive an inverse norm, storing it as a scalar tensor. The flow looks straightforward: compute the norm, create the inv_tensor, and execute the command. I’ll ensure the kernel processes the multiplication by this scalar efficiently to minimize overhead and maintain clarity in the project specification.
+
+I'm considering an alternative approach to handle the scale input for my operations. Instead of using a scalar directly with `Muls`, I could broadcast a local vector filled with the inverse value and utilize `AscendC::Mul` for elementwise multiplication. I'll create an inverse tensor in `python_bind`, ensuring it matches the shape of the input tensor to facilitate efficient operations. 
+
+While maintaining this shape does add overhead, it seems acceptable in this context. I’ll also need to align the output naming conventions and ensure that everything is consistent across the project, including implementation details for registration and execution commands.
+
+I'm focusing on crafting the necessary code strings while ensuring to follow instructions correctly. I need to include the proper headers like "frobenius_norm_custom_tiling.h" for host operations and "frobenius_norm_custom_tiling_data.h" for kernel data. I'll also verify that the name in the REGISTER_TILING_DATA_CLASS matches precisely.
+
+Within the operations class, I’ll define the data type and format accurately, set the workspace size, and ensure the output shape and data type align with the input. Now, let’s get to producing the code strings!
+

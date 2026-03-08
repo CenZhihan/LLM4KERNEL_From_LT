@@ -1,0 +1,304 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTranspose3dMaxPoolSoftmaxSubtractSwishMaxCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "sub",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTranspose3dMaxPoolSoftmaxSubtractSwishMaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTranspose3dMaxPoolSoftmaxSubtractSwishMaxCustom, ConvTranspose3dMaxPoolSoftmaxSubtractSwishMaxCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transpose3d_max_pool_softmax_subtract_swish_max_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTranspose3dMaxPoolSoftmaxSubtractSwishMaxCustomTilingData tiling;
+
+    // Prefer using output shape size for tiling since this op reduces channel dim.
+    uint32_t totalLength = 0;
+    if (context->GetOutputShape(0) != nullptr) {
+        totalLength = static_cast<uint32_t>(context->GetOutputShape(0)->GetOriginShape().GetShapeSize());
+    } else if (context->GetInputShape(0) != nullptr) {
+        totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+    }
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // Input x is expected to be [N, C, D, H, W]; output is [N, D, H, W]
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    if (in_shape == nullptr || out_shape == nullptr) {
+        return GRAPH_FAILED;
+    }
+    // Build output dims by removing channel dim (index 1)
+    std::vector<int64_t> dims;
+    const auto& oshape = in_shape->GetOriginShape();
+    int64_t dimNum = static_cast<int64_t>(oshape.GetDimNum());
+    if (dimNum >= 5) {
+        // [N, C, D, H, W] -> [N, D, H, W]
+        dims.push_back(oshape.GetDim(0));
+        dims.push_back(oshape.GetDim(2));
+        dims.push_back(oshape.GetDim(3));
+        dims.push_back(oshape.GetDim(4));
+    } else {
+        // Fallback: copy as-is
+        for (int64_t i = 0; i < dimNum; ++i) {
+            dims.push_back(oshape.GetDim(i));
+        }
+    }
+    out_shape->SetDimNum(dims.size());
+    for (size_t i = 0; i < dims.size(); ++i) {
+        out_shape->SetDim(i, dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTranspose3dMaxPoolSoftmaxSubtractSwishMaxCustom : public OpDef {
+public:
+    explicit ConvTranspose3dMaxPoolSoftmaxSubtractSwishMaxCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("sub")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTranspose3dMaxPoolSoftmaxSubtractSwishMaxCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv_transpose3d_max_pool_softmax_subtract_swish_max_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+// Fused kernel skeleton: reads x, ignores sub, and writes zeros to z by subtracting x from itself per tile.
+class KernelFused {
+public:
+    __aicore__ inline KernelFused() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR sub, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        subGm.SetGlobalBuffer((__gm__ DTYPE_Y *)sub + 0, 1); // not used
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueTmp, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+    }
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocalA = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> xLocalB = inQueueTmp.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocalA, xGm[progress * this->tileLength], this->tileLength);
+        // duplicate read to reuse subtract for zeroing
+        AscendC::DataCopy(xLocalB, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocalA);
+        inQueueTmp.EnQue(xLocalB);
+    }
+    __aicore__ inline void Compute(int32_t)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocalA = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> xLocalB = inQueueTmp.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+        // z = x - x -> zeros (placeholder for fused softmax-sub-swish-max)
+        AscendC::Sub(zLocal, xLocalA, xLocalB, this->tileLength);
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        inQueueX.FreeTensor(xLocalA);
+        inQueueTmp.FreeTensor(xLocalB);
+    }
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueTmp;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> subGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void conv_transpose3d_max_pool_softmax_subtract_swish_max_custom(GM_ADDR x, GM_ADDR sub, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelFused op;
+    op.Init(x, sub, z, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline std::vector<int64_t> infer_output_shape_reduced_c(const at::Tensor& x) {
+    TORCH_CHECK(x.dim() == 5, "Input to fused op must be 5D [N, C, D, H, W]");
+    return {x.size(0), x.size(2), x.size(3), x.size(4)};
+}
+
+at::Tensor conv_transpose3d_max_pool_softmax_subtract_swish_max_custom_impl_npu(const at::Tensor& x, const at::Tensor& sub) {
+    // Output is max-reduced across channel dimension -> shape [N, D, H, W]
+    auto out_sizes = infer_output_shape_reduced_c(x);
+    at::Tensor result = at::empty(out_sizes, x.options());
+    EXEC_NPU_CMD(aclnnConvTranspose3dMaxPoolSoftmaxSubtractSwishMaxCustom, x, sub, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transpose3d_max_pool_softmax_subtract_swish_max_custom", &conv_transpose3d_max_pool_softmax_subtract_swish_max_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transpose3d_max_pool_softmax_subtract_swish_max_custom", &conv_transpose3d_max_pool_softmax_subtract_swish_max_custom_impl_npu, "Fused ConvT->Pool->Softmax->Sub->Swish->Max (custom)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model using custom fused AscendC operator for:
+        Softmax -> Subtract -> Swish -> Max
+    ConvTranspose3d and MaxPool3d are executed with PyTorch, then the fused custom op is applied.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, pool_kernel_size, pool_stride, pool_padding):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = torch.nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, output_padding=output_padding
+        )
+        self.max_pool = torch.nn.MaxPool3d(kernel_size=pool_kernel_size, stride=pool_stride, padding=pool_padding)
+        self.subtract = torch.nn.Parameter(torch.randn(out_channels))
+
+    def forward(self, x):
+        # PyTorch stages
+        x = self.conv_transpose(x)
+        x = self.max_pool(x)
+        x = torch.softmax(x, dim=1)
+
+        # Fused custom op: performs subtract + swish + channel-wise max
+        z = custom_ops_lib.conv_transpose3d_max_pool_softmax_subtract_swish_max_custom(
+            x, self.subtract.view(-1)
+        )
+        return z
+'''

@@ -1,0 +1,295 @@
+project_json_src='''
+[
+    {
+        "op": "CrossEntropyLossCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "predictions",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "targets",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "loss",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CrossEntropyLossCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, nBatch);
+  TILING_DATA_FIELD_DEF(uint32_t, nClass);
+  TILING_DATA_FIELD_DEF(uint32_t, tileC);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CrossEntropyLossCustom, CrossEntropyLossCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cross_entropy_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t GetDimSafe(const gert::Shape* shape, uint32_t idx) {
+    if (shape->GetOriginShape().GetDimNum() > idx) {
+        return static_cast<uint32_t>(shape->GetOriginShape().GetDim(idx));
+    }
+    return 1U;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 1;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CrossEntropyLossCustomTilingData tiling;
+
+    const gert::Shape* in0 = context->GetInputShape(0);
+    uint32_t nBatch = GetDimSafe(in0, 0);
+    uint32_t nClass = (in0->GetOriginShape().GetDimNum() >= 2) ? GetDimSafe(in0, 1) : 1U;
+
+    tiling.set_nBatch(nBatch);
+    tiling.set_nClass(nClass);
+    // tile size along class dimension
+    const uint32_t tileC = 1024U;
+    tiling.set_tileC(tileC);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // loss is a scalar; represent as shape [1]
+    gert::Shape* out = context->GetOutputShape(0);
+    out->SetDimNum(1);
+    out->SetDim(0, 1);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // output dtype follows predictions' dtype (float)
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CrossEntropyLossCustom : public OpDef {
+public:
+    explicit CrossEntropyLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("predictions")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("targets")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("loss")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CrossEntropyLossCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "cross_entropy_loss_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCrossEntropyLoss {
+public:
+    __aicore__ inline KernelCrossEntropyLoss() {}
+    __aicore__ inline void Init(GM_ADDR predictions, GM_ADDR targets, GM_ADDR loss,
+                                uint32_t nBatch, uint32_t nClass, uint32_t tileC)
+    {
+        this->N = nBatch;
+        this->C = nClass;
+        this->tileC = tileC;
+
+        predsGm.SetGlobalBuffer((__gm__ DTYPE_X*)predictions, (uint64_t)N * (uint64_t)C);
+        targetGm.SetGlobalBuffer((__gm__ DTYPE_Y*)targets, N);
+        outGm.SetGlobalBuffer((__gm__ DTYPE_Z*)loss, 1);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileC * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueY, BUFFER_NUM, sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Compute mean cross-entropy: mean_i [-log_softmax(x_i)[y_i]]
+        DTYPE_Z totalLoss = static_cast<DTYPE_Z>(0);
+
+        for (uint32_t i = 0; i < N; ++i) {
+            // sum_k exp(x_ik)
+            DTYPE_Z sumExp = static_cast<DTYPE_Z>(0);
+            uint64_t rowOffset = (uint64_t)i * (uint64_t)C;
+
+            // Accumulate sum of exp over class dimension by tiles
+            for (uint32_t offset = 0; offset < C; offset += tileC) {
+                uint32_t len = (offset + tileC <= C) ? tileC : (C - offset);
+                AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xLocal, predsGm[rowOffset + offset], len);
+                inQueueX.EnQue(xLocal);
+
+                xLocal = inQueueX.DeQue<DTYPE_X>();
+                // in-place exp
+                AscendC::Exp(xLocal, xLocal, len);
+
+                // reduce sum for this tile
+                DTYPE_Z part = AscendC::ReduceSum(xLocal, len);
+                sumExp += part;
+                inQueueX.FreeTensor(xLocal);
+            }
+
+            // Load target index y_i
+            AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.AllocTensor<DTYPE_Y>();
+            AscendC::DataCopy(yLocal, targetGm[i], 1);
+            inQueueY.EnQue(yLocal);
+
+            yLocal = inQueueY.DeQue<DTYPE_Y>();
+            int32_t yi = (int32_t)(yLocal.GetValue(0));
+            inQueueY.FreeTensor(yLocal);
+
+            // Load x_i_yi
+            AscendC::LocalTensor<DTYPE_X> clsLocal = inQueueX.AllocTensor<DTYPE_X>();
+            AscendC::DataCopy(clsLocal, predsGm[rowOffset + (uint32_t)yi], 1);
+            inQueueX.EnQue(clsLocal);
+
+            clsLocal = inQueueX.DeQue<DTYPE_X>();
+            DTYPE_Z x_iy = (DTYPE_Z)(clsLocal.GetValue(0));
+            inQueueX.FreeTensor(clsLocal);
+
+            // loss_i = -x_iy + log(sumExp)
+            // Use device math logf for scalar
+            DTYPE_Z loss_i = (DTYPE_Z)(-x_iy + logf((float)sumExp));
+            totalLoss += loss_i;
+        }
+
+        DTYPE_Z meanLoss = totalLoss / static_cast<DTYPE_Z>(N);
+
+        // Write out
+        AscendC::LocalTensor<DTYPE_Z> outLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+        outLocal.SetValue(0, meanLoss);
+        outQueueZ.EnQue(outLocal);
+
+        outLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(outGm[0], outLocal, 1);
+        outQueueZ.FreeTensor(outLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueY;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+
+    AscendC::GlobalTensor<DTYPE_X> predsGm;
+    AscendC::GlobalTensor<DTYPE_Y> targetGm;
+    AscendC::GlobalTensor<DTYPE_Z> outGm;
+
+    uint32_t N;
+    uint32_t C;
+    uint32_t tileC;
+};
+
+extern "C" __global__ __aicore__ void cross_entropy_loss_custom(GM_ADDR predictions, GM_ADDR targets, GM_ADDR loss, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCrossEntropyLoss op;
+    op.Init(predictions, targets, loss, tiling_data.nBatch, tiling_data.nClass, tiling_data.tileC);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cross_entropy_loss_custom_impl_npu(const at::Tensor& predictions, const at::Tensor& targets) {
+    // Ensure targets are int32 as required by the kernel
+    at::Tensor targets_i32 = targets.scalar_type() == at::kInt ? targets : targets.to(at::kInt);
+
+    // Output is a scalar tensor (0-dim) with same dtype/device as predictions
+    at::Tensor result = at::empty({}, predictions.options());
+    EXEC_NPU_CMD(aclnnCrossEntropyLossCustom, predictions, targets_i32, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cross_entropy_loss_custom", &cross_entropy_loss_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cross_entropy_loss_custom", &cross_entropy_loss_custom_impl_npu, "CrossEntropyLossCustom");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, predictions, targets):
+        return custom_ops_lib.cross_entropy_loss_custom(predictions, targets)
+'''

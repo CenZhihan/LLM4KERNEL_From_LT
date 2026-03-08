@@ -1,0 +1,274 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTransposed1dCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTransposed1dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cin);
+  TILING_DATA_FIELD_DEF(uint32_t, cout);
+  TILING_DATA_FIELD_DEF(uint32_t, lin);
+  TILING_DATA_FIELD_DEF(uint32_t, ksize);
+  TILING_DATA_FIELD_DEF(uint32_t, lout);
+  TILING_DATA_FIELD_DEF(uint64_t, totalOutElems);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTransposed1dCustom, ConvTransposed1dCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transposed_1d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTransposed1dCustomTilingData tiling;
+
+    const auto *x_shape = context->GetInputShape(0);
+    const auto *w_shape = context->GetInputShape(1);
+
+    uint32_t n = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t cin = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    uint32_t lin = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(2));
+
+    uint32_t w_cin = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(0));
+    uint32_t cout = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(1));
+    uint32_t ksize = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(2));
+
+    // basic checks
+    if (w_cin != cin) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t lout = lin + ksize - 1;
+    uint64_t totalOutElems = static_cast<uint64_t>(n) * static_cast<uint64_t>(cout) * static_cast<uint64_t>(lout);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_cin(cin);
+    tiling.set_cout(cout);
+    tiling.set_lin(lin);
+    tiling.set_ksize(ksize);
+    tiling.set_lout(lout);
+    tiling.set_totalOutElems(totalOutElems);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspaces = context->GetWorkspaceSizes(1);
+    workspaces[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+
+    int64_t n = x_shape->GetDim(0);
+    int64_t cin = x_shape->GetDim(1);
+    int64_t lin = x_shape->GetDim(2);
+
+    int64_t w_cin = w_shape->GetDim(0);
+    int64_t cout = w_shape->GetDim(1);
+    int64_t ksize = w_shape->GetDim(2);
+
+    if (w_cin != cin) {
+        return GRAPH_FAILED;
+    }
+
+    int64_t lout = lin + ksize - 1;
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(3);
+    y_shape->SetDim(0, n);
+    y_shape->SetDim(1, cout);
+    y_shape->SetDim(2, lout);
+
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTransposed1dCustom : public OpDef {
+public:
+    explicit ConvTransposed1dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTransposed1dCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv_transposed_1d_custom_tiling_data.h"
+
+// Naive reference implementation for stride=1, padding=0, groups=1, bias=False
+// y[n, co, lo] = sum_{ci=0..Cin-1} sum_{k=0..K-1} x[n, ci, lo - k] * w[ci, co, k], valid only when (0 <= lo-k < Lin)
+
+extern "C" __global__ __aicore__ void conv_transposed_1d_custom(GM_ADDR x, GM_ADDR w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+
+    const uint32_t N = tiling_data.n;
+    const uint32_t Cin = tiling_data.cin;
+    const uint32_t Cout = tiling_data.cout;
+    const uint32_t Lin = tiling_data.lin;
+    const uint32_t K = tiling_data.ksize;
+    const uint32_t Lout = tiling_data.lout;
+    const uint64_t totalOutElems = tiling_data.totalOutElems;
+
+    const uint32_t blockNum = AscendC::GetBlockNum();
+    const uint32_t blockIdx = AscendC::GetBlockIdx();
+
+    const uint64_t base = (totalOutElems / blockNum) * blockIdx;
+    const uint64_t tail = (blockIdx == (blockNum - 1)) ? totalOutElems : ((totalOutElems / blockNum) * (blockIdx + 1));
+
+    __gm__ DTYPE_X* x_gm = reinterpret_cast<__gm__ DTYPE_X*>(x);
+    __gm__ DTYPE_W* w_gm = reinterpret_cast<__gm__ DTYPE_W*>(w);
+    __gm__ DTYPE_Y* y_gm = reinterpret_cast<__gm__ DTYPE_Y*>(y);
+
+    for (uint64_t idx = base; idx < tail; ++idx) {
+        uint32_t lo = static_cast<uint32_t>(idx % Lout);
+        uint64_t t1 = idx / Lout;
+        uint32_t co = static_cast<uint32_t>(t1 % Cout);
+        uint32_t n  = static_cast<uint32_t>(t1 / Cout);
+
+        float acc = 0.0f;
+
+        for (uint32_t ci = 0; ci < Cin; ++ci) {
+            for (uint32_t k = 0; k < K; ++k) {
+                int32_t ti = static_cast<int32_t>(lo) - static_cast<int32_t>(k);
+                if (ti < 0 || ti >= static_cast<int32_t>(Lin)) continue;
+
+                uint64_t x_index = ((static_cast<uint64_t>(n) * Cin + ci) * Lin) + static_cast<uint32_t>(ti);
+                uint64_t w_index = ((static_cast<uint64_t>(ci) * Cout + co) * K) + k;
+
+                acc += static_cast<float>(x_gm[x_index]) * static_cast<float>(w_gm[w_index]);
+            }
+        }
+        y_gm[idx] = static_cast<DTYPE_Y>(acc);
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_transposed_1d_custom_impl_npu(const at::Tensor& x, const at::Tensor& w) {
+    TORCH_CHECK(x.dim() == 3, \"Input x must be 3D [N, Cin, Lin]\");
+    TORCH_CHECK(w.dim() == 3, \"Weight w must be 3D [Cin, Cout, K]\");
+    TORCH_CHECK(x.dtype() == w.dtype(), \"x and w must have the same dtype\");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, \"This custom kernel currently supports float32 only\");
+    TORCH_CHECK(w.size(0) == x.size(1), \"w.size(0) must equal x.size(1) (Cin)\");
+    auto N = x.size(0);
+    auto Cin = x.size(1);
+    auto Lin = x.size(2);
+    auto Cout = w.size(1);
+    auto K = w.size(2);
+    auto Lout = Lin + K - 1;
+
+    at::Tensor y = at::empty({N, Cout, Lout}, x.options());
+    EXEC_NPU_CMD(aclnnConvTransposed1dCustom, x, w, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"conv_transposed_1d_custom\", &conv_transposed_1d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"conv_transposed_1d_custom\", &conv_transposed_1d_custom_impl_npu, \"ConvTransposed1dCustom\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int) -> None:
+        super().__init__()
+        # Weight layout matches PyTorch ConvTranspose1d: [in_channels, out_channels, kernel_size]
+        self.weight = torch.nn.Parameter(torch.empty(in_channels, out_channels, kernel_size))
+        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5)) if hasattr(torch.nn.init, "kaiming_uniform_") else torch.nn.init.uniform_(self.weight, -0.1, 0.1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Custom kernel assumes stride=1, padding=0, groups=1, bias=False
+        return custom_ops_lib.conv_transposed_1d_custom(x, self.weight)
+'''

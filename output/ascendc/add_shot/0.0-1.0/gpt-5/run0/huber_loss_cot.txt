@@ -1,0 +1,49 @@
+**Implementing custom kernel**
+
+I need to produce code featuring a custom AscendC kernel named HuberLossCustom, which should compute smooth L1 loss between predictions and targets. PyTorch's default for smooth L1 loss is reduction='mean', with beta set at 1.0. So, I’ll implement an operator that calculates element-wise SmoothL1 loss and reduces it to a scalar. Even though the output should match the input shape, for loss with reduction mean, it must return a scalar tensor shape of [1].
+
+**Clarifying custom operator implementation**
+
+I think implementing the custom operator likely expects ND format. I can set the output type to float and aim for a scalar shape using InferShape. The ops infrastructure might support 0-D shapes, which I believe are considered ND with shape [1] on NPU. To be safe, I'll implement a mean reduction to return a single value stored as one element. When hooking into PyTorch, I need to ensure the wrapper returns a tensor similar to at::empty_like(self). Additionally, I must register the schema in the torch library correctly.
+
+**Defining kernel for Smooth L1 loss**
+
+I need to set the kernel function name as huber_loss_custom in kernel_src. The host_operator_src will define tiling, shapes, and type names. I'll follow the example but adjust it to compute Smooth L1 loss per element using the formula: 
+
+loss(x, y) = 
+0.5 * (x-y)^2 / beta if |x-y| < beta,
+|x-y| - 0.5 * beta otherwise, 
+with beta set to 1.0. Then, for mean reduction, I’ll create a kernel pipeline that: copies x and y segments to a local buffer, computes the absolute difference, and accumulates a scalar sum. Finally, I’ll handle reduction across tiles and blocks.
+
+**Handling operator output**
+
+It looks like the operator expects a single output. Should I compute per-element outputs first and then reduce? No, since it's just a single custom kernel, I should simplify things. I’ll compute the element-wise loss and then perform block-level reduction to generate a single scalar using global atomic adds. 
+
+I wonder if AscendC supports atomic adds for floats, which seems likely, but I'm unsure about the API. Maybe there’s AscendC::AtomicAdd? Alternatively, I could accumulate each block's results into the global z at index blockIdx 0, but that's not very robust. Another idea is to create an output array the same size as inputs for per-element loss, and apply at::mean on the CPU later, but that feels like extra overhead. The goal is to replace relevant PyTorch operators with the AscendC kernel.
+
+**Constructing the Huber Loss custom operation**
+
+I’ll write the code starting with AscendC tensors for computing the element-wise Smooth L1 loss. The operations will include computing the difference, its absolute value, and the quadratic values based on the loss formulas. Then I’ll create a mask using the `Compare` operation. 
+
+To compute the sum, I'll use `AscendC::ReduceSum` and finally compute the mean. The output should correspond to the expected scalar shape. I’ll define the proper shapes and types, ensuring that the kernel function name matches exactly. 
+
+Lastly, I’ll set up the Python bindings to return a single scalar tensor, ensuring it integrates smoothly into the model.
+
+**Crafting Huber loss implementation**
+
+I need to ensure that the input names in `host_operator_src` match, using "predictions" and "targets" with "loss" as the output. I'll write the necessary code, starting with a JSON structure in `project_json_src`.
+
+Next, the `host_tiling_src` will reference "huber_loss_custom_tiling.h." In `host_operator_src`, I’ll include this header and register necessary classes. The shape inference needs to be handled carefully to maintain consistency, aiming for a scalar output while ensuring the Python binding returns a tensor with the correct shape.
+
+To compute the Huber loss per element, I'll express the formula accurately using the minimum function and basic arithmetic operations, maintaining focus on clarity and functionality. Additionally, I’m making sure to consider potential edge cases and ensuring proper dimensionality throughout the implementation.
+
+**Developing Huber Loss Implementation**
+
+I'm working on the Huber loss kernel where I need to ensure appropriate usage of operations like `Min`, `Max`, and others to handle the computations. 
+
+For the loss calculation, I noticed that when handling `abs > beta`, the formulas simplify nicely. I'll set up local tensors to store values without excessive memory overhead, keeping it efficient for smaller tile lengths.
+
+In the `python_bind` section, I plan to return the elementwise loss, and then the model will call this implementation and get a scalar by using `.mean()`. 
+
+I’ll create the necessary strings for the project JSON and the various sources, ensuring everything is structured properly for clear integration and function.
+

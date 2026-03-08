@@ -1,0 +1,323 @@
+project_json_src='''
+[
+    {
+        "op": "BatchedMatrixMultiplicationCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "A",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "B",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "C",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(BatchedMatrixMultiplicationCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, rowsPerBlock);
+  TILING_DATA_FIELD_DEF(uint32_t, tileM);
+  TILING_DATA_FIELD_DEF(uint32_t, tileN);
+  TILING_DATA_FIELD_DEF(uint32_t, tileK);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(BatchedMatrixMultiplicationCustom, BatchedMatrixMultiplicationCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "batched_matrix_multiplication_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t DEFAULT_TILE_M = 64;
+const uint32_t DEFAULT_TILE_N = 64;
+const uint32_t DEFAULT_TILE_K = 64;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    BatchedMatrixMultiplicationCustomTilingData tiling;
+
+    auto a_shape = context->GetInputShape(0)->GetOriginShape();
+    auto b_shape = context->GetInputShape(1)->GetOriginShape();
+
+    uint32_t batch = static_cast<uint32_t>(a_shape.GetDim(0));
+    uint32_t m = static_cast<uint32_t>(a_shape.GetDim(1));
+    uint32_t k = static_cast<uint32_t>(a_shape.GetDim(2));
+    uint32_t n = static_cast<uint32_t>(b_shape.GetDim(2));
+
+    uint64_t rowsTotal = static_cast<uint64_t>(batch) * static_cast<uint64_t>(m);
+    uint32_t rowsPerBlock = static_cast<uint32_t>((rowsTotal + BLOCK_DIM - 1) / BLOCK_DIM);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_batch(batch);
+    tiling.set_m(m);
+    tiling.set_k(k);
+    tiling.set_n(n);
+    tiling.set_rowsPerBlock(rowsPerBlock);
+    tiling.set_tileM(DEFAULT_TILE_M);
+    tiling.set_tileN(DEFAULT_TILE_N);
+    tiling.set_tileK(DEFAULT_TILE_K);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* a_shape = context->GetInputShape(0);
+    const gert::Shape* b_shape = context->GetInputShape(1);
+    gert::Shape* c_shape = context->GetOutputShape(0);
+
+    auto a = a_shape->GetOriginShape();
+    auto b = b_shape->GetOriginShape();
+
+    // C shape: (batch, m, n)
+    int64_t batch = a.GetDim(0);
+    int64_t m = a.GetDim(1);
+    int64_t n = b.GetDim(2);
+
+    c_shape->SetDimNum(3);
+    c_shape->SetDim(0, batch);
+    c_shape->SetDim(1, m);
+    c_shape->SetDim(2, n);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class BatchedMatrixMultiplicationCustom : public OpDef {
+public:
+    explicit BatchedMatrixMultiplicationCustom(const char* name) : OpDef(name)
+    {
+        this->Input("A")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("B")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("C")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(BatchedMatrixMultiplicationCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "batched_matrix_multiplication_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelBmm {
+public:
+    __aicore__ inline KernelBmm() {}
+    __aicore__ inline void Init(GM_ADDR A, GM_ADDR B, GM_ADDR C,
+                                uint32_t batch, uint32_t m, uint32_t k, uint32_t n,
+                                uint32_t rowsPerBlock, uint32_t tileM, uint32_t tileN, uint32_t tileK)
+    {
+        this->batch = batch;
+        this->m = m;
+        this->k = k;
+        this->n = n;
+        this->rowsPerBlock = rowsPerBlock;
+        this->tileM = tileM;
+        this->tileN = tileN;
+        this->tileK = tileK;
+
+        aGm.SetGlobalBuffer((__gm__ DTYPE_X *)A, static_cast<uint64_t>(batch) * m * k);
+        bGm.SetGlobalBuffer((__gm__ DTYPE_Y *)B, static_cast<uint64_t>(batch) * k * n);
+        cGm.SetGlobalBuffer((__gm__ DTYPE_Z *)C, static_cast<uint64_t>(batch) * m * n);
+
+        pipe.InitBuffer(aRowQueue, BUFFER_NUM, this->tileK * sizeof(DTYPE_X));
+        pipe.InitBuffer(bTileQueue, BUFFER_NUM, this->tileK * this->tileN * sizeof(DTYPE_Y));
+        pipe.InitBuffer(cVecQueue, BUFFER_NUM, this->tileN * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+
+        uint64_t totalRows = static_cast<uint64_t>(batch) * m;
+        uint64_t startRow = static_cast<uint64_t>(blockIdx) * rowsPerBlock;
+        uint64_t endRow = startRow + rowsPerBlock;
+        if (endRow > totalRows) endRow = totalRows;
+
+        for (uint64_t r = startRow; r < endRow; ++r) {
+            uint32_t b = static_cast<uint32_t>(r / m);
+            uint32_t i = static_cast<uint32_t>(r % m);
+
+            for (uint32_t jn = 0; jn < n; jn += tileN) {
+                uint32_t curTileN = AscendC::Min(tileN, n - jn);
+
+                AscendC::LocalTensor<DTYPE_Z> cVec = cVecQueue.AllocTensor<DTYPE_Z>();
+                AscendC::Dup(cVec, static_cast<DTYPE_Z>(0), curTileN);
+
+                for (uint32_t kk = 0; kk < k; kk += tileK) {
+                    uint32_t curTileK = AscendC::Min(tileK, k - kk);
+
+                    AscendC::LocalTensor<DTYPE_X> aRow = aRowQueue.AllocTensor<DTYPE_X>();
+                    AscendC::LocalTensor<DTYPE_Y> bTile = bTileQueue.AllocTensor<DTYPE_Y>();
+
+                    // GM offsets
+                    uint64_t aOffset = static_cast<uint64_t>(b) * m * k + static_cast<uint64_t>(i) * k + kk;
+                    uint64_t bOffset = static_cast<uint64_t>(b) * k * n + static_cast<uint64_t>(kk) * n + jn;
+
+                    // Load A(i, kk:kk+curTileK)
+                    AscendC::DataCopy(aRow, aGm[aOffset], curTileK);
+                    // Load B(kk:kk+curTileK, jn:jn+curTileN) as a contiguous tile
+                    for (uint32_t tk = 0; tk < curTileK; ++tk) {
+                        AscendC::DataCopy(bTile[tk * curTileN], bGm[bOffset + static_cast<uint64_t>(tk) * n], curTileN);
+                    }
+
+                    // Compute: cVec += aRow * bTile (outer-product accumulation)
+                    for (uint32_t tk = 0; tk < curTileK; ++tk) {
+                        AscendC::LocalTensor<DTYPE_Z> tmp = cVecQueue.AllocTensor<DTYPE_Z>();
+                        AscendC::Mul(tmp, bTile[tk * curTileN], aRow[tk], curTileN); // broadcast multiply
+                        AscendC::Add(cVec, cVec, tmp, curTileN);
+                        cVecQueue.FreeTensor(tmp);
+                    }
+
+                    aRowQueue.FreeTensor(aRow);
+                    bTileQueue.FreeTensor(bTile);
+                }
+
+                // Store C(b, i, jn:jn+curTileN)
+                uint64_t cOffset = static_cast<uint64_t>(b) * m * n + static_cast<uint64_t>(i) * n + jn;
+                AscendC::DataCopy(cGm[cOffset], cVec, curTileN);
+                cVecQueue.FreeTensor(cVec);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> aRowQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> bTileQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> cVecQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> aGm;
+    AscendC::GlobalTensor<DTYPE_Y> bGm;
+    AscendC::GlobalTensor<DTYPE_Z> cGm;
+
+    uint32_t batch;
+    uint32_t m;
+    uint32_t k;
+    uint32_t n;
+    uint32_t rowsPerBlock;
+    uint32_t tileM;
+    uint32_t tileN;
+    uint32_t tileK;
+};
+
+extern "C" __global__ __aicore__ void batched_matrix_multiplication_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelBmm op;
+    op.Init(A, B, C,
+            tiling_data.batch, tiling_data.m, tiling_data.k, tiling_data.n,
+            tiling_data.rowsPerBlock, tiling_data.tileM, tiling_data.tileN, tiling_data.tileK);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor batched_matrix_multiplication_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    auto batch = A.size(0);
+    auto m = A.size(1);
+    auto n = B.size(2);
+    at::Tensor result = at::empty({batch, m, n}, A.options());
+    EXEC_NPU_CMD(aclnnBatchedMatrixMultiplicationCustom, A, B, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("batched_matrix_multiplication_custom", &batched_matrix_multiplication_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("batched_matrix_multiplication_custom", &batched_matrix_multiplication_custom_impl_npu, "Batched MatMul");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.batched_matrix_multiplication_custom(A, B)
+'''

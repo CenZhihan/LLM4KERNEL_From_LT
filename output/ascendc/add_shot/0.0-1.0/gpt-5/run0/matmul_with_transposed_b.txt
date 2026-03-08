@@ -1,0 +1,354 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulWithTransposedBCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "a",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "c",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulWithTransposedBCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, tileM);
+  TILING_DATA_FIELD_DEF(uint32_t, tileN);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulWithTransposedBCustom, MatmulWithTransposedBCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "matmul_with_transposed_b_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t GetDim(const gert::Shape* s, size_t i) {
+    return static_cast<uint32_t>(s->GetOriginShape().GetDim(i));
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MatmulWithTransposedBCustomTilingData tiling;
+
+    const auto* a_shape = context->GetInputShape(0);
+    const auto* b_shape = context->GetInputShape(1);
+
+    if (a_shape->GetOriginShape().GetDimNum() != 2 || b_shape->GetOriginShape().GetDimNum() != 2) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t M = GetDim(a_shape, 0);
+    uint32_t K = GetDim(a_shape, 1);
+    uint32_t N = GetDim(b_shape, 0);
+    uint32_t Kb = GetDim(b_shape, 1);
+
+    if (K != Kb) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Simple tiling: split M across blocks, use full K and full N inside the block.
+    // You can refine this according to local memory constraints.
+    uint32_t tileM = 64;
+    if (tileM == 0) tileM = 64;
+    // Ensure tileM divides M for simplicity; production code should handle remainders.
+    if (M % tileM != 0) {
+        // fallback to 32
+        tileM = 32;
+        if (M % tileM != 0) {
+            tileM = 16;
+        }
+    }
+    if (tileM == 0) tileM = 16;
+
+    tiling.set_m(M);
+    tiling.set_n(N);
+    tiling.set_k(K);
+    tiling.set_tileM(tileM);
+    tiling.set_tileN(N); // take full N so output copy is contiguous
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* a_shape = context->GetInputShape(0);
+    const gert::Shape* b_shape = context->GetInputShape(1);
+    if (a_shape->GetOriginShape().GetDimNum() != 2 || b_shape->GetOriginShape().GetDimNum() != 2) {
+        return GRAPH_FAILED;
+    }
+    uint64_t M = a_shape->GetOriginShape().GetDim(0);
+    uint64_t K = a_shape->GetOriginShape().GetDim(1);
+    uint64_t N = b_shape->GetOriginShape().GetDim(0);
+    uint64_t Kb = b_shape->GetOriginShape().GetDim(1);
+    if (K != Kb) {
+        return GRAPH_FAILED;
+    }
+    gert::Shape* c_shape = context->GetOutputShape(0);
+    gert::Shape out;
+    out.SetDimNum(2);
+    out.SetDim(0, M);
+    out.SetDim(1, N);
+    *c_shape = out;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MatmulWithTransposedBCustom : public OpDef {
+public:
+    explicit MatmulWithTransposedBCustom(const char* name) : OpDef(name)
+    {
+        this->Input("a")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("c")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulWithTransposedBCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "matmul_with_transposed_b_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 1; // number of buffers for each queue
+
+class KernelMatmulWithTransposedB {
+public:
+    __aicore__ inline KernelMatmulWithTransposedB() {}
+    __aicore__ inline void Init(GM_ADDR a, GM_ADDR b, GM_ADDR c,
+                                uint32_t m, uint32_t n, uint32_t k,
+                                uint32_t tileM, uint32_t tileN)
+    {
+        this->M = m;
+        this->N = n;
+        this->K = k;
+        this->tileM = tileM;
+        this->tileN = tileN;
+
+        // Split M across blocks
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+
+        this->MPerBlock = (M + blockNum - 1) / blockNum; // ceil-div for safety
+        // clamp to remaining
+        uint32_t startM = blockIdx * this->MPerBlock;
+        if (startM + this->MPerBlock > M) {
+            this->MPerBlock = (M > startM) ? (M - startM) : 0;
+        }
+
+        aGm.SetGlobalBuffer((__gm__ DTYPE_A *)a + (uint64_t)startM * K, (uint64_t)this->MPerBlock * K);
+        bGm.SetGlobalBuffer((__gm__ DTYPE_B *)b, (uint64_t)N * K);
+        cGm.SetGlobalBuffer((__gm__ DTYPE_C *)c + (uint64_t)startM * N, (uint64_t)this->MPerBlock * N);
+
+        // Buffers: A tile = tileM x K, B tile = tileN(=N) x K, C tile = tileM x tileN(=N)
+        pipe.InitBuffer(inQueueA, BUFFER_NUM, (uint64_t)tileM * K * sizeof(DTYPE_A));
+        pipe.InitBuffer(inQueueB, BUFFER_NUM, (uint64_t)tileN * K * sizeof(DTYPE_B));
+        pipe.InitBuffer(outQueueC, BUFFER_NUM, (uint64_t)tileM * tileN * sizeof(DTYPE_C));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (this->MPerBlock == 0) {
+            return;
+        }
+        // For simplicity: tileN == N, so we loop only across M tiles
+        uint32_t mTiles = (this->MPerBlock + tileM - 1) / tileM;
+        for (uint32_t mt = 0; mt < mTiles; ++mt) {
+            uint32_t curTileM = tileM;
+            // last tile may be smaller
+            if ((mt + 1) * tileM > this->MPerBlock) {
+                curTileM = this->MPerBlock - mt * tileM;
+            }
+            CopyIn(mt, curTileM);
+            Compute(mt, curTileM);
+            CopyOut(mt, curTileM);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t mt, uint32_t curTileM)
+    {
+        AscendC::LocalTensor<DTYPE_A> aLocal = inQueueA.AllocTensor<DTYPE_A>();
+        AscendC::LocalTensor<DTYPE_B> bLocal = inQueueB.AllocTensor<DTYPE_B>();
+
+        uint64_t aOffset = (uint64_t)mt * tileM * K;
+        uint64_t aLen = (uint64_t)curTileM * K;
+
+        // B is full tile (tileN == N)
+        uint64_t bOffset = 0;
+        uint64_t bLen = (uint64_t)tileN * K;
+
+        AscendC::DataCopy(aLocal, aGm[aOffset], aLen);
+        AscendC::DataCopy(bLocal, bGm[bOffset], bLen);
+
+        inQueueA.EnQue(aLocal);
+        inQueueB.EnQue(bLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t mt, uint32_t curTileM)
+    {
+        AscendC::LocalTensor<DTYPE_A> aLocal = inQueueA.DeQue<DTYPE_A>();
+        AscendC::LocalTensor<DTYPE_B> bLocal = inQueueB.DeQue<DTYPE_B>();
+        AscendC::LocalTensor<DTYPE_C> cLocal = outQueueC.AllocTensor<DTYPE_C>();
+
+        // Compute C_tile(curTileM x tileN) = A_tile(curTileM x K) * (B_tile(tileN x K))^T
+        // Assume AscendC::MatMul supports transpose flag for B.
+        AscendC::MatMul(cLocal, aLocal, bLocal, curTileM, tileN, K, /*transA*/false, /*transB*/true);
+
+        outQueueC.EnQue<DTYPE_C>(cLocal);
+        inQueueA.FreeTensor(aLocal);
+        inQueueB.FreeTensor(bLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t mt, uint32_t curTileM)
+    {
+        AscendC::LocalTensor<DTYPE_C> cLocal = outQueueC.DeQue<DTYPE_C>();
+
+        uint64_t cOffset = (uint64_t)mt * tileM * N;
+        uint64_t cLen = (uint64_t)curTileM * N;
+
+        AscendC::DataCopy(cGm[cOffset], cLocal, cLen);
+
+        outQueueC.FreeTensor(cLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueA, inQueueB;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueC;
+
+    AscendC::GlobalTensor<DTYPE_A> aGm;
+    AscendC::GlobalTensor<DTYPE_B> bGm;
+    AscendC::GlobalTensor<DTYPE_C> cGm;
+
+    uint32_t M;
+    uint32_t N;
+    uint32_t K;
+    uint32_t tileM;
+    uint32_t tileN;
+    uint32_t MPerBlock;
+};
+
+extern "C" __global__ __aicore__ void matmul_with_transposed_b_custom(GM_ADDR a, GM_ADDR b, GM_ADDR c, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulWithTransposedB op;
+    op.Init(a, b, c,
+            tiling_data.m, tiling_data.n, tiling_data.k,
+            tiling_data.tileM, tiling_data.tileN);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_with_transposed_b_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    // A: [M, K], B: [N, K]; computes A @ B.T => [M, N]
+    at::Tensor result = at::empty({A.size(0), B.size(0)}, A.options());
+    EXEC_NPU_CMD(aclnnMatmulWithTransposedBCustom, A, B, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_with_transposed_b_custom", &matmul_with_transposed_b_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_with_transposed_b_custom", &matmul_with_transposed_b_custom_impl_npu, "C = A @ B.T");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        # A: [M, K], B: [N, K] -> returns [M, N] via custom kernel
+        return custom_ops_lib.matmul_with_transposed_b_custom(A, B)
+'''

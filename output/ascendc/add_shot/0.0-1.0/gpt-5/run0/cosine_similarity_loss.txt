@@ -1,0 +1,324 @@
+project_json_src='''
+[
+    {
+        "op": "CosineSimilarityLossCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CosineSimilarityLossCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CosineSimilarityLossCustom, CosineSimilarityLossCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cosine_similarity_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CosineSimilarityLossCustomTilingData tiling;
+
+    const auto* inputShape = context->GetInputShape(0);
+    auto origin = inputShape->GetOriginShape();
+    uint32_t dimNum = origin.GetDimNum();
+    uint32_t rows = 1;
+    uint32_t cols = 1;
+    if (dimNum >= 1) rows = static_cast<uint32_t>(origin.GetDim(0));
+    if (dimNum >= 2) cols = static_cast<uint32_t>(origin.GetDim(1));
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto in_origin = in_shape->GetOriginShape();
+    int64_t rows = in_origin.GetDim(0);
+
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    out_shape->SetDimNum(1);
+    out_shape->SetDim(0, rows);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CosineSimilarityLossCustom : public OpDef {
+public:
+    explicit CosineSimilarityLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CosineSimilarityLossCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "cosine_similarity_loss_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2; // double buffer
+constexpr float EPS = 1e-12f;
+
+class KernelCosSimLoss {
+public:
+    __aicore__ inline KernelCosSimLoss() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z, uint32_t rows, uint32_t cols, uint32_t tileNum)
+    {
+        this->rows = rows;
+        this->cols = cols;
+        this->tileNum = tileNum;
+
+        // Split rows across blocks
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+
+        this->rowsPerBlock = rows / blockNum;
+        uint32_t tail = rows % blockNum;
+        // Distribute remainder rows to first 'tail' blocks
+        this->rowStart = blockIdx * this->rowsPerBlock + AscendC::Min(blockIdx, tail);
+        this->myRows = this->rowsPerBlock + (blockIdx < tail ? 1 : 0);
+
+        // Choose tile length along cols for local buffer
+        this->tileCols = AscendC::Max((uint32_t)1, (uint32_t)(cols / (tileNum * BUFFER_NUM)));
+        if (this->tileCols > cols) this->tileCols = cols;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->rowStart * this->cols, this->myRows * this->cols);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->rowStart * this->cols, this->myRows * this->cols);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + this->rowStart, this->myRows);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileCols * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueY, BUFFER_NUM, this->tileCols * sizeof(DTYPE_Y));
+        // we only need single-value buffer for output per row
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, 1 * sizeof(DTYPE_Z));
+        pipe.InitBuffer(tmpQueueA, BUFFER_NUM, this->tileCols * sizeof(DTYPE_Z));
+        pipe.InitBuffer(tmpQueueB, BUFFER_NUM, this->tileCols * sizeof(DTYPE_Z));
+        pipe.InitBuffer(tmpQueueC, BUFFER_NUM, this->tileCols * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = 0; r < this->myRows; ++r) {
+            float accDot = 0.0f;
+            float accPX  = 0.0f;
+            float accPY  = 0.0f;
+
+            uint32_t processed = 0;
+            uint32_t toggle = 0;
+
+            while (processed < this->cols) {
+                uint32_t len = AscendC::Min(this->tileCols, this->cols - processed);
+
+                // Copy in tiles for row r
+                AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.AllocTensor<DTYPE_Y>();
+                AscendC::DataCopy(xLocal, xGm[r * this->cols + processed], len);
+                AscendC::DataCopy(yLocal, yGm[r * this->cols + processed], len);
+                inQueueX.EnQue(xLocal);
+                inQueueY.EnQue(yLocal);
+
+                // Compute partials
+                AscendC::LocalTensor<DTYPE_X> xTile = inQueueX.DeQue<DTYPE_X>();
+                AscendC::LocalTensor<DTYPE_Y> yTile = inQueueY.DeQue<DTYPE_Y>();
+
+                AscendC::LocalTensor<DTYPE_Z> mulXY = tmpQueueA.AllocTensor<DTYPE_Z>();
+                AscendC::LocalTensor<DTYPE_Z> sqX   = tmpQueueB.AllocTensor<DTYPE_Z>();
+                AscendC::LocalTensor<DTYPE_Z> sqY   = tmpQueueC.AllocTensor<DTYPE_Z>();
+
+                AscendC::Mul(mulXY, xTile, yTile, len);      // x*y
+                AscendC::Mul(sqX, xTile, xTile, len);        // x*x
+                AscendC::Mul(sqY, yTile, yTile, len);        // y*y
+
+                // ReduceSum over tile
+                float sDot = AscendC::ReduceSum(mulXY, len);
+                float sPX  = AscendC::ReduceSum(sqX, len);
+                float sPY  = AscendC::ReduceSum(sqY, len);
+
+                accDot += sDot;
+                accPX  += sPX;
+                accPY  += sPY;
+
+                tmpQueueA.FreeTensor(mulXY);
+                tmpQueueB.FreeTensor(sqX);
+                tmpQueueC.FreeTensor(sqY);
+
+                inQueueX.FreeTensor(xTile);
+                inQueueY.FreeTensor(yTile);
+
+                processed += len;
+                toggle ^= 1;
+            }
+
+            float denom = AscendC::Sqrt(accPX) * AscendC::Sqrt(accPY) + EPS;
+            float cosine = accDot / denom;
+            float loss = 1.0f - cosine;
+
+            AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+            zLocal.SetValue(0, (DTYPE_Z)loss);
+            outQueueZ.EnQue<DTYPE_Z>(zLocal);
+
+            AscendC::LocalTensor<DTYPE_Z> zOut = outQueueZ.DeQue<DTYPE_Z>();
+            AscendC::DataCopy(zGm[r], zOut, 1);
+            outQueueZ.FreeTensor(zOut);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX, inQueueY;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> tmpQueueA, tmpQueueB, tmpQueueC;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t tileNum;
+
+    uint32_t rowStart;
+    uint32_t rowsPerBlock;
+    uint32_t myRows;
+    uint32_t tileCols;
+};
+
+extern "C" __global__ __aicore__ void cosine_similarity_loss_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCosSimLoss op;
+    op.Init(x, y, z, tiling_data.rows, tiling_data.cols, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cosine_similarity_loss_custom_impl_npu(const at::Tensor& predictions, const at::Tensor& targets) {
+    TORCH_CHECK(predictions.dim() >= 2, "predictions must be at least 2D [N, D]");
+    TORCH_CHECK(predictions.sizes() == targets.sizes(), "predictions and targets must have the same shape");
+    auto opts = predictions.options();
+    auto N = predictions.size(0);
+    at::Tensor result = at::empty({N}, opts);
+    EXEC_NPU_CMD(aclnnCosineSimilarityLossCustom, predictions, targets, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cosine_similarity_loss_custom", &cosine_similarity_loss_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cosine_similarity_loss_custom", &cosine_similarity_loss_custom_impl_npu, "Per-sample cosine similarity loss");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, predictions, targets):
+        # Custom op returns per-sample loss vector of shape [N]
+        loss_vec = custom_ops_lib.cosine_similarity_loss_custom(predictions, targets)
+        return loss_vec.mean()
+'''

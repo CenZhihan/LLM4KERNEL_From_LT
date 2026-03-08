@@ -1,0 +1,289 @@
+project_json_src='''
+[
+    {
+        "op": "AveragePooling1dCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "attr": [
+            {
+                "name": "kernel_size",
+                "type": "int",
+                "value": ""
+            },
+            {
+                "name": "stride",
+                "type": "int",
+                "value": ""
+            },
+            {
+                "name": "padding",
+                "type": "int",
+                "value": ""
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(AveragePooling1dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalOutputLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, channels);
+  TILING_DATA_FIELD_DEF(uint32_t, inputLen);
+  TILING_DATA_FIELD_DEF(uint32_t, outputLen);
+
+  TILING_DATA_FIELD_DEF(uint32_t, kernelSize);
+  TILING_DATA_FIELD_DEF(uint32_t, stride);
+  TILING_DATA_FIELD_DEF(uint32_t, padding);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(AveragePooling1dCustom, AveragePooling1dCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "average_pooling_1d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    AveragePooling1dCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    // Expect ND with (N, C, L)
+    uint32_t n = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(0));
+    uint32_t c = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(1));
+    uint32_t lin = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(2));
+
+    // Read attributes
+    int64_t k = 1;
+    int64_t s = 1;
+    int64_t p = 0;
+    if (context->GetAttrs() != nullptr) {
+        k = context->GetAttrs()->GetInt("kernel_size");
+        s = context->GetAttrs()->GetInt("stride");
+        p = context->GetAttrs()->GetInt("padding");
+    }
+
+    // Output length: floor((L_in + 2*padding - kernel_size) / stride) + 1
+    uint32_t lout = static_cast<uint32_t>(((int64_t)lin + 2 * p - k) / s + 1);
+    uint32_t totalOut = n * c * lout;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalOutputLength(totalOut);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.set_batch(n);
+    tiling.set_channels(c);
+    tiling.set_inputLen(lin);
+    tiling.set_outputLen(lout);
+
+    tiling.set_kernelSize(static_cast<uint32_t>(k));
+    tiling.set_stride(static_cast<uint32_t>(s));
+    tiling.set_padding(static_cast<uint32_t>(p));
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    auto* attrs = context->GetAttrs();
+
+    int64_t k = 1;
+    int64_t s = 1;
+    int64_t p = 0;
+    if (attrs != nullptr) {
+        k = attrs->GetInt("kernel_size");
+        s = attrs->GetInt("stride");
+        p = attrs->GetInt("padding");
+    }
+
+    uint64_t n = x_shape->GetDim(0);
+    uint64_t c = x_shape->GetDim(1);
+    uint64_t lin = x_shape->GetDim(2);
+    uint64_t lout = static_cast<uint64_t>(((int64_t)lin + 2 * p - k) / s + 1);
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDim(0, n);
+    y_shape->SetDim(1, c);
+    y_shape->SetDim(2, lout);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class AveragePooling1dCustom : public OpDef {
+public:
+    explicit AveragePooling1dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("kernel_size").Int();
+        this->Attr("stride").Int();
+        this->Attr("padding").Int();
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(AveragePooling1dCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "average_pooling_1d_custom_tiling_data.h"
+
+extern "C" __global__ __aicore__ void average_pooling_1d_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+
+    // Unpack tiling parameters
+    const uint32_t totalOut = tiling_data.totalOutputLength;
+    const uint32_t inputLen  = tiling_data.inputLen;
+    const uint32_t outputLen = tiling_data.outputLen;
+    const uint32_t kernel    = tiling_data.kernelSize;
+    const uint32_t stride    = tiling_data.stride;
+    const uint32_t padding   = tiling_data.padding;
+
+    __gm__ DTYPE_X* xPtr = (__gm__ DTYPE_X*)x;
+    __gm__ DTYPE_Y* yPtr = (__gm__ DTYPE_Y*)y;
+
+    const uint32_t blockNum = AscendC::GetBlockNum();
+    const uint32_t blockIdx = AscendC::GetBlockIdx();
+    const uint32_t work = (totalOut + blockNum - 1) / blockNum;
+
+    const uint32_t start = blockIdx * work;
+    const uint32_t end = AscendC::Min(totalOut, start + work);
+
+    for (uint32_t p = start; p < end; ++p) {
+        uint32_t nc = p / outputLen;
+        uint32_t t  = p % outputLen;
+
+        int32_t start_in = static_cast<int32_t>(t) * static_cast<int32_t>(stride) - static_cast<int32_t>(padding);
+        float acc = 0.0f;
+
+        // Sum over kernel window, with zero-padding included in denominator
+        for (uint32_t k = 0; k < kernel; ++k) {
+            int32_t idx = start_in + static_cast<int32_t>(k);
+            if (idx >= 0 && idx < static_cast<int32_t>(inputLen)) {
+                acc += static_cast<float>(xPtr[nc * inputLen + static_cast<uint32_t>(idx)]);
+            }
+        }
+        float avg = acc / static_cast<float>(kernel);
+        yPtr[p] = static_cast<DTYPE_Y>(avg);
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor average_pooling_1d_custom_impl_npu(const at::Tensor& x, int64_t kernel_size, int64_t stride, int64_t padding) {
+    TORCH_CHECK(x.dim() == 3, \"Input must be 3D (N, C, L)\");
+    auto sizes = x.sizes();
+    int64_t N = sizes[0];
+    int64_t C = sizes[1];
+    int64_t Lin = sizes[2];
+    int64_t Lout = (Lin + 2 * padding - kernel_size) / stride + 1;
+    TORCH_CHECK(Lout > 0, \"Invalid output length computed for AvgPool1d\");
+
+    at::Tensor result = at::empty({N, C, Lout}, x.options());
+    EXEC_NPU_CMD(aclnnAveragePooling1dCustom, x, result, kernel_size, stride, padding);
+    return result;
+}
+
+TORCH_LIBRARY(myops, m) {
+    m.def(\"average_pooling_1d_custom(Tensor x, int kernel_size, int stride, int padding) -> Tensor\");
+}
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"average_pooling_1d_custom\", &average_pooling_1d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"average_pooling_1d_custom\", &average_pooling_1d_custom_impl_npu, \"Custom AvgPool1d\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model using custom AscendC AvgPool1d kernel.
+    """
+    def __init__(self, kernel_size: int, stride: int = 1, padding: int = 0):
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.average_pooling_1d_custom(x, self.kernel_size, self.stride, self.padding)
+'''

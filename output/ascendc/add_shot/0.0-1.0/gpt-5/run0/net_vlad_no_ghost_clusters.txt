@@ -1,0 +1,331 @@
+project_json_src='''
+[
+    {
+        "op": "NetVladNoGhostClustersCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "assignment",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "clusters2",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(NetVladNoGhostClustersCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, B);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, D);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(NetVladNoGhostClustersCustom, NetVladNoGhostClustersCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "net_vlad_no_ghost_clusters_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    NetVladNoGhostClustersCustomTilingData tiling;
+
+    auto* asn_shape = context->GetInputShape(0); // [B, N, K]
+    auto* x_shape   = context->GetInputShape(1); // [B, N, D]
+    auto* c2_shape  = context->GetInputShape(2); // [1, D, K]
+
+    uint32_t B = (uint32_t)asn_shape->GetOriginShape().GetDim(0);
+    uint32_t N = (uint32_t)asn_shape->GetOriginShape().GetDim(1);
+    uint32_t K = (uint32_t)asn_shape->GetOriginShape().GetDim(2);
+    uint32_t D = (uint32_t)x_shape->GetOriginShape().GetDim(2);
+
+    uint64_t total64 = (uint64_t)B * (uint64_t)D * (uint64_t)K;
+    uint32_t totalLength = (uint32_t)total64;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_B(B);
+    tiling.set_N(N);
+    tiling.set_D(D);
+    tiling.set_K(K);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // Inputs: assignment [B, N, K], x [B, N, D], clusters2 [1, D, K]
+    const gert::Shape* asn = context->GetInputShape(0);
+    const gert::Shape* x    = context->GetInputShape(1);
+    gert::Shape* out = context->GetOutputShape(0);
+
+    std::vector<int64_t> out_vec(3);
+    out_vec[0] = asn->GetDim(0);     // B
+    out_vec[1] = x->GetDim(2);       // D
+    out_vec[2] = asn->GetDim(2);     // K
+    out->SetDimNum(3);
+    for (size_t i = 0; i < 3; ++i) out->SetDim(i, out_vec[i]);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class NetVladNoGhostClustersCustom : public OpDef {
+public:
+    explicit NetVladNoGhostClustersCustom(const char* name) : OpDef(name)
+    {
+        this->Input("assignment")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("clusters2")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("out")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(NetVladNoGhostClustersCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "net_vlad_no_ghost_clusters_custom_tiling_data.h"
+
+// Computes vlad_pre = sum_n assignment[b,n,k]*x[b,n,d] - (sum_n assignment[b,n,k]) * clusters2[0,d,k]
+// Shapes:
+//  assignment: [B, N, K]
+//  x:         [B, N, D]
+//  clusters2: [1, D, K]
+//  out:       [B, D, K]
+
+extern "C" __global__ __aicore__ void net_vlad_no_ghost_clusters_custom(GM_ADDR assignment,
+                                                                        GM_ADDR x,
+                                                                        GM_ADDR clusters2,
+                                                                        GM_ADDR out,
+                                                                        GM_ADDR workspace,
+                                                                        GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+
+    const uint32_t B = tiling_data.B;
+    const uint32_t N = tiling_data.N;
+    const uint32_t D = tiling_data.D;
+    const uint32_t K = tiling_data.K;
+    const uint32_t total = tiling_data.totalLength;
+
+    const uint32_t block_num = AscendC::GetBlockNum();
+    const uint32_t block_idx = AscendC::GetBlockIdx();
+
+    // balanced split
+    uint32_t base = (total + block_num - 1) / block_num;
+    uint32_t start = base * block_idx;
+    uint32_t end = start + base;
+    if (end > total) end = total;
+
+    __gm__ float* asn = reinterpret_cast<__gm__ float*>(assignment);
+    __gm__ float* xgm = reinterpret_cast<__gm__ float*>(x);
+    __gm__ float* c2  = reinterpret_cast<__gm__ float*>(clusters2);
+    __gm__ float* y   = reinterpret_cast<__gm__ float*>(out);
+
+    for (uint32_t idx = start; idx < end; ++idx) {
+        // map idx -> (b, d, k) with layout [B, D, K]
+        uint32_t tmp = idx;
+        uint32_t k = tmp % K; tmp /= K;
+        uint32_t d = tmp % D; tmp /= D;
+        uint32_t b = tmp;
+
+        float dot = 0.f;
+        float asum = 0.f;
+
+        // offsets base
+        uint64_t asn_bn_base = (uint64_t)b * (uint64_t)N * (uint64_t)K;
+        uint64_t x_bn_base   = (uint64_t)b * (uint64_t)N * (uint64_t)D;
+
+        for (uint32_t n = 0; n < N; ++n) {
+            uint64_t a_off = asn_bn_base + (uint64_t)n * (uint64_t)K + (uint64_t)k;
+            uint64_t x_off = x_bn_base   + (uint64_t)n * (uint64_t)D + (uint64_t)d;
+            float aval = asn[a_off];
+            float xval = xgm[x_off];
+            dot  += aval * xval;
+            asum += aval;
+        }
+
+        uint64_t c2_off = (uint64_t)d * (uint64_t)K + (uint64_t)k;
+        float c2v = c2[c2_off];
+
+        float outv = dot - asum * c2v;
+
+        uint64_t y_off = ((uint64_t)b * (uint64_t)D + (uint64_t)d) * (uint64_t)K + (uint64_t)k;
+        y[y_off] = outv;
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor net_vlad_no_ghost_clusters_custom_impl_npu(const at::Tensor& assignment,
+                                                      const at::Tensor& x,
+                                                      const at::Tensor& clusters2) {
+    TORCH_CHECK(assignment.dim() == 3, "assignment must be [B, N, K]");
+    TORCH_CHECK(x.dim() == 3, "x must be [B, N, D]");
+    TORCH_CHECK(clusters2.dim() == 3, "clusters2 must be [1, D, K]");
+
+    auto B = assignment.size(0);
+    auto N = assignment.size(1);
+    auto K = assignment.size(2);
+    auto D = x.size(2);
+
+    // Output [B, D, K]
+    at::Tensor result = at::empty({B, D, K}, assignment.options());
+    EXEC_NPU_CMD(aclnnNetVladNoGhostClustersCustom, assignment, x, clusters2, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("net_vlad_no_ghost_clusters_custom", &net_vlad_no_ghost_clusters_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("net_vlad_no_ghost_clusters_custom", &net_vlad_no_ghost_clusters_custom_impl_npu,
+          "NetVLAD (no ghost clusters) fused accumulation");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        import math
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+
+    def forward(self, x, mask=None):
+        # x: [B, N, D]
+        B, N, D = x.shape[0], x.shape[1], x.shape[2]
+        x_flat = x.view(-1, self.feature_size)  # BN x D
+
+        if x_flat.device != self.clusters.device:
+            raise ValueError(f"x.device {x_flat.device} != cluster.device {self.clusters.device}")
+
+        assignment = th.matmul(x_flat, self.clusters)  # BN x (K+G)
+        assignment = self.batch_norm(assignment)
+        assignment = F.softmax(assignment, dim=1)
+        assignment = assignment[:, :self.cluster_size]  # BN x K
+        assignment = assignment.view(B, N, self.cluster_size)  # B x N x K
+
+        # Custom fused kernel to compute:
+        # vlad_pre = sum_n a[b,n,k]*x[b,n,d] - (sum_n a[b,n,k]) * c2[0,d,k]
+        vlad_pre = custom_ops_lib.net_vlad_no_ghost_clusters_custom(assignment, x, self.clusters2)  # B x D x K
+
+        # L2 intra norm along D
+        vlad = F.normalize(vlad_pre, dim=1)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(B, self.cluster_size * self.feature_size)
+        vlad = F.normalize(vlad, dim=1)
+        return vlad
+'''

@@ -1,0 +1,262 @@
+project_json_src='''
+[
+    {
+        "op": "CrossEntropyLossCustom",
+        "input_desc": [
+            {
+                "name": "logits",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "target",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CrossEntropyLossCustomTilingData)
+    TILING_DATA_FIELD_DEF(uint32_t, rows);
+    TILING_DATA_FIELD_DEF(uint32_t, cols);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CrossEntropyLossCustom, CrossEntropyLossCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cross_entropy_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <string.h>
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CrossEntropyLossCustomTilingData tiling;
+
+    // Input 0: logits with shape [N, C]
+    // Input 1: target with shape [N]
+    uint64_t totalLengthLogits = context->GetInputShape(0)->GetStorageShape().GetShapeSize();
+    uint64_t totalLengthTarget = context->GetInputShape(1)->GetStorageShape().GetShapeSize();
+
+    uint32_t rows = static_cast<uint32_t>(totalLengthTarget);
+    uint32_t cols = static_cast<uint32_t>(totalLengthLogits / (rows == 0 ? 1 : rows));
+
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+
+    // Use single block by default
+    context->SetBlockDim(1);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CrossEntropyLossCustom : public OpDef {
+public:
+    explicit CrossEntropyLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("logits")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("target")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CrossEntropyLossCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelCrossEntropyLoss {
+public:
+    __aicore__ inline KernelCrossEntropyLoss() {}
+
+    __aicore__ inline void Init(GM_ADDR logits, GM_ADDR target, GM_ADDR y,
+                                uint32_t rows, uint32_t cols) {
+        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
+        this->rows = rows;
+        this->cols = cols;
+
+        logitsGm.SetGlobalBuffer((__gm__ float*)logits, static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols));
+        targetGm.SetGlobalBuffer((__gm__ int32_t*)target, rows);
+        outGm.SetGlobalBuffer((__gm__ float*)y, 32);
+
+        pipe.InitBuffer(inQueueIN, BUFFER_NUM, this->cols * sizeof(float));
+        pipe.InitBuffer(tempBuf, this->cols * sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        float lossSum = 0.0f;
+
+        for (uint32_t i = 0; i < rows; ++i) {
+            CopyInRow(i);
+            lossSum += ComputeRow(i);
+        }
+
+        AscendC::LocalTensor<float> tmp = tempBuf.Get<float>();
+        AscendC::LocalTensor<float> denom = inQueueIN.AllocTensor<float>();
+
+        tmp.SetValue(0, lossSum);
+        AscendC::Duplicate(denom, static_cast<float>(rows), 1);
+        AscendC::Div(tmp, tmp, denom, 1);
+
+        outGm.SetValue(0, tmp.GetValue(0));
+        inQueueIN.FreeTensor(denom);
+    }
+
+private:
+    __aicore__ inline void CopyInRow(uint32_t rowIdx) {
+        AscendC::LocalTensor<float> rowLocal = inQueueIN.AllocTensor<float>();
+        uint64_t offset = static_cast<uint64_t>(rowIdx) * static_cast<uint64_t>(cols);
+        AscendC::DataCopy(rowLocal[0], logitsGm[offset], cols);
+        inQueueIN.EnQue(rowLocal);
+    }
+
+    __aicore__ inline float ComputeRow(uint32_t rowIdx) {
+        AscendC::LocalTensor<float> rowLocal = inQueueIN.DeQue<float>();
+        AscendC::LocalTensor<float> tmp = tempBuf.Get<float>();
+
+        uint32_t tgt = static_cast<uint32_t>(targetGm.GetValue(rowIdx));
+        // Read target logit before modifying rowLocal
+        float target_val = rowLocal.GetValue(static_cast<int32_t>(tgt));
+
+        // Compute max for numerical stability
+        float maxv = rowLocal.GetValue(0);
+        for (uint32_t j = 1; j < cols; ++j) {
+            float v = rowLocal.GetValue(static_cast<int32_t>(j));
+            maxv = v > maxv ? v : maxv;
+        }
+
+        // rowLocal = rowLocal - maxv
+        AscendC::Duplicate(tmp, maxv, cols);
+        AscendC::Sub(rowLocal, rowLocal, tmp, cols);
+
+        // exp(rowLocal)
+        AscendC::Exp(rowLocal, rowLocal, cols);
+
+        // sumexp = sum(exp)
+        AscendC::ReduceSum<float>(rowLocal, rowLocal, tmp, cols);
+        float sumexp = rowLocal.GetValue(0);
+
+        // logsumexp = log(sumexp) + maxv
+        tmp.SetValue(0, sumexp);
+        AscendC::Log(tmp, tmp, 1);
+        float logsumexp = tmp.GetValue(0) + maxv;
+
+        float loss = logsumexp - target_val;
+
+        inQueueIN.FreeTensor(rowLocal);
+        return loss;
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueIN;
+    AscendC::TBuf<> tempBuf;
+
+    AscendC::GlobalTensor<float> logitsGm;
+    AscendC::GlobalTensor<int32_t> targetGm;
+    AscendC::GlobalTensor<float> outGm;
+
+    uint32_t rows;
+    uint32_t cols;
+};
+
+extern "C" __global__ __aicore__ void cross_entropy_loss_custom(GM_ADDR logits, GM_ADDR target, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCrossEntropyLoss op;
+    op.Init(logits, target, y, tiling_data.rows, tiling_data.cols);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cross_entropy_loss_impl_npu(const at::Tensor& logits, const at::Tensor& target) {
+    at::Tensor logits_f = logits.contiguous();
+    at::Tensor target_i32 = target.to(at::kInt).contiguous();
+    at::Tensor result = at::empty({}, logits.options());
+    EXEC_NPU_CMD(aclnnCrossEntropyLossCustom, logits_f, target_i32, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cross_entropy_loss_custom", &cross_entropy_loss_impl_npu);
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cross_entropy_loss_custom", &cross_entropy_loss_impl_npu, "cross entropy loss");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.cross_entropy_loss_custom(predictions, targets)
+'''

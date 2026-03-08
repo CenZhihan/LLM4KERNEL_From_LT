@@ -1,0 +1,303 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTranspose3dBatchNormSubtractCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTranspose3dBatchNormSubtractCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, d);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTranspose3dBatchNormSubtractCustom, ConvTranspose3dBatchNormSubtractCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transpose3d_batch_norm_subtract_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 32;   // number of parallel cores used
+const uint32_t TILE_NUM  = 8;    // number of tiles per (N,C) channel
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTranspose3dBatchNormSubtractCustomTilingData tiling;
+
+    const auto *inShape = context->GetInputShape(0);
+    uint32_t dims = inShape->GetOriginShape().GetDimNum();
+    if (dims != 5) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t n = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(0));
+    uint32_t c = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(1));
+    uint32_t d = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(2));
+    uint32_t h = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(3));
+    uint32_t w = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(4));
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_d(d);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTranspose3dBatchNormSubtractCustom : public OpDef {
+public:
+    explicit ConvTranspose3dBatchNormSubtractCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTranspose3dBatchNormSubtractCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv_transpose3d_batch_norm_subtract_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelSubtractSpatialMean {
+public:
+    __aicore__ inline KernelSubtractSpatialMean() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t d, uint32_t h, uint32_t w,
+                                uint32_t tileNum)
+    {
+        this->n = n;
+        this->c = c;
+        this->d = d;
+        this->h = h;
+        this->w = w;
+        this->channels = n * c;
+        this->spatial = d * h * w;
+        this->tileNum = tileNum;
+        this->tileLength = AscendC::max((uint32_t)1, (uint32_t)(this->spatial / (tileNum * BUFFER_NUM)));
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x, this->channels * this->spatial);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y, this->channels * this->spatial);
+        pipe.InitBuffer(inQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        // a tiny buffer to hold scalar reductions
+        pipe.InitBuffer(tmpQueue, 1, sizeof(DTYPE_X)); // one scalar buffer
+    }
+
+    __aicore__ inline void Process()
+    {
+        uint32_t grid = AscendC::GetBlockNum();
+        uint32_t bid = AscendC::GetBlockIdx();
+
+        for (uint32_t ch = bid; ch < this->channels; ch += grid) {
+            // First pass: compute sum over spatial dims for channel ch
+            AscendC::LocalTensor<DTYPE_X> sumLocal = tmpQueue.AllocTensor<DTYPE_X>();
+            // initialize sumLocal to 0
+            AscendC::SetValue(sumLocal, (DTYPE_X)0, 1);
+
+            uint32_t processed = 0;
+            uint32_t tilesTotal = (this->spatial + this->tileLength - 1) / this->tileLength;
+            for (uint32_t t = 0; t < tilesTotal; ++t) {
+                uint32_t len = AscendC::min(this->tileLength, this->spatial - processed);
+                AscendC::LocalTensor<DTYPE_X> xLocal = inQueue.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xLocal, xGm[ch * this->spatial + processed], len);
+                inQueue.EnQue(xLocal);
+
+                AscendC::LocalTensor<DTYPE_X> xTile = inQueue.DeQue<DTYPE_X>();
+                AscendC::LocalTensor<DTYPE_X> tileSum = tmpQueue.AllocTensor<DTYPE_X>();
+                // reduce tile to scalar
+                AscendC::ReduceSum(tileSum, xTile, len);
+                // accumulate into sumLocal
+                AscendC::Add(sumLocal, sumLocal, tileSum, 1);
+
+                tmpQueue.FreeTensor(tileSum);
+                inQueue.FreeTensor(xTile);
+                processed += len;
+            }
+
+            // compute mean = sum / spatial
+            DTYPE_X invSpatial = (DTYPE_X)(1.0f / (float)this->spatial);
+            AscendC::Muls(sumLocal, sumLocal, invSpatial, 1); // now sumLocal holds mean
+
+            // Second pass: subtract mean from each element and write out
+            processed = 0;
+            for (uint32_t t = 0; t < tilesTotal; ++t) {
+                uint32_t len = AscendC::min(this->tileLength, this->spatial - processed);
+
+                AscendC::LocalTensor<DTYPE_X> xLocal = inQueue.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xLocal, xGm[ch * this->spatial + processed], len);
+                inQueue.EnQue(xLocal);
+
+                AscendC::LocalTensor<DTYPE_X> xTile = inQueue.DeQue<DTYPE_X>();
+                AscendC::LocalTensor<DTYPE_Y> yTile = outQueue.AllocTensor<DTYPE_Y>();
+
+                // broadcast mean to a temporary buffer
+                AscendC::LocalTensor<DTYPE_X> meanVec = outQueue.AllocTensor<DTYPE_X>();
+                AscendC::Duplicate(meanVec, sumLocal.GetValue(0), len);
+
+                AscendC::Sub(yTile, xTile, meanVec, len);
+
+                outQueue.EnQue<DTYPE_Y>(yTile);
+
+                // free temps
+                outQueue.FreeTensor(meanVec);
+                inQueue.FreeTensor(xTile);
+
+                AscendC::LocalTensor<DTYPE_Y> yOut = outQueue.DeQue<DTYPE_Y>();
+                AscendC::DataCopy(yGm[ch * this->spatial + processed], yOut, len);
+                outQueue.FreeTensor(yOut);
+
+                processed += len;
+            }
+
+            tmpQueue.FreeTensor(sumLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> tmpQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t n, c, d, h, w;
+    uint32_t channels;
+    uint32_t spatial;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void conv_transpose3d_batch_norm_subtract_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelSubtractSpatialMean op;
+    op.Init(x, y,
+            tiling_data.n, tiling_data.c, tiling_data.d, tiling_data.h, tiling_data.w,
+            tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_transpose3d_batch_norm_subtract_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnConvTranspose3dBatchNormSubtractCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transpose3d_batch_norm_subtract_custom", &conv_transpose3d_batch_norm_subtract_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transpose3d_batch_norm_subtract_custom", &conv_transpose3d_batch_norm_subtract_custom_impl_npu, "Subtract spatial mean after BN");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    A 3D convolutional transpose layer followed by Batch Normalization,
+    then a custom fused AscendC operator that subtracts the per-(N,C) spatial mean.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=True):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = torch.nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
+        self.batch_norm = torch.nn.BatchNorm3d(out_channels)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.batch_norm(x)
+        # Replace: x = x - torch.mean(x, dim=(2,3,4), keepdim=True)
+        x = custom_ops_lib.conv_transpose3d_batch_norm_subtract_custom(x)
+        return x
+'''

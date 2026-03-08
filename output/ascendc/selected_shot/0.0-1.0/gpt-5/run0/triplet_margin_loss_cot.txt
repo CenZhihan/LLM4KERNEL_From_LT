@@ -1,0 +1,50 @@
+**Considering tensor operations**
+
+I’m thinking about how to generalize shapes. I’ll implement flattening along all dimensions except the first, treating the first as "feature length" equals totalLength divided by batch size. I need to understand the shape inside the tiling context, which mainly gives the storage shape. Computing totalLength as shape size and batch from GetInputShape(0) is crucial. It seems simpler to treat the tensor as 1D, but I won’t be able to compute per-sample distances for hinge. So, perhaps I need to implement kernel computing pairwise distances with a loop across features.
+
+**Navigating multi-level reductions**
+
+I’m finding that writing complex multi-level reductions in AscendC is quite a challenge. In one example, a kernel reduces to a scalar mean of squared differences across all elements. For triplet calculations, we require per-row square roots and hinge. I could use segmented reductions since the local tile length will be multiples of feature length. To handle pairwise distances, I need sums across dimensions per sample, which complicates things. Instead, I might design host tiling to ensure feature length divides the tile length.
+
+**Calculating tile dimensions**
+
+I'm considering that since D can be as large as 8192, I could set tileLength equal to D, so each tile processes exactly one sample. That might be on the smaller side for occupancy, though. I can define tileNum as equal to N, which seems reasonable. I need to compute D from the input shape, using the ND format to get dimensions. The Host Tiling function should help with that, but I'm uncertain of the method names. It looks like GetShapeSize is used in examples, while I could also use GetStorageShape() or GetDimNum. Let's see how I can compute the first dimension from this information!
+
+**Avoiding risk in coding**
+
+I want to avoid unnecessary risks, so I'm considering passing the tile length equal to the stride along the last dimensions. If I can't get the dimensions, I could assume the feature dimension equals the total shape size divided by the first dimension. But that's not very safe. The coding examples I've seen often treat this as a 1D length. For triplet calculations, we need per-sample reductions. I might compute distances for flattened arrays as two distances between big vectors, but I realize it has to be per-sample instead. It could be helpful to implement a Python operation that decomposes TripletMarginLoss into vectorized operations while using AscendC kernels.
+
+**Designing a triplet margin loss kernel**
+
+I’m considering how to create a kernel that computes the final mean hinge across pairwise distances. I could precompute per-sample distances using optimized NPU operations. The kernel should handle hinge and reduction—like the MSELoss example that replaced squared differences. For TripletMarginLoss, I want pairwise distances, then the hinge, and finally the mean. It might work to compute squared L2 distances without using square roots directly. 
+
+In terms of structuring the kernel, I plan to acquire the input shape and derive batch and feature dimensions. I’ll design a kernel to copy data, compute differences, and ultimately store results. I'll also introduce margin as an extra input. It seems the host operator must fetch margin from model attributes, potentially allowing a dummy input to work around limitations. Let's get to implementing this!
+
+**Implementing hinge loss calculations**
+
+For calculating hinge loss, I plan to start with the subtraction of positive and anchor values, storing the result in pLocal. I’ll then square that difference and perform a reduction to sum the results. It’s a bit tricky since I can’t allocate more memory, but I can reuse parts of pLocal and nLocal for computations.
+
+After computing the squared sums, I’ll calculate the square roots with an epsilon value added, which helps avoid zeroes when computing distances. I'll create a small temporary tensor for the epsilon and manage the necessary operations while keeping essential values intact. 
+
+My approach involves making sure I use existing memory efficiently without corrupting original data, so there will be careful reuse of arrays for each step. Let's move on to finalize the calculations for each processing step!
+
+**Calculating margin hinge in kernel**
+
+To compute the margin hinge, I need to load the margin from global memory when initializing the process. I plan to copy this value into a small local variable for later operations. 
+
+The simplest approach seems to be defining a member variable for the margin and copying it into a temporary buffer ahead of the loop to avoid repeated overhead. I’ll ensure not to overwrite important values during this process. Once I compute distances and apply the hinge loss function, I’ll perform necessary reductions and use temporary vectors for calculations to streamline efficiency. 
+
+Finally, I’ll produce the output and clean up the allocated memory.
+
+**Implementing triplet margin loss**
+
+To compute the triplet margin loss, I’ll store the necessary parameters like tileLength and featureLength, while also defining a custom operation class. I need a Tiling class to handle the structure for all required fields.
+
+I’ll implement the necessary structures and include the appropriate headers in my source file. In the kernel, my main focus will be on data copying and aligning features efficiently. Each loop iteration will handle the losses calculation, ultimately reducing them appropriately. Finally, I’ll ensure that the margins and other calculations yield the desired output while maintaining clean memory management.
+
+**Creating Python bindings**
+
+For the Python binding code, I need to include the necessary headers, as demonstrated in the example. The function `triplet_margin_loss_impl_npu` will return the result, and I’ll ensure it's properly mapped using the `TORCH_LIBRARY_IMPL(myops, PrivateUse1, m)` for `triplet_margin_loss_custom`. 
+
+In the model source, I'll import Torch and establish the `ModelNew` class with `__init__(margin=1.0)`. The forward method will return the custom operation call, which is straightforward. Now, I'll format the final code block with triple quotes and the appropriate indentation. Time to produce that clean code!
+

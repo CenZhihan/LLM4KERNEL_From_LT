@@ -1,0 +1,30 @@
+**Considering implementation details**
+
+I'm thinking about using epsilon as an attribute in JSON instead of input. The example doesn’t mention attribute fields, but modifying the epsilon constant in the kernel could work. Setting eps to 1e-5 should preserve existing functionality. Now, for designing host tiling data: since InstanceNorm reduces across HxW and per-channel, I need to break data into blocks and tiles. It feels simpler to treat the flattened spatial dimension as S=H*W, computing mean/var for each (N,C) group. I’ll implement this in two passes within the kernel.
+
+**Understanding memory layout**
+
+I'm looking at how vectorization is typically expected to work on Ascend, where we can process N*C groups of length S. This means I need to interpret memory as contiguous per group. In the NCHW layout, data for each (n,c) is indeed contiguous across the H*W dimensions. Memory layout implies that the index for NCHW is calculated in a specific way: ((n*C + c)*H + h)*W + w. So, for fixed n and c, the block at the given offset contains S contiguous elements. Now, I need to decide on a tile length, maybe 1024, and compute sums using LocalTensor. I also need to incorporate DTYPE_ macros from the kernel operator header in my kernels, as they're typically defined by KernelDef.
+
+**Defining data types and tiling**
+
+In the sample, they used DTYPE_X, Y, and Z. For a single input/output, I need DTYPE_X and DTYPE_Y. I’ll set DTYPE_X to be either half or float; since the project JSON restricts to float, I’ll use float for both DTYPE_X and DTYPE_Y. In a single operation, there's just one x input and one y output. The sample also uses these macros defined in the add_custom_tiling_data.h file, relying on external mappings for the data types. I’ll stick with using float for both. 
+
+Now, implementing TPipe style means I’ll compute per tile and accumulate local sums/ssq across each group (N*C). I need to pass N, C, and S (spatial size), where groups = N*C and totalLength = N*C*S. The tiling function will compute the shape dimensions, so I’ll create fields for totalLength, groupSize, groups, and tileNum.
+
+**Setting up block partitioning**
+
+I’m planning to set the block partition by splitting groups across multiple blocks. The number of groups per block can be calculated as groups divided by block_num, plus any remainder. For simplicity, I might consider setting the block number to 1, but a consistent block dimension of around 8 could be better. When implementing, I need to compute blockLength based on the number of elements per block. 
+
+I have to avoid mixing groups in instance norm, so partitioning by flat length could be problematic, leading to incorrect sums. To ensure proper alignment, I’ll compute the groups per block and adjust data offsets accordingly. 
+
+I’ll define the AddCustom sample in host_tiling_src and create InstanceNormCustomTilingData, which includes fields like groupSize, groupNum, and tileNum. The block dimension could be set to 8 as well, and I’ll compute tileNum, potentially also 8, while considering workspace sizes and ensuring the shape/inference functions have one input and output share the same shape.
+
+**Implementing reduce and normalization in AscendC**
+
+I'm exploring the built-in vector reduce sum functions from the AscendC library, like AscendC::ReduceSum and AscendC::Square. Many sample codes show operations like Add, Sub, and ReduceSum as well, so I’ll consider using these in implementation. However, to avoid complications, I might just loop through tile elements and compute sums in scalar form. LocalTensor pointer indexing isn’t standard, and I'm not sure about accessing elements directly, so I'll keep it simple.
+
+For calculating the mean, I’ll assume AscendC::ReduceSum exists and can return a float. I want to propose computations, including tile sums and squares. It’s important to allocate memory correctly and ensure that local tensors and queues are defined properly. 
+
+I’m thinking of preparing LocalTensors for mean and standard deviation by utilizing functions like AscendC::Dup for broadcasting. The compute will involve a two-phase loop for accumulating sums, followed by reduction operations. I’ll also ensure I keep memory limits in mind while using temporary queues. Finally, I’ll adjust shapes to get the dimensions needed for the input tensors based on the required operations.
+

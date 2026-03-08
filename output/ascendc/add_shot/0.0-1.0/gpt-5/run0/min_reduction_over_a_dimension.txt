@@ -1,0 +1,330 @@
+project_json_src='''
+[
+    {
+        "op": "MinReductionOverADimensionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "attr": [
+            {
+                "name": "dim",
+                "type": "int"
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MinReductionOverADimensionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, outer);
+  TILING_DATA_FIELD_DEF(uint32_t, axisLen);
+  TILING_DATA_FIELD_DEF(uint32_t, inner);
+  TILING_DATA_FIELD_DEF(uint32_t, tileInner);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MinReductionOverADimensionCustom, MinReductionOverADimensionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "min_reduction_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <algorithm>
+#include <numeric>
+
+namespace {
+inline int64_t CanonicalDim(int64_t dim, int64_t rank) {
+    if (dim < 0) dim += rank;
+    return dim;
+}
+
+inline uint64_t ProdDims(const gert::Shape &shape, int64_t start, int64_t end) {
+    // multiply dims in [start, end)
+    uint64_t p = 1;
+    for (int64_t i = start; i < end; ++i) {
+        p *= static_cast<uint64_t>(shape.GetDim(i));
+    }
+    return p;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MinReductionOverADimensionCustomTilingData tiling;
+
+    const gert::Shape* inShapeWrap = context->GetInputShape(0);
+    const auto &inShape = inShapeWrap->GetOriginShape();
+    const int64_t rank = static_cast<int64_t>(inShape.GetDimNum());
+
+    int64_t dimAttr = 0;
+    // Try to get attribute 'dim'
+    context->GetAttr("dim", dimAttr);
+    const int64_t axis = CanonicalDim(dimAttr, rank);
+
+    uint64_t outer = ProdDims(inShape, 0, axis);
+    uint64_t axisLen = static_cast<uint64_t>(inShape.GetDim(axis));
+    uint64_t inner = ProdDims(inShape, axis + 1, rank);
+
+    uint64_t totalLength = outer * axisLen * inner;
+    // Choose a reasonable tile size along the innermost dimension processed (inner)
+    uint64_t tileInner = std::min<uint64_t>(inner, 4096); // elements
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(static_cast<uint32_t>(totalLength));
+    tiling.set_outer(static_cast<uint32_t>(outer));
+    tiling.set_axisLen(static_cast<uint32_t>(axisLen));
+    tiling.set_inner(static_cast<uint32_t>(inner));
+    tiling.set_tileInner(static_cast<uint32_t>(tileInner));
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    auto origin = x_shape->GetOriginShape();
+    int64_t rank = static_cast<int64_t>(origin.GetDimNum());
+
+    int64_t dimAttr = 0;
+    context->GetAttr("dim", dimAttr);
+    int64_t axis = dimAttr;
+    if (axis < 0) axis += rank;
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    // Build reduced shape (remove axis dim)
+    std::vector<int64_t> outDims;
+    outDims.reserve(std::max<int64_t>(rank - 1, 1));
+    for (int64_t i = 0; i < rank; ++i) {
+        if (i == axis) continue;
+        outDims.push_back(origin.GetDim(i));
+    }
+    if (outDims.empty()) {
+        // Reduction to scalar: represent as shape [1]
+        outDims.push_back(1);
+    }
+    gert::Shape outShape;
+    outShape.SetDimNum(outDims.size());
+    for (size_t i = 0; i < outDims.size(); ++i) {
+        outShape.SetDim(i, outDims[i]);
+    }
+    y_shape->SetOriginShape(outShape);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MinReductionOverADimensionCustom : public OpDef {
+public:
+    explicit MinReductionOverADimensionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("dim").Int(0);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MinReductionOverADimensionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "min_reduction_over_a_dimension_custom_tiling_data.h"
+
+constexpr int32_t INBUF_NUM = 2;
+
+class KernelMinReduce {
+public:
+    __aicore__ inline KernelMinReduce() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength,
+                                uint32_t outer, uint32_t axisLen, uint32_t inner,
+                                uint32_t tileInner)
+    {
+        this->outer = outer;
+        this->axisLen = axisLen;
+        this->inner = inner;
+        this->tileInner = tileInner;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, totalLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y, (outer * inner));
+
+        pipe.InitBuffer(inAccQueue, INBUF_NUM, this->tileInner * sizeof(DTYPE_X));
+        pipe.InitBuffer(inTmpQueue, INBUF_NUM, this->tileInner * sizeof(DTYPE_X));
+    }
+
+    __aicore__ inline void Process()
+    {
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+
+        // Distribute 'outer' across blocks
+        uint32_t outerPerBlock = (outer + blockNum - 1) / blockNum;
+        uint32_t outerStart = blockIdx * outerPerBlock;
+        uint32_t outerEnd = AscendC::Min(outer, outerStart + outerPerBlock);
+
+        for (uint32_t o = outerStart; o < outerEnd; ++o) {
+            // Process inner dimension in tiles
+            for (uint32_t iOff = 0; iOff < inner; iOff += tileInner) {
+                uint32_t curTile = AscendC::Min(tileInner, inner - iOff);
+
+                AscendC::LocalTensor<DTYPE_X> accLocal = inAccQueue.AllocTensor<DTYPE_X>();
+                // First slice initializes accumulator
+                uint64_t baseOffset0 = ((uint64_t)o * axisLen + 0) * inner + iOff;
+                AscendC::DataCopy(accLocal, xGm[baseOffset0], curTile);
+
+                // Reduce across the axis
+                for (uint32_t a = 1; a < axisLen; ++a) {
+                    AscendC::LocalTensor<DTYPE_X> tmpLocal = inTmpQueue.AllocTensor<DTYPE_X>();
+                    uint64_t baseOffsetA = ((uint64_t)o * axisLen + a) * inner + iOff;
+                    AscendC::DataCopy(tmpLocal, xGm[baseOffsetA], curTile);
+
+                    // element-wise min: accLocal = min(accLocal, tmpLocal)
+                    AscendC::Min(accLocal, accLocal, tmpLocal, curTile);
+
+                    inTmpQueue.FreeTensor(tmpLocal);
+                }
+
+                // Write out result for this tile
+                uint64_t outOffset = (uint64_t)o * inner + iOff;
+                AscendC::DataCopy(yGm[outOffset], accLocal, curTile);
+
+                inAccQueue.FreeTensor(accLocal);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, INBUF_NUM> inAccQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, INBUF_NUM> inTmpQueue;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t outer;
+    uint32_t axisLen;
+    uint32_t inner;
+    uint32_t tileInner;
+};
+
+extern "C" __global__ __aicore__ void min_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMinReduce op;
+    op.Init(x, y,
+            tiling_data.totalLength,
+            tiling_data.outer, tiling_data.axisLen, tiling_data.inner,
+            tiling_data.tileInner);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor min_reduction_over_a_dimension_custom_impl_npu(const at::Tensor& self, int64_t dim) {
+    // Output shape is input shape with 'dim' reduced (keepdim=False)
+    auto sizes = self.sizes().vec();
+    if (dim < 0) dim += static_cast<int64_t>(sizes.size());
+    std::vector<int64_t> out_sizes;
+    out_sizes.reserve(sizes.size() > 0 ? sizes.size() - 1 : 1);
+    for (int64_t i = 0; i < (int64_t)sizes.size(); ++i) {
+        if (i == dim) continue;
+        out_sizes.push_back(sizes[i]);
+    }
+    if (out_sizes.empty()) out_sizes.push_back(1);
+    at::Tensor result = at::empty(out_sizes, self.options());
+    EXEC_NPU_CMD(aclnnMinReductionOverADimensionCustom, self, dim, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("min_reduction_over_a_dimension_custom", &min_reduction_over_a_dimension_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("min_reduction_over_a_dimension_custom", &min_reduction_over_a_dimension_custom_impl_npu, "min reduction over a dimension");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model that performs min reduction over a specific dimension using a custom AscendC kernel.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.min_reduction_over_a_dimension_custom(x, self.dim)
+'''

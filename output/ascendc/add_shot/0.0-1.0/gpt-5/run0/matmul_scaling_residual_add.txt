@@ -1,0 +1,253 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulScalingResidualAddCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "residual",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulScalingResidualAddCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulScalingResidualAddCustom, MatmulScalingResidualAddCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "matmul_scaling_residual_add_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MatmulScalingResidualAddCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    const gert::Shape* res_shape = context->GetInputShape(1);
+    if (in_shape->GetOriginShape().GetShapeSize() != res_shape->GetOriginShape().GetShapeSize()) {
+        return ge::GRAPH_FAILED;
+    }
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MatmulScalingResidualAddCustom : public OpDef {
+public:
+    explicit MatmulScalingResidualAddCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("residual")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulScalingResidualAddCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "matmul_scaling_residual_add_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelMsraAdd {
+public:
+    __aicore__ inline KernelMsraAdd() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR residual, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        rGm.SetGlobalBuffer((__gm__ DTYPE_Y *)residual + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueR, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+    }
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> rLocal = inQueueR.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(rLocal, rGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+        inQueueR.EnQue(rLocal);
+    }
+    __aicore__ inline void Compute(int32_t)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> rLocal = inQueueR.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+
+        AscendC::Add(zLocal, xLocal, rLocal, this->tileLength);
+
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueR.FreeTensor(rLocal);
+    }
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueR;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> rGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void matmul_scaling_residual_add_custom(GM_ADDR x, GM_ADDR residual, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMsraAdd op;
+    op.Init(x, residual, z, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_scaling_residual_add_custom_impl_npu(const at::Tensor& self, const at::Tensor& residual) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnMatmulScalingResidualAddCustom, self, residual, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_scaling_residual_add_custom", &matmul_scaling_residual_add_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_scaling_residual_add_custom", &matmul_scaling_residual_add_custom_impl_npu, "scaled x + residual");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.matmul = torch.nn.Linear(in_features, out_features)
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        y = self.matmul(x)
+        y_scaled = y * self.scaling_factor
+        y_residual = y.detach()
+        return custom_ops_lib.matmul_scaling_residual_add_custom(y_scaled, y_residual)
+'''

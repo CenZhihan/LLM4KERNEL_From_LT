@@ -1,0 +1,241 @@
+project_json_src='''
+[
+    {
+        "op": "VanillaRnnHiddenCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "preact",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "hidden",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(VanillaRnnHiddenCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(VanillaRnnHiddenCustom, VanillaRnnHiddenCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "vanilla_rnn_hidden_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    VanillaRnnHiddenCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class VanillaRnnHiddenCustom : public OpDef {
+public:
+    explicit VanillaRnnHiddenCustom(const char* name) : OpDef(name)
+    {
+        this->Input("preact")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("hidden")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(VanillaRnnHiddenCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "vanilla_rnn_hidden_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+class KernelVanillaRnnHidden {
+public:
+    __aicore__ inline KernelVanillaRnnHidden() {}
+    __aicore__ inline void Init(GM_ADDR preact, GM_ADDR hidden, uint32_t totalLength, uint32_t tileNum)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        preactGm.SetGlobalBuffer((__gm__ DTYPE_X *)preact + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        hiddenGm.SetGlobalBuffer((__gm__ DTYPE_Z *)hidden + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueuePreact, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueHidden, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> preactLocal = inQueuePreact.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(preactLocal, preactGm[progress * this->tileLength], this->tileLength);
+        inQueuePreact.EnQue(preactLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t)
+    {
+        AscendC::LocalTensor<DTYPE_X> preactLocal = inQueuePreact.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Z> hiddenLocal = outQueueHidden.AllocTensor<DTYPE_Z>();
+        AscendC::Tanh(hiddenLocal, preactLocal, this->tileLength);
+        outQueueHidden.EnQue<DTYPE_Z>(hiddenLocal);
+        inQueuePreact.FreeTensor(preactLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Z> hiddenLocal = outQueueHidden.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(hiddenGm[progress * this->tileLength], hiddenLocal, this->tileLength);
+        outQueueHidden.FreeTensor(hiddenLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueuePreact;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueHidden;
+    AscendC::GlobalTensor<DTYPE_X> preactGm;
+    AscendC::GlobalTensor<DTYPE_Z> hiddenGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void vanilla_rnn_hidden_custom(GM_ADDR preact, GM_ADDR hidden, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelVanillaRnnHidden op;
+    op.Init(preact, hidden, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor vanilla_rnn_hidden_custom_impl_npu(const at::Tensor& preact) {
+    at::Tensor result = at::empty_like(preact);
+    EXEC_NPU_CMD(aclnnVanillaRnnHiddenCustom, preact, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("vanilla_rnn_hidden_custom", &vanilla_rnn_hidden_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("vanilla_rnn_hidden_custom", &vanilla_rnn_hidden_custom_impl_npu, "Vanilla RNN hidden activation (tanh)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, output_size: int):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+
+        # Same structure as original: fuse only the hidden activation via custom AscendC op
+        self.i2h = torch.nn.Linear(input_size + hidden_size, hidden_size)
+        self.h2o = torch.nn.Linear(hidden_size, output_size)
+
+    def forward(self, x: torch.Tensor, h0: torch.Tensor) -> torch.Tensor:
+        seq_len, batch_size, _ = x.size()
+        hidden = h0.to(x.device)
+        outputs = []
+
+        for t in range(seq_len):
+            combined = torch.cat((x[t], hidden), dim=1)  # (batch, input+hidden)
+            preact = self.i2h(combined)                  # (batch, hidden)
+            hidden = custom_ops_lib.vanilla_rnn_hidden_custom(preact)
+            output = self.h2o(hidden)                    # (batch, output)
+            outputs.append(output)
+
+        return torch.stack(outputs, dim=0)
+'''

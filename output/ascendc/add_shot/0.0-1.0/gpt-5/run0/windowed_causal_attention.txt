@@ -1,0 +1,420 @@
+project_json_src='''
+[
+    {
+        "op": "WindowedCausalAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "k",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "window",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "o",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(WindowedCausalAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, B);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, Dh);
+  TILING_DATA_FIELD_DEF(uint32_t, window);
+  TILING_DATA_FIELD_DEF(uint32_t, totalTokens);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(WindowedCausalAttentionCustom, WindowedCausalAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "windowed_causal_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    WindowedCausalAttentionCustomTilingData tiling;
+
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    // Expecting shape [B, N, H, Dh]
+    uint32_t B = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(0));
+    uint32_t N = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(1));
+    uint32_t H = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(2));
+    uint32_t Dh = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(3));
+
+    // window is provided as a 1-element int32 tensor; still store in tiling for kernel convenience
+    // Default to 1 if not provided
+    uint32_t window = 1;
+    const gert::Tensor* win_tensor = context->GetInputTensor(3);
+    if (win_tensor != nullptr && win_tensor->GetData() != nullptr && win_tensor->GetSize() >= sizeof(int32_t)) {
+        window = static_cast<uint32_t>(*reinterpret_cast<const int32_t*>(win_tensor->GetData()));
+    }
+
+    uint32_t totalTokens = B * N * H;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_B(B);
+    tiling.set_N(N);
+    tiling.set_H(H);
+    tiling.set_Dh(Dh);
+    tiling.set_window(window);
+    tiling.set_totalTokens(totalTokens);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    gert::Shape* o_shape = context->GetOutputShape(0);
+    *o_shape = *q_shape; // output [B, N, H, Dh]
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class WindowedCausalAttentionCustom : public OpDef {
+public:
+    explicit WindowedCausalAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("k")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("v")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("window")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("o")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(WindowedCausalAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "windowed_causal_attention_custom_tiling_data.h"
+
+typedef float DTYPE_Q;
+typedef float DTYPE_K;
+typedef float DTYPE_V;
+typedef float DTYPE_O;
+
+class KernelWindowedCausalAttention {
+public:
+    __aicore__ inline KernelWindowedCausalAttention() {}
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o,
+                                uint32_t B, uint32_t N, uint32_t H, uint32_t Dh, uint32_t window)
+    {
+        this->B = B;
+        this->N = N;
+        this->H = H;
+        this->Dh = Dh;
+        this->window = window;
+
+        qGm.SetGlobalBuffer((__gm__ DTYPE_Q*)q, (uint32_t)(B * N * H * Dh));
+        kGm.SetGlobalBuffer((__gm__ DTYPE_K*)k, (uint32_t)(B * N * H * Dh));
+        vGm.SetGlobalBuffer((__gm__ DTYPE_V*)v, (uint32_t)(B * N * H * Dh));
+        oGm.SetGlobalBuffer((__gm__ DTYPE_O*)o, (uint32_t)(B * N * H * Dh));
+
+        // local buffers
+        uint32_t qSize = Dh;
+        uint32_t kvSize = window * Dh;
+        uint32_t sSize = window;
+
+        pipe.InitBuffer(qQueue, 1, qSize * sizeof(DTYPE_Q));
+        pipe.InitBuffer(kQueue, 1, kvSize * sizeof(DTYPE_K));
+        pipe.InitBuffer(vQueue, 1, kvSize * sizeof(DTYPE_V));
+        pipe.InitBuffer(oQueue, 1, qSize * sizeof(DTYPE_O));
+        pipe.InitBuffer(sQueue, 1, sSize * sizeof(float));
+    }
+
+    __aicore__ inline void Process(uint32_t totalTokens)
+    {
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t tokensPerBlock = totalTokens / blockNum + (blockIdx < (totalTokens % blockNum) ? 1 : 0);
+        uint32_t startToken = (totalTokens / blockNum) * blockIdx + AscendC::Min(blockIdx, totalTokens % blockNum);
+
+        uint32_t pitchDh = Dh;
+        uint32_t pitchH = Dh;
+        uint32_t pitchN = H * Dh;
+        uint32_t pitchB = N * H * Dh;
+
+        float scale = 1.0f / AscendC::Sqrt((float)Dh);
+
+        for (uint32_t t = 0; t < tokensPerBlock; ++t) {
+            uint32_t g = startToken + t;
+            if (g >= B * N * H) break;
+            // decode (b, n, h)
+            uint32_t tmp = g;
+            uint32_t b = tmp / (N * H);
+            tmp = tmp % (N * H);
+            uint32_t n = tmp / H;
+            uint32_t h = tmp % H;
+
+            uint32_t start = (n >= window) ? (n - window + 1) : 0; // inclusive start
+            uint32_t len = n - start + 1;
+
+            // Allocate locals
+            AscendC::LocalTensor<DTYPE_Q> qLocal = qQueue.AllocTensor<DTYPE_Q>();
+            AscendC::LocalTensor<DTYPE_K> kLocal = kQueue.AllocTensor<DTYPE_K>();
+            AscendC::LocalTensor<DTYPE_V> vLocal = vQueue.AllocTensor<DTYPE_V>();
+            AscendC::LocalTensor<DTYPE_O> oLocal = oQueue.AllocTensor<DTYPE_O>();
+            AscendC::LocalTensor<float> sLocal = sQueue.AllocTensor<float>();
+
+            // copy q
+            uint32_t qOff = b * pitchB + n * pitchN + h * pitchH;
+            AscendC::DataCopy(qLocal, qGm[qOff], Dh);
+
+            // copy K window
+            uint32_t kOffBase = b * pitchB + start * pitchN + h * pitchH;
+            AscendC::DataCopy(kLocal, kGm[kOffBase], len * Dh);
+
+            // copy V window
+            uint32_t vOffBase = b * pitchB + start * pitchN + h * pitchH;
+            AscendC::DataCopy(vLocal, vGm[vOffBase], len * Dh);
+
+            // scores = (q · k_j) * scale
+            float sMax = -3.402823e38f;
+            for (uint32_t j = 0; j < len; ++j) {
+                float acc = 0.f;
+                uint32_t base = j * Dh;
+                for (uint32_t d = 0; d < Dh; ++d) {
+                    acc += (float)qLocal.GetValue(d) * (float)kLocal.GetValue(base + d);
+                }
+                acc *= scale;
+                sLocal.SetValue(j, acc);
+                sMax = acc > sMax ? acc : sMax;
+            }
+
+            // softmax
+            float sumExp = 0.f;
+            for (uint32_t j = 0; j < len; ++j) {
+                float e = AscendC::Exp(sLocal.GetValue(j) - sMax);
+                sLocal.SetValue(j, e);
+                sumExp += e;
+            }
+            float invSum = 1.0f / (sumExp + 1e-6f);
+            for (uint32_t j = 0; j < len; ++j) {
+                float w = sLocal.GetValue(j) * invSum;
+                sLocal.SetValue(j, w);
+            }
+
+            // out = sum_j w_j * v_j
+            for (uint32_t d = 0; d < Dh; ++d) {
+                oLocal.SetValue(d, (DTYPE_O)0);
+            }
+            for (uint32_t j = 0; j < len; ++j) {
+                float w = sLocal.GetValue(j);
+                uint32_t base = j * Dh;
+                for (uint32_t d = 0; d < Dh; ++d) {
+                    float cur = (float)oLocal.GetValue(d) + w * (float)vLocal.GetValue(base + d);
+                    oLocal.SetValue(d, (DTYPE_O)cur);
+                }
+            }
+
+            // write out
+            uint32_t oOff = qOff;
+            AscendC::DataCopy(oGm[oOff], oLocal, Dh);
+
+            // free
+            qQueue.FreeTensor(qLocal);
+            kQueue.FreeTensor(kLocal);
+            vQueue.FreeTensor(vLocal);
+            oQueue.FreeTensor(oLocal);
+            sQueue.FreeTensor(sLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> qQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> kQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> vQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> oQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> sQueue;
+
+    AscendC::GlobalTensor<DTYPE_Q> qGm;
+    AscendC::GlobalTensor<DTYPE_K> kGm;
+    AscendC::GlobalTensor<DTYPE_V> vGm;
+    AscendC::GlobalTensor<DTYPE_O> oGm;
+
+    uint32_t B, N, H, Dh, window;
+};
+
+extern "C" __global__ __aicore__ void windowed_causal_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR windowTensor, GM_ADDR o, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelWindowedCausalAttention op;
+    uint32_t B = tiling_data.B;
+    uint32_t N = tiling_data.N;
+    uint32_t H = tiling_data.H;
+    uint32_t Dh = tiling_data.Dh;
+    uint32_t win = tiling_data.window;
+
+    // In case the host didn't fill tiling window, read from tensor
+    if (win == 0 && windowTensor != nullptr) {
+        __gm__ int32_t* wptr = (__gm__ int32_t*)windowTensor;
+        win = (uint32_t)(*wptr);
+    }
+    if (win == 0) win = 1;
+
+    op.Init(q, k, v, o, B, N, H, Dh, win);
+    op.Process(tiling_data.totalTokens);
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor windowed_causal_attention_custom_impl_npu(const at::Tensor& q,
+                                                     const at::Tensor& k,
+                                                     const at::Tensor& v,
+                                                     int64_t window_size) {
+    TORCH_CHECK(q.device().type() == c10::DeviceType::PrivateUse1, "q must be on NPU");
+    TORCH_CHECK(k.device() == q.device() && v.device() == q.device(), "k and v must be on the same device as q");
+    TORCH_CHECK(q.sizes() == v.sizes() && q.sizes() == k.sizes(), "q, k, v must have the same shape [B, N, H, Dh]");
+
+    at::Tensor result = at::empty_like(q);
+    auto options = at::TensorOptions().dtype(at::kInt).device(q.device());
+    at::Tensor window_tensor = at::empty({1}, options);
+    window_tensor.fill_(static_cast<int>(window_size));
+
+    EXEC_NPU_CMD(aclnnWindowedCausalAttentionCustom, q, k, v, window_tensor, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("windowed_causal_attention_custom", &windowed_causal_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("windowed_causal_attention_custom", &windowed_causal_attention_custom_impl_npu, "Windowed causal attention");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, d_model=1024, num_heads=16, window_size=256):
+        super().__init__()
+        self.q_proj = torch.nn.Linear(d_model, d_model)
+        self.k_proj = torch.nn.Linear(d_model, d_model)
+        self.v_proj = torch.nn.Linear(d_model, d_model)
+        self.out_proj = torch.nn.Linear(d_model, d_model)
+        self.num_heads = num_heads
+        self.window_size = window_size
+
+    def forward(self, x):
+        B, N, D = x.shape
+        H = self.num_heads
+        d_h = D // H
+
+        Q = self.q_proj(x).view(B, N, H, d_h)
+        K = self.k_proj(x).view(B, N, H, d_h)
+        V = self.v_proj(x).view(B, N, H, d_h)
+
+        attn_out = custom_ops_lib.windowed_causal_attention_custom(Q, K, V, self.window_size)
+        return self.out_proj(attn_out.reshape(B, N, D))
+'''

@@ -1,0 +1,406 @@
+project_json_src='''
+[
+    {
+        "op": "ScatterCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "idx",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            },
+            {
+                "name": "updates",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ScatterCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalXLength);
+  TILING_DATA_FIELD_DEF(uint32_t, totalUpdatesLength);
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, updatesCols);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ScatterCustom, ScatterCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "scatter_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ScatterCustomTilingData tiling;
+
+    const auto& xShape = context->GetInputShape(0)->GetOriginShape();
+    const auto& idxShape = context->GetInputShape(1)->GetOriginShape();
+    const auto& updShape = context->GetInputShape(2)->GetOriginShape();
+
+    uint32_t totalXLength = static_cast<uint32_t>(xShape.GetShapeSize());
+    uint32_t totalUpdatesLength = static_cast<uint32_t>(updShape.GetShapeSize());
+    uint32_t rows = 1;
+    uint32_t cols = 1;
+    if (xShape.GetDimNum() >= 2) {
+        rows = static_cast<uint32_t>(xShape.GetDim(0));
+        cols = static_cast<uint32_t>(xShape.GetDim(1));
+    }
+    uint32_t updatesCols = 1;
+    if (updShape.GetDimNum() >= 2) {
+        updatesCols = static_cast<uint32_t>(updShape.GetDim(1));
+    }
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalXLength(totalXLength);
+    tiling.set_totalUpdatesLength(totalUpdatesLength);
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+    tiling.set_updatesCols(updatesCols);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    *z_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ScatterCustom : public OpDef {
+public:
+    explicit ScatterCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("idx")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("updates")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ScatterCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "scatter_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+class KernelScatter {
+public:
+    __aicore__ inline KernelScatter() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR idx, GM_ADDR updates, GM_ADDR z,
+                                uint32_t totalXLength, uint32_t totalUpdatesLength,
+                                uint32_t rows, uint32_t cols, uint32_t updatesCols, uint32_t tileNum)
+    {
+        this->blockNum = AscendC::GetBlockNum();
+        this->blockIdx = AscendC::GetBlockIdx();
+
+        this->tileNum = tileNum;
+        this->rows = rows;
+        this->cols = cols;
+        this->updatesCols = updatesCols;
+
+        // Split work across blocks
+        this->xBlockLength = (totalXLength + this->blockNum - 1) / this->blockNum;
+        this->xBlockStart = this->xBlockLength * this->blockIdx;
+        if (this->xBlockStart + this->xBlockLength > totalXLength) {
+            this->xBlockLength = (totalXLength > this->xBlockStart) ? (totalXLength - this->xBlockStart) : 0;
+        }
+
+        this->updBlockLength = (totalUpdatesLength + this->blockNum - 1) / this->blockNum;
+        this->updBlockStart = this->updBlockLength * this->blockIdx;
+        if (this->updBlockStart + this->updBlockLength > totalUpdatesLength) {
+            this->updBlockLength = (totalUpdatesLength > this->updBlockStart) ? (totalUpdatesLength - this->updBlockStart) : 0;
+        }
+
+        // Tile sizes
+        this->tileLenCopy = (this->xBlockLength / (this->tileNum * BUFFER_NUM));
+        if (this->tileLenCopy == 0 && this->xBlockLength > 0) this->tileLenCopy = this->xBlockLength; // ensure progress
+
+        this->tileLenUpd = (this->updBlockLength / (this->tileNum * BUFFER_NUM));
+        if (this->tileLenUpd == 0 && this->updBlockLength > 0) this->tileLenUpd = this->updBlockLength; // ensure progress
+
+        // Set Global buffers (offset by block)
+        xGm.SetGlobalBuffer((__gm__ float *)x + this->xBlockStart, this->xBlockLength);
+        idxGm.SetGlobalBuffer((__gm__ int32_t *)idx + this->updBlockStart, this->updBlockLength);
+        updGm.SetGlobalBuffer((__gm__ float *)updates + this->updBlockStart, this->updBlockLength);
+        zGm.SetGlobalBuffer((__gm__ float *)z + this->xBlockStart, this->xBlockLength);
+
+        // Init pipe buffers
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLenCopy * sizeof(float));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLenCopy * sizeof(float));
+        pipe.InitBuffer(inQueueIdx, BUFFER_NUM, this->tileLenUpd * sizeof(int32_t));
+        pipe.InitBuffer(inQueueUpd, BUFFER_NUM, this->tileLenUpd * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Phase 1: copy x -> z
+        if (this->xBlockLength > 0) {
+            int32_t loopsCopy = AscendC::CeilDiv<int32_t>(this->xBlockLength, this->tileLenCopy);
+            for (int32_t i = 0; i < loopsCopy; ++i) {
+                uint32_t curLen = GetCurCopyLen(i);
+                CopyInX(i, curLen);
+                CopyOutZ(i, curLen);
+            }
+        }
+        // Phase 2: scatter updates into z
+        if (this->updBlockLength > 0 && this->cols > 0 && this->updatesCols > 0) {
+            int32_t loopsUpd = AscendC::CeilDiv<int32_t>(this->updBlockLength, this->tileLenUpd);
+            for (int32_t i = 0; i < loopsUpd; ++i) {
+                uint32_t curLen = GetCurUpdLen(i);
+                CopyInIdxUpd(i, curLen);
+                ScatterApply(i, curLen);
+            }
+        }
+    }
+
+private:
+    __aicore__ inline uint32_t GetCurCopyLen(int32_t iter)
+    {
+        uint64_t processed = static_cast<uint64_t>(iter) * this->tileLenCopy;
+        uint64_t remain = (processed < this->xBlockLength) ? (this->xBlockLength - processed) : 0;
+        return static_cast<uint32_t>(remain < this->tileLenCopy ? remain : this->tileLenCopy);
+    }
+    __aicore__ inline uint32_t GetCurUpdLen(int32_t iter)
+    {
+        uint64_t processed = static_cast<uint64_t>(iter) * this->tileLenUpd;
+        uint64_t remain = (processed < this->updBlockLength) ? (this->updBlockLength - processed) : 0;
+        return static_cast<uint32_t>(remain < this->tileLenUpd ? remain : this->tileLenUpd);
+    }
+
+    __aicore__ inline void CopyInX(int32_t iter, uint32_t curLen)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm[static_cast<uint64_t>(iter) * this->tileLenCopy], curLen);
+        inQueueX.EnQue(xLocal);
+    }
+    __aicore__ inline void CopyOutZ(int32_t iter, uint32_t curLen)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> zLocal = outQueueZ.AllocTensor<float>();
+        AscendC::DataCopy(zLocal, xLocal, curLen);
+        outQueueZ.EnQue<float>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+
+        AscendC::LocalTensor<float> zLocal2 = outQueueZ.DeQue<float>();
+        AscendC::DataCopy(zGm[static_cast<uint64_t>(iter) * this->tileLenCopy], zLocal2, curLen);
+        outQueueZ.FreeTensor(zLocal2);
+    }
+
+    __aicore__ inline void CopyInIdxUpd(int32_t iter, uint32_t curLen)
+    {
+        AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.AllocTensor<int32_t>();
+        AscendC::LocalTensor<float> updLocal = inQueueUpd.AllocTensor<float>();
+        AscendC::DataCopy(idxLocal, idxGm[static_cast<uint64_t>(iter) * this->tileLenUpd], curLen);
+        AscendC::DataCopy(updLocal, updGm[static_cast<uint64_t>(iter) * this->tileLenUpd], curLen);
+        inQueueIdx.EnQue(idxLocal);
+        inQueueUpd.EnQue(updLocal);
+    }
+
+    __aicore__ inline void ScatterApply(int32_t iter, uint32_t curLen)
+    {
+        AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.DeQue<int32_t>();
+        AscendC::LocalTensor<float> updLocal = inQueueUpd.DeQue<float>();
+
+        // Global starting index within the full updates tensor for this tile
+        uint64_t globalUpdBase = static_cast<uint64_t>(this->updBlockStart) + static_cast<uint64_t>(iter) * this->tileLenUpd;
+
+        // For each element in the tile, compute target and apply update
+        for (uint32_t k = 0; k < curLen; ++k) {
+            // Read index and value from local tensors
+            int32_t colIdx = idxLocal.GetValue(k);   // expected API to read scalar from local tensor
+            float val = updLocal.GetValue(k);        // expected API to read scalar from local tensor
+
+            // Compute row based on global update position
+            uint64_t g = globalUpdBase + k;
+            uint32_t row = static_cast<uint32_t>(g / static_cast<uint64_t>(this->updatesCols));
+
+            // Bounds check (defensive)
+            if (colIdx >= 0 && static_cast<uint32_t>(colIdx) < this->cols && row < this->rows) {
+                uint64_t pos = static_cast<uint64_t>(row) * this->cols + static_cast<uint32_t>(colIdx);
+
+                // Write single value to global memory
+                zGm.SetValue(pos - static_cast<uint64_t>(this->xBlockStart), val); // offset within this block's zGm view
+            }
+        }
+
+        inQueueIdx.FreeTensor(idxLocal);
+        inQueueUpd.FreeTensor(updLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+
+    // Queues for phase 1 (copy)
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+
+    // Queues for phase 2 (updates)
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueIdx;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueUpd;
+
+    // Global tensors
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<int32_t> idxGm;
+    AscendC::GlobalTensor<float> updGm;
+    AscendC::GlobalTensor<float> zGm;
+
+    // Sizes/tiling
+    uint32_t blockNum;
+    uint32_t blockIdx;
+
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t updatesCols;
+
+    uint32_t tileNum;
+
+    uint32_t xBlockLength;
+    uint32_t xBlockStart;
+
+    uint32_t updBlockLength;
+    uint32_t updBlockStart;
+
+    uint32_t tileLenCopy;
+    uint32_t tileLenUpd;
+};
+
+extern "C" __global__ __aicore__ void scatter_custom(GM_ADDR x, GM_ADDR idx, GM_ADDR updates, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelScatter op;
+    op.Init(x, idx, updates, z,
+            tiling_data.totalXLength,
+            tiling_data.totalUpdatesLength,
+            tiling_data.rows,
+            tiling_data.cols,
+            tiling_data.updatesCols,
+            tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor scatter_custom_impl_npu(const at::Tensor& x, const at::Tensor& idx, const at::Tensor& updates) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnScatterCustom, x, idx, updates, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("scatter_custom", &scatter_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("scatter_custom", &scatter_custom_impl_npu, "scatter along dim=1");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, idx, updates):
+        return custom_ops_lib.scatter_custom(x, idx, updates)
+'''

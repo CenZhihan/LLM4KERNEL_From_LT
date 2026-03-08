@@ -1,0 +1,44 @@
+**Examining input formats**
+
+I'm considering the operator inputs in PyTorch, which are in a default contiguous NCHW format. It might be necessary for the Python wrapper to permute to NHWC before passing it to the custom kernel, which is acceptable for optimization but does add overhead. A more efficient approach would involve defining the operator to handle NHWC directly, simplifying the kernel for pointwise convolution. We can flatten the input shape for better memory management while ensuring performance focuses on a seamless data layout.
+
+**Processing channel operations**
+
+I need to focus on how our TQue expects vector length for operations, which are mostly vector-wise. We can actually process per channel by implementing tile-length vector operations. For a specific channel index, I can copy a local vector of length tileLength. However, the stride creates some complexity since it jumps by Cin, making it a bit less contiguous. To efficiently compute the outputs, I can perform a small matrix-matrix multiplication using the copied full tile block with the weights, applying loops and element-wise operations for each output channel.
+
+**Understanding memory layout**
+
+I can make this work with vector operations by treating A[:,ci] as a tileLength vector that has a stride of 1. If I load a block of [tileLength, Cin] in row-major order, then the key memory layout of NHWC will ensure that the necessary positions are contiguous. I've defined M as N*H*W and know that the index for NHWC is calculated in a specific order. As t progresses, it turns out that the blocks remain contiguous, allowing for efficient access across the channels.
+
+**Implementing contiguous storage**
+
+I’m realizing that storing A as a shape of [tileLength, Cin] keeps everything contiguous, which makes copying a chunk of size tileLength*Cin quite feasible. Here’s the plan: 
+
+First, the host wrapper will change x from NCHW to NHWC format, keeping it contiguous. The kernel will handle this x_NHWC and the weights [Cout, Cin], producing outputs y_NHWC. 
+
+The kernel will split the total size M into blocks and process tiles by tileLength. For each tile, I'll copy the xTile into a local buffer and compute the output yTile through a fused multiply-add accumulate. I'll need to keep the local buffer sizes manageable, which might mean setting the tileLength small enough to fit appropriately.
+
+**Designing tensor operations**
+
+I’m thinking through how to manage tensor operations effectively, especially with 2D arrays and tiling. For my approach, using a vector length of tileRows means I can allocate input and output queues effectively, but it seems I’ll need to manage strides and contiguity carefully for optimal performance.
+
+I'll first copy the xLocal vector from GM based on offsets for each channel, ensuring I handle accumulations appropriately. We’ll take advantage of the NCHW format to maintain contiguity across the W dimension while also managing dimensions through nested loops. Using AutoBuffer for LocalTensor allocation could help streamline the process. Let's get all necessary dimensions set up for the tiling data and iterate efficiently through batches and heights!
+
+**Implementing tensor management**
+
+I’m working on a strategy for managing tensor allocations using queues. First, I’ll allocate xLocal within an input queue and copy data into it. OutLocal will also be allocated, initialized to zeros, possibly using AscendC's SetValue or Dup methods.
+
+For calculations, I’ll multiply xLocal by the weight scalar for each channel and accumulate results in OutLocal. I can optimize weight handling by using local tensors to allow quick access. I'll define types and ensure consistency with file naming and macros, ensuring proper integration for tiling and kernel operations. Let's streamline this process!
+
+**Managing tensor computations**
+
+I’m going to set a workspace size of zero and keep things simple, using `BUFFER_NUM = 1`. I’ll create input and output queues along with local weight storage. Next, I’ll calculate the grid distribution for blocks and determine the range for processing.
+
+For each weight row, I might allocate a buffer through a pipe. I’ll compute local tensors and use data copies to handle weights without complicated queuing. The multiplication operations will use `Muls` for scaling, and I’ll aggregate results carefully. Finally, I’ll make sure the Python bindings and model initialization are properly configured to match the expected weight dimensions.
+
+**Setting up tensor computations**
+
+I’m planning to use `AscendC::Muls` for scaling with temporary memory and queues. I’ll set up the necessary buffers for input, output, and weights based on the tile size. The operator `ConvPointwise2dCustom` will take inputs `x` and `w`, producing output `y`, while ensuring to define the correct fields in the tiling data.
+
+I’ll make sure to include the right headers and accurately define the shapes needed for the model. Finally, I need to double-check macro definitions to avoid any issues during compilation and ensure everything aligns properly.
+

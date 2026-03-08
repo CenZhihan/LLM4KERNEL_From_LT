@@ -1,0 +1,372 @@
+project_json_src='''
+[
+    {
+        "op": "LayerNormCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "gamma",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "beta",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(LayerNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);  // total elements of x
+  TILING_DATA_FIELD_DEF(uint32_t, rowSize);      // product of normalized_shape (N)
+  TILING_DATA_FIELD_DEF(uint32_t, rowCount);     // number of rows M
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(LayerNormCustom, LayerNormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "layer_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 16;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    LayerNormCustomTilingData tiling;
+
+    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+    uint32_t rowSize = static_cast<uint32_t>(context->GetInputShape(1)->GetOriginShape().GetShapeSize()); // gamma length = N
+    if (rowSize == 0) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t rowCount = totalLength / rowSize;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_rowSize(rowSize);
+    tiling.set_rowCount(rowCount);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class LayerNormCustom : public OpDef {
+public:
+    explicit LayerNormCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("gamma")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("beta")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(LayerNormCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "layer_norm_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+constexpr float EPSILON = 1e-5f;
+
+class KernelLayerNorm {
+public:
+    __aicore__ inline KernelLayerNorm() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y,
+                                uint32_t totalLength, uint32_t rowSize, uint32_t rowCount)
+    {
+        this->rowSize = rowSize;
+        this->rowCount = rowCount;
+
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+
+        this->rowsPerBlock = (rowCount + blockNum - 1) / blockNum;
+        this->startRow = blockIdx * this->rowsPerBlock;
+        if (this->startRow > rowCount) {
+            this->startRow = rowCount;
+        }
+        this->endRow = this->startRow + this->rowsPerBlock;
+        if (this->endRow > rowCount) {
+            this->endRow = rowCount;
+        }
+        this->procRows = (this->endRow > this->startRow) ? (this->endRow - this->startRow) : 0;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + (uint64_t)this->startRow * this->rowSize,
+                            (uint64_t)this->procRows * this->rowSize);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z*)y + (uint64_t)this->startRow * this->rowSize,
+                            (uint64_t)this->procRows * this->rowSize);
+        gammaGm.SetGlobalBuffer((__gm__ DTYPE_Y*)gamma, this->rowSize);
+        betaGm.SetGlobalBuffer((__gm__ DTYPE_Y*)beta, this->rowSize);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->rowSize * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueGamma, 1, this->rowSize * sizeof(DTYPE_Y));
+        pipe.InitBuffer(inQueueBeta, 1, this->rowSize * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->rowSize * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (this->procRows == 0) {
+            return;
+        }
+        // Preload gamma and beta once per block
+        AscendC::LocalTensor<DTYPE_Y> gammaLocal = inQueueGamma.AllocTensor<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Y> betaLocal = inQueueBeta.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(gammaLocal, gammaGm[0], this->rowSize);
+        AscendC::DataCopy(betaLocal, betaGm[0], this->rowSize);
+        inQueueGamma.EnQue(gammaLocal);
+        inQueueBeta.EnQue(betaLocal);
+
+        for (uint32_t r = 0; r < this->procRows; ++r) {
+            CopyIn(r);
+            Compute(r);
+            CopyOut(r);
+        }
+
+        // free cached gamma/beta
+        gammaLocal = inQueueGamma.DeQue<DTYPE_Y>();
+        betaLocal = inQueueBeta.DeQue<DTYPE_Y>();
+        inQueueGamma.FreeTensor(gammaLocal);
+        inQueueBeta.FreeTensor(betaLocal);
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[(uint64_t)rowIdx * this->rowSize], this->rowSize);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t /*rowIdx*/)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> gammaLocal = inQueueGamma.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Y> betaLocal = inQueueBeta.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
+
+        // mean = sum(x) / N
+        DTYPE_Z sumVal = AscendC::ReduceSum(xLocal, this->rowSize);
+        DTYPE_Z mean = sumVal / (DTYPE_Z)this->rowSize;
+
+        // x_minus_mean = x - mean
+        AscendC::LocalTensor<DTYPE_Z> tmpLocal1 = outQueueY.AllocTensor<DTYPE_Z>();
+        AscendC::Sub(tmpLocal1, xLocal, mean, this->rowSize); // broadcast scalar mean
+
+        // var = sum((x-mean)^2) / N
+        AscendC::LocalTensor<DTYPE_Z> tmpLocal2 = outQueueY.AllocTensor<DTYPE_Z>();
+        AscendC::Mul(tmpLocal2, tmpLocal1, tmpLocal1, this->rowSize);
+        DTYPE_Z sqSum = AscendC::ReduceSum(tmpLocal2, this->rowSize);
+        DTYPE_Z var = sqSum / (DTYPE_Z)this->rowSize;
+
+        // inv_std = 1 / sqrt(var + eps)
+        DTYPE_Z invStd = AscendC::Rsqrt(var + (DTYPE_Z)EPSILON);
+
+        // norm = (x - mean) * inv_std
+        AscendC::Mul(tmpLocal1, tmpLocal1, invStd, this->rowSize); // reuse tmpLocal1 as norm
+
+        // y = norm * gamma + beta
+        AscendC::Mul(yLocal, tmpLocal1, gammaLocal, this->rowSize);
+        AscendC::Add(yLocal, yLocal, betaLocal, this->rowSize);
+
+        outQueueY.EnQue(yLocal);
+
+        // free temps and inputs
+        outQueueY.FreeTensor(tmpLocal2);
+        outQueueY.FreeTensor(tmpLocal1);
+        inQueueX.FreeTensor(xLocal);
+        // keep gamma/beta cached in queues for reuse
+        inQueueGamma.EnQue(gammaLocal);
+        inQueueBeta.EnQue(betaLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[(uint64_t)rowIdx * this->rowSize], yLocal, this->rowSize);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueGamma;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueBeta;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> gammaGm;
+    AscendC::GlobalTensor<DTYPE_Y> betaGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    uint32_t rowSize;
+    uint32_t rowCount;
+    uint32_t rowsPerBlock;
+    uint32_t startRow;
+    uint32_t endRow;
+    uint32_t procRows;
+};
+
+extern "C" __global__ __aicore__ void layer_norm_custom(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelLayerNorm op;
+    op.Init(x, gamma, beta, y, tiling_data.totalLength, tiling_data.rowSize, tiling_data.rowCount);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor layer_norm_custom_impl_npu(const at::Tensor& x2d, const at::Tensor& gamma, const at::Tensor& beta) {
+    at::Tensor y2d = at::empty_like(x2d);
+    EXEC_NPU_CMD(aclnnLayerNormCustom, x2d, gamma, beta, y2d);
+    return y2d;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("layer_norm_custom", &layer_norm_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("layer_norm_custom", &layer_norm_custom_impl_npu, "LayerNorm over last dim with affine");
+}
+"""
+
+model_src='''
+import math
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    LayerNorm implemented with a custom AscendC kernel.
+    Normalizes across the last len(normalized_shape) dimensions.
+    """
+    def __init__(self, normalized_shape: tuple, eps: float = 1e-5, elementwise_affine: bool = True) -> None:
+        super().__init__()
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        N = 1
+        for d in self.normalized_shape:
+            N *= d
+        if elementwise_affine:
+            self.weight = torch.nn.Parameter(torch.ones(self.normalized_shape))
+            self.bias = torch.nn.Parameter(torch.zeros(self.normalized_shape))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Flatten to 2D (M, N) where N = product of normalized_shape
+        N = 1
+        for d in self.normalized_shape:
+            N *= d
+        M = x.numel() // N
+        x2d = x.contiguous().view(M, N)
+        if self.elementwise_affine and self.weight is not None and self.bias is not None:
+            gamma = self.weight.contiguous().view(N)
+            beta = self.bias.contiguous().view(N)
+        else:
+            gamma = torch.ones(N, dtype=x.dtype, device=x.device)
+            beta = torch.zeros(N, dtype=x.dtype, device=x.device)
+        # Call custom kernel: it normalizes each row over last dim N and applies affine
+        y2d = custom_ops_lib.layer_norm_custom(x2d, gamma, beta)
+        y = y2d.view_as(x)
+        return y
+'''

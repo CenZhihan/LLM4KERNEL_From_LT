@@ -1,0 +1,319 @@
+project_json_src='''
+[
+    {
+        "op": "GridSampleRandomWarpCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "grid",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GridSampleRandomWarpCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, inH);
+  TILING_DATA_FIELD_DEF(uint32_t, inW);
+  TILING_DATA_FIELD_DEF(uint32_t, outH);
+  TILING_DATA_FIELD_DEF(uint32_t, outW);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GridSampleRandomWarpCustom, GridSampleRandomWarpCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "grid_sample_random_warp_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GridSampleRandomWarpCustomTilingData tiling;
+
+    auto *x_shape = context->GetInputShape(0);
+    auto *grid_shape = context->GetInputShape(1);
+
+    uint32_t n = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t c = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    uint32_t inH = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(2));
+    uint32_t inW = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(3));
+
+    uint32_t outH = static_cast<uint32_t>(grid_shape->GetOriginShape().GetDim(1));
+    uint32_t outW = static_cast<uint32_t>(grid_shape->GetOriginShape().GetDim(2));
+
+    uint32_t totalLength = n * c * outH * outW;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_inH(inH);
+    tiling.set_inW(inW);
+    tiling.set_outH(outH);
+    tiling.set_outW(outW);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* grid_shape = context->GetInputShape(1);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    // x: [N, C, inH, inW], grid: [N, outH, outW, 2] -> y: [N, C, outH, outW]
+    std::vector<int64_t> out_dims(4);
+    out_dims[0] = x_shape->GetDim(0);
+    out_dims[1] = x_shape->GetDim(1);
+    out_dims[2] = grid_shape->GetDim(1);
+    out_dims[3] = grid_shape->GetDim(2);
+
+    y_shape->SetDimNum(4);
+    for (size_t i = 0; i < 4; ++i) {
+        y_shape->SetDim(i, out_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GridSampleRandomWarpCustom : public OpDef {
+public:
+    explicit GridSampleRandomWarpCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("grid")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GridSampleRandomWarpCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "grid_sample_random_warp_custom_tiling_data.h"
+#include <cmath>
+
+class KernelGridSample {
+public:
+    __aicore__ inline KernelGridSample() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR grid, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t inH, uint32_t inW,
+                                uint32_t outH, uint32_t outW, uint32_t totalLength, uint32_t tileNum)
+    {
+        xPtr = (__gm__ float*)x;
+        gridPtr = (__gm__ float*)grid;
+        yPtr = (__gm__ float*)y;
+
+        this->N = n; this->C = c; this->inH = inH; this->inW = inW;
+        this->outH = outH; this->outW = outW;
+        this->totalLength = totalLength;
+        this->tileNum = tileNum;
+
+        this->blockNum = AscendC::GetBlockNum();
+        this->blockIdx = AscendC::GetBlockIdx();
+
+        // simple split, assume totalLength divisible by blockNum (common for typical sizes)
+        this->blockLength = totalLength / blockNum;
+        this->startIndex = this->blockLength * this->blockIdx;
+    }
+
+    __aicore__ inline float read_input(int n, int c, int h, int w) {
+        if (h < 0 || h >= (int)inH || w < 0 || w >= (int)inW) {
+            return 0.0f;
+        }
+        int idx = (((n * (int)C + c) * (int)inH + h) * (int)inW + w);
+        return xPtr[idx];
+    }
+
+    __aicore__ inline void Process()
+    {
+        // For each output element in this block
+        for (uint32_t i = 0; i < blockLength; ++i) {
+            uint32_t outIndex = startIndex + i;
+
+            // Decode n, c, oh, ow from linear index
+            uint32_t perN = C * outH * outW;
+            uint32_t n = outIndex / perN;
+            uint32_t rem1 = outIndex % perN;
+            uint32_t c = rem1 / (outH * outW);
+            uint32_t rem2 = rem1 % (outH * outW);
+            uint32_t oh = rem2 / outW;
+            uint32_t ow = rem2 % outW;
+
+            // grid index (N, outH, outW, 2)
+            uint32_t gbase = ((n * outH + oh) * outW + ow) * 2;
+            float gx = gridPtr[gbase + 0];
+            float gy = gridPtr[gbase + 1];
+
+            // align_corners = false mapping
+            float ix = (gx + 1.0f) * 0.5f * (float)inW - 0.5f;
+            float iy = (gy + 1.0f) * 0.5f * (float)inH - 0.5f;
+
+            int x0 = (int)floorf(ix);
+            int y0 = (int)floorf(iy);
+            int x1 = x0 + 1;
+            int y1 = y0 + 1;
+
+            float wx1 = ix - (float)x0;
+            float wy1 = iy - (float)y0;
+            float wx0 = 1.0f - wx1;
+            float wy0 = 1.0f - wy1;
+
+            float v00 = read_input((int)n, (int)c, y0, x0);
+            float v01 = read_input((int)n, (int)c, y0, x1);
+            float v10 = read_input((int)n, (int)c, y1, x0);
+            float v11 = read_input((int)n, (int)c, y1, x1);
+
+            float val0 = v00 * wx0 + v01 * wx1;
+            float val1 = v10 * wx0 + v11 * wx1;
+            float val = val0 * wy0 + val1 * wy1;
+
+            yPtr[outIndex] = val;
+        }
+    }
+
+private:
+    __gm__ float* xPtr;
+    __gm__ float* gridPtr;
+    __gm__ float* yPtr;
+
+    uint32_t N, C, inH, inW, outH, outW;
+    uint32_t totalLength;
+    uint32_t tileNum;
+    uint32_t blockNum;
+    uint32_t blockIdx;
+    uint32_t blockLength;
+    uint32_t startIndex;
+};
+
+extern "C" __global__ __aicore__ void grid_sample_random_warp_custom(GM_ADDR x, GM_ADDR grid, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGridSample op;
+    op.Init(x, grid, y,
+            tiling_data.n, tiling_data.c, tiling_data.inH, tiling_data.inW,
+            tiling_data.outH, tiling_data.outW, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor grid_sample_random_warp_custom_impl_npu(const at::Tensor& x, const at::Tensor& grid) {
+    auto N = x.size(0);
+    auto C = x.size(1);
+    auto outH = grid.size(1);
+    auto outW = grid.size(2);
+    at::Tensor result = at::empty({N, C, outH, outW}, x.options());
+    EXEC_NPU_CMD(aclnnGridSampleRandomWarpCustom, x, grid, result);
+    return result;
+}
+
+TORCH_LIBRARY(myops, m) {
+    m.def("grid_sample_random_warp_custom(Tensor x, Tensor grid) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("grid_sample_random_warp_custom", &grid_sample_random_warp_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("grid_sample_random_warp_custom", &grid_sample_random_warp_custom_impl_npu, "GridSample bilinear align_corners=False");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, grid):
+        return custom_ops_lib.grid_sample_random_warp_custom(x, grid)
+'''

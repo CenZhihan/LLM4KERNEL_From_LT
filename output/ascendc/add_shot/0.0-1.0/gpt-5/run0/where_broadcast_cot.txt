@@ -1,0 +1,24 @@
+I'm thinking about default row-major memory in PyTorch, especially for a shape of [64,512,64]. In this setup, the innermost dimension is last, so changes in i2 happen quickly. For the cond with a shape of [1,512,1], it seems to repeat every 64 across i2 and also across i0. The memory layout is actually contiguous with dimensions [1,512,1], storing 512 elements. When I consider broadcasting, the index depends only on i1, which lets me compute cond indices efficiently. I might explore tiling across segments.
+
+I'm analyzing how tile regions work in linear memory while stepping through i2, which is the fastest. The cond index stays constant for runs of length d2 (64) as i2 changes, making it repeat across i0. This setup allows me to process in chunk sizes that are multiples of d2 to build condLocal quickly. DataCopy can't duplicate, but I wonder if I can apply vector operations using a scalar cond value and if AscendC supports filling with that scalar. I need to consider filling piecewise while accounting for the cond boolean.
+
+To simplify things, I think I can set the tile length equal to d2 (64) and progress across rows. In the CopyIn process, I can compute the cond value for that row and store it, either as a single-element local value or fill a mask local. The framework uses vector copies of x and y. So, if I set tileLength to d2, then my tiles will align perfectly with the rows in memory, allowing me to fetch the cond scalar using cond[i1] and compute zLocal with xLocal or yLocal based on that condition.
+
+I need to use vector operations for selecting values based on a condition. Specifically, I can use the Add operation to express z as “xLocal if cond else yLocal.” I’m considering AscendC::Select for this, and maybe AscendC::vcmp and vsel for comparisons. To be safer, I could convert the cond boolean into a scalar (0.0 or 1.0) and compute z using a formula. This approach requires Multiply and Add vector operations, which AscendC provides. Since cond changes per row tile, having cond_f as a scalar per tile works out nicely.
+
+I'm working on loading the tile row and setting up the calculations. First, I need to read the cond scalar into a local variable and convert it to a float value. For zLocal, I can scale it based on cond_val using Muls. I'll also allocate additional local memory for zLocal and potentially reuse xLocal. I’m considering whether to use DataCopy for local to local transfers, but I’m unsure if that’s supported. 
+
+It seems safer to stick with the Muls approach and utilize proper DTYPE macros for x, y, z, and cond. I'll need to ensure I set up the GlobalTensor types correctly and define the buffer sizes properly while computing across tile rows systematically. This might involve specifying conditions based on the read view of the array data type.
+
+I'm working on designing the Host tiling for the TilingFunc. First, I need to ensure the input shape is rank 3, computing dimensions from the shape of x. Next, I’ll calculate the tile number based on the total length, which is derived from the dimensions.
+
+Once I have the global offsets set up, I’ll move to the copying phase, making sure the tile starts aligned to row boundaries. I'll need to compute global indices for reading cond values as well as ensuring proper local copies. While addressing DataCopy operations, I'll need to confirm whether local-to-local copy is supported, though it seems best to use Muls for safety in copying values.
+
+I'm designing the host tiling for the `where_broadcast_custom` operation. This involves defining the function signatures and setting up the necessary project JSON configurations. I’m implementing kernel entry logic using conditions to multiply either `xLocal` or `yLocal`. 
+
+Next, I’ll gather the input shapes, especially for `cond`, `x`, and `y`, while ensuring I derive dimensions properly. Getting dimensions might be tricky if I can't find direct API documentation, but I will compute them where possible. I'll also make sure to handle queue sizes and local allocations for the required data.
+
+In the `Init` function, I'll store the computed values like `totalLength`, `d1`, and `cond` dimensions. Specifically, I'll calculate `rowsPerBlock` and handle the indexing for the global row. This includes determining the `cond index` based on the conditions. 
+
+I need to consider how to copy values from the global memory to the local tensor efficiently. Calculating the `condVal` requires proper access methods, and I’m leaning toward using `GetValue(0)`. Then, I'll set up various file inclusions and ensure that the project structure aligns with the operations for broadcast. Finally, it’s time to write the code.
+

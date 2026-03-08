@@ -1,0 +1,307 @@
+project_json_src='''
+[
+    {
+        "op": "GemmAddReluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmAddReluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, rowsPerBlock);
+  TILING_DATA_FIELD_DEF(uint32_t, tileK);
+  TILING_DATA_FIELD_DEF(uint32_t, tileN);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmAddReluCustom, GemmAddReluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gemm_add_relu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_K = 128;
+const uint32_t TILE_N = 128;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GemmAddReluCustomTilingData tiling;
+
+    auto x_origin = context->GetInputShape(0)->GetOriginShape();
+    auto w_origin = context->GetInputShape(1)->GetOriginShape();
+    // x: [M, K], w: [N, K], b: [N], y: [M, N]
+    uint32_t m = static_cast<uint32_t>(x_origin.GetDim(0));
+    uint32_t k = static_cast<uint32_t>(x_origin.GetDim(1));
+    uint32_t n = static_cast<uint32_t>(w_origin.GetDim(0));
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    uint32_t rowsPerBlock = (m + BLOCK_DIM - 1) / BLOCK_DIM;
+
+    tiling.set_m(m);
+    tiling.set_n(n);
+    tiling.set_k(k);
+    tiling.set_rowsPerBlock(rowsPerBlock);
+    tiling.set_tileK(TILE_K);
+    tiling.set_tileN(TILE_N);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace_sizes = context->GetWorkspaceSizes(1);
+    workspace_sizes[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    // y: [x_dim0, w_dim0]
+    int64_t m = x_shape->GetOriginShape().GetDim(0);
+    int64_t n = w_shape->GetOriginShape().GetDim(0);
+
+    gert::Shape out;
+    out.SetDimNum(2);
+    out.SetDim(0, m);
+    out.SetDim(1, n);
+    *y_shape = out;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GemmAddReluCustom : public OpDef {
+public:
+    explicit GemmAddReluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmAddReluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "gemm_add_relu_custom_tiling_data.h"
+
+class KernelGemmAddRelu {
+public:
+    __aicore__ inline KernelGemmAddRelu() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                uint32_t m, uint32_t n, uint32_t k,
+                                uint32_t rowsPerBlock, uint32_t tileK, uint32_t tileN)
+    {
+        this->m = m;
+        this->n = n;
+        this->k = k;
+        this->rowsPerBlock = rowsPerBlock;
+        this->tileK = tileK;
+        this->tileN = tileN;
+
+        uint32_t startRow = rowsPerBlock * AscendC::GetBlockIdx();
+        startRow = startRow > m ? m : startRow;
+        uint32_t endRow = startRow + rowsPerBlock;
+        endRow = endRow > m ? m : endRow;
+
+        this->rowStart = startRow;
+        this->rowEnd = endRow;
+
+        xGm = reinterpret_cast<__gm__ DTYPE_X *>(x);
+        wGm = reinterpret_cast<__gm__ DTYPE_W *>(w);
+        bGm = reinterpret_cast<__gm__ DTYPE_B *>(b);
+        yGm = reinterpret_cast<__gm__ DTYPE_Y *>(y);
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = rowStart; r < rowEnd; ++r) {
+            uint32_t xRowBase = r * k;
+            uint32_t yRowBase = r * n;
+
+            for (uint32_t n0 = 0; n0 < n; n0 += tileN) {
+                uint32_t curN = (n0 + tileN <= n) ? tileN : (n - n0);
+
+                // local accumulators
+                // initialize to 0
+                for (uint32_t j = 0; j < curN; ++j) {
+                    acc[j] = static_cast<DTYPE_Y>(0);
+                }
+
+                // GEMM accumulation: y[r, n0:n0+curN] = sum_k x[r,k] * w[n0:n0+curN, k]
+                for (uint32_t k0 = 0; k0 < k; k0 += tileK) {
+                    uint32_t curK = (k0 + tileK <= k) ? tileK : (k - k0);
+
+                    // multiply-accumulate
+                    for (uint32_t t = 0; t < curK; ++t) {
+                        DTYPE_X xval = xGm[xRowBase + (k0 + t)];
+                        // for each output channel in this tile
+                        for (uint32_t j = 0; j < curN; ++j) {
+                            // w is [n,k] row-major: row (n0+j), col (k0+t)
+                            DTYPE_W wval = wGm[(n0 + j) * k + (k0 + t)];
+                            acc[j] += static_cast<DTYPE_Y>(xval * wval);
+                        }
+                    }
+                }
+
+                // add bias and apply ReLU
+                for (uint32_t j = 0; j < curN; ++j) {
+                    DTYPE_Y v = acc[j] + static_cast<DTYPE_Y>(bGm[n0 + j]);
+                    // ReLU
+                    v = v > static_cast<DTYPE_Y>(0) ? v : static_cast<DTYPE_Y>(0);
+                    yGm[yRowBase + n0 + j] = v;
+                }
+            }
+        }
+    }
+
+private:
+    // GM pointers
+    __gm__ DTYPE_X* xGm;
+    __gm__ DTYPE_W* wGm;
+    __gm__ DTYPE_B* bGm;
+    __gm__ DTYPE_Y* yGm;
+
+    // dims
+    uint32_t m;
+    uint32_t n;
+    uint32_t k;
+    uint32_t rowsPerBlock;
+    uint32_t tileK;
+    uint32_t tileN;
+
+    uint32_t rowStart;
+    uint32_t rowEnd;
+
+    // local accumulator buffer sized by maximum tileN
+    // Assuming tileN won't exceed 1024 here; can be tuned by tiling config
+    DTYPE_Y acc[1024];
+};
+
+extern "C" __global__ __aicore__ void gemm_add_relu_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGemmAddRelu op;
+    op.Init(x, w, b, y,
+            tiling_data.m, tiling_data.n, tiling_data.k,
+            tiling_data.rowsPerBlock, tiling_data.tileK, tiling_data.tileN);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gemm_add_relu_custom_impl_npu(const at::Tensor& x,
+                                         const at::Tensor& w,
+                                         const at::Tensor& b) {
+    auto y_sizes = std::vector<int64_t>{x.size(0), w.size(0)};
+    at::Tensor y = at::empty(y_sizes, x.options());
+    EXEC_NPU_CMD(aclnnGemmAddReluCustom, x, w, b, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_add_relu_custom", &gemm_add_relu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_add_relu_custom", &gemm_add_relu_custom_impl_npu, "fused gemm + bias + relu");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Fused Gemm + Bias + ReLU using custom AscendC kernel.
+    """
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.gemm = torch.nn.Linear(in_features, out_features, bias=False)
+        self.bias = torch.nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        # Fused call: y = relu(x @ W^T + b)
+        return custom_ops_lib.gemm_add_relu_custom(x, self.gemm.weight, self.bias)
+'''

@@ -1,0 +1,395 @@
+project_json_src='''
+[
+    {
+        "op": "ConvDepthwiseSeparable2dCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "dw",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "pw",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvDepthwiseSeparable2dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint32_t, kH);
+  TILING_DATA_FIELD_DEF(uint32_t, kW);
+  TILING_DATA_FIELD_DEF(uint32_t, outC);
+  TILING_DATA_FIELD_DEF(uint32_t, strideH);
+  TILING_DATA_FIELD_DEF(uint32_t, strideW);
+  TILING_DATA_FIELD_DEF(uint32_t, padH);
+  TILING_DATA_FIELD_DEF(uint32_t, padW);
+  TILING_DATA_FIELD_DEF(uint32_t, dilH);
+  TILING_DATA_FIELD_DEF(uint32_t, dilW);
+  TILING_DATA_FIELD_DEF(uint32_t, Hout);
+  TILING_DATA_FIELD_DEF(uint32_t, Wout);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvDepthwiseSeparable2dCustom, ConvDepthwiseSeparable2dCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_depthwise_separable_2d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline int64_t CalcOutDim(int64_t in, int64_t pad, int64_t dil, int64_t k, int64_t stride) {
+    return (in + 2 * pad - dil * (k - 1) - 1) / stride + 1;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvDepthwiseSeparable2dCustomTilingData tiling;
+
+    // Input tensor x: N, C, H, W
+    auto inShape = context->GetInputShape(0)->GetOriginShape();
+    uint32_t N = static_cast<uint32_t>(inShape.GetDim(0));
+    uint32_t C = static_cast<uint32_t>(inShape.GetDim(1));
+    uint32_t H = static_cast<uint32_t>(inShape.GetDim(2));
+    uint32_t W = static_cast<uint32_t>(inShape.GetDim(3));
+
+    // Depthwise weight: [C, 1, kH, kW]
+    auto dwShape = context->GetInputShape(1)->GetOriginShape();
+    uint32_t kH = static_cast<uint32_t>(dwShape.GetDim(2));
+    uint32_t kW = static_cast<uint32_t>(dwShape.GetDim(3));
+
+    // Pointwise weight: [outC, C, 1, 1]
+    auto pwShape = context->GetInputShape(2)->GetOriginShape();
+    uint32_t outC = static_cast<uint32_t>(pwShape.GetDim(0));
+
+    // Attributes (defaults)
+    int64_t stride = 1;
+    int64_t padding = 0;
+    int64_t dilation = 1;
+
+    // Try to get attributes from context if available
+    // Note: API style may vary; using a safe-get pattern with defaults
+    auto attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        if (attrs->HasAttr("stride")) { stride = attrs->GetInt("stride"); }
+        if (attrs->HasAttr("padding")) { padding = attrs->GetInt("padding"); }
+        if (attrs->HasAttr("dilation")) { dilation = attrs->GetInt("dilation"); }
+    }
+
+    uint32_t strideH = static_cast<uint32_t>(stride);
+    uint32_t strideW = static_cast<uint32_t>(stride);
+    uint32_t padH = static_cast<uint32_t>(padding);
+    uint32_t padW = static_cast<uint32_t>(padding);
+    uint32_t dilH = static_cast<uint32_t>(dilation);
+    uint32_t dilW = static_cast<uint32_t>(dilation);
+
+    uint32_t Hout = static_cast<uint32_t>(CalcOutDim(H, padH, dilH, kH, strideH));
+    uint32_t Wout = static_cast<uint32_t>(CalcOutDim(W, padW, dilW, kW, strideW));
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_N(N);
+    tiling.set_C(C);
+    tiling.set_H(H);
+    tiling.set_W(W);
+    tiling.set_kH(kH);
+    tiling.set_kW(kW);
+    tiling.set_outC(outC);
+    tiling.set_strideH(strideH);
+    tiling.set_strideW(strideW);
+    tiling.set_padH(padH);
+    tiling.set_padW(padW);
+    tiling.set_dilH(dilH);
+    tiling.set_dilW(dilW);
+    tiling.set_Hout(Hout);
+    tiling.set_Wout(Wout);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* dw_shape = context->GetInputShape(1);
+    const gert::Shape* pw_shape = context->GetInputShape(2);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    int64_t N = x_shape->GetDim(0);
+    int64_t C = x_shape->GetDim(1);
+    int64_t H = x_shape->GetDim(2);
+    int64_t W = x_shape->GetDim(3);
+
+    int64_t kH = dw_shape->GetDim(2);
+    int64_t kW = dw_shape->GetDim(3);
+    int64_t outC = pw_shape->GetDim(0);
+
+    // Attributes with defaults
+    int64_t stride = 1, padding = 0, dilation = 1;
+    auto attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        if (attrs->HasAttr("stride")) { stride = attrs->GetInt("stride"); }
+        if (attrs->HasAttr("padding")) { padding = attrs->GetInt("padding"); }
+        if (attrs->HasAttr("dilation")) { dilation = attrs->GetInt("dilation"); }
+    }
+
+    auto calc_out = [](int64_t in, int64_t pad, int64_t dil, int64_t k, int64_t stride) -> int64_t {
+        return (in + 2 * pad - dil * (k - 1) - 1) / stride + 1;
+    };
+
+    int64_t Hout = calc_out(H, padding, dilation, kH, stride);
+    int64_t Wout = calc_out(W, padding, dilation, kW, stride);
+
+    y_shape->SetDimNum(4);
+    y_shape->SetDim(0, N);
+    y_shape->SetDim(1, outC);
+    y_shape->SetDim(2, Hout);
+    y_shape->SetDim(3, Wout);
+
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvDepthwiseSeparable2dCustom : public OpDef {
+public:
+    explicit ConvDepthwiseSeparable2dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("dw")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("pw")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // Attributes (ints)
+        this->Attr("stride").Int(1);
+        this->Attr("padding").Int(0);
+        this->Attr("dilation").Int(1);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(ConvDepthwiseSeparable2dCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv_depthwise_separable_2d_custom_tiling_data.h"
+
+using DTYPE_IN = float;
+using DTYPE_DW = float;
+using DTYPE_PW = float;
+using DTYPE_OUT = float;
+
+static __aicore__ inline uint64_t idx4d(uint32_t n, uint32_t c, uint32_t h, uint32_t w,
+                                        uint32_t C, uint32_t H, uint32_t W) {
+    return (((uint64_t)n * C + c) * H + h) * W + w;
+}
+
+extern "C" __global__ __aicore__ void conv_depthwise_separable_2d_custom(GM_ADDR x, GM_ADDR dw, GM_ADDR pw, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+
+    uint32_t N = tiling_data.N;
+    uint32_t C = tiling_data.C;
+    uint32_t H = tiling_data.H;
+    uint32_t W = tiling_data.W;
+    uint32_t kH = tiling_data.kH;
+    uint32_t kW = tiling_data.kW;
+    uint32_t outC = tiling_data.outC;
+    uint32_t strideH = tiling_data.strideH;
+    uint32_t strideW = tiling_data.strideW;
+    uint32_t padH = tiling_data.padH;
+    uint32_t padW = tiling_data.padW;
+    uint32_t dilH = tiling_data.dilH;
+    uint32_t dilW = tiling_data.dilW;
+    uint32_t Hout = tiling_data.Hout;
+    uint32_t Wout = tiling_data.Wout;
+
+    __gm__ DTYPE_IN* xGm = (__gm__ DTYPE_IN*)x;
+    __gm__ DTYPE_DW* dwGm = (__gm__ DTYPE_DW*)dw;
+    __gm__ DTYPE_PW* pwGm = (__gm__ DTYPE_PW*)pw;
+    __gm__ DTYPE_OUT* yGm = (__gm__ DTYPE_OUT*)y;
+
+    uint64_t total = (uint64_t)N * (uint64_t)outC * (uint64_t)Hout * (uint64_t)Wout;
+
+    uint32_t blockNum = AscendC::GetBlockNum();
+    uint32_t blockIdx = AscendC::GetBlockIdx();
+
+    uint64_t base = (total / blockNum) * blockIdx;
+    uint64_t tail = (blockIdx == blockNum - 1) ? total : (total / blockNum) * (blockIdx + 1);
+
+    for (uint64_t idx = base; idx < tail; ++idx) {
+        uint64_t t = idx;
+        uint32_t ow = (uint32_t)(t % Wout); t /= Wout;
+        uint32_t oh = (uint32_t)(t % Hout); t /= Hout;
+        uint32_t oc = (uint32_t)(t % outC); t /= outC;
+        uint32_t n  = (uint32_t)t;
+
+        float acc_out = 0.0f;
+
+        for (uint32_t c = 0; c < C; ++c) {
+            float acc_dw = 0.0f;
+            for (uint32_t kh = 0; kh < kH; ++kh) {
+                int32_t ih = (int32_t)oh * (int32_t)strideH - (int32_t)padH + (int32_t)kh * (int32_t)dilH;
+                if (ih < 0 || ih >= (int32_t)H) continue;
+                for (uint32_t kw = 0; kw < kW; ++kw) {
+                    int32_t iw = (int32_t)ow * (int32_t)strideW - (int32_t)padW + (int32_t)kw * (int32_t)dilW;
+                    if (iw < 0 || iw >= (int32_t)W) continue;
+                    uint64_t xIdx = idx4d(n, c, (uint32_t)ih, (uint32_t)iw, C, H, W);
+                    uint64_t dwIdx = (((uint64_t)c * 1 + 0) * kH + kh) * kW + kw; // [C,1,kH,kW]
+                    acc_dw += (float)xGm[xIdx] * (float)dwGm[dwIdx];
+                }
+            }
+            // pw [outC, C, 1, 1]
+            uint64_t pwIdx = ((uint64_t)oc * C + c);
+            acc_out += acc_dw * (float)pwGm[pwIdx];
+        }
+
+        uint64_t yIdx = (((uint64_t)n * outC + oc) * Hout + oh) * Wout + ow;
+        yGm[yIdx] = (DTYPE_OUT)acc_out;
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline int64_t calc_out_dim(int64_t in, int64_t pad, int64_t dil, int64_t k, int64_t stride) {
+    return (in + 2 * pad - dil * (k - 1) - 1) / stride + 1;
+}
+
+at::Tensor conv_depthwise_separable_2d_custom_impl_npu(const at::Tensor& x,
+                                                       const at::Tensor& dw,
+                                                       const at::Tensor& pw,
+                                                       int64_t stride,
+                                                       int64_t padding,
+                                                       int64_t dilation) {
+    TORCH_CHECK(x.dim() == 4, "x must be 4D NCHW");
+    TORCH_CHECK(dw.dim() == 4, "dw must be [C,1,kH,kW]");
+    TORCH_CHECK(pw.dim() == 4, "pw must be [outC,C,1,1]");
+    int64_t N = x.size(0);
+    int64_t C = x.size(1);
+    int64_t H = x.size(2);
+    int64_t W = x.size(3);
+    int64_t kH = dw.size(2);
+    int64_t kW = dw.size(3);
+    int64_t outC = pw.size(0);
+
+    int64_t Hout = calc_out_dim(H, padding, dilation, kH, stride);
+    int64_t Wout = calc_out_dim(W, padding, dilation, kW, stride);
+
+    at::Tensor result = at::empty({N, outC, Hout, Wout}, x.options());
+    EXEC_NPU_CMD(aclnnConvDepthwiseSeparable2dCustom, x, dw, pw, result, stride, padding, dilation);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_depthwise_separable_2d_custom", &conv_depthwise_separable_2d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_depthwise_separable_2d_custom", &conv_depthwise_separable_2d_custom_impl_npu, "Depthwise Separable Conv2d");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized depthwise-separable 2D convolution using custom AscendC kernel.
+    Supports NCHW float tensors. Bias is not fused.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super().__init__()
+        # Keep nn.Conv2d modules to host and manage weights/buffers (bias ignored/fallback handled by caller)
+        self.depthwise = torch.nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=in_channels, bias=False)
+        self.pointwise = torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s = int(self.depthwise.stride[0])
+        p = int(self.depthwise.padding[0])
+        d = int(self.depthwise.dilation[0])
+        # Fused DW + PW kernel (bias not fused)
+        y = custom_ops_lib.conv_depthwise_separable_2d_custom(
+            x,
+            self.depthwise.weight,
+            self.pointwise.weight,
+            s, p, d
+        )
+        return y
+'''

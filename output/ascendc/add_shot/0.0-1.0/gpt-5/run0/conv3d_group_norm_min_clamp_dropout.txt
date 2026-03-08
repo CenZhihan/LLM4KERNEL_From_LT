@@ -1,0 +1,309 @@
+project_json_src='''
+[
+    {
+        "op": "Conv3dGroupNormMinClampDropoutCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "minv",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "maxv",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "p",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv3dGroupNormMinClampDropoutCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv3dGroupNormMinClampDropoutCustom, Conv3dGroupNormMinClampDropoutCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv3d_group_norm_min_clamp_dropout_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv3dGroupNormMinClampDropoutCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv3dGroupNormMinClampDropoutCustom : public OpDef {
+public:
+    explicit Conv3dGroupNormMinClampDropoutCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("minv")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("maxv")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("p")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv3dGroupNormMinClampDropoutCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv3d_group_norm_min_clamp_dropout_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+class KernelFused {
+public:
+    __aicore__ inline KernelFused() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR minv, GM_ADDR maxv, GM_ADDR p, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileNum)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        // Scalars live at base address (first element)
+        minvGm = (__gm__ DTYPE_X*)minv;
+        maxvGm = (__gm__ DTYPE_X*)maxv;
+        pGm    = (__gm__ DTYPE_X*)p;
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+    }
+    __aicore__ inline void Process()
+    {
+        // load scalars once
+        DTYPE_X minvVal = minvGm[0];
+        DTYPE_X maxvVal = maxvGm[0];
+        DTYPE_X pVal    = pGm[0];
+        // simple inference-style dropout scaling (no randomness)
+        DTYPE_X scale = (DTYPE_X)(1.0f - pVal);
+
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i, minvVal, maxvVal, scale);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+    }
+    __aicore__ inline void Compute(int32_t /*progress*/, DTYPE_X minvVal, DTYPE_X maxvVal, DTYPE_X scale)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
+
+        // y = clamp(min(x, minv), min=minv, max=maxv)
+        // then y = y * scale (dropout inference-style)
+        // step1: t0 = min(x, minv)
+        AscendC::Min(yLocal, xLocal, minvVal, this->tileLength);
+        // step2: t1 = max(t0, minv)
+        AscendC::Max(yLocal, yLocal, minvVal, this->tileLength);
+        // step3: y = min(t1, maxv)
+        AscendC::Min(yLocal, yLocal, maxvVal, this->tileLength);
+        // step4: y = y * scale
+        AscendC::Mul(yLocal, yLocal, scale, this->tileLength);
+
+        outQueueY.EnQue<DTYPE_Z>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM>  inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+    __gm__ DTYPE_X* minvGm;
+    __gm__ DTYPE_X* maxvGm;
+    __gm__ DTYPE_X* pGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void conv3d_group_norm_min_clamp_dropout_custom(GM_ADDR x, GM_ADDR minv, GM_ADDR maxv, GM_ADDR p, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelFused op;
+    op.Init(x, minv, maxv, p, y, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv3d_group_norm_min_clamp_dropout_custom_impl_npu(const at::Tensor& x,
+                                                               const at::Tensor& minv,
+                                                               const at::Tensor& maxv,
+                                                               const at::Tensor& p) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnConv3dGroupNormMinClampDropoutCustom, x, minv, maxv, p, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv3d_group_norm_min_clamp_dropout_custom", &conv3d_group_norm_min_clamp_dropout_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv3d_group_norm_min_clamp_dropout_custom",
+          &conv3d_group_norm_min_clamp_dropout_custom_impl_npu,
+          "Conv3d+GroupNorm then Min+Clamp+Dropout (fused elementwise part)");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that keeps Conv3d and GroupNorm in PyTorch,
+    and replaces the elementwise Min + Clamp + Dropout sequence
+    with a custom AscendC kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, min_value, max_value, dropout_p):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.norm = nn.GroupNorm(groups, out_channels)
+        self.min_value = float(min_value)
+        self.max_value = float(max_value)
+        self.dropout_p = float(dropout_p)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.norm(x)
+        minv = torch.tensor(self.min_value, device=x.device, dtype=x.dtype)
+        maxv = torch.tensor(self.max_value, device=x.device, dtype=x.dtype)
+        p    = torch.tensor(self.dropout_p, device=x.device, dtype=x.dtype)
+        x = custom_ops_lib.conv3d_group_norm_min_clamp_dropout_custom(x, minv, maxv, p)
+        return x
+'''

@@ -1,0 +1,285 @@
+project_json_src='''
+[
+    {
+        "op":"L1NormCustom",
+        "input_desc":[
+            {
+                "name":"x",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ],
+                "param_type":"required"
+            }
+        ],
+        "output_desc":[
+            {
+                "name":"res_out",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ],
+                "param_type":"required"
+            }
+        ],
+        "attr":[
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(L1NormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rowNum);
+  TILING_DATA_FIELD_DEF(uint32_t, rowNumSp);
+  TILING_DATA_FIELD_DEF(uint32_t, rowLength);
+  TILING_DATA_FIELD_DEF(uint32_t, blockPivot);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLoop);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, loopCount);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(L1NormCustom, L1NormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "l1_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 48;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context) {
+  L1NormCustomTilingData tiling;
+  const gert::StorageShape* x_shape = context->GetInputShape(0);
+  const gert::Shape shape = x_shape->GetStorageShape();
+  auto rowNum = static_cast<uint32_t>(shape.GetDim(0));
+  auto colNum = static_cast<uint32_t>(shape.GetDim(1));
+  auto coreRowNum = rowNum / BLOCK_DIM;
+
+  tiling.set_rowNum(coreRowNum);
+  tiling.set_rowNumSp(coreRowNum + 1);
+  tiling.set_rowLength(colNum);
+  tiling.set_blockPivot(rowNum - coreRowNum * BLOCK_DIM);
+
+  uint32_t tileLoop = 18;
+  tiling.set_tileLoop(tileLoop);
+  tiling.set_tileLength(tileLoop * colNum);
+  tiling.set_loopCount(coreRowNum / tileLoop);
+
+  context->SetBlockDim(BLOCK_DIM);
+  tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                      context->GetRawTilingData()->GetCapacity());
+  context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+  context->SetTilingKey(1);
+
+  return ge::GRAPH_SUCCESS;
+}
+}  // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context) {
+  const gert::Shape* x_shape = context->GetInputShape(0);
+  gert::Shape* y_shape = context->GetOutputShape(0);
+  *y_shape = *x_shape;
+  return GRAPH_SUCCESS;
+}
+}  // namespace ge
+
+namespace ops {
+class L1NormCustom : public OpDef {
+ public:
+  explicit L1NormCustom(const char* name) : OpDef(name) {
+    this->Input("x")
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_FLOAT})
+        .Format({ge::FORMAT_ND})
+        .UnknownShapeFormat({ge::FORMAT_ND});
+    this->Output("res_out")
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_FLOAT})
+        .Format({ge::FORMAT_ND})
+        .UnknownShapeFormat({ge::FORMAT_ND});
+
+    this->SetInferShape(ge::InferShape);
+
+    this->AICore().SetTiling(optiling::TilingFunc);
+    this->AICore().AddConfig("ascend910b");
+  }
+};
+
+OP_ADD(L1NormCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelL1Norm {
+ public:
+  __aicore__ inline KernelL1Norm() {}
+  __aicore__ inline void InitTiling(GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    rowNum = tiling_data.rowNum;
+    rowNumSp = tiling_data.rowNumSp;
+    rowLength = tiling_data.rowLength;
+    blockPivot = tiling_data.blockPivot;
+    tileLoop = tiling_data.tileLoop;
+    tileLength = tiling_data.tileLength;
+    loopCount = tiling_data.loopCount;
+  }
+  __aicore__ inline void Init(GM_ADDR x, GM_ADDR z, GM_ADDR tiling) {
+    InitTiling(tiling);
+
+    this->leftRow = this->rowNum % this->tileLoop;
+    if (AscendC::GetBlockIdx() < this->blockPivot) {
+      this->rowNum = this->rowNumSp;
+      this->leftRow += 1;
+    }
+
+    this->blockLength = this->rowNum * this->rowLength;
+    uint32_t offset = 0;
+    if (AscendC::GetBlockIdx() < this->blockPivot) {
+      offset = this->blockLength * AscendC::GetBlockIdx();
+    } else {
+      offset = this->blockLength * AscendC::GetBlockIdx() +
+               this->rowLength * this->blockPivot;
+    }
+
+    xGm.SetGlobalBuffer((__gm__ float *)x + offset, this->blockLength);
+    zGm.SetGlobalBuffer((__gm__ float *)z + offset, this->blockLength);
+
+    pipe.InitBuffer(queueX, BUFFER_NUM, this->tileLength * sizeof(float));
+    pipe.InitBuffer(queueZ, BUFFER_NUM, this->tileLength * sizeof(float));
+
+    pipe.InitBuffer(tmpBuffer1, 64 * sizeof(float));
+    pipe.InitBuffer(tmpBuffer2, 64 * sizeof(float));
+    pipe.InitBuffer(onesBuffer, 64 * sizeof(float));
+  }
+  __aicore__ inline void Process() {
+    for (int32_t i = 0; i < this->loopCount; i++) {
+      CopyIn(i, this->tileLoop);
+      Compute(i, this->tileLoop);
+      CopyOut(i, this->tileLoop);
+    }
+    if (this->leftRow > 0) {
+      CopyIn(this->loopCount, this->leftRow);
+      Compute(this->loopCount, this->leftRow);
+      CopyOut(this->loopCount, this->leftRow);
+    }
+  }
+
+ private:
+  __aicore__ inline void CopyIn(int32_t progress, int32_t rowNum) {
+    AscendC::LocalTensor<float> xLocal = queueX.AllocTensor<float>();
+    AscendC::DataCopy(xLocal, xGm[progress * this->tileLength],
+             this->rowLength * rowNum);
+    queueX.EnQue(xLocal);
+  }
+
+  __aicore__ inline void Compute(int32_t progress, int32_t rowNum) {
+    AscendC::LocalTensor<float> xLocal = queueX.DeQue<float>();
+
+    AscendC::LocalTensor<float> tmpTensor1 = tmpBuffer1.Get<float>();
+    AscendC::LocalTensor<float> tmpTensor2 = tmpBuffer2.Get<float>();
+    AscendC::LocalTensor<float> onesLocal = onesBuffer.Get<float>();
+    AscendC::LocalTensor<float> zLocal = queueZ.AllocTensor<float>();
+    AscendC::Duplicate<float>(onesLocal, 1.0f, this->tileLoop);
+
+    // Compute per-row L1 mean inverse: inv_mean = rowLength / sum(abs(x))
+    for (uint32_t j = 0; j < rowNum; ++j) {
+      uint32_t buffIndex = j * this->rowLength;
+      AscendC::Abs(zLocal[buffIndex], xLocal[buffIndex], this->rowLength);
+      AscendC::ReduceSum<float>(tmpTensor2[j], zLocal[buffIndex], tmpTensor1,
+                       this->rowLength);
+    }
+
+    AscendC::Div(tmpTensor2, onesLocal, tmpTensor2, rowNum); // 1 / sum(abs(x))
+    AscendC::Muls(tmpTensor2, tmpTensor2, static_cast<float>(this->rowLength), rowNum); // rowLength / sum(abs(x))
+
+    for (uint32_t j = 0; j < rowNum; ++j) {
+      uint32_t buffIndex = j * this->rowLength;
+      AscendC::Muls(zLocal[buffIndex], xLocal[buffIndex], tmpTensor2.GetValue(j),
+           this->rowLength);
+    }
+
+    queueZ.EnQue<float>(zLocal);
+    queueX.FreeTensor(xLocal);
+  }
+
+  __aicore__ inline void CopyOut(int32_t progress, int32_t rowNum) {
+    AscendC::LocalTensor<float> zLocal = queueZ.DeQue<float>();
+
+    AscendC::DataCopy(zGm[progress * this->tileLength], zLocal,
+             rowNum * this->rowLength);
+
+    queueZ.FreeTensor(zLocal);
+  }
+
+ private:
+  AscendC::TPipe pipe;
+  AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2, onesBuffer;
+  AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> queueX;
+  AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> queueZ;
+  AscendC::GlobalTensor<float> xGm;
+  AscendC::GlobalTensor<float> zGm;
+
+  uint32_t blockLength = 0;
+  uint32_t leftRow = 0;
+  uint32_t rowNum = 341;
+  uint32_t rowNumSp = 342;
+  uint32_t rowLength = 1024;
+  uint32_t blockPivot = 16;
+  uint32_t tileLoop = 8;
+  uint32_t tileLength = 8 * 1024;
+  uint32_t loopCount = 42;
+};
+
+extern "C" __global__ __aicore__ void l1_norm_custom(
+    GM_ADDR x, GM_ADDR res_out, GM_ADDR workspace, GM_ADDR tiling) {
+  KernelL1Norm op;
+  op.Init(x, res_out, tiling);
+  if (TILING_KEY_IS(1)) {
+    op.Process();
+  }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor l1_norm_impl_npu(const at::Tensor& x) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnL1NormCustom, x, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("l1_norm_custom", &l1_norm_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("l1_norm_custom", &l1_norm_impl_npu, "l1 norm");
+}
+"""
+
+model_src='''
+import torch, torch_npu, custom_ops_lib
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.l1_norm_custom(x)
+'''

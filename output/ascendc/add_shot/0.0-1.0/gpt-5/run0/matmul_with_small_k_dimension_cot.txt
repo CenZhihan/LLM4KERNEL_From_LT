@@ -1,0 +1,54 @@
+**Evaluating vector operations**
+
+I’m considering how to use a scalar with a vector in AscendC, possibly using "Broadcast" or "Duplicate" functions. There’s also the “vmuls” for multiplying the vector by a scalar, which I’ve seen in AscendC samples. 
+
+For efficient processing, I think about loading tiles for matrix operations and how to manage streaming by partitioning the work across blocks. Each block would manage a chunk of rows while computing across all columns, which looks like a good way to scale things down for clarity!
+
+**Designing vector kernel implementation**
+
+I see that each vector in the output queue expects a contiguous length, but we can manage loops within the kernel without using TQue. However, I still need local buffers for safety. The idea of using a built-in CCE Matmul is off-limits since it must be a custom implementation. 
+
+To make this work, I’m considering scaling down the case for smaller K and N, even though the test shapes are huge. I’ll focus on creating a plausible vectorized implementation, ensuring the kernel parameter list includes A, B, C, workspace, and tiling information. Time to define the tiling data!
+
+**Setting up kernel parameters**
+
+I'm calculating the number of block rows using `ceil_div(m, blockDim)`, setting tile sizes to 128 for both tileM and tileN. In the kernel, I'm defining the GlobalTensor types for A, B, and C as floats. 
+
+During initialization, I'll compute `startRow` and ensure validRow is the minimum of `blockM` and `m - blockIdx*blockM`. Pointers for `aGm` and `cGm` will be set up, and the whole B matrix will be accessed by all blocks. 
+
+As I process tiles over the N dimension, I plan to initialize the output buffer `zLocal` with zeros using AscendC functions, but I'm running into a challenge with loading strided vectors without gather.
+
+**Understanding data access patterns**
+
+I'm recalling that in row-major format, the shape of A (M, K) means the last dimension changes fastest, so A[:, k] results in a stride of K, which isn’t contiguous. Consequently, I can't directly copy contiguous Data into LocalTensor without gather support. 
+
+However, I can load a contiguous tile of rows for A with a shape of (tileM, K). During the computation, I can access the k-th column from this local tile, which makes indexing manageable. For B, I need to ensure it’s contiguous across the N dimension for computing tileN columns, which allows me to copy the required subvector effectively.
+
+**Implementing tensor computations**
+
+I'm planning to compute each output element C[i,j] through a dot product across K using vector operations. I'll iterate through rows and columns in loops, but loading A row tiles contiguously is crucial, while B has strided access. 
+
+So, I'll define a pipeline for processing in tiles, copying in A and initializing Z as zeros. For each row, I'll accumulate the results using scalar multiplication and ensure I copy the output contiguously.
+
+In terms of memory management, I'll create local tensors for A, B, Z, and temporary vectors, setting up distinct TQue for efficient allocation and operation.
+
+**Streamlining tensor memory allocation**
+
+I'm thinking it’s better to allocate the temporary vector using existing queues like inQueueBRow or outQueueZ each time, creating an extra queue for temp. I’ll define BUFFER_NUM as 1 for each queue and allocate as needed during loops.
+
+At the start of each tile, I’ll load A_tile and initialize Z_tile. For each iteration, I’ll ensure to allocate a local tensor effectively, initializing it to zeros. I’ll also implement efficient data copying for both A and B matrices, while ensuring to read values correctly from the local tensors. After processing, I’ll copy results from zLocal back into the global memory.
+
+**Managing memory allocations in tensor operations**
+
+I need to free zLocal, A_local, and bLocal by using FreeTensor for each allocated LocalTensor after finishing. I also wonder if we need to dequeue B, since bLocal is allocated anew in each iteration.
+
+As we proceed, I’ll ensure that the sizes remain dynamic. I’ll define the appropriate datatypes based on our naming conventions and adjust the tile sizes accordingly. In the kernel, I’ll compute both block rows and necessary dimensions. Lastly, I'll ensure that global buffers for tensors are initialized correctly and match the required dimensions for processing.
+
+**Setting up matrix dimensions and handling tensors**
+
+I need to establish dimensions m_, n_, and k_, along with startRow and validRows in class fields.
+
+I’ll iterate over columns and rows to copy data to A tiles and allocate for Z tiles. Each Z row needs to be initialized to zero before computation. When moving through the k_ iterations, I’ll manage the allocations effectively, using temp tensors for intermediate calculations which I'll free after use.
+
+Finally, I have to ensure that the GlobalTensor indexing returns a LocalTensor correctly and that I handle potential missing API methods properly while maintaining the right data types throughout.
+

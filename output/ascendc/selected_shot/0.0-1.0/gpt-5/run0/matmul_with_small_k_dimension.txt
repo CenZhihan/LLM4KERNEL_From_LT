@@ -1,0 +1,290 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulWithSmallKDimensionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "A",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "B",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "C",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulWithSmallKDimensionCustomTilingData)
+TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, cubeTilingData);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulWithSmallKDimensionCustom, MatmulWithSmallKDimensionCustomTilingData)
+} // namespace optiling
+"""
+
+host_operator_src="""
+#include "matmul_with_small_k_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/tiling_api.h"
+
+using namespace matmul_tiling;
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    auto shape_A = context->GetInputTensor(0)->GetOriginShape();
+    auto shape_B = context->GetInputTensor(1)->GetOriginShape();
+
+    int32_t M = shape_A.GetDim(0);
+    int32_t K = shape_A.GetDim(1);
+    int32_t N = shape_B.GetDim(1);
+
+    // Prefer larger M/N tiles when K is small to improve efficiency
+    int32_t baseM = 256;
+    int32_t baseN = 256;
+
+    MultiCoreMatmulTiling cubeTiling(ascendcPlatform);
+    cubeTiling.SetDim(2);
+    cubeTiling.SetAType(TPosition::GM, CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    cubeTiling.SetBType(TPosition::GM, CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    cubeTiling.SetCType(TPosition::GM, CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    cubeTiling.SetShape(M, N, K);
+    cubeTiling.SetOrgShape(M, N, K);
+    cubeTiling.SetFixSplit(baseM, baseN, -1);
+    cubeTiling.SetBias(false); // no bias path
+    cubeTiling.SetBufferSpace(-1, -1, -1);
+
+    MatmulWithSmallKDimensionCustomTilingData tiling;
+    if (cubeTiling.GetTiling(tiling.cubeTilingData) == -1) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Use different tiling keys to optionally enable extra local workspace when K is very small
+    if (K <= 64) {
+        context->SetTilingKey(2);
+    } else {
+        context->SetTilingKey(1);
+    }
+
+    // BlockDim by platform
+    if (ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND310P) {
+        context->SetBlockDim(2);
+    } else {
+        context->SetBlockDim(1);
+    }
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t userWorkspaceSize = 0;
+    size_t systemWorkspaceSize = static_cast<size_t>(ascendcPlatform.GetLibApiWorkSpaceSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = userWorkspaceSize + systemWorkspaceSize;
+
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ops {
+class MatmulWithSmallKDimensionCustom : public OpDef {
+public:
+    explicit MatmulWithSmallKDimensionCustom(const char *name) : OpDef(name)
+    {
+        this->Input("A")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+        this->Input("B")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+        this->Output("C")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc)
+            .AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulWithSmallKDimensionCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+using namespace matmul;
+
+__aicore__ inline uint32_t Ceiling(uint32_t a, uint32_t b)
+{
+    return (a + b - 1) / b;
+}
+
+template <typename aType, typename bType, typename cType> class MatmulKernel {
+public:
+    __aicore__ inline MatmulKernel(){};
+    __aicore__ inline void Init(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, const TCubeTiling &tiling);
+    template <bool setTmpSpace = false> __aicore__ inline void Process(AscendC::TPipe *pipe);
+
+    __aicore__ inline void CalcOffset(int32_t blockIdx, const TCubeTiling &tiling, int32_t &offsetA, int32_t &offsetB,
+                                      int32_t &offsetC);
+
+    Matmul<
+        MatmulType<AscendC::TPosition::GM, CubeFormat::ND, aType>,
+        MatmulType<AscendC::TPosition::GM, CubeFormat::ND, bType>,
+        MatmulType<AscendC::TPosition::GM, CubeFormat::ND, cType>
+    > matmulObj;
+
+    AscendC::GlobalTensor<aType> aGlobal;
+    AscendC::GlobalTensor<bType> bGlobal;
+    AscendC::GlobalTensor<cType> cGlobal;
+    TCubeTiling tiling;
+};
+
+template <typename aType, typename bType, typename cType>
+__aicore__ inline void MatmulKernel<aType, bType, cType>::Init(GM_ADDR A, GM_ADDR B, GM_ADDR C,
+                                                               GM_ADDR workspace, const TCubeTiling &tiling)
+{
+    this->tiling = tiling;
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ aType *>(A), tiling.M * tiling.Ka);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ bType *>(B), tiling.Kb * tiling.N);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ cType *>(C), tiling.M * tiling.N);
+
+    int32_t offsetA = 0;
+    int32_t offsetB = 0;
+    int32_t offsetC = 0;
+    CalcOffset(GetBlockIdx(), tiling, offsetA, offsetB, offsetC);
+    aGlobal = aGlobal[offsetA];
+    bGlobal = bGlobal[offsetB];
+    cGlobal = cGlobal[offsetC];
+
+    if (GetSysWorkSpacePtr() == nullptr) {
+        return;
+    }
+}
+
+template <typename aType, typename bType, typename cType>
+template <bool setTmpSpace>
+__aicore__ inline void MatmulKernel<aType, bType, cType>::Process(AscendC::TPipe *pipe)
+{
+    if constexpr (setTmpSpace) {
+        AscendC::TBuf<> tmpMMFormatUb;
+        AscendC::LocalTensor<uint8_t> mmformatUb;
+        pipe->InitBuffer(tmpMMFormatUb, AscendC::TOTAL_VEC_LOCAL_SIZE);
+        mmformatUb = tmpMMFormatUb.Get<uint8_t>(AscendC::TOTAL_VEC_LOCAL_SIZE);
+        matmulObj.SetLocalWorkspace(mmformatUb);
+    }
+
+    matmulObj.SetTensorA(aGlobal);
+    matmulObj.SetTensorB(bGlobal);
+    matmulObj.IterateAll(cGlobal);
+    matmulObj.End();
+}
+
+template <typename aType, typename bType, typename cType>
+__aicore__ inline void
+MatmulKernel<aType, bType, cType>::CalcOffset(int32_t blockIdx, const TCubeTiling &tiling, int32_t &offsetA,
+                                              int32_t &offsetB, int32_t &offsetC)
+{
+    auto mSingleBlocks = Ceiling(tiling.M, tiling.singleCoreM);
+    auto mCoreIndx = blockIdx % mSingleBlocks;
+    auto nCoreIndx = blockIdx / mSingleBlocks;
+
+    offsetA = mCoreIndx * tiling.Ka * tiling.singleCoreM;
+    offsetB = nCoreIndx * tiling.singleCoreN;
+    offsetC = mCoreIndx * tiling.N * tiling.singleCoreM + nCoreIndx * tiling.singleCoreN;
+}
+
+extern "C" __global__ __aicore__ void matmul_with_small_k_dimension_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C,
+                                                                           GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    MatmulKernel<float, float, float> matmulKernel;
+    AscendC::TPipe pipe;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), matmulKernel.matmulObj, &tilingData.cubeTilingData);
+    matmulKernel.Init(A, B, C, workspace, tilingData.cubeTilingData);
+    if (TILING_KEY_IS(1)) {
+        matmulKernel.Process(&pipe);
+    } else if (TILING_KEY_IS(2)) {
+        matmulKernel.Process<true>(&pipe);
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_with_small_k_dimension_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    // Expect 2D inputs: (M, K) x (K, N) -> (M, N)
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, \"Inputs must be 2D tensors\");
+    TORCH_CHECK(A.size(1) == B.size(0), \"Incompatible matmul dimensions\");
+
+    auto M = A.size(0);
+    auto N = B.size(1);
+    at::Tensor result = at::empty({M, N}, A.options());
+    EXEC_NPU_CMD(aclnnMatmulWithSmallKDimensionCustom, A, B, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"matmul_with_small_k_dimension_custom\", &matmul_with_small_k_dimension_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"matmul_with_small_k_dimension_custom\", &matmul_with_small_k_dimension_custom_impl_npu, \"matmul optimized for small K\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.matmul_with_small_k_dimension_custom(A, B)
+'''

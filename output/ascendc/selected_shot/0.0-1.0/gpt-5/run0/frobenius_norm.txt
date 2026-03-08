@@ -1,0 +1,289 @@
+project_json_src='''
+[
+    {
+        "op":"FrobeniusNormCustom",
+        "input_desc":[
+            {
+                "name":"x",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ],
+                "param_type":"required"
+            }
+        ],
+        "output_desc":[
+            {
+                "name":"res_out",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ],
+                "param_type":"required"
+            }
+        ],
+        "attr":[
+            {
+                "name":"epsilon",
+                "type": [
+                    "float"
+                ],
+                "default_value":1e-12,
+                "param_type":"optional"
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(FrobeniusNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint64_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, loopCount);
+  TILING_DATA_FIELD_DEF(uint32_t, tailLength);
+  TILING_DATA_FIELD_DEF(float, eps);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(FrobeniusNormCustom, FrobeniusNormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "frobenius_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context) {
+  FrobeniusNormCustomTilingData tiling;
+  const gert::StorageShape* x_shape = context->GetInputShape(0);
+  const gert::Shape shape = x_shape->GetStorageShape();
+
+  uint64_t total = 1;
+  for (size_t i = 0; i < shape.GetDimNum(); ++i) {
+    total *= static_cast<uint64_t>(shape.GetDim(i));
+  }
+
+  // Choose a reasonable tile length; adjust if needed
+  const uint32_t kTile = 4096;
+
+  tiling.set_totalLength(total);
+  tiling.set_tileLength(kTile);
+  tiling.set_loopCount(static_cast<uint32_t>(total / kTile));
+  tiling.set_tailLength(static_cast<uint32_t>(total % kTile));
+
+  const float* epsilonAttr = context->GetAttrs()->GetAttrPointer<float>(0);
+  tiling.set_eps(*epsilonAttr);
+
+  context->SetBlockDim(BLOCK_DIM);
+  tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                      context->GetRawTilingData()->GetCapacity());
+  context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+  context->SetTilingKey(1);
+
+  return ge::GRAPH_SUCCESS;
+}
+}  // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context) {
+  const gert::Shape* x_shape = context->GetInputShape(0);
+  gert::Shape* y_shape = context->GetOutputShape(0);
+  *y_shape = *x_shape;
+  return GRAPH_SUCCESS;
+}
+}  // namespace ge
+
+namespace ops {
+class FrobeniusNormCustom : public OpDef {
+ public:
+  explicit FrobeniusNormCustom(const char* name) : OpDef(name) {
+    this->Input("x")
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_FLOAT})
+        .Format({ge::FORMAT_ND})
+        .UnknownShapeFormat({ge::FORMAT_ND});
+    this->Output("res_out")
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_FLOAT})
+        .Format({ge::FORMAT_ND})
+        .UnknownShapeFormat({ge::FORMAT_ND});
+    this->Attr("epsilon").AttrType(OPTIONAL).Float(1e-12);
+
+    this->SetInferShape(ge::InferShape);
+
+    this->AICore().SetTiling(optiling::TilingFunc);
+    this->AICore().AddConfig("ascend910b");
+  }
+};
+
+OP_ADD(FrobeniusNormCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelFrobeniusNorm {
+ public:
+  __aicore__ inline KernelFrobeniusNorm() {}
+  __aicore__ inline void InitTiling(GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    totalLength = tiling_data.totalLength;
+    tileLength = tiling_data.tileLength;
+    loopCount = tiling_data.loopCount;
+    tailLength = tiling_data.tailLength;
+    eps = tiling_data.eps;
+  }
+
+  __aicore__ inline void Init(GM_ADDR x, GM_ADDR z, GM_ADDR tiling) {
+    InitTiling(tiling);
+
+    xGm.SetGlobalBuffer((__gm__ float *)x, totalLength);
+    zGm.SetGlobalBuffer((__gm__ float *)z, totalLength);
+
+    pipe.InitBuffer(queueX, BUFFER_NUM, this->tileLength * sizeof(float));
+    pipe.InitBuffer(queueZ, BUFFER_NUM, this->tileLength * sizeof(float));
+
+    pipe.InitBuffer(tmpBuffer1, 64 * sizeof(float));
+    pipe.InitBuffer(tmpBuffer2, 64 * sizeof(float));
+    pipe.InitBuffer(onesBuffer, 64 * sizeof(float));
+  }
+
+  __aicore__ inline void Process() {
+    float sumsq = 0.f;
+
+    // Phase 1: accumulate sum of squares
+    for (uint32_t i = 0; i < this->loopCount; ++i) {
+      uint64_t offset = static_cast<uint64_t>(i) * this->tileLength;
+      SumTile(offset, this->tileLength, sumsq);
+    }
+    if (this->tailLength > 0) {
+      uint64_t offset = static_cast<uint64_t>(this->loopCount) * this->tileLength;
+      SumTile(offset, this->tailLength, sumsq);
+    }
+
+    // Compute inverse norm = 1.0 / sqrt(sumsq + eps)
+    AscendC::LocalTensor<float> tmpScalar = tmpBuffer2.Get<float>();
+    AscendC::LocalTensor<float> tmpWork = tmpBuffer1.Get<float>();
+    AscendC::LocalTensor<float> onesLocal = onesBuffer.Get<float>();
+    AscendC::Duplicate<float>(tmpScalar, sumsq, 1);
+    AscendC::Adds(tmpScalar, tmpScalar, this->eps, 1);
+    AscendC::Sqrt(tmpScalar, tmpScalar, 1);
+    AscendC::Duplicate<float>(onesLocal, 1.0f, 1);
+    AscendC::Div(tmpScalar, onesLocal, tmpScalar, 1);
+    float invNorm = tmpScalar.GetValue(0);
+
+    // Phase 2: normalize
+    for (uint32_t i = 0; i < this->loopCount; ++i) {
+      uint64_t offset = static_cast<uint64_t>(i) * this->tileLength;
+      NormalizeTile(offset, this->tileLength, invNorm);
+    }
+    if (this->tailLength > 0) {
+      uint64_t offset = static_cast<uint64_t>(this->loopCount) * this->tileLength;
+      NormalizeTile(offset, this->tailLength, invNorm);
+    }
+  }
+
+ private:
+  __aicore__ inline void SumTile(uint64_t offset, uint32_t length, float &sumsq) {
+    AscendC::LocalTensor<float> xLocal = queueX.AllocTensor<float>();
+    AscendC::DataCopy(xLocal, xGm[offset], length);
+    queueX.EnQue(xLocal);
+    xLocal = queueX.DeQue<float>();
+
+    AscendC::LocalTensor<float> zLocal = queueZ.AllocTensor<float>();
+    AscendC::Mul(zLocal, xLocal, xLocal, length);  // square
+
+    AscendC::LocalTensor<float> tmpRedBuf = tmpBuffer1.Get<float>();
+    AscendC::LocalTensor<float> tmpScalar = tmpBuffer2.Get<float>();
+    AscendC::ReduceSum<float>(tmpScalar[0], zLocal, tmpRedBuf, length);
+    sumsq += tmpScalar.GetValue(0);
+
+    queueZ.FreeTensor(zLocal);
+    queueX.FreeTensor(xLocal);
+  }
+
+  __aicore__ inline void NormalizeTile(uint64_t offset, uint32_t length, float invNorm) {
+    AscendC::LocalTensor<float> xLocal = queueX.AllocTensor<float>();
+    AscendC::DataCopy(xLocal, xGm[offset], length);
+    queueX.EnQue(xLocal);
+    xLocal = queueX.DeQue<float>();
+
+    AscendC::LocalTensor<float> zLocal = queueZ.AllocTensor<float>();
+    AscendC::Muls(zLocal, xLocal, invNorm, length);
+
+    AscendC::DataCopy(zGm[offset], zLocal, length);
+
+    queueZ.FreeTensor(zLocal);
+    queueX.FreeTensor(xLocal);
+  }
+
+ private:
+  AscendC::TPipe pipe;
+  AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2, onesBuffer;
+  AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> queueX;
+  AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> queueZ;
+
+  AscendC::GlobalTensor<float> xGm;
+  AscendC::GlobalTensor<float> zGm;
+
+  uint64_t totalLength = 0;
+  uint32_t tileLength = 4096;
+  uint32_t loopCount = 0;
+  uint32_t tailLength = 0;
+  float eps = 1e-12f;
+};
+
+extern "C" __global__ __aicore__ void frobenius_norm_custom(
+    GM_ADDR x, GM_ADDR res_out, GM_ADDR workspace, GM_ADDR tiling) {
+  KernelFrobeniusNorm op;
+  op.Init(x, res_out, tiling);
+  if (TILING_KEY_IS(1)) {
+    op.Process();
+  }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor frobenius_norm_impl_npu(const at::Tensor& x, double epsilon) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnFrobeniusNormCustom, x, epsilon, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("frobenius_norm_custom", &frobenius_norm_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("frobenius_norm_custom", &frobenius_norm_impl_npu, "Frobenius norm normalization");
+}
+"""
+
+model_src='''
+import torch, torch_npu, custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, epsilon: float = 1e-12):
+        super(ModelNew, self).__init__()
+        self.epsilon = float(epsilon)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.frobenius_norm_custom(x, self.epsilon)
+'''

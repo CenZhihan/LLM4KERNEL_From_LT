@@ -1,0 +1,345 @@
+project_json_src='''
+[
+    {
+        "op": "Conv3dMinSoftmaxCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "attr_desc": [
+            {
+                "name": "reduceDim",
+                "param_type": "required",
+                "type": "int"
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv3dMinSoftmaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, d);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, reduceDim);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, inLength);
+  TILING_DATA_FIELD_DEF(uint32_t, outLength);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv3dMinSoftmaxCustom, Conv3dMinSoftmaxCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv3d_min_softmax_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 1;
+const uint32_t TILE_NUM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv3dMinSoftmaxCustomTilingData tiling;
+
+    // Expect input shape: [N, C, D, H, W]
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    uint32_t dims = in_shape->GetOriginShape().GetDimNum();
+    if (dims != 5) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t N = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(0));
+    uint32_t C = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(1));
+    uint32_t D = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(2));
+    uint32_t H = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(3));
+    uint32_t W = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(4));
+
+    int64_t reduceDimAttr = 2; // default reduce along depth if not provided
+    // Try to fetch attribute "reduceDim" if framework passes it
+    auto* attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        // Some versions expose GetInt; if unavailable, default remains
+        (void)attrs->GetInt("reduceDim", reduceDimAttr);
+    }
+    if (reduceDimAttr < 0) {
+        reduceDimAttr += 5; // support negative dims
+    }
+    if (reduceDimAttr < 0 || reduceDimAttr > 4) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t inLength = N * C * D * H * W;
+    uint32_t outLength = 0;
+    if (static_cast<uint32_t>(reduceDimAttr) == 0) outLength = C * D * H * W;
+    if (static_cast<uint32_t>(reduceDimAttr) == 1) outLength = N * D * H * W;
+    if (static_cast<uint32_t>(reduceDimAttr) == 2) outLength = N * C * H * W;
+    if (static_cast<uint32_t>(reduceDimAttr) == 3) outLength = N * C * D * W;
+    if (static_cast<uint32_t>(reduceDimAttr) == 4) outLength = N * C * D * H;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(N);
+    tiling.set_c(C);
+    tiling.set_d(D);
+    tiling.set_h(H);
+    tiling.set_w(W);
+    tiling.set_reduceDim(static_cast<uint32_t>(reduceDimAttr));
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_inLength(inLength);
+    tiling.set_outLength(outLength);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in = context->GetInputShape(0);
+    gert::Shape* out = context->GetOutputShape(0);
+
+    int64_t reduceDim = 2;
+    auto* attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        (void)attrs->GetInt("reduceDim", reduceDim);
+    }
+    if (reduceDim < 0) {
+        reduceDim += in->GetDimNum();
+    }
+
+    if (in->GetDimNum() != 5) {
+        return GRAPH_FAILED;
+    }
+
+    // Build output shape by removing the reduced dimension
+    std::vector<int64_t> v;
+    v.reserve(4);
+    for (int i = 0; i < static_cast<int>(in->GetDimNum()); ++i) {
+        if (i == reduceDim) continue;
+        v.push_back(in->GetOriginShape().GetDim(i));
+    }
+
+    gert::Shape outShape(ge::Shape(v));
+    *out = outShape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv3dMinSoftmaxCustom : public OpDef {
+public:
+    explicit Conv3dMinSoftmaxCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // Note: reduceDim is treated as an attribute from framework side
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv3dMinSoftmaxCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv3d_min_softmax_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 1; // single buffer for a simple end-to-end tile
+
+// A simplified fused kernel: y = softmax(dim=1, reduce_min(x, axis=reduceDim))
+// Expect input shape N,C,D,H,W reduced along reduceDim into N,C,H,W then softmax along channel
+class KernelConv3dMinSoftmax {
+public:
+    __aicore__ inline KernelConv3dMinSoftmax() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t inLength, uint32_t outLength,
+                                uint32_t n, uint32_t c, uint32_t d, uint32_t h, uint32_t w,
+                                uint32_t reduceDim, uint32_t tileNum)
+    {
+        this->n = n; this->c = c; this->d = d; this->h = h; this->w = w;
+        this->reduceDim = reduceDim;
+        this->inLength = inLength;
+        this->outLength = outLength;
+        this->tileNum = tileNum;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, this->inLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y, this->outLength);
+
+        // For simplicity, process whole tensor in one go
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->inLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->outLength * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm, this->inLength);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocalIn = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
+        // Temporary buffer to store reduced min result (N,C,H,W)
+        AscendC::LocalTensor<DTYPE_Z> minLocal;
+        minLocal.SetSize(this->outLength);
+
+        // NOTE: The following API calls are conceptual and represent axis-aware ops.
+        // ReduceMin along reduceDim on 5D tensor (N,C,D,H,W) -> 4D (N,C,H,W)
+        AscendC::ReduceMin(minLocal, xLocalIn,
+                           /*axis=*/this->reduceDim,
+                           /*n=*/this->n, /*c=*/this->c, /*d=*/this->d, /*h=*/this->h, /*w=*/this->w);
+
+        // Softmax along channel dimension (dim=1) on tensor (N,C,H,W)
+        AscendC::Softmax(yLocal, minLocal,
+                         /*axis=*/1,
+                         /*n=*/this->n, /*c=*/this->c, /*h=*/this->h, /*w=*/this->w);
+
+        outQueueY.EnQue<DTYPE_Z>(yLocal);
+        inQueueX.FreeTensor(xLocalIn);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm, yLocal, this->outLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    AscendC::LocalTensor<DTYPE_X> xLocal;
+
+    uint32_t n, c, d, h, w;
+    uint32_t reduceDim;
+    uint32_t tileNum;
+    uint32_t inLength;
+    uint32_t outLength;
+};
+
+extern "C" __global__ __aicore__ void conv3d_min_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv3dMinSoftmax op;
+    op.Init(x, y,
+            tiling_data.inLength, tiling_data.outLength,
+            tiling_data.n, tiling_data.c, tiling_data.d, tiling_data.h, tiling_data.w,
+            tiling_data.reduceDim, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv3d_min_softmax_custom_impl_npu(const at::Tensor& self, int64_t reduce_dim) {
+    // Build output shape by removing reduced dimension
+    TORCH_CHECK(self.dim() == 5, "Input to conv3d_min_softmax_custom must be 5D (N,C,D,H,W)");
+    int64_t rd = reduce_dim;
+    if (rd < 0) rd += self.dim();
+    TORCH_CHECK(rd >= 0 && rd < self.dim(), "reduce_dim out of range");
+    std::vector<int64_t> out_sizes;
+    out_sizes.reserve(self.dim() - 1);
+    for (int64_t i = 0; i < self.dim(); ++i) {
+        if (i == rd) continue;
+        out_sizes.push_back(self.size(i));
+    }
+    at::Tensor result = at::empty(out_sizes, self.options());
+    EXEC_NPU_CMD(aclnnConv3dMinSoftmaxCustom, self, reduce_dim, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv3d_min_softmax_custom", &conv3d_min_softmax_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv3d_min_softmax_custom", &conv3d_min_softmax_custom_impl_npu, "ReduceMin+Softmax fusion on 3D conv output");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Fused operator replaces min + softmax after Conv3d.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, dim):
+        super(ModelNew, self).__init__()
+        self.conv = torch.nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.dim = dim  # dimension along which to apply minimum operation
+
+    def forward(self, x):
+        x = self.conv(x)  # N, C, D, H, W
+        # Fused custom op: reduce-min along self.dim, then softmax along channel (dim=1)
+        x = custom_ops_lib.conv3d_min_softmax_custom(x, int(self.dim))
+        return x
+'''

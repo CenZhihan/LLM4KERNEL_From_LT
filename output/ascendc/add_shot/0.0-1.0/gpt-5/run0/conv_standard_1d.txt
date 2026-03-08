@@ -1,0 +1,401 @@
+project_json_src='''
+[
+    {
+        "op": "ConvStandard1dCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "attr": [
+            {
+                "name": "stride",
+                "param_type": "required",
+                "type": "int"
+            },
+            {
+                "name": "padding",
+                "param_type": "required",
+                "type": "int"
+            },
+            {
+                "name": "dilation",
+                "param_type": "required",
+                "type": "int"
+            },
+            {
+                "name": "groups",
+                "param_type": "required",
+                "type": "int"
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvStandard1dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cin);
+  TILING_DATA_FIELD_DEF(uint32_t, cout);
+  TILING_DATA_FIELD_DEF(uint32_t, lin);
+  TILING_DATA_FIELD_DEF(uint32_t, lout);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, stride);
+  TILING_DATA_FIELD_DEF(uint32_t, padding);
+  TILING_DATA_FIELD_DEF(uint32_t, dilation);
+  TILING_DATA_FIELD_DEF(uint32_t, groups);
+  TILING_DATA_FIELD_DEF(uint64_t, totalOut);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvStandard1dCustom, ConvStandard1dCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_standard_1d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvStandard1dCustomTilingData tiling;
+
+    auto x_shape = context->GetInputShape(0)->GetOriginShape();
+    auto w_shape = context->GetInputShape(1)->GetOriginShape();
+
+    uint32_t n = (x_shape.GetDimNum() > 0) ? static_cast<uint32_t>(x_shape.GetDim(0)) : 1;
+    uint32_t cin = (x_shape.GetDimNum() > 1) ? static_cast<uint32_t>(x_shape.GetDim(1)) : 1;
+    uint32_t lin = (x_shape.GetDimNum() > 2) ? static_cast<uint32_t>(x_shape.GetDim(2)) : 1;
+
+    uint32_t cout = (w_shape.GetDimNum() > 0) ? static_cast<uint32_t>(w_shape.GetDim(0)) : 1;
+    uint32_t k = (w_shape.GetDimNum() > 2) ? static_cast<uint32_t>(w_shape.GetDim(2)) : 1;
+
+    uint32_t stride = 1;
+    uint32_t padding = 0;
+    uint32_t dilation = 1;
+    uint32_t groups = 1;
+
+    // Compute output length (valid for typical conv1d)
+    uint32_t lout = 0;
+    if (stride == 0) stride = 1;
+    if (lin + 2 * padding >= dilation * (k - 1) + 1) {
+        lout = static_cast<uint32_t>(((int64_t)lin + 2 * padding - dilation * (k - 1) - 1) / stride + 1);
+    } else {
+        lout = 0;
+    }
+
+    uint64_t totalOut = static_cast<uint64_t>(n) * static_cast<uint64_t>(cout) * static_cast<uint64_t>(lout);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_cin(cin);
+    tiling.set_cout(cout);
+    tiling.set_lin(lin);
+    tiling.set_lout(lout);
+    tiling.set_k(k);
+    tiling.set_stride(stride);
+    tiling.set_padding(padding);
+    tiling.set_dilation(dilation);
+    tiling.set_groups(groups);
+    tiling.set_totalOut(totalOut);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+
+    int64_t n = x_shape->GetDimNum() > 0 ? x_shape->GetDim(0) : 1;
+    int64_t cin = x_shape->GetDimNum() > 1 ? x_shape->GetDim(1) : 1;
+    int64_t lin = x_shape->GetDimNum() > 2 ? x_shape->GetDim(2) : 1;
+    int64_t cout = w_shape->GetDimNum() > 0 ? w_shape->GetDim(0) : 1;
+    int64_t k = w_shape->GetDimNum() > 2 ? w_shape->GetDim(2) : 1;
+
+    int64_t stride = 1;
+    int64_t padding = 0;
+    int64_t dilation = 1;
+    int64_t groups = 1;
+    (void)cin; (void)groups; // not used in size formula here
+
+    int64_t lout = 0;
+    if (lin + 2 * padding >= dilation * (k - 1) + 1) {
+        lout = ((lin + 2 * padding - dilation * (k - 1) - 1) / stride) + 1;
+    }
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(3);
+    y_shape->SetDim(0, n);
+    y_shape->SetDim(1, cout);
+    y_shape->SetDim(2, lout);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvStandard1dCustom : public OpDef {
+public:
+    explicit ConvStandard1dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("stride").Int();
+        this->Attr("padding").Int();
+        this->Attr("dilation").Int();
+        this->Attr("groups").Int();
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(ConvStandard1dCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv_standard_1d_custom_tiling_data.h"
+
+#ifndef DTYPE_X
+#define DTYPE_X float
+#endif
+#ifndef DTYPE_W
+#define DTYPE_W float
+#endif
+#ifndef DTYPE_Y
+#define DTYPE_Y float
+#endif
+
+class KernelConv1D {
+public:
+    __aicore__ inline KernelConv1D() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                uint32_t n, uint32_t cin, uint32_t cout,
+                                uint32_t lin, uint32_t lout, uint32_t k,
+                                uint32_t stride, uint32_t padding, uint32_t dilation,
+                                uint64_t totalOut)
+    {
+        this->xPtr = (__gm__ DTYPE_X*)x;
+        this->wPtr = (__gm__ DTYPE_W*)w;
+        this->yPtr = (__gm__ DTYPE_Y*)y;
+
+        this->N = n; this->Cin = cin; this->Cout = cout;
+        this->Lin = lin; this->Lout = lout; this->K = k;
+        this->Stride = stride; this->Padding = padding; this->Dilation = dilation;
+        this->totalOut = totalOut;
+
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t bid = AscendC::GetBlockIdx();
+
+        uint64_t basePerBlock = totalOut / blocks;
+        uint64_t remainder = totalOut % blocks;
+        // distribute remainder
+        this->blockStart = basePerBlock * bid + (bid < remainder ? bid : remainder);
+        this->blockLen = basePerBlock + (bid < remainder ? 1 : 0);
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Linearize output as (n, co, lo)
+        for (uint64_t t = 0; t < this->blockLen; ++t) {
+            uint64_t gIdx = this->blockStart + t;
+            if (gIdx >= totalOut) break;
+
+            uint32_t lo = static_cast<uint32_t>(gIdx % Lout);
+            uint64_t tmp = gIdx / Lout;
+            uint32_t co = static_cast<uint32_t>(tmp % Cout);
+            uint32_t n  = static_cast<uint32_t>(tmp / Cout);
+
+            int32_t in_base_l = static_cast<int32_t>(lo) * static_cast<int32_t>(Stride) - static_cast<int32_t>(Padding);
+
+            float acc = 0.f;
+            for (uint32_t ci = 0; ci < Cin; ++ci) {
+                for (uint32_t kk = 0; kk < K; ++kk) {
+                    int32_t li = in_base_l + static_cast<int32_t>(kk) * static_cast<int32_t>(Dilation);
+                    if (li >= 0 && li < static_cast<int32_t>(Lin)) {
+                        uint64_t x_index = static_cast<uint64_t>(n) * Cin * Lin
+                                         + static_cast<uint64_t>(ci) * Lin
+                                         + static_cast<uint64_t>(li);
+                        uint64_t w_index = static_cast<uint64_t>(co) * Cin * K
+                                         + static_cast<uint64_t>(ci) * K
+                                         + static_cast<uint64_t>(kk);
+                        acc += static_cast<float>(xPtr[x_index]) * static_cast<float>(wPtr[w_index]);
+                    }
+                }
+            }
+            yPtr[gIdx] = static_cast<DTYPE_Y>(acc);
+        }
+    }
+
+private:
+    __gm__ DTYPE_X* xPtr;
+    __gm__ DTYPE_W* wPtr;
+    __gm__ DTYPE_Y* yPtr;
+
+    uint32_t N, Cin, Cout, Lin, Lout, K;
+    uint32_t Stride, Padding, Dilation;
+    uint64_t totalOut;
+
+    uint64_t blockStart;
+    uint64_t blockLen;
+};
+
+extern "C" __global__ __aicore__ void conv_standard_1d_custom(GM_ADDR x, GM_ADDR w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv1D op;
+    op.Init(x, w, y,
+            tiling_data.n, tiling_data.cin, tiling_data.cout,
+            tiling_data.lin, tiling_data.lout, tiling_data.k,
+            tiling_data.stride, tiling_data.padding, tiling_data.dilation,
+            tiling_data.totalOut);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline int64_t conv1d_out_length(int64_t L_in, int64_t pad, int64_t dil, int64_t k, int64_t stride) {
+    return (L_in + 2 * pad - dil * (k - 1) - 1) / stride + 1;
+}
+
+at::Tensor conv_standard_1d_custom_impl_npu(const at::Tensor& input,
+                                            const at::Tensor& weight,
+                                            int64_t stride,
+                                            int64_t padding,
+                                            int64_t dilation,
+                                            int64_t groups) {
+    TORCH_CHECK(input.dim() == 3, "input must be (N, C_in, L)");
+    TORCH_CHECK(weight.dim() == 3, "weight must be (C_out, C_in, K)");
+    TORCH_CHECK(groups == 1, "groups != 1 not supported in this custom kernel yet");
+
+    auto N = input.size(0);
+    auto Cin = input.size(1);
+    auto Lin = input.size(2);
+    auto Cout = weight.size(0);
+    auto K = weight.size(2);
+
+    TORCH_CHECK(Cin == weight.size(1), "Cin mismatch between input and weight");
+    auto Lout = conv1d_out_length(Lin, padding, dilation, K, stride);
+    TORCH_CHECK(Lout >= 0, "Invalid output length computed");
+
+    at::Tensor result = at::empty({N, Cout, Lout}, input.options());
+    EXEC_NPU_CMD(aclnnConvStandard1dCustom, input, weight, stride, padding, dilation, groups, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_standard_1d_custom", &conv_standard_1d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_standard_1d_custom", &conv_standard_1d_custom_impl_npu, "Conv1D standard custom");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.init as init
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    """
+    Custom Conv1D using AscendC kernel conv_standard_1d_custom.
+    Supports common case: stride=1, padding=0, dilation=1, groups=1, bias optional.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1, bias: bool = False):
+        super().__init__()
+        assert groups == 1, "groups != 1 not supported in this custom kernel"
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.bias = None
+
+        # Kaiming uniform init similar to nn.Conv1d
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5) if hasattr(__import__("math"), "sqrt") else 0)
+        if self.bias is not None:
+            fan_in = in_channels * kernel_size
+            bound = 1 / (fan_in ** 0.5) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = custom_ops_lib.conv_standard_1d_custom(x, self.weight, self.stride, self.padding, self.dilation, self.groups)
+        if self.bias is not None:
+            y = y + self.bias.view(1, -1, 1)
+        return y
+'''

@@ -1,0 +1,465 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTransposed1dDilatedCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "optional",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTransposed1dDilatedCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cin);
+  TILING_DATA_FIELD_DEF(uint32_t, cout);
+  TILING_DATA_FIELD_DEF(uint32_t, lin);
+  TILING_DATA_FIELD_DEF(uint32_t, kernel);
+  TILING_DATA_FIELD_DEF(uint32_t, lout);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, hasBias);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTransposed1dDilatedCustom, ConvTransposed1dDilatedCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transposed_1d_dilated_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint64_t GetDimSafe(const gert::Shape* s, size_t i) {
+    if (s == nullptr) return 0;
+    const auto& os = s->GetOriginShape();
+    if (i >= os.GetDimNum()) return 0;
+    return static_cast<uint64_t>(os.GetDim(i));
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTransposed1dDilatedCustomTilingData tiling;
+
+    const gert::Shape* x_shape = context->GetInputShape(0); // [N, Cin, Lin]
+    const gert::Shape* w_shape = context->GetInputShape(1); // [Cin, Cout, K_eff]
+
+    uint32_t n    = static_cast<uint32_t>(GetDimSafe(x_shape, 0));
+    uint32_t cin  = static_cast<uint32_t>(GetDimSafe(x_shape, 1));
+    uint32_t lin  = static_cast<uint32_t>(GetDimSafe(x_shape, 2));
+    uint32_t cin_w  = static_cast<uint32_t>(GetDimSafe(w_shape, 0));
+    uint32_t cout = static_cast<uint32_t>(GetDimSafe(w_shape, 1));
+    uint32_t k    = static_cast<uint32_t>(GetDimSafe(w_shape, 2));
+
+    // basic consistency
+    if (cin_w != cin) {
+        // fallback safe guard
+        cin = cin_w;
+    }
+
+    // For stride=1, padding=0, dilation already expanded into w:
+    // Lout = Lin + K - 1
+    uint32_t lout = lin + k - 1;
+
+    uint32_t totalLength = n * cout * lout;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_cin(cin);
+    tiling.set_cout(cout);
+    tiling.set_lin(lin);
+    tiling.set_kernel(k);
+    tiling.set_lout(lout);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+
+    // bias presence
+    uint32_t hasBias = (context->GetNumInputs() >= 3 && context->GetInputShape(2)->GetOriginShape().GetDimNum() > 0) ? 1u : 0u;
+    tiling.set_hasBias(hasBias);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0); // [N, Cin, Lin]
+    const gert::Shape* w_shape = context->GetInputShape(1); // [Cin, Cout, K_eff]
+
+    uint64_t n   = x_shape->GetOriginShape().GetDim(0);
+    uint64_t cin = x_shape->GetOriginShape().GetDim(1);
+    uint64_t lin = x_shape->GetOriginShape().GetDim(2);
+
+    uint64_t cin_w = w_shape->GetOriginShape().GetDim(0);
+    uint64_t cout  = w_shape->GetOriginShape().GetDim(1);
+    uint64_t k     = w_shape->GetOriginShape().GetDim(2);
+
+    if (cin != cin_w) {
+        // simple fallback for mismatch
+        cin = cin_w;
+    }
+
+    uint64_t lout = lin + k - 1; // assuming dilation already applied to w, stride=1, padding=0
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(3);
+    y_shape->SetDim(0, n);
+    y_shape->SetDim(1, cout);
+    y_shape->SetDim(2, lout);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTransposed1dDilatedCustom : public OpDef {
+public:
+    explicit ConvTransposed1dDilatedCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTransposed1dDilatedCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv_transposed_1d_dilated_custom_tiling_data.h"
+
+// This kernel implements a basic ConvTranspose1D with stride=1 and padding=0,
+// assuming dilation has been expanded into the kernel weight (K_eff = (K-1)*dilation+1).
+// Input:  x [N, Cin, Lin]
+// Weight: w [Cin, Cout, K_eff]
+// Bias:   b [Cout] (optional)
+// Output: z [N, Cout, Lin + K_eff - 1]
+//
+// The implementation uses a simple 1D flatten mapping and per-block ranges over the
+// flattened output tensor. For brevity and portability, we use GM reads inside loops.
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelConvTransposed1DDilated {
+public:
+    __aicore__ inline KernelConvTransposed1DDilated() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR z,
+                                uint32_t n, uint32_t cin, uint32_t cout,
+                                uint32_t lin, uint32_t kernel, uint32_t lout,
+                                uint32_t totalLength, uint32_t tileNum, uint32_t hasBias)
+    {
+        this->n = n;
+        this->cin = cin;
+        this->cout = cout;
+        this->lin = lin;
+        this->kernel = kernel;
+        this->lout = lout;
+        this->hasBias = hasBias;
+
+        this->totalLength = totalLength;
+        this->blockLength = (totalLength + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
+        // clamp block range within total
+        uint32_t blockId = AscendC::GetBlockIdx();
+        this->start = blockId * this->blockLength;
+        uint32_t endAll = (blockId + 1) * this->blockLength;
+        this->end = endAll < totalLength ? endAll : totalLength;
+
+        this->tileNum = tileNum;
+        this->tileLength = ((this->end - this->start) + (tileNum * BUFFER_NUM) - 1) / (tileNum * BUFFER_NUM);
+        if (this->tileLength == 0) this->tileLength = 1;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, (uint32_t)((uint64_t)n*cin*lin));
+        wGm.SetGlobalBuffer((__gm__ DTYPE_W *)w, (uint32_t)((uint64_t)cin*cout*kernel));
+        if (hasBias) {
+            bGm.SetGlobalBuffer((__gm__ DTYPE_B *)b, cout);
+        }
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z, (uint32_t)((uint64_t)n*cout*lout));
+
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        uint32_t totalTiles = 0;
+        if (this->end > this->start)
+            totalTiles = ((this->end - this->start) + this->tileLength - 1) / this->tileLength;
+
+        for (uint32_t t = 0; t < totalTiles; ++t) {
+            uint32_t tileStart = this->start + t * this->tileLength;
+            uint32_t curLen = this->tileLength;
+            if (tileStart + curLen > this->end) {
+                curLen = this->end - tileStart;
+            }
+            Compute(tileStart, curLen);
+            CopyOut(tileStart, curLen);
+        }
+    }
+
+private:
+    __aicore__ inline void Compute(uint32_t flatStart, uint32_t len)
+    {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+        // initialize local output buffer to bias or zero
+        for (uint32_t i = 0; i < len; ++i) {
+            // Map flat index -> (n, co, lo)
+            uint32_t flat = flatStart + i;
+            uint32_t nIdx  = flat / (cout * lout);
+            uint32_t rem   = flat % (cout * lout);
+            uint32_t coIdx = rem / lout;
+            uint32_t loIdx = rem % lout;
+
+            DTYPE_Z acc = (DTYPE_Z)0;
+            if (hasBias) {
+                // bias index [cout]
+                acc = (DTYPE_Z)bGm[coIdx];
+            }
+
+            // Sum over cin and kernel
+            for (uint32_t ci = 0; ci < cin; ++ci) {
+                // For each k where li = loIdx - k is valid
+                uint32_t kMax = kernel;
+                for (uint32_t k = 0; k < kMax; ++k) {
+                    int64_t li = (int64_t)loIdx - (int64_t)k;
+                    if (li >= 0 && (uint32_t)li < lin) {
+                        // x index: ((nIdx*cin + ci)*lin + li)
+                        uint64_t xIndex = ((uint64_t)nIdx * cin + ci) * lin + (uint64_t)li;
+                        // w index: ((ci*cout + coIdx)*kernel + k)
+                        uint64_t wIndex = ((uint64_t)ci * cout + coIdx) * kernel + k;
+
+                        DTYPE_X xv = xGm[(uint32_t)xIndex];
+                        DTYPE_W wv = wGm[(uint32_t)wIndex];
+                        acc = (DTYPE_Z)(acc + (DTYPE_Z)(xv * wv));
+                    }
+                }
+            }
+            zLocal.SetValue(i, acc);
+        }
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t flatStart, uint32_t len)
+    {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        // write back to GM
+        // z flat layout is already [N, Cout, Lout]
+        AscendC::DataCopy(zGm[flatStart], zLocal, len);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_W> wGm;
+    AscendC::GlobalTensor<DTYPE_B> bGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+
+    uint32_t n, cin, cout, lin, kernel, lout;
+    uint32_t totalLength;
+    uint32_t blockLength;
+    uint32_t start, end;
+    uint32_t tileNum;
+    uint32_t tileLength;
+    uint32_t hasBias;
+};
+
+extern "C" __global__ __aicore__ void conv_transposed_1d_dilated_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConvTransposed1DDilated op;
+    op.Init(x, w, b, z,
+            tiling_data.n, tiling_data.cin, tiling_data.cout,
+            tiling_data.lin, tiling_data.kernel, tiling_data.lout,
+            tiling_data.totalLength, tiling_data.tileNum, tiling_data.hasBias);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_transposed_1d_dilated_custom_impl_npu(const at::Tensor& x,
+                                                      const at::Tensor& w,
+                                                      c10::optional<at::Tensor> b_opt) {
+    // infer output shape: [N, Cout, Lin + K_eff - 1]
+    TORCH_CHECK(x.dim() == 3, "x must be 3D [N, Cin, Lin]");
+    TORCH_CHECK(w.dim() == 3, "w must be 3D [Cin, Cout, K_eff]");
+    auto N = x.size(0);
+    auto Cin = x.size(1);
+    auto Lin = x.size(2);
+    TORCH_CHECK(w.size(0) == Cin, "Weight Cin must match input Cin");
+    auto Cout = w.size(1);
+    auto K = w.size(2);
+    auto Lout = Lin + K - 1;
+
+    at::Tensor result = at::empty({N, Cout, Lout}, x.options());
+
+    if (b_opt.has_value()) {
+        EXEC_NPU_CMD(aclnnConvTransposed1dDilatedCustom, x, w, b_opt.value(), result);
+    } else {
+        // pass an empty tensor for bias
+        at::Tensor empty_bias;
+        EXEC_NPU_CMD(aclnnConvTransposed1dDilatedCustom, x, w, empty_bias, result);
+    }
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transposed_1d_dilated_custom", &conv_transposed_1d_dilated_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transposed_1d_dilated_custom", &conv_transposed_1d_dilated_custom_impl_npu, "ConvTranspose1d (dilated weight) custom");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+import torch.nn as nn
+
+def _expand_dilated_weight(w: torch.Tensor, dilation: int) -> torch.Tensor:
+    # w shape: [Cin, Cout, K]
+    if dilation == 1:
+        return w
+    cin, cout, k = w.shape
+    if k <= 1:
+        return w
+    keff = (k - 1) * dilation + 1
+    w_eff = w.new_zeros(cin, cout, keff)
+    # insert zeros between taps along kernel dim
+    w_eff[..., ::dilation] = w
+    return w_eff
+
+class ModelNew(torch.nn.Module):
+    """
+    Custom ConvTranspose1d implemented with AscendC kernel.
+    The dilation is materialized into the weight before dispatch, and the kernel assumes stride=1, padding=0.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super().__init__()
+        assert stride == 1, "This optimized kernel currently supports stride=1"
+        assert padding == 0, "This optimized kernel currently supports padding=0"
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        # Parameter layout matches PyTorch ConvTranspose1d: [in_channels, out_channels, kernel_size]
+        self.weight = nn.Parameter(torch.empty(in_channels, out_channels, kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_channels))
+        else:
+            self.register_parameter("bias", None)
+        # simple initialization consistent with PyTorch default kaiming uniform
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = in_channels * kernel_size
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # materialize dilation into weight so that device kernel doesn't need dilation handling
+        w_eff = _expand_dilated_weight(self.weight, self.dilation)
+        if self.bias is None:
+            return custom_ops_lib.conv_transposed_1d_dilated_custom(x, w_eff, None)
+        else:
+            return custom_ops_lib.conv_transposed_1d_dilated_custom(x, w_eff, self.bias)
+
+import math
+'''

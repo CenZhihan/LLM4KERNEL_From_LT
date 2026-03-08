@@ -1,0 +1,28 @@
+**Considering broadcasting approaches**
+
+I'm reflecting on how many sample custom ops focus on simple 1D transforms. For broadcasting, I could flatten and utilize ND index mapping on the host or consider vector broadcast operations. It seems like AscendC supports broadcasting by replicating smaller tensors across tiles; however, I'm not entirely sure about that. Since this task is scoped, I think we should create a kernel that assumes inputs are either identical or already broadcasted to the same shape. I need to ensure that the Python binding operator accommodates mismatched shapes, relying on host code for broadcasting. The NPU framework expects both original tensors for the custom op, allowing us to instruct input_desc with ND format and unknown shapes.
+
+**Evaluating broadcasting techniques**
+
+In Tiling, I can access input shapes and calculate the output shape based on broadcasting. For the kernel, I can read both x and y from GM, but if their shapes differ, I need to compute reading indices with broadcast logic. One straightforward way is to use AscendC’s “Broadcast” with modulo indexing, which isn’t trivial. Alternately, I could pre-broadcast inputs on the Python side using torch.broadcast_to, expanding them to the same shape. This would work on CPU, but on NPU, it returns a smaller storage view with a stride of zero, leading to incorrect memory reads when sending to the kernel.
+
+**Planning for NPU runtime**
+
+The NPU runtime views our input as a physical buffer pointer, while our kernel expects flattened arrays of a certain total length. This approach won’t work for broadcasted views since their storage doesn’t contain expanded elements. I need to materialize the broadcast to contiguous memory using `.expand()` and then `.contiguous()` before calling. Although the instruction says to replace PyTorch operators with custom AscendC kernels, I can still preprocess in the model’s forward pass, like calling `a.expand(broadcast_shape).contiguous()` for both tensors before using the custom op. This may add some memory and performance overhead, but it’s a viable option. For the maximum operation using broadcast, pre-expanding both tensors ensures the kernel stays as a simple elementwise max, and I can compute the shape with `torch.broadcast_shapes(a.shape, b.shape)`.
+
+**Implementing max broadcast custom operation**
+
+I’m planning to call the custom operation "max_broadcast_custom," designed to assume the same shapes and float data types. The `get_inputs` function uses `torch.rand` to generate inputs, so I'll use our custom operator directly. In `project_json_src`, I need to define the op "MaxBroadcastCustom" with inputs x and y as float ND and output z as float ND. The host tiling is similar to AddCustom, and I'll get the total length from the output shape. Since we’re passing contiguous expanded tensors, the total length can be derived from the size of input 0. I'll set the workspace accordingly. In `host_operator_src`, I'll include tiling header names and registration. The shape inference should compute the broadcast shape from inputs, but since our Python code handles expansion, the shapes will be equal. Still, I can implement a broadcast-based shape inference by selecting the maximum rank. Typically, I just set the output equal to the first input.
+
+**Structuring max broadcast custom op**
+
+I'll set the output shape to match input 0, which is fine since we expect expanded inputs. For naming, I’ll use "max_broadcast_custom_tiling.h" and "max_broadcast_custom_tiling_data.h" to mirror the example. The kernel function will be defined similarly to the add kernel, but using the Max function instead. For Python binding, I’ll register "MaxBroadcastCustom" and ensure we pre-expand shapes. The binding function will take care of tensor auto-expansion and call `EXEC_NPU_CMD`. In the tiling function, I'll obtain the total length from the input shape. I’ll create the project JSON to declare the op, and define the class and function for proper tiling and output management.
+
+**Defining kernel and binding function**
+
+In the kernel source, I'll include "kernel_operator.h" and define BUFFER_NUM as 2. I’ve decided to name the class "KernelMaxBroadcast." For the function, it will be "max_broadcast_custom," and I'll use `AscendC::Max` instead of `AscendC::Add`. I want to ensure the function name is consistent with the Max function used in AscendC, likely sticking with "Max."
+
+In the Python binding source, I'll implement `max_broadcast_custom_impl_npu` using expanded tensors with `at::broadcast_tensors`, create an empty tensor like `a_exp`, and call `EXEC_NPU_CMD(aclnnMaxBroadcastCustom`. After that, I'll handle registration. 
+
+In the model source, I'll define `ModelNew` and call `custom_ops_lib.max_broadcast_custom(a, b)`, ensuring that the data type remains float32. Now, it seems everything aligns, so I feel ready to write the code!
+

@@ -1,0 +1,354 @@
+project_json_src='''
+[
+    {
+        "op": "ProductReductionOverADimensionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(TilingData)
+TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+TILING_DATA_FIELD_DEF(uint32_t, outLength);
+TILING_DATA_FIELD_DEF(uint32_t, reduceSize);
+TILING_DATA_FIELD_DEF(uint32_t, outerNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ProductReductionOverADimensionCustom, TilingData)
+} // namespace optiling
+
+"""
+
+host_operator_src="""
+#include "product_reduction_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+#define PRODUCT_TILING_0 1
+#define PRODUCT_TILING_1 2
+#define PRODUCT_TILING_2 3
+
+namespace optiling {
+constexpr uint32_t BLOCK_DIM = 1;
+constexpr uint32_t ONE_REPEAT_LEN = 256;
+constexpr uint32_t ONE_BLOCK_LEN = 32;
+constexpr uint32_t FLOAT_THRESHOLD0 = ONE_REPEAT_LEN / sizeof(float);
+constexpr uint32_t FLOAT_THRESHOLD1 = ONE_REPEAT_LEN / sizeof(float) * ONE_BLOCK_LEN / sizeof(float);
+constexpr uint32_t FLOAT_THRESHOLD2 = ONE_REPEAT_LEN / sizeof(float) * ONE_REPEAT_LEN / sizeof(float);
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    TilingData tiling;
+    const auto &shape = context->GetInputShape(0)->GetOriginShape();
+    uint32_t totalLength = shape.GetShapeSize();
+    uint32_t dimNum = shape.GetDimNum();
+    uint32_t reduceSize = dimNum > 0 ? static_cast<uint32_t>(shape.GetDim(dimNum - 1)) : 1;
+    uint32_t outerNum = reduceSize == 0 ? 0 : totalLength / reduceSize;
+
+    auto inputDtype = context->GetInputTensor(0)->GetDataType();
+    if (totalLength <= FLOAT_THRESHOLD0 && inputDtype == ge::DT_FLOAT) {
+        context->SetTilingKey(PRODUCT_TILING_0);
+    } else if (totalLength <= FLOAT_THRESHOLD1 && inputDtype == ge::DT_FLOAT) {
+        context->SetTilingKey(PRODUCT_TILING_1);
+    } else if (totalLength <= FLOAT_THRESHOLD2 && inputDtype == ge::DT_FLOAT) {
+        context->SetTilingKey(PRODUCT_TILING_2);
+    }
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_reduceSize(reduceSize);
+    tiling.set_outerNum(outerNum);
+    tiling.set_outLength(outerNum);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const auto &in_shape = context->GetInputShape(0)->GetOriginShape();
+    int64_t dimNum = static_cast<int64_t>(in_shape.GetDimNum());
+    std::vector<int64_t> out_dims;
+    out_dims.reserve(dimNum);
+    for (int64_t i = 0; i < dimNum; ++i) {
+        out_dims.push_back(in_shape.GetDim(i));
+    }
+    if (dimNum > 0) {
+        out_dims[dimNum - 1] = 1; // keepdim=True on last dimension
+    }
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = out_dims;
+    return GRAPH_SUCCESS;
+}
+
+static graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class ProductReductionOverADimensionCustom : public OpDef {
+public:
+    explicit ProductReductionOverADimensionCustom(const char *name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore()
+            .SetTiling(optiling::TilingFunc)
+            .AddConfig("ascend910b");
+    }
+};
+OP_ADD(ProductReductionOverADimensionCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "product_reduction_over_a_dimension_custom_tiling_data.h"
+
+#define PRODUCT_TILING_0 1
+#define PRODUCT_TILING_1 2
+#define PRODUCT_TILING_2 3
+
+class KernelProdReduceLastDim {
+static constexpr uint32_t DEFAULT_BLK_STRIDE = 1;
+static constexpr uint32_t DEFAULT_REP_STRIDE = 8;
+static constexpr uint32_t REP_LEN = 256;
+static constexpr uint32_t BLK_LEN = 32;
+public:
+    __aicore__ inline KernelProdReduceLastDim() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR z, uint32_t totalLength, uint32_t outLength, uint32_t reduceSize, uint32_t outerNum)
+    {
+        this->totalLength = totalLength;
+        this->outLength = outLength;
+        this->reduceSize = reduceSize;
+        this->outerNum = outerNum;
+
+        xGm.SetGlobalBuffer((__gm__ float *)x, totalLength);
+        zGm.SetGlobalBuffer((__gm__ float *)z, outLength);
+        pipe.InitBuffer(outQueueZ, 1, outLength * sizeof(float));
+        pipe.InitBuffer(inQueueX, 1, totalLength * sizeof(float));
+    }
+    __aicore__ inline void Process1()
+    {
+        CopyIn();
+        Compute1();
+        CopyOut();
+    }
+    __aicore__ inline void Process2()
+    {
+        CopyIn();
+        Compute2();
+        CopyOut();
+    }
+    __aicore__ inline void Process3()
+    {
+        CopyIn();
+        Compute3();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm, totalLength);
+        inQueueX.EnQue(xLocal);
+    }
+
+    // Small tensors: use WholeReduceProd directly
+    __aicore__ inline void Compute1()
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> zLocal = outQueueZ.AllocTensor<float>();
+        // Reduce all elements to one scalar resultScalar in first position, then duplicate to all outputs
+        constexpr int64_t maskLen = REP_LEN / sizeof(float);
+        // Produce a single product result into the head of zLocal
+        AscendC::WholeReduceProd<float>(zLocal, xLocal, maskLen, 1,
+            DEFAULT_BLK_STRIDE, DEFAULT_BLK_STRIDE, DEFAULT_REP_STRIDE);
+        // Broadcast the scalar across outLength
+        AscendC::Duplicate<float>(zLocal, zLocal, outLength);
+        outQueueZ.EnQue<float>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    // Medium tensors: block then whole reduce to a single scalar, broadcast to output
+    __aicore__ inline void Compute2()
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> zLocal = outQueueZ.AllocTensor<float>();
+        pipe.InitBuffer(calcBuf, totalLength * sizeof(float));
+        AscendC::LocalTensor<float> tempTensor1 = calcBuf.Get<float>();
+        constexpr uint32_t c0Count = BLK_LEN / sizeof(float);
+        AscendC::SetMaskCount();
+        AscendC::SetVectorMask<float>(0, totalLength);
+        AscendC::BlockReduceProd<float, false>(tempTensor1, xLocal, AscendC::MASK_PLACEHOLDER, 1,
+            DEFAULT_BLK_STRIDE, DEFAULT_BLK_STRIDE, DEFAULT_REP_STRIDE);
+        AscendC::PipeBarrier<PIPE_V>();
+        const uint32_t blockNum0 = (totalLength + c0Count - 1) / c0Count;
+        AscendC::SetVectorMask<float>(0, blockNum0);
+        AscendC::WholeReduceProd<float, false>(zLocal, tempTensor1, AscendC::MASK_PLACEHOLDER, 1,
+            DEFAULT_BLK_STRIDE, DEFAULT_BLK_STRIDE, DEFAULT_REP_STRIDE);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::SetMaskNorm();
+        AscendC::Duplicate<float>(zLocal, zLocal, outLength);
+        outQueueZ.EnQue<float>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    // Large tensors: multi-stage whole reduce to a single scalar, broadcast to output
+    __aicore__ inline void Compute3()
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> zLocal = outQueueZ.AllocTensor<float>();
+        pipe.InitBuffer(calcBuf, totalLength * sizeof(float));
+        AscendC::LocalTensor<float> tempTensor1 = calcBuf.Get<float>();
+        const uint32_t repeatNum = (totalLength * sizeof(float) + REP_LEN - 1) / REP_LEN;
+        AscendC::SetMaskCount();
+        AscendC::SetVectorMask<float>(0, totalLength);
+        AscendC::WholeReduceProd<float, false>(tempTensor1, xLocal, AscendC::MASK_PLACEHOLDER, 1,
+            DEFAULT_BLK_STRIDE, DEFAULT_BLK_STRIDE, DEFAULT_REP_STRIDE);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::SetVectorMask<float>(0, repeatNum);
+        AscendC::WholeReduceProd<float, false>(zLocal, tempTensor1, AscendC::MASK_PLACEHOLDER, 1,
+            DEFAULT_BLK_STRIDE, DEFAULT_BLK_STRIDE, DEFAULT_REP_STRIDE);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::SetMaskNorm();
+        AscendC::Duplicate<float>(zLocal, zLocal, outLength);
+        outQueueZ.EnQue<float>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<float> zLocal = outQueueZ.DeQue<float>();
+        AscendC::DataCopy(zGm, zLocal, this->outLength);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueZ;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> calcBuf;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> zGm;
+    uint32_t totalLength;
+    uint32_t outLength;
+    uint32_t reduceSize;
+    uint32_t outerNum;
+};
+
+extern "C" __global__ __aicore__ void product_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelProdReduceLastDim op;
+    op.Init(x, z, tiling_data.totalLength, tiling_data.outLength, tiling_data.reduceSize, tiling_data.outerNum);
+    if (TILING_KEY_IS(PRODUCT_TILING_0)) {
+        op.Process1();
+    } else if (TILING_KEY_IS(PRODUCT_TILING_1)) {
+        op.Process2();
+    } else if (TILING_KEY_IS(PRODUCT_TILING_2)) {
+        op.Process3();
+    } else {
+        op.Process3();
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor product_reduction_over_a_dimension_impl_npu(const at::Tensor& x) {
+    // Kernel reduces along last dimension with keepdim=True
+    auto sizes = x.sizes().vec();
+    if (sizes.empty()) {
+        sizes.push_back(1);
+    } else {
+        sizes.back() = 1;
+    }
+    at::Tensor result = at::empty(sizes, x.options());
+    EXEC_NPU_CMD(aclnnProductReductionOverADimensionCustom, x, result);
+    return result;
+}
+
+TORCH_LIBRARY(myops, m) {
+    m.def("product_reduction_over_a_dimension_custom(Tensor x) -> Tensor");
+}
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("product_reduction_over_a_dimension_custom", &product_reduction_over_a_dimension_impl_npu);
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("product_reduction_over_a_dimension_custom", &product_reduction_over_a_dimension_impl_npu, "product reduction over last dim (keepdim=True)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model that performs product reduction over a specified dimension using a custom AscendC kernel.
+    The custom kernel reduces along the last dimension with keepdim=True, so we transpose before/after.
+    """
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Move target dim to the last position and ensure contiguous memory
+        y = x.transpose(self.dim, -1).contiguous()
+        # Custom kernel reduces along last dim with keepdim=True
+        z_keepdim = custom_ops_lib.product_reduction_over_a_dimension_custom(y)
+        # Move reduced dimension back to original position and squeeze it
+        z_keepdim = z_keepdim.transpose(self.dim, -1)
+        return z_keepdim.squeeze(self.dim)
+'''

@@ -1,0 +1,46 @@
+**Defining shape inference**
+
+I'm thinking about defining the input description with a single x for ND floats and output y for ND floats. The host operator needs to handle tiling, which includes setting tile sizes. When inferring shape, the output shape will be the same as the input shape, but with the last dimension removed. Our kernel should reduce the product over that last dimension for ND inputs by calculating per block to create segments representing multiple output elements from the input.
+
+**Optimizing vector processing**
+
+I'm focusing on efficient vectorization by processing in tiles along the K dimension with local accumulation. I plan to initialize the output vector to ones and, for each tile chunk, load a tile of length `tileLength` to multiply and accumulate across the K dimension for each M element. Given our memory layout, I'll perform element-wise multiplication while accumulating across K, which simplifies to scaling a scalar per row. I'll investigate AscendC's ReduceProd API and see if I can emulate a product operation, but log-sum-exp might not be allowed.
+
+**Exploring reduction techniques**
+
+I'm considering processing small K loops per row to accumulate results into a scalar using local registers. However, implementing AscendC code with loops per element might work for correctness but could be tricky to compile. Instead, I’m thinking about using repeated pairwise multiplication with AscendC::Mul. This would involve broadcasting from a local vector of partial results tiled across the M dimension, iterating across M instead of K. Since loading tiles along M means elements are strided in memory, not contiguous, I’d have to address that with a gather operation, which complicates things.
+
+**Setting up input layout**
+
+I think it's easier to organize the input layout as M x K, ensuring contiguous storage along K. This way, I'll process each row using contiguous memory blocks, allowing each thread to handle a row individually. AscendC expects a vectorized DataCopy of these contiguous sequences, but I can still copy a contiguous tile-length from GM to local for each row. After that, I need to reduce within the local vector by multiplying all entries to get a scalar. For this, I could use pairwise multiplication with a running accumulator in a single-element vector and utilize AscendC::Mul for vector instructions. I'm just not sure if there's a built-in "Reduce" function for this.
+
+**Simplifying kernel implementation**
+
+Given the complexity, I'm thinking of keeping the kernel code simple while using __gm__ pointer arithmetic and plain C++ loops for loads and multiplication. However, AscendC prohibits while loops on the CPU, so I need to use AscendC intrinsics instead. I believe there might be an operator like AscendC::ReduceProd for product reductions, but I'm uncertain. Since AscendC has various APIs, including ReduceSum and ReduceMax, I'll implement product reduction through pairwise multiplication while maintaining a local buffer for accumulation across the last dimension. In essence, using horizontal reduction operations might help, but I need to address potential inefficiencies. I’ll create plausible code with the assumption that AscendC provides similar functionality for ReduceProd as it does for ReduceSum. Finally, I'll use a tree reduction method to obtain the product efficiently while ensuring proper handling of zeros and negative values.
+
+**Implementing product reduction**
+
+I want to reduce to a single element in xLocal[0] using a tree reduction approach with chunk_len padded to the next power of two. If not a power of two, I can compute the product of the processed part and the remaining scalars using sequential multiplication. I think a loop that halves the stride for pairwise reduction would work best, though if chunk_len is odd, the final element may remain multiplied incorrectly.
+
+I’ll implement this while ensuring that I handle any odd elements properly. My plan includes multiplying each “half” and propagating any remaining elements. I need to ensure I use the correct functions like AscendC::Mul and possibly AscendC::MultiplyScalar for scalar multiplication. I’ll also maintain an accumulator in a LocalTensor for the final result, gradually building it up by multiplying the partial products. Finally, I can effectively design tiling for memory layout and address mapping during the data copy process.
+
+**Designing the product reduction kernel**
+
+I need to use the TPipe and TQue in AscendC for my implementation, but it might not be strictly necessary. I'm thinking about allocating a LocalTensor working buffer size for tileK without a pipeline. I need to define the DTYPE_X and DTYPE_Y macros based on the tiling data header since they were used in the sample.
+
+It's crucial to maintain consistent naming for ease of understanding. The output name will be "y," and I've decided on necessary headers for inclusion, such as "product_reduction_over_a_dimension_custom_tiling_data.h." 
+
+I also need to compute variables like totalLength, lastDim, and the number of rows per block to effectively manage the memory and processing. For the output shape, I plan to remove the last dimension from the input shape. Finally, I'm setting up the kernel code structure, including necessary local memory allocations and using a loop for efficient processing.
+
+**Simplifying queue usage for reduction**
+
+I'm considering skipping outQueue and directly using DataCopy for zGm. In the CopyIn stage, I could copy the chunk from xLocal and reduce it to a scalar in a temporary local variable, accumulating these values. It’s tricky with memory allocation since I need to manage 'acc' across tiles. Using an additional queue for a single-element buffer for 'acc' would help simplify things. 
+
+I can leverage a LocalTensor directly and handle it more programmatically. Within each processing loop, I can compute and handle memory effectively without unnecessary queue complexity, setting 'acc' from the first tile and multiplying as I go. Finally, I need to ensure proper memory management for any allocated tensors.
+
+**Defining the reduction operation**
+
+I'm planning to follow the same approach for simplicity, using a shape of `batch_size * dim1` for M and `K = dim2`, possibly making `128 * 4096` divisible by a hardware-specific block number. I'll define the Python binding function as `product_reduction_over_a_dimension_custom_impl_npu`, which will return a result using `aclnnProductReductionOverADimensionCustom`. In the model source, I'll create `ModelNew` to handle the reduction dimension.
+
+For the complete code, I'll ensure the kernel function is named correctly and cover the necessary components like tiling data and operator source. I can finalize the C++ code with appropriate approximations for API usage.
+

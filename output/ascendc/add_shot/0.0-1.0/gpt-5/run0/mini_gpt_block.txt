@@ -1,0 +1,295 @@
+project_json_src='''
+[
+    {
+        "op": "MiniGptBlockCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MiniGptBlockCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MiniGptBlockCustom, MiniGptBlockCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "mini_gpt_block_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MiniGptBlockCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    *z_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MiniGptBlockCustom : public OpDef {
+public:
+    explicit MiniGptBlockCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MiniGptBlockCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "mini_gpt_block_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+class KernelResidualAdd {
+public:
+    __aicore__ inline KernelResidualAdd() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+    }
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(yLocal, yGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+        inQueueY.EnQue(yLocal);
+    }
+    __aicore__ inline void Compute(int32_t)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+        AscendC::Add(zLocal, xLocal, yLocal, this->tileLength);
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueY.FreeTensor(yLocal);
+    }
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueY;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void mini_gpt_block_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelResidualAdd op;
+    op.Init(x, y, z, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor mini_gpt_block_custom_impl_npu(const at::Tensor& self, const at::Tensor& other) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnMiniGptBlockCustom, self, other, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("mini_gpt_block_custom", &mini_gpt_block_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mini_gpt_block_custom", &mini_gpt_block_custom_impl_npu, "residual add for mini gpt block");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import torch_npu
+import custom_ops_lib
+
+# From https://github.com/karpathy/minGPT/blob/master/mingpt/model.py
+
+class NewGELU(nn.Module):
+    def __init__(self):
+        super(NewGELU, self).__init__()
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        self.attn_dropout = nn.Dropout(attn_pdrop)
+        self.resid_dropout = nn.Dropout(resid_pdrop)
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen)).view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.size()
+        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+class ModelNew(nn.Module):
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen)
+        self.ln_2 = nn.LayerNorm(n_embd)
+        self.mlp = nn.ModuleDict(dict(
+            c_fc    = nn.Linear(n_embd, 4 * n_embd),
+            c_proj  = nn.Linear(4 * n_embd, n_embd),
+            act     = NewGELU(),
+            dropout = nn.Dropout(resid_pdrop),
+        ))
+        m = self.mlp
+        self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x))))
+
+    def forward(self, x):
+        # residual 1: x + attn(ln1(x))
+        r1 = self.attn(self.ln_1(x))
+        x = custom_ops_lib.mini_gpt_block_custom(x, r1)
+        # residual 2: x + mlp(ln2(x))
+        r2 = self.mlpf(self.ln_2(x))
+        x = custom_ops_lib.mini_gpt_block_custom(x, r2)
+        return x
+'''

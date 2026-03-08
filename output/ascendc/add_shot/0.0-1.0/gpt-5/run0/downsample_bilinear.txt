@@ -1,0 +1,330 @@
+project_json_src='''
+[
+    {
+        "op": "DownsampleBilinearCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(DownsampleBilinearCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalOutLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, hIn);
+  TILING_DATA_FIELD_DEF(uint32_t, wIn);
+  TILING_DATA_FIELD_DEF(uint32_t, hOut);
+  TILING_DATA_FIELD_DEF(uint32_t, wOut);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(DownsampleBilinearCustom, DownsampleBilinearCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "downsample_bilinear_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+constexpr uint32_t OUT_H = 60;
+constexpr uint32_t OUT_W = 80;
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    DownsampleBilinearCustomTilingData tiling;
+
+    const gert::Shape* inShape = context->GetInputShape(0);
+    auto origin = inShape->GetOriginShape();
+    uint32_t N = origin.GetDim(0);
+    uint32_t C = origin.GetDim(1);
+    uint32_t H = origin.GetDim(2);
+    uint32_t W = origin.GetDim(3);
+
+    uint32_t totalOutLength = N * C * OUT_H * OUT_W;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalOutLength(totalOutLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_n(N);
+    tiling.set_c(C);
+    tiling.set_hIn(H);
+    tiling.set_wIn(W);
+    tiling.set_hOut(OUT_H);
+    tiling.set_wOut(OUT_W);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+
+    std::vector<int64_t> dims(4);
+    dims[0] = in_shape->GetDim(0);
+    dims[1] = in_shape->GetDim(1);
+    dims[2] = 60;
+    dims[3] = 80;
+    out_shape->SetDim(dims);
+
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class DownsampleBilinearCustom : public OpDef {
+public:
+    explicit DownsampleBilinearCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(DownsampleBilinearCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "downsample_bilinear_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelDownsampleBilinear {
+public:
+    __aicore__ inline KernelDownsampleBilinear() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalOutLength, uint32_t tileNum,
+                                uint32_t n, uint32_t c, uint32_t hIn, uint32_t wIn,
+                                uint32_t hOut, uint32_t wOut)
+    {
+        this->N = n; this->C = c; this->HIn = hIn; this->WIn = wIn;
+        this->HOut = hOut; this->WOut = wOut;
+
+        this->totalOutLen = totalOutLength;
+        this->blockOutLen = (totalOutLength + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
+        this->blockStart = this->blockOutLen * AscendC::GetBlockIdx();
+        if (this->blockStart + this->blockOutLen > totalOutLength) {
+            this->blockOutLen = totalOutLength - this->blockStart;
+        }
+
+        this->tileNum = tileNum;
+        this->tileOutLen = (this->blockOutLen + (tileNum * BUFFER_NUM) - 1) / (tileNum * BUFFER_NUM);
+
+        xGm.SetGlobalBuffer((__gm__ float *)x, (uint32_t)(N * C * HIn * WIn));
+        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockStart, this->blockOutLen);
+
+        pipe.InitBuffer(outQueue, BUFFER_NUM, this->tileOutLen * sizeof(float));
+        // small temp buffers to fetch two contiguous values from two rows
+        pipe.InitBuffer(tmpRow0, BUFFER_NUM, 2 * sizeof(float));
+        pipe.InitBuffer(tmpRow1, BUFFER_NUM, 2 * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = (this->blockOutLen + this->tileOutLen - 1) / this->tileOutLen;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void Compute(int32_t progress)
+    {
+        AscendC::LocalTensor<float> zLocal = outQueue.AllocTensor<float>();
+        uint32_t base = progress * this->tileOutLen;
+        uint32_t valid = this->tileOutLen;
+        if (base + valid > this->blockOutLen) {
+            valid = this->blockOutLen - base;
+        }
+
+        for (uint32_t t = 0; t < valid; ++t) {
+            uint32_t outIndex = this->blockStart + base + t;
+
+            // unravel index to N,C,H,W
+            uint32_t HW_out = HOut * WOut;
+            uint32_t CW_out = C * HW_out;
+
+            uint32_t n = outIndex / CW_out;
+            uint32_t rem1 = outIndex % CW_out;
+            uint32_t c = rem1 / HW_out;
+            uint32_t rem2 = rem1 % HW_out;
+            uint32_t oh = rem2 / WOut;
+            uint32_t ow = rem2 % WOut;
+
+            // align_corners = false, scale = 4 -> in = 4*out + 1.5 -> floor = 4*out + 1, frac = 0.5
+            uint32_t ih = (oh << 2) + 1; // 4*oh + 1
+            uint32_t iw = (ow << 2) + 1; // 4*ow + 1
+
+            // base index in input tensor
+            uint64_t baseIn = (((uint64_t)n * C + c) * HIn + ih) * WIn + iw;
+
+            // load two contiguous from row ih: (ih, iw) and (ih, iw+1)
+            AscendC::LocalTensor<float> row0 = tmpRow0.AllocTensor<float>();
+            AscendC::DataCopy(row0, xGm[baseIn], 2);
+
+            // load two contiguous from row ih+1: (ih+1, iw) and (ih+1, iw+1)
+            AscendC::LocalTensor<float> row1 = tmpRow1.AllocTensor<float>();
+            AscendC::DataCopy(row1, xGm[baseIn + WIn], 2);
+
+            // compute average of 4 samples (bilinear with fx=fy=0.5)
+            // simple scalar accumulation via local memory
+            float v00 = row0.GetValue(0);
+            float v01 = row0.GetValue(1);
+            float v10 = row1.GetValue(0);
+            float v11 = row1.GetValue(1);
+            float outv = 0.25f * (v00 + v01 + v10 + v11);
+
+            zLocal.SetValue(t, outv);
+
+            tmpRow0.FreeTensor(row0);
+            tmpRow1.FreeTensor(row1);
+        }
+        outQueue.EnQue<float>(zLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<float> zLocal = outQueue.DeQue<float>();
+        uint32_t base = progress * this->tileOutLen;
+        uint32_t valid = this->tileOutLen;
+        if (base + valid > this->blockOutLen) {
+            valid = this->blockOutLen - base;
+        }
+        AscendC::DataCopy(yGm[base], zLocal, valid);
+        outQueue.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> tmpRow0, tmpRow1;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t N, C, HIn, WIn, HOut, WOut;
+    uint32_t totalOutLen;
+    uint32_t blockOutLen;
+    uint32_t blockStart;
+    uint32_t tileNum;
+    uint32_t tileOutLen;
+};
+
+extern "C" __global__ __aicore__ void downsample_bilinear_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelDownsampleBilinear op;
+    op.Init(
+        x, y,
+        tiling_data.totalOutLength, tiling_data.tileNum,
+        tiling_data.n, tiling_data.c, tiling_data.hIn, tiling_data.wIn,
+        tiling_data.hOut, tiling_data.wOut
+    );
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor downsample_bilinear_custom_impl_npu(const at::Tensor& self) {
+    TORCH_CHECK(self.dim() == 4, "Input must be NCHW 4D tensor");
+    auto sizes = self.sizes();
+    int64_t N = sizes[0], C = sizes[1];
+    int64_t H_out = 60, W_out = 80;
+    at::Tensor result = at::empty({N, C, H_out, W_out}, self.options());
+    EXEC_NPU_CMD(aclnnDownsampleBilinearCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("downsample_bilinear_custom", &downsample_bilinear_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("downsample_bilinear_custom", &downsample_bilinear_custom_impl_npu, "Bilinear downsample to 60x80 (align_corners=False)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x):
+        return custom_ops_lib.downsample_bilinear_custom(x)
+'''

@@ -1,0 +1,398 @@
+project_json_src='''
+[
+    {
+        "op": "MambaReturnFinalStateCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "states",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MambaReturnFinalStateCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, b);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, p);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, z);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, totalRows);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MambaReturnFinalStateCustom, MambaReturnFinalStateCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "mamba_return_final_state_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MambaReturnFinalStateCustomTilingData tiling;
+
+    const auto* statesShape = context->GetInputShape(0);
+    const auto& sOrigin = statesShape->GetOriginShape();
+
+    // states is expected as [B, H, P, N, Z]
+    uint32_t B = static_cast<uint32_t>(sOrigin.GetDim(0));
+    uint32_t H = static_cast<uint32_t>(sOrigin.GetDim(1));
+    uint32_t P = static_cast<uint32_t>(sOrigin.GetDim(2));
+    uint32_t N = static_cast<uint32_t>(sOrigin.GetDim(3));
+    uint32_t Z = static_cast<uint32_t>(sOrigin.GetDim(4));
+
+    const auto* vShape = context->GetInputShape(1);
+    const auto& vOrigin = vShape->GetOriginShape();
+    // v is expected as [B, H, C]
+    uint32_t C = static_cast<uint32_t>(vOrigin.GetDim(2));
+
+    uint32_t totalRows = B * H * P * N;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_b(B);
+    tiling.set_h(H);
+    tiling.set_p(P);
+    tiling.set_n(N);
+    tiling.set_z(Z);
+    tiling.set_c(C);
+    tiling.set_totalRows(totalRows);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* statesShape = context->GetInputShape(0);
+    gert::Shape* outShape = context->GetOutputShape(0);
+
+    // states: [B,H,P,N,Z] -> out: [B,H,P,N]
+    std::vector<int64_t> dims;
+    dims.push_back(statesShape->GetDim(0));
+    dims.push_back(statesShape->GetDim(1));
+    dims.push_back(statesShape->GetDim(2));
+    dims.push_back(statesShape->GetDim(3));
+    outShape->SetDim(dims);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MambaReturnFinalStateCustom : public OpDef {
+public:
+    explicit MambaReturnFinalStateCustom(const char* name) : OpDef(name)
+    {
+        this->Input("states")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("v")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("out")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MambaReturnFinalStateCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "mamba_return_final_state_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelMambaReturnFinalState {
+public:
+    __aicore__ inline KernelMambaReturnFinalState() {}
+
+    __aicore__ inline void Init(GM_ADDR states, GM_ADDR v, GM_ADDR out,
+                                uint32_t B, uint32_t H, uint32_t P, uint32_t N,
+                                uint32_t Z, uint32_t C, uint32_t totalRows, uint32_t tileNum)
+    {
+        this->B = B;
+        this->H = H;
+        this->P = P;
+        this->N = N;
+        this->Z = Z;
+        this->C = C;
+        this->totalRows = totalRows;
+        this->tileNum = tileNum;
+
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blkIdx = AscendC::GetBlockIdx();
+
+        // ceil division for rows per block
+        this->rowsPerBlock = (totalRows + blockNum - 1) / blockNum;
+        this->startRow = this->rowsPerBlock * blkIdx;
+        uint32_t endRow = this->startRow + this->rowsPerBlock;
+        if (endRow > totalRows) endRow = totalRows;
+        this->validRows = (endRow > this->startRow) ? (endRow - this->startRow) : 0;
+
+        // Flattened layout: states [B,H,P,N,Z] -> contiguous rows of length Z
+        statesGm.SetGlobalBuffer((__gm__ DTYPE_STATES *)states + static_cast<uint64_t>(this->startRow) * Z,
+                                 static_cast<uint64_t>(this->validRows) * Z);
+        // v kept as full buffer: [B,H,C]
+        vGm.SetGlobalBuffer((__gm__ DTYPE_V *)v, static_cast<uint64_t>(B) * H * C);
+        // out flattened: [B,H,P,N]
+        outGm.SetGlobalBuffer((__gm__ DTYPE_OUT *)out + this->startRow, this->validRows);
+
+        pipe.InitBuffer(inQueueStates, BUFFER_NUM, this->Z * sizeof(DTYPE_STATES));
+        pipe.InitBuffer(inQueueV, BUFFER_NUM, this->C * sizeof(DTYPE_V));
+        pipe.InitBuffer(outQueue, BUFFER_NUM, 1 * sizeof(DTYPE_OUT));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t i = 0; i < this->validRows; ++i) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t progress)
+    {
+        // Copy the states row [Z]
+        AscendC::LocalTensor<DTYPE_STATES> sLocal = inQueueStates.AllocTensor<DTYPE_STATES>();
+        AscendC::DataCopy(sLocal, statesGm[static_cast<uint64_t>(progress) * Z], Z);
+        inQueueStates.EnQue(sLocal);
+
+        // Figure out which (b,h) this row belongs to, then copy corresponding v[b,h,:] of length C
+        uint64_t globalRow = static_cast<uint64_t>(startRow) + progress;
+        uint64_t rowsPerBH = static_cast<uint64_t>(P) * N;
+        uint64_t bhIndex = globalRow / rowsPerBH;
+        uint32_t bIdx = static_cast<uint32_t>(bhIndex / H);
+        uint32_t hIdx = static_cast<uint32_t>(bhIndex % H);
+        uint64_t vOffset = (static_cast<uint64_t>(bIdx) * H + hIdx) * C;
+
+        AscendC::LocalTensor<DTYPE_V> vLocal = inQueueV.AllocTensor<DTYPE_V>();
+        AscendC::DataCopy(vLocal, vGm[vOffset], C);
+        inQueueV.EnQue(vLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE_STATES> sLocal = inQueueStates.DeQue<DTYPE_STATES>();
+        AscendC::LocalTensor<DTYPE_V> vLocal = inQueueV.DeQue<DTYPE_V>();
+        AscendC::LocalTensor<DTYPE_OUT> outLocal = outQueue.AllocTensor<DTYPE_OUT>();
+
+        // Weighted sum across Z = C+1:
+        // out = states[Z-1] * 1 + sum_{j=0..C-1} exp(sum_{k=j..C-1} v[k]) * states[j]
+        float acc = 0.0f;
+        if (Z > 0) {
+            acc = static_cast<float>(sLocal[Z - 1]); // weight for last entry is 1
+        }
+        float running = 0.0f;
+        for (int32_t j = static_cast<int32_t>(C) - 1; j >= 0; --j) {
+            running += static_cast<float>(vLocal[j]);
+            float w = expf(running);
+            acc += w * static_cast<float>(sLocal[static_cast<uint32_t>(j)]);
+        }
+        outLocal[0] = static_cast<DTYPE_OUT>(acc);
+
+        outQueue.EnQue<DTYPE_OUT>(outLocal);
+        inQueueStates.FreeTensor(sLocal);
+        inQueueV.FreeTensor(vLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_OUT> outLocal = outQueue.DeQue<DTYPE_OUT>();
+        AscendC::DataCopy(outGm[progress], outLocal, 1);
+        outQueue.FreeTensor(outLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueStates;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueV;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+
+    AscendC::GlobalTensor<DTYPE_STATES> statesGm;
+    AscendC::GlobalTensor<DTYPE_V> vGm;
+    AscendC::GlobalTensor<DTYPE_OUT> outGm;
+
+    uint32_t B;
+    uint32_t H;
+    uint32_t P;
+    uint32_t N;
+    uint32_t Z;
+    uint32_t C;
+    uint32_t totalRows;
+    uint32_t tileNum;
+
+    uint32_t rowsPerBlock;
+    uint32_t startRow;
+    uint32_t validRows;
+};
+
+extern "C" __global__ __aicore__ void mamba_return_final_state_custom(GM_ADDR states, GM_ADDR v, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMambaReturnFinalState op;
+    op.Init(states, v, out,
+            tiling_data.b, tiling_data.h, tiling_data.p, tiling_data.n,
+            tiling_data.z, tiling_data.c, tiling_data.totalRows, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor mamba_return_final_state_custom_impl_npu(const at::Tensor& states, const at::Tensor& v) {
+    // states: [B,H,P,N,Z] contiguous, v: [B,H,C]
+    TORCH_CHECK(states.scalar_type() == at::kFloat, "Only float32 is supported");
+    TORCH_CHECK(v.scalar_type() == at::kFloat, "Only float32 is supported");
+
+    auto sizes = states.sizes();
+    TORCH_CHECK(sizes.size() == 5, "states must be 5D [B,H,P,N,Z]");
+    int64_t B = sizes[0], H = sizes[1], P = sizes[2], N = sizes[3], Z = sizes[4];
+
+    at::Tensor out = at::empty({B, H, P, N}, states.options());
+    EXEC_NPU_CMD(aclnnMambaReturnFinalStateCustom, states, v, out);
+    return out;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("mamba_return_final_state_custom", &mamba_return_final_state_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mamba_return_final_state_custom", &mamba_return_final_state_custom_impl_npu, "Compute final state across chunks");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+from einops import rearrange
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        super().__init__()
+        assert seq_length % block_len == 0, "Sequence length must be divisible by block length"
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.block_len = block_len
+
+        self.A = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+
+    def segsum(self, x):
+        T = x.size(-1)
+        x_cumsum = torch.cumsum(x, dim=-1)
+        x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=0)
+        x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+        return x_segsum
+
+    def forward(self, X, initial_states=None):
+        X_blocks, A_blocks, B_blocks, C_blocks = [
+            rearrange(x, "b (c l) ... -> b c l ...", l=self.block_len)
+            for x in (X, self.A, self.B, self.C)
+        ]
+        A_blocks = rearrange(A_blocks, "b c l h -> b h c l")
+        A_cumsum = torch.cumsum(A_blocks, dim=-1)
+
+        # 1. Diagonal block outputs (kept for correctness parity; not returned)
+        L = torch.exp(self.segsum(A_blocks))
+        _ = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp",
+                         C_blocks, B_blocks, L, X_blocks)
+
+        # 2. Intra-chunk states
+        decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
+        states = torch.einsum("bclhn,bhcl,bclhp->bchpn",
+                              B_blocks, decay_states, X_blocks)
+
+        # 3. Inter-chunk recurrence: replace with custom kernel that returns final state
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+        states_cat = torch.cat([initial_states, states], dim=1)  # [B, C+1, H, P, N]
+
+        # Prepare inputs for kernel
+        # states_perm: [B,H,P,N,Z] with Z=C+1 contiguous, v: [B,H,C] where C=Z-1
+        states_perm = states_cat.permute(0, 2, 3, 4, 1).contiguous()
+        v = A_cumsum[:, :, :, -1]  # [B,H,C]
+        final_state = custom_ops_lib.mamba_return_final_state_custom(states_perm, v)
+        return final_state
+'''

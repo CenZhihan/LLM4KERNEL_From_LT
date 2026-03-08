@@ -1,0 +1,339 @@
+project_json_src='''
+[
+    {
+        "op": "StandardMatrixMultiplicationCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "A",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "B",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "C",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(StandardMatrixMultiplicationCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, M);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, tileM);
+  TILING_DATA_FIELD_DEF(uint32_t, tileN);
+  TILING_DATA_FIELD_DEF(uint32_t, tileK);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(StandardMatrixMultiplicationCustom, StandardMatrixMultiplicationCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "standard_matrix_multiplication_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t ClampTile(uint32_t x, uint32_t maxv) { return x > maxv ? maxv : x; }
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    StandardMatrixMultiplicationCustomTilingData tiling;
+
+    auto aShape = context->GetInputShape(0)->GetOriginShape();
+    auto bShape = context->GetInputShape(1)->GetOriginShape();
+
+    if (aShape.GetDimNum() != 2 || bShape.GetDimNum() != 2) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t M = static_cast<uint32_t>(aShape.GetDim(0));
+    uint32_t K = static_cast<uint32_t>(aShape.GetDim(1));
+    uint32_t K2 = static_cast<uint32_t>(bShape.GetDim(0));
+    uint32_t N = static_cast<uint32_t>(bShape.GetDim(1));
+    if (K != K2) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Basic tiling heuristics
+    uint32_t tM = 64;
+    uint32_t tN = 64;
+    uint32_t tK = 64;
+
+    // Clamp tiles to problem size (avoid zero)
+    tM = ClampTile(tM, M == 0 ? 1 : M);
+    tN = ClampTile(tN, N == 0 ? 1 : N);
+    tK = ClampTile(tK, K == 0 ? 1 : K);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_M(M);
+    tiling.set_N(N);
+    tiling.set_K(K);
+    tiling.set_tileM(tM);
+    tiling.set_tileN(tN);
+    tiling.set_tileK(tK);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* a_shape = context->GetInputShape(0);
+    const gert::Shape* b_shape = context->GetInputShape(1);
+    if (a_shape->GetDimNum() != 2 || b_shape->GetDimNum() != 2) {
+        return GRAPH_FAILED;
+    }
+    if (a_shape->GetDim(1) != b_shape->GetDim(0)) {
+        return GRAPH_FAILED;
+    }
+    gert::Shape* c_shape = context->GetOutputShape(0);
+    c_shape->SetDimNum(2);
+    c_shape->SetDim(0, a_shape->GetDim(0));
+    c_shape->SetDim(1, b_shape->GetDim(1));
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+
+namespace ops {
+class StandardMatrixMultiplicationCustom : public OpDef {
+public:
+    explicit StandardMatrixMultiplicationCustom(const char* name) : OpDef(name)
+    {
+        this->Input("A")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("B")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("C")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(StandardMatrixMultiplicationCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "standard_matrix_multiplication_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelStandardMatMul {
+public:
+    __aicore__ inline KernelStandardMatMul() {}
+
+    __aicore__ inline void Init(GM_ADDR A, GM_ADDR B, GM_ADDR C,
+                                uint32_t M, uint32_t N, uint32_t K,
+                                uint32_t tileM, uint32_t tileN, uint32_t tileK)
+    {
+        this->M = M;
+        this->N = N;
+        this->K = K;
+        this->tileM = tileM;
+        this->tileN = tileN;
+        this->tileK = tileK;
+
+        uint32_t blkNum = AscendC::GetBlockNum();
+        uint32_t blkIdx = AscendC::GetBlockIdx();
+
+        // Split by rows
+        uint32_t rowsPerBlock = (M + blkNum - 1) / blkNum;
+        this->mStart = blkIdx * rowsPerBlock;
+        if (this->mStart > M) this->mStart = M;
+        this->mCount = (this->mStart + rowsPerBlock <= M) ? rowsPerBlock : (M - this->mStart);
+
+        aGm.SetGlobalBuffer((__gm__ DTYPE_A *)A + static_cast<uint64_t>(this->mStart) * K, static_cast<uint64_t>(this->mCount) * K);
+        bGm.SetGlobalBuffer((__gm__ DTYPE_B *)B, static_cast<uint64_t>(K) * N);
+        cGm.SetGlobalBuffer((__gm__ DTYPE_C *)C + static_cast<uint64_t>(this->mStart) * N, static_cast<uint64_t>(this->mCount) * N);
+
+        // UB buffer initialization for tiles
+        pipe.InitBuffer(inQueueA, BUFFER_NUM, static_cast<uint64_t>(tileM) * tileK * sizeof(DTYPE_A));
+        pipe.InitBuffer(inQueueB, BUFFER_NUM, static_cast<uint64_t>(tileK) * tileN * sizeof(DTYPE_B));
+        pipe.InitBuffer(outQueueC, BUFFER_NUM, static_cast<uint64_t>(tileM) * tileN * sizeof(DTYPE_C));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (this->mCount == 0 || this->N == 0 || this->K == 0) {
+            return;
+        }
+
+        // Iterate over row tiles for this block
+        for (uint32_t m0 = 0; m0 < this->mCount; m0 += this->tileM) {
+            uint32_t mt = AscendC::min(this->tileM, this->mCount - m0);
+            for (uint32_t n0 = 0; n0 < this->N; n0 += this->tileN) {
+                uint32_t nt = AscendC::min(this->tileN, this->N - n0);
+
+                // Allocate and zero-initialize C tile
+                AscendC::LocalTensor<DTYPE_C> cLocal = outQueueC.AllocTensor<DTYPE_C>();
+                AscendC::Duplicate<DTYPE_C>(cLocal, static_cast<DTYPE_C>(0), static_cast<uint64_t>(mt) * nt);
+
+                // Accumulate across K dimension
+                for (uint32_t k0 = 0; k0 < this->K; k0 += this->tileK) {
+                    uint32_t kt = AscendC::min(this->tileK, this->K - k0);
+
+                    // Load A tile (mt x kt) row by row
+                    AscendC::LocalTensor<DTYPE_A> aLocal = inQueueA.AllocTensor<DTYPE_A>();
+                    for (uint32_t i = 0; i < mt; ++i) {
+                        uint64_t aSrcOffset = (static_cast<uint64_t>(m0 + i) * this->K) + k0;
+                        uint64_t aDstOffset = static_cast<uint64_t>(i) * kt;
+                        AscendC::DataCopy(aLocal[aDstOffset], aGm[aSrcOffset], kt);
+                    }
+                    inQueueA.EnQue(aLocal);
+
+                    // Load B tile (kt x nt) row by row
+                    AscendC::LocalTensor<DTYPE_B> bLocal = inQueueB.AllocTensor<DTYPE_B>();
+                    for (uint32_t p = 0; p < kt; ++p) {
+                        uint64_t bSrcOffset = (static_cast<uint64_t>(k0 + p) * this->N) + n0;
+                        uint64_t bDstOffset = static_cast<uint64_t>(p) * nt;
+                        AscendC::DataCopy(bLocal[bDstOffset], bGm[bSrcOffset], nt);
+                    }
+                    inQueueB.EnQue(bLocal);
+
+                    // Dequeue and compute GEMM on tiles, accumulate into cLocal
+                    AscendC::LocalTensor<DTYPE_A> aTile = inQueueA.DeQue<DTYPE_A>();
+                    AscendC::LocalTensor<DTYPE_B> bTile = inQueueB.DeQue<DTYPE_B>();
+
+                    // MatMul accumulate: cLocal(mt x nt) += aTile(mt x kt) * bTile(kt x nt)
+                    AscendC::MatMul(cLocal, aTile, bTile, mt, nt, kt, /*accumulate=*/true);
+
+                    inQueueA.FreeTensor(aTile);
+                    inQueueB.FreeTensor(bTile);
+                }
+
+                // Store C tile (mt x nt) row by row
+                for (uint32_t i = 0; i < mt; ++i) {
+                    uint64_t cDstOffset = (static_cast<uint64_t>(m0 + i) * this->N) + n0;
+                    uint64_t cSrcOffset = static_cast<uint64_t>(i) * nt;
+                    AscendC::DataCopy(cGm[cDstOffset], cLocal[cSrcOffset], nt);
+                }
+                outQueueC.FreeTensor(cLocal);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueA, inQueueB;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueC;
+
+    AscendC::GlobalTensor<DTYPE_A> aGm;
+    AscendC::GlobalTensor<DTYPE_B> bGm;
+    AscendC::GlobalTensor<DTYPE_C> cGm;
+
+    uint32_t M, N, K;
+    uint32_t tileM, tileN, tileK;
+    uint32_t mStart, mCount;
+};
+
+extern "C" __global__ __aicore__ void standard_matrix_multiplication_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelStandardMatMul op;
+    op.Init(A, B, C,
+            tiling_data.M, tiling_data.N, tiling_data.K,
+            tiling_data.tileM, tiling_data.tileN, tiling_data.tileK);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor standard_matrix_multiplication_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "Inputs must be 2D");
+    TORCH_CHECK(A.size(1) == B.size(0), "Incompatible matmul shapes");
+    at::Tensor C = at::empty({A.size(0), B.size(1)}, A.options());
+    EXEC_NPU_CMD(aclnnStandardMatrixMultiplicationCustom, A, B, C);
+    return C;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("standard_matrix_multiplication_custom", &standard_matrix_multiplication_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("standard_matrix_multiplication_custom", &standard_matrix_multiplication_custom_impl_npu, "C = A @ B");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.standard_matrix_multiplication_custom(A, B)
+'''

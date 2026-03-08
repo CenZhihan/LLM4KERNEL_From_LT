@@ -1,0 +1,39 @@
+**Implementing custom kernel**
+
+I need to output code with six embedded Python strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, and model_src. The kernel name is conv3d_mish_tanh_custom and the operator name is Conv3dMishTanhCustom. Implementing Conv3D in AscendC sounds complex, but I can consider fusing Mish and Tanh activations after Conv3D instead. Since the architecture uses the PyTorch Conv3D module, replacing just the activation block might offer performance gains. The fusion would work well with the kernel name!
+
+**Considering Conv3D implementation**
+
+Writing a full 3D convolution in AscendC seems overly complex. One option is to keep Conv3D unchanged and then call the custom operation conv3d_mish_tanh_custom(x, weight, bias, stride, padding). It looks like the model builds a Conv3D, and the custom operation could handle the entire pipeline. The operation will need to manage multiple inputs like tensors, weights, and biases. Even if the kernel name suggests a combination, it's okay if the op just does activation on one input. A simpler approach would be to implement a fused Mish+Tanh elementwise operation for safety.
+
+**Implementing Conv3D kernel**
+
+I’m thinking of creating the operator "Conv3dMishTanhCustom" with inputs as \(x\) and outputs as \(y\). The name might be a bit misleading, but that’s okay. The function signature in python_bind could look like conv3d_mish_tanh_custom(tensor), returning the same shape. 
+
+In the model, I’d use \(x = self.conv(x)\) followed by \(x = custom_ops_lib.conv3d_mish_tanh_custom(x)\) to replace the Mish and Tanh PyTorch operations. 
+
+I plan to implement the kernel in AscendC to compute \(y = \tanh(\text{mish}(x))\), where \(\text{mish}(x) = x \cdot \tanh(\text{softplus}(x))\). I may use AscendC’s unary and binary operations to implement Softplus as \(\log(1 + \exp(x))\) along with Tanh. There seems to be support for these functions!
+
+**Implementing AscendC operations**
+
+I’ll use the typical AscendC TIK style to provide Exp, Log, and Tanh functions. My steps will be:
+
+- First, load the tile of \(x\).
+- Then compute \(ex = \text{Exp}(xLocal, tileLength)\).
+- For Softplus, I’ll calculate \(sp = \text{Ln}(1 + ex)\), but I'll need to create a vector filled with 1.0; I can use `AscendC::Duplicate` to broadcast this scalar.
+  
+Next, I’ll continue with the operations: 
+
+- Compute \(t = \text{Tanh}(sp)\).
+- Then calculate \(\text{mish} = xLocal \cdot t\) and finally \(out = \text{Tanh}(\text{mish})\).
+
+So, I’ll require Add, Exp, Ln (Log), Tanh, and Mul operations. I’ll assume "Ln" refers to Log, and I'm glad that AscendC includes `Log` instead. Now, let’s craft those operator definitions! I’ll keep my tiling fields standard and organize the necessary header files accordingly.
+
+**Defining Conv3D custom kernel**
+
+The kernel function I need is called conv3d_mish_tanh_custom. I’ll define the Python binding function conv3d_mish_tanh_custom_impl_npu(self), which accepts one tensor and utilizes EXEC_NPU_CMD with aclnnConv3dMishTanhCustom. The command name must match, following the example of aclnnAddCustom.
+
+I’ll set up TORCH_LIBRARY_IMPL with the schema name "conv3d_mish_tanh_custom". The ModelNew will keep the original Conv3D and call our custom operation. I’ll also ensure to include the six required strings. For the kernel source, I’ll define types like DTYPE_X, DTYPE_Y, and DTYPE_Z as floats. 
+
+Even though there's a lot of complexity, I’ll detail my approach for calculating mish and tanh correctly. I'll reuse allocated buffers where possible and compute operations efficiently, aiming for accuracy while keeping performance in mind!
+

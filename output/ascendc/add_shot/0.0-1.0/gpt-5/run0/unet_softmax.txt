@@ -1,0 +1,315 @@
+project_json_src='''
+[
+    {
+        "op": "UnetSoftmaxCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(UnetSoftmaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalRows);
+  TILING_DATA_FIELD_DEF(uint32_t, rowSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(UnetSoftmaxCustom, UnetSoftmaxCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "unet_softmax_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    UnetSoftmaxCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    uint32_t dimNum = origin.GetDimNum();
+    if (dimNum == 0) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t rowSize = static_cast<uint32_t>(origin.GetDim(dimNum - 1));
+    uint64_t totalSize = origin.GetShapeSize();
+    uint32_t totalRows = static_cast<uint32_t>(totalSize / rowSize);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalRows(totalRows);
+    tiling.set_rowSize(rowSize);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class UnetSoftmaxCustom : public OpDef {
+public:
+    explicit UnetSoftmaxCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(UnetSoftmaxCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "unet_softmax_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2; // double buffer
+
+// Softmax along the last dimension
+class KernelUnetSoftmax {
+public:
+    __aicore__ inline KernelUnetSoftmax() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalRows, uint32_t rowSize)
+    {
+        this->totalRows = totalRows;
+        this->rowSize = rowSize;
+
+        // rows per block (ceil divide)
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t bid = AscendC::GetBlockIdx();
+        uint32_t rowsPerBlock = (totalRows + blocks - 1) / blocks;
+        uint32_t startRow = rowsPerBlock * bid;
+        uint32_t endRow = startRow + rowsPerBlock;
+        if (endRow > totalRows) endRow = totalRows;
+        this->rowsThisBlock = (startRow < endRow) ? (endRow - startRow) : 0;
+        this->baseOffset = static_cast<uint64_t>(startRow) * static_cast<uint64_t>(rowSize);
+
+        // each tile processes exactly one row
+        this->tileLength = this->rowSize;
+        this->tileNum = this->rowsThisBlock;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->baseOffset, static_cast<uint64_t>(this->rowsThisBlock) * this->rowSize);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->baseOffset, static_cast<uint64_t>(this->rowsThisBlock) * this->rowSize);
+
+        // allocate double-buffered queues for one row each time
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t i = 0; i < this->tileNum; ++i) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+
+        // Numerically stable softmax on a single row:
+        // y = exp(x - max(x)) / sum(exp(x - max(x)))
+        DTYPE_X maxVal = AscendC::ReduceMax(xLocal, this->tileLength);
+        AscendC::Sub(yLocal, xLocal, maxVal, this->tileLength);     // yLocal = x - max
+        AscendC::Exp(yLocal, yLocal, this->tileLength);             // yLocal = exp(x - max)
+        DTYPE_Y sumVal = AscendC::ReduceSum(yLocal, this->tileLength);
+        AscendC::Div(yLocal, yLocal, sumVal, this->tileLength);     // yLocal = yLocal / sum
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t totalRows;
+    uint32_t rowSize;
+    uint32_t rowsThisBlock;
+    uint64_t baseOffset;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void unet_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelUnetSoftmax op;
+    op.Init(x, y, tiling_data.totalRows, tiling_data.rowSize);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor unet_softmax_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnUnetSoftmaxCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("unet_softmax_custom", &unet_softmax_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("unet_softmax_custom", &unet_softmax_custom_impl_npu, "softmax along last dim");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class DoubleConvNew(torch.nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = torch.nn.BatchNorm2d(out_channels)
+        self.conv2 = torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = torch.nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = custom_ops_lib.unet_softmax_custom(x)  # softmax on last dim
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = custom_ops_lib.unet_softmax_custom(x)  # softmax on last dim
+        return x
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, features):
+        super(ModelNew, self).__init__()
+        self.encoder1 = DoubleConvNew(in_channels, features)
+        self.pool1 = torch.nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder2 = DoubleConvNew(features, features * 2)
+        self.pool2 = torch.nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder3 = DoubleConvNew(features * 2, features * 4)
+        self.pool3 = torch.nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder4 = DoubleConvNew(features * 4, features * 8)
+        self.pool4 = torch.nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.bottleneck = DoubleConvNew(features * 8, features * 16)
+
+        self.upconv4 = torch.nn.ConvTranspose2d(features * 16, features * 8, kernel_size=2, stride=2)
+        self.decoder4 = DoubleConvNew(features * 16, features * 8)
+        self.upconv3 = torch.nn.ConvTranspose2d(features * 8, features * 4, kernel_size=2, stride=2)
+        self.decoder3 = DoubleConvNew(features * 8, features * 4)
+        self.upconv2 = torch.nn.ConvTranspose2d(features * 4, features * 2, kernel_size=2, stride=2)
+        self.decoder2 = DoubleConvNew(features * 8, features * 2)
+        self.upconv1 = torch.nn.ConvTranspose2d(features * 2, features, kernel_size=2, stride=2)
+        self.decoder1 = DoubleConvNew(features * 2, features)
+
+        self.final_conv = torch.nn.Conv2d(features, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        enc1 = self.encoder1(x)
+        enc2 = self.encoder2(self.pool1(enc1))
+        enc3 = self.encoder3(self.pool2(enc2))
+        enc4 = self.encoder4(self.pool3(enc3))
+
+        bottleneck = self.bottleneck(self.pool4(enc4))
+
+        dec4 = self.upconv4(bottleneck)
+        dec4 = torch.cat((dec4, enc4), dim=1)
+        dec4 = self.decoder4(dec4)
+        dec3 = self.upconv3(dec4)
+        dec3 = torch.cat((dec3, enc3), dim=1)
+        dec3 = self.decoder3(dec3)
+        dec2 = self.upconv2(dec3)
+        dec2 = torch.cat((dec2, enc2), dim=1)
+        dec2 = self.decoder2(dec2)
+        dec1 = self.upconv1(dec2)
+        dec1 = torch.cat((dec1, enc1), dim=1)
+        dec1 = self.decoder1(dec1)
+
+        return self.final_conv(dec1)
+'''

@@ -1,0 +1,40 @@
+**Exploring PyTorch transformation**
+
+I’m realizing that a transformation requires replacing PyTorch operators with custom AscendC kernels. I could write a custom operator that takes one tensor and a scalar, outputting the scaled tensor. However, detaching cannot happen on the device. In autograd, I can define a custom function for proper gradient handling. It seems the C++ operator is only forward, leading autograd to see it as non-differentiable, even though the example's simple add suggests it's supported. I'll explore more about their specific implementation.
+
+**Considering NPU autograd implementation**
+
+With NPU, the backend manages autograd through decomposition or registered gradients. I’m realizing that, to be cautious, we might just focus on inference, as there was no mention of training. The original model uses clone().detach(), which strikes me as odd for training. For the forward kernel, we do a fused scale plus a residual add, but the gradient is only scale. To maintain the gradient, I can create a custom autograd Function to multiply grad_output by scale in the backward pass. I'll need to define a kernel called matmul_scaling_residual_add_custom, which includes matmul operations as well.
+
+**Exploring kernel implementation**
+
+The kernel name points to fusing matmul, scaling, and residual add. Since our architecture uses nn.Linear, we could replace the entire forward block with a custom kernel that takes the input x, weights, bias, and scaling factor. This would compute y = linear(x) and then z = y * scale + stopgrad(y). Implementing full matmul with bias and scaling plus residual seems complex but doable. I need to define inputs in project_json correctly, likely including x, weight, bias, and scaling_factor, but the earlier example only dealt with float ND types.
+
+**Designing PyTorch Linear kernel**
+
+PyTorch's Linear layer uses a weight shape of (out_features, in_features), performing multiplication with x @ W.T plus bias. I can assume we're implementing standard matmul with X and W^T, plus bias. The bias will be a 1D tensor for out_features, resulting in output y of shape (batch_size, out_features). I might pass scale as a separate tensor or attribute, keeping the interface straightforward. For the kernel code on AscendC, implementing matrix multiplication seems complex, but I could focus on developing custom kernels to optimize by replacing specific operators, potentially leaving the linear part intact.
+
+**Refining custom kernel design**
+
+I’m considering how to replace relevant PyTorch operators while keeping nn.Linear intact. We could create a custom operation for scaling and residual add that uses inputs x and returns y * scale + y. The kernel name suggests fusing scale+residual add after matmul, but I might not need to include matmul directly. Our custom op can efficiently implement this by treating y and using scale directly for the output. I should define the inputs clearly in project_json and ensure proper backward handling to maintain gradient flow. Overall, it sounds feasible with some careful implementation.
+
+**Implementing kernel operations**
+
+I'm planning to implement a kernel to compute y = x * scale + x, processing it tile-by-tile. We need two global buffers for inputs xGm and sGm, with sGm set as a scalar for simplicity. In the AscendC library, I'll utilize scalar operations for calculations. It seems there's a function for multiplying a vector by a scalar. 
+
+Instead of complex duplications, I'll keep it straightforward by passing y and y_res (detached). Hence the custom kernel will handle the addition of these tensors efficiently. For the project_json, inputs will be "x" and "residual," both ND floats, and output "y." I'll ensure the pipeline operates correctly and maintains gradient flow.
+
+**Implementing the custom kernel**
+
+I'm moving forward with a kernel that focuses on simple elementwise addition. I'll define a project_json operation called "MatmulScalingResidualAddCustom," with inputs "x" and "residual," both of the same shape as floats, producing output "y." The kernel will add these inputs, and I'll base the code on the AddCustom example but rename it appropriately.
+
+For the ModelNew class, this means I will perform calculations like: y = self.matmul(x), y_scaled = y * scaling_factor, and out = custom_ops_lib.matmul_scaling_residual_add_custom(y_scaled, y_res). I'll ensure that all components work together seamlessly while prioritizing performance over autograd details, and will get the project set up correctly.
+
+**Crafting project components**
+
+I'm working on creating the strings. For the project_json_src, I'm defining an operation called "MatmulScalingResidualAddCustom" in C++ with two ND float inputs named "x" and "residual." The output will be "z" for consistency with the rest of the implementation.
+
+In the host_tiling_src, I need to set up TILING_DATA_DEF and register the tiling data class. The host_operator_src will include necessary headers and define the operation. 
+
+For the kernel_src, I'll use a clear naming convention, like KernelMsraAdd, and ensure the implementation logic follows the pattern established in earlier examples. Finally, I'll make sure to include all the required six Python strings exactly named for clarity.
+

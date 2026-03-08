@@ -1,0 +1,258 @@
+project_json_src='''
+[
+    {
+        "op": "GemmMaxSubtractGeluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmMaxSubtractGeluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmMaxSubtractGeluCustom, GemmMaxSubtractGeluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gemm_max_subtract_gelu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GemmMaxSubtractGeluCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    uint32_t dims = origin.GetDimNum();
+    if (dims < 2) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t rows = (uint32_t)origin.GetDim(0);
+    uint32_t cols = (uint32_t)origin.GetDim(1);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    auto origin = x_shape->GetOriginShape();
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    // Expect 2D input [batch, features]; output is [batch, 1]
+    std::vector<int64_t> out_dims;
+    if (origin.GetDimNum() >= 1) {
+        out_dims.push_back(origin.GetDim(0));
+    } else {
+        out_dims.push_back(1);
+    }
+    out_dims.push_back(1);
+    y_shape->SetDimNum(out_dims.size());
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        y_shape->SetDim(i, out_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GemmMaxSubtractGeluCustom : public OpDef {
+public:
+    explicit GemmMaxSubtractGeluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmMaxSubtractGeluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "gemm_max_subtract_gelu_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelGemmMaxSubtractGelu {
+public:
+    __aicore__ inline KernelGemmMaxSubtractGelu() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t rows, uint32_t cols, uint32_t /*tileNum*/)
+    {
+        this->rows = rows;
+        this->cols = cols;
+
+        uint32_t coreNum = AscendC::GetBlockNum();
+        uint32_t coreIdx = AscendC::GetBlockIdx();
+
+        uint32_t base = rows / coreNum;
+        uint32_t rem  = rows % coreNum;
+
+        this->startRow = base * coreIdx + AscendC::min(coreIdx, rem);
+        this->myRows   = base + ((coreIdx < rem) ? 1 : 0);
+
+        // Set GM buffers. Input stride is cols per row; output is 1 per row.
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + (uint64_t)this->startRow * (uint64_t)this->cols, (uint64_t)this->myRows * (uint64_t)this->cols);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y + this->startRow, this->myRows);
+
+        pipe.InitBuffer(outQueue, BUFFER_NUM, 1 * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // According to the model: y = max(x, dim=1, keepdim=True)
+        // y = y - y.mean(dim=1, keepdim=True) -> zeros
+        // gelu(0) -> 0
+        // Therefore we can directly write zeros for each row.
+        for (uint32_t r = 0; r < this->myRows; ++r) {
+            WriteZero(r);
+        }
+    }
+
+private:
+    __aicore__ inline void WriteZero(uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueue.AllocTensor<DTYPE_Z>();
+        AscendC::Duplicate(yLocal, static_cast<DTYPE_Z>(0), 1);
+        outQueue.EnQue<DTYPE_Z>(yLocal);
+
+        AscendC::LocalTensor<DTYPE_Z> yLocalDeq = outQueue.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[rowIdx], yLocalDeq, 1);
+        outQueue.FreeTensor(yLocalDeq);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t startRow;
+    uint32_t myRows;
+};
+
+extern "C" __global__ __aicore__ void gemm_max_subtract_gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGemmMaxSubtractGelu op;
+    op.Init(x, y, tiling_data.rows, tiling_data.cols, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gemm_max_subtract_gelu_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty({self.size(0), 1}, self.options());
+    EXEC_NPU_CMD(aclnnGemmMaxSubtractGeluCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_max_subtract_gelu_custom", &gemm_max_subtract_gelu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_max_subtract_gelu_custom", &gemm_max_subtract_gelu_custom_impl_npu, "GEMM->Max->Subtract->GELU fused (post-GEMM) op");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model that keeps GEMM in PyTorch and replaces the Max-Subtract-GELU chain
+    with a fused custom AscendC operator.
+    """
+    def __init__(self, in_features, out_features, max_dim):
+        super(ModelNew, self).__init__()
+        self.gemm = torch.nn.Linear(in_features, out_features)
+        self.max_dim = max_dim  # expected to be 1
+
+    def forward(self, x):
+        x = self.gemm(x)  # [batch, out_features]
+        # Fused custom op computes: max over dim=1 (keepdim=True), subtract mean, then GELU
+        x = custom_ops_lib.gemm_max_subtract_gelu_custom(x)
+        return x
+'''

@@ -1,0 +1,305 @@
+project_json_src='''
+[
+    {
+        "op": "ProductReductionOverADimensionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ProductReductionOverADimensionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, lastDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ProductReductionOverADimensionCustom, ProductReductionOverADimensionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "product_reduction_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ProductReductionOverADimensionCustomTilingData tiling;
+
+    // Input shape
+    const gert::Shape* inShape = context->GetInputShape(0);
+    auto origin = inShape->GetOriginShape();
+    uint32_t dimNum = origin.GetDimNum();
+    if (dimNum == 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint64_t totalLength = origin.GetShapeSize();
+    uint64_t lastDim = origin.GetDim(dimNum - 1);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(static_cast<uint32_t>(totalLength));
+    tiling.set_lastDim(static_cast<uint32_t>(lastDim));
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    auto x_origin = x_shape->GetOriginShape();
+    uint32_t dimNum = x_origin.GetDimNum();
+    if (dimNum == 0) {
+        return GRAPH_FAILED;
+    }
+    // Reduce over the last dimension. Output dims = input dims without the last one.
+    std::vector<int64_t> outDims;
+    outDims.reserve(dimNum > 0 ? (dimNum - 1) : 0);
+    for (uint32_t i = 0; i + 1 < dimNum; ++i) {
+        outDims.push_back(x_origin.GetDim(i));
+    }
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(outDims.size());
+    for (size_t i = 0; i < outDims.size(); ++i) {
+        y_shape->SetDim(i, outDims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ProductReductionOverADimensionCustom : public OpDef {
+public:
+    explicit ProductReductionOverADimensionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ProductReductionOverADimensionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "product_reduction_over_a_dimension_custom_tiling_data.h"
+
+constexpr int32_t IN_BUFFER_NUM = 2; // double-buffering for input tiles
+constexpr uint32_t TILE_K = 1024;    // elements along the last dimension per tile
+
+class KernelReduceProdLastDim {
+public:
+    __aicore__ inline KernelReduceProdLastDim() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t lastDim)
+    {
+        this->lastDim = lastDim;
+        // Treat input as [M, K] where K=lastDim, M=totalLength/lastDim
+        this->totalRows = totalLength / lastDim;
+
+        // Split rows among blocks
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->rowsPerBlock = this->totalRows / blockNum;
+        this->rowOffset = this->rowsPerBlock * blockIdx;
+
+        // Set GM buffers
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->rowOffset * this->lastDim, this->rowsPerBlock * this->lastDim);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + this->rowOffset, this->rowsPerBlock);
+
+        // Init pipe buffers
+        pipe.InitBuffer(inQueueX, IN_BUFFER_NUM, TILE_K * sizeof(DTYPE_X));
+        pipe.InitBuffer(tmpQueue, 1, sizeof(DTYPE_Y)); // for accumulator (1 element)
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = 0; r < this->rowsPerBlock; ++r) {
+            ProcessOneRow(r);
+        }
+    }
+
+private:
+    __aicore__ inline void ReduceChunkToScalar(AscendC::LocalTensor<DTYPE_X>& buf, uint32_t len)
+    {
+        // Tree reduction in-place: buf[0] ends up holding the product of buf[0:len]
+        uint32_t chunk = len;
+        while (chunk > 1) {
+            uint32_t half = chunk >> 1; // floor(chunk/2)
+            if (half > 0) {
+                AscendC::Mul(buf, buf, buf[half], half);
+            }
+            if ((chunk & 1) == 1) {
+                // multiply the leftover element into position 0
+                AscendC::Mul(buf, buf, buf[2 * half], 1);
+                chunk = half; // leftover accounted into buf[0]
+            } else {
+                chunk = half;
+            }
+        }
+    }
+
+    __aicore__ inline void ProcessOneRow(uint32_t rowIdx)
+    {
+        uint32_t processed = 0;
+        uint32_t remain = this->lastDim;
+        bool firstChunk = true;
+
+        // Allocate 1-element local tensor for accumulator
+        AscendC::LocalTensor<DTYPE_Y> accLocal = tmpQueue.AllocTensor<DTYPE_Y>();
+
+        while (remain > 0) {
+            uint32_t copyLen = remain > TILE_K ? TILE_K : remain;
+
+            AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+            // copy contiguous chunk from [rowIdx, processed:processed+copyLen)
+            AscendC::DataCopy(xLocal, xGm[rowIdx * this->lastDim + processed], copyLen);
+            inQueueX.EnQue(xLocal);
+
+            xLocal = inQueueX.DeQue<DTYPE_X>();
+            ReduceChunkToScalar(xLocal, copyLen);
+
+            if (firstChunk) {
+                // Initialize accumulator with first partial product
+                AscendC::DataCopy(accLocal, xLocal, 1);
+                firstChunk = false;
+            } else {
+                // accLocal[0] *= xLocal[0]
+                AscendC::Mul(accLocal, accLocal, xLocal, 1);
+            }
+
+            inQueueX.FreeTensor(xLocal);
+            processed += copyLen;
+            remain -= copyLen;
+        }
+
+        // Write the accumulated product to GM output
+        AscendC::DataCopy(yGm[rowIdx], accLocal, 1);
+        tmpQueue.FreeTensor(accLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, IN_BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> tmpQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t lastDim;
+    uint32_t totalRows;
+    uint32_t rowsPerBlock;
+    uint32_t rowOffset;
+};
+
+extern "C" __global__ __aicore__ void product_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelReduceProdLastDim op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.lastDim);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor product_reduction_over_a_dimension_custom_impl_npu(const at::Tensor& self) {
+    // Reduce over the last dimension of 'self'
+    std::vector<int64_t> out_sizes(self.sizes().begin(), self.sizes().end() - 1);
+    at::Tensor result = at::empty(out_sizes, self.options());
+    EXEC_NPU_CMD(aclnnProductReductionOverADimensionCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("product_reduction_over_a_dimension_custom", &product_reduction_over_a_dimension_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("product_reduction_over_a_dimension_custom", &product_reduction_over_a_dimension_custom_impl_npu, "Reduce product over last dimension");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model: moves the target reduction dim to the last axis, then uses a custom AscendC kernel
+    that reduces product over the last dimension.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Move the reduction dimension to the last axis for the custom kernel
+        if self.dim < 0:
+            dim = self.dim % x.ndim
+        else:
+            dim = self.dim
+        x_perm = x.moveaxis(dim, -1)
+        return custom_ops_lib.product_reduction_over_a_dimension_custom(x_perm)
+'''

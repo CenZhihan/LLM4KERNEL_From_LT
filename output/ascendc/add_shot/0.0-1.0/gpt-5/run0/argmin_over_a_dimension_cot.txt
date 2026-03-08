@@ -1,0 +1,49 @@
+**Considering custom op design**
+
+I need to create six strings for the custom AscendC operator that implements argmin over a specified dimension. The kernel will be named argmin_over_a_dimension_custom, with a PascalCase version ArgminOverADimensionCustom. I'll define the project_json_src with inputs such as x (float) and possibly an integer dimension. It seems we have to consider the output dtype, which could be int64 or int32, as PyTorch usually returns Long. Integrating with PyTorch bindings will be necessary too.
+
+**Designing tiling for NPU**
+
+In NPU examples, TilingFunc usually sets block dimensions, so I need to create fields in the tiling data structure, such as totalLength, reduceDimSize, outerStride, innerStride, axis, and tileNum. The goal is to perform argmin along a specified axis in a 3D shape, ideally supporting ND dimensions as well. For kernel simplicity, I think I’ll flatten everything except the axis and compute argmin per line by scanning. I’ll likely employ loops for implementation, focusing on performance by tiling across other dimensions.
+
+**Implementing the kernel**
+
+I'm focusing on creating a kernel that processes blocks across multiple "rows," where each row corresponds to the axis dimension. I’ll start by handling ND shapes, potentially up to 4D, but I'll generalize by flattening the dimensions into a single list.
+
+So, I'll compute the necessary parameters: the axis from tiling data, the product of dimensions before the axis (pre), the length of the axis (axis_len), and the product of dimensions after the axis (post). The total number of rows will be pre multiplied by post. 
+
+For each row, I’ll find the index of the minimum value among the entries corresponding to that axis length, using parallel processing across blocks. Memory will be arranged in a row-major format, and I'll calculate the base offset for each row accordingly. The tiling data will need to include all relevant shape information for this process.
+
+**Defining tileRows and data handling**
+
+I need to provide tileRows for each queue, passing precomputed integers from the tiling stage. The host operator's tiling function will get the dimensions from context->GetInputShape(0), as shapes are known. I’ll pack fields for uint32: rows, axis_len, post, and tileRows. 
+
+In the AscendC kernel, I could copy each row element from global memory, but that’s inefficient for demonstration. I’ll allocate minimal local buffers and process them row-by-row. However, there’s a problem with using DataCopy because the row elements along the axis are strided by post, making them non-contiguous when post is greater than one. I'll need to consider using vector operations or look into StridedCopy in AscendC.
+
+**Refining the argmin implementation**
+
+I need to consider performing argmin along the last dimension by transposing shapes, but I can't change the data. The best option is to restrict the dimension to the last one. However, since the user might need to invoke it with dim=1, that complicates things.
+
+Instead, I can compute argmin by reading from global memory and use pointer arithmetic to load one value at a time. It’s not the most efficient method, but it’s acceptable for a demo. I want to explore methods to ensure the outputs align with PyTorch's expectations regarding dtype, especially for int32 and int64 compatibility.
+
+I’ll also define the kernel function and class, ensuring the tiling data aligns with necessary macros and headers. Finally, shaping the output correctly regarding the reduction dimension is essential, whether to keep it the same as input with one dimension removed or adjusting in ModelNew.
+
+**Implementing argmin inference**
+
+I'm thinking about how to create a custom operation to generate indices while keeping the same shape as the input using keepdim=True and then use `.squeeze(dim)` in Python for matching semantics. This allows for minor additions, though they want "replacing relevant PyTorch operators." So, the kernel has to compute row indices and store them with a shape that retains the original dimensions, except the size along the specified axis is 1.
+
+To facilitate that, I need to ensure the store indexing aligns, while addressing how to pass attribute data like "dim" into the operation. I'll set up the necessary functions, define attribute handling, and establish the proper context for shape inference all while sticking to the expected data types. I'll carefully construct the code to make sure everything integrates seamlessly.
+
+**Designing argmin operator class**
+
+I'm outlining how to create our operator with one input and one output, requiring DTYPE_X and DTYPE_Z. I’ll design a kernel class with an entry function specifically for argmin operations.
+
+In this function, I’ll calculate the starting and ending indices for processing with respect to blocks. I think I’ll need to allocate local buffers for efficient data management during the computation. I'll utilize DataCopy for transferring values between global memory and local tensors.
+
+Additionally, I must handle reading and writing indices appropriately, especially considering the use of local memory and ensuring we maintain the output shape as needed. It’s crucial to establish a logical flow for the processing while adhering to the necessary constraints of the kernel operations.
+
+**Implementing argmin function**
+
+In this specific case, I'm setting the dimension parameter to 1. I plan to transpose dimensions to make the target axis last, which will allow my kernel to perform the argmin across that last dimension. Once I finish the operation, I can squeeze the last dimension and return the result.
+
+I believe that using local buffers will help during data processing, particularly for contiguous reading within rows. I’ll likely implement a loop for identifying minimum values and their indices, keeping in mind the potential complexities of retrieving indices alongside the minimum values. I'll define appropriate tiling data and integrate those structures into my kernel for better efficiency.

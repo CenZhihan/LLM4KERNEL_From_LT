@@ -1,0 +1,290 @@
+project_json_src='''
+[
+    {
+        "op": "ArgmaxOverADimensionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "attr": [
+            {
+                "name": "axis",
+                "param_type": "required",
+                "type": "int"
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int64"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ArgmaxOverADimensionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, outerLen);
+  TILING_DATA_FIELD_DEF(uint32_t, reduceLen);
+  TILING_DATA_FIELD_DEF(uint32_t, innerLen);
+  TILING_DATA_FIELD_DEF(uint32_t, totalOut);
+  TILING_DATA_FIELD_DEF(int32_t, axis);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ArgmaxOverADimensionCustom, ArgmaxOverADimensionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "argmax_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <algorithm>
+#include <cstdint>
+#include <vector>
+
+namespace {
+inline int64_t NormalizeAxis(int64_t axis, int64_t rank) {
+    if (axis < 0) axis += rank;
+    return axis;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ArgmaxOverADimensionCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    int64_t rank = static_cast<int64_t>(in_shape->GetDimNum());
+    int64_t axis = 0;
+    // get axis attr, fallback 0 if not found
+    if (context->GetAttrs() != nullptr && context->GetAttrs()->HasAttr("axis")) {
+        axis = context->GetAttrs()->GetInt("axis");
+    }
+    axis = NormalizeAxis(axis, rank);
+
+    uint64_t outer = 1;
+    for (int64_t i = 0; i < axis; ++i) {
+        outer *= static_cast<uint64_t>(in_shape->GetDim(i));
+    }
+    uint64_t reduce = static_cast<uint64_t>(in_shape->GetDim(axis));
+    uint64_t inner = 1;
+    for (int64_t i = axis + 1; i < rank; ++i) {
+        inner *= static_cast<uint64_t>(in_shape->GetDim(i));
+    }
+    uint64_t totalOut = outer * inner;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_outerLen(static_cast<uint32_t>(outer));
+    tiling.set_reduceLen(static_cast<uint32_t>(reduce));
+    tiling.set_innerLen(static_cast<uint32_t>(inner));
+    tiling.set_totalOut(static_cast<uint32_t>(totalOut));
+    tiling.set_axis(static_cast<int32_t>(axis));
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    int64_t rank = static_cast<int64_t>(x_shape->GetDimNum());
+
+    int64_t axis = 0;
+    if (context->GetAttrs() != nullptr && context->GetAttrs()->HasAttr("axis")) {
+        axis = context->GetAttrs()->GetInt("axis");
+    }
+    if (axis < 0) axis += rank;
+    if (axis < 0) axis = 0;
+    if (axis >= rank) axis = rank - 1;
+
+    std::vector<int64_t> out_dims;
+    out_dims.reserve(std::max<int64_t>(rank - 1, 0));
+    for (int64_t i = 0; i < rank; ++i) {
+        if (i == axis) continue;
+        out_dims.push_back(x_shape->GetDim(i));
+    }
+    y_shape->SetDimNum(out_dims.size());
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        y_shape->SetDim(i, out_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    context->SetOutputDataType(0, ge::DT_INT64);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ArgmaxOverADimensionCustom : public OpDef {
+public:
+    explicit ArgmaxOverADimensionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT64})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("axis").SetType(OPTION_INT).SetDefault(0);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ArgmaxOverADimensionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "argmax_over_a_dimension_custom_tiling_data.h"
+#include <stdint.h>
+#include <limits>
+
+extern "C" __global__ __aicore__ void argmax_over_a_dimension_custom(GM_ADDR x, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+
+    const uint32_t outerLen = tiling_data.outerLen;
+    const uint32_t reduceLen = tiling_data.reduceLen;
+    const uint32_t innerLen = tiling_data.innerLen;
+    const uint32_t totalOut = tiling_data.totalOut;
+
+    const __gm__ float* xGm = reinterpret_cast<const __gm__ float*>(x);
+    __gm__ int64_t* zGm = reinterpret_cast<__gm__ int64_t*>(z);
+
+    uint32_t blockNum = AscendC::GetBlockNum();
+    uint32_t blockIdx = AscendC::GetBlockIdx();
+
+    uint32_t base = totalOut / blockNum;
+    uint32_t rem = totalOut % blockNum;
+    uint32_t myStart = base * blockIdx + (blockIdx < rem ? blockIdx : rem);
+    uint32_t myLen = base + (blockIdx < rem ? 1 : 0);
+
+    for (uint32_t outIdx = 0; outIdx < myLen; ++outIdx) {
+        uint32_t globalOut = myStart + outIdx;
+        if (globalOut >= totalOut) break;
+
+        uint32_t outerIndex = (innerLen == 0) ? 0 : (globalOut / innerLen);
+        uint32_t innerIndex = (innerLen == 0) ? 0 : (globalOut % innerLen);
+
+        // Base offset in flattened input for r=0
+        // Flattened index: ((outerIndex * reduceLen) + r) * innerLen + innerIndex
+        uint64_t baseOffset = static_cast<uint64_t>(outerIndex) * static_cast<uint64_t>(reduceLen) * static_cast<uint64_t>(innerLen)
+                            + static_cast<uint64_t>(innerIndex);
+
+        float maxVal = -std::numeric_limits<float>::infinity();
+        int64_t maxIdx = 0;
+
+        uint64_t offset = baseOffset;
+        for (uint32_t r = 0; r < reduceLen; ++r) {
+            float v = xGm[offset];
+            if (v > maxVal) {
+                maxVal = v;
+                maxIdx = static_cast<int64_t>(r);
+            }
+            offset += static_cast<uint64_t>(innerLen);
+        }
+        zGm[globalOut] = maxIdx;
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+#include <vector>
+
+static inline std::vector<int64_t> infer_argmax_out_shape(const at::Tensor& self, int64_t dim) {
+    auto sizes = self.sizes().vec();
+    int64_t rank = static_cast<int64_t>(sizes.size());
+    if (dim < 0) dim += rank;
+    if (dim < 0) dim = 0;
+    if (dim >= rank) dim = rank - 1;
+    std::vector<int64_t> out;
+    out.reserve(std::max<int64_t>(rank - 1, 0));
+    for (int64_t i = 0; i < rank; ++i) {
+        if (i == dim) continue;
+        out.push_back(sizes[i]);
+    }
+    return out;
+}
+
+at::Tensor argmax_over_a_dimension_custom_impl_npu(const at::Tensor& self, int64_t dim) {
+    auto out_sizes = infer_argmax_out_shape(self, dim);
+    at::Tensor result = at::empty(out_sizes, self.options().dtype(at::kLong));
+    EXEC_NPU_CMD(aclnnArgmaxOverADimensionCustom, self, dim, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("argmax_over_a_dimension_custom", &argmax_over_a_dimension_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("argmax_over_a_dimension_custom", &argmax_over_a_dimension_custom_impl_npu, "Argmax over a dimension");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model that performs Argmax over a specified dimension using a custom AscendC kernel.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.argmax_over_a_dimension_custom(x, self.dim)
+'''
