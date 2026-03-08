@@ -15,7 +15,7 @@ extern "C" {
 /* funtion: aclnnEluCustomGetWorkspaceSize
  * parameters :
  * x : required
- * alpha : optional
+ * alpha : required
  * out : required
  * workspaceSize : size of workspace(output).
  * executor : executor context(output).
@@ -23,7 +23,7 @@ extern "C" {
 __attribute__((visibility("default")))
 aclnnStatus aclnnEluCustomGetWorkspaceSize(
     const aclTensor *x,
-    double alpha,
+    bool alpha,
     const aclTensor *out,
     uint64_t *workspaceSize,
     aclOpExecutor **executor);

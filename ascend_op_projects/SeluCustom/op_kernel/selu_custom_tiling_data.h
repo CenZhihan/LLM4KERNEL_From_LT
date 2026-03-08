@@ -10,8 +10,6 @@
 struct SeluCustomTilingData {
     uint32_t totalLength = 0;
     uint32_t tileNum = 0;
-    float alpha = 0;
-    float scale = 0;
 };
 #pragma pack()
 

@@ -6,12 +6,14 @@
 
 namespace ge {
 
-REG_OP(HardtanhCustom)
+REG_OP(Conv2dAddScaleSigmoidGroupNormCustom)
     .INPUT(x, ge::TensorType::ALL())
+    .INPUT(bias, ge::TensorType::ALL())
+    .INPUT(scale, ge::TensorType::ALL())
+    .INPUT(gamma, ge::TensorType::ALL())
+    .INPUT(beta, ge::TensorType::ALL())
     .OUTPUT(y, ge::TensorType::ALL())
-    .ATTR(min_val, Float, -1)
-    .ATTR(max_val, Float, 1)
-    .OP_END_FACTORY_REG(HardtanhCustom);
+    .OP_END_FACTORY_REG(Conv2dAddScaleSigmoidGroupNormCustom);
 
 }
 

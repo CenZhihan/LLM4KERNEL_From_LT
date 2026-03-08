@@ -10,8 +10,6 @@
 struct HardtanhCustomTilingData {
     uint32_t totalLength = 0;
     uint32_t tileNum = 0;
-    float minVal = 0;
-    float maxVal = 0;
 };
 #pragma pack()
 

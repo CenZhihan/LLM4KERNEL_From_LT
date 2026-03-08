@@ -42,34 +42,38 @@ def eval_single(response_txt:str, op, language):
         raise ValueError(f"Unsupported language/platform: {language}")
     
     hardware = backend.get_hardware_name()
-
-    result = {'compiled': False, 'correctness': None, 'performance': None, 'hardware':hardware}
-    generated_code = extract_first_code(response_txt, ['python', 'cpp'])
-    if generated_code is None:
-        generated_code = response_txt
-    compiled, compile_info = backend.compile(generated_code, op)
-    if not compiled:
-        result['compile_info'] = compile_info
+    result = {'compiled': False, 'correctness': None, 'performance': None, 'hardware': hardware}
+    try:
+        generated_code = extract_first_code(response_txt, ['python', 'cpp'])
+        if generated_code is None:
+            generated_code = response_txt
+        compiled, compile_info = backend.compile(generated_code, op)
+        if not compiled:
+            result['compile_info'] = compile_info
+            return result
+        result['compiled'] = True
+        ref_src_path = get_ref_src_path(op)
+        with open(ref_src_path, 'r') as f:
+            ref_src = f.read()
+        correctness, info = backend.correctness_execution(ref_src)
+        if not correctness:
+            result['correctness_info'] = info
+            return result
+        result['correctness'] = True
+        elapsed_times = backend.time_execution()
+        result['performance'] = {
+            "mean": float(f"{np.mean(elapsed_times):.3g}"),
+            "std": float(f"{np.std(elapsed_times):.3g}"),
+            "min": float(f"{np.min(elapsed_times):.3g}"),
+            "max": float(f"{np.max(elapsed_times):.3g}"),
+            "num_trials": len(elapsed_times),
+        }
+        backend.cleanup()
         return result
-    result['compiled'] = True
-    ref_src_path = get_ref_src_path(op)
-    with open(ref_src_path, 'r') as f:
-        ref_src = f.read()
-    correctness, info = backend.correctness_execution(ref_src)
-    if not correctness:
-        result['correctness_info'] = info
-        return result
-    result['correctness'] = True
-    elapsed_times = backend.time_execution()
-    result['performance'] = {
-        "mean": float(f"{np.mean(elapsed_times):.3g}"),
-        "std": float(f"{np.std(elapsed_times):.3g}"),
-        "min": float(f"{np.min(elapsed_times):.3g}"),
-        "max": float(f"{np.max(elapsed_times):.3g}"),
-        "num_trials": len(elapsed_times),
-    }
-    backend.cleanup()
-    return result
+    finally:
+        # ascendc：用完后删除该 op 的工程目录和 JSON，避免 ascend_op_projects 越积越多
+        if hasattr(backend, 'cleanup_project_if_any'):
+            backend.cleanup_project_if_any()
 
 def eval_all(out_dir, language, op_tested=dataset.keys()):
     result = {}

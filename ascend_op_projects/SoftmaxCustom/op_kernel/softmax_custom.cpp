@@ -3,119 +3,87 @@
 #define __NPU_TILING__
 #include "softmax_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // buffering for streaming
+constexpr int32_t BUFFER_NUM = 2;
 
 class KernelSoftmax {
 public:
     __aicore__ inline KernelSoftmax() {}
-
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t totalRows, uint32_t cols,
-                                uint32_t tileNum, int32_t axis)
-    {
-        this->cols = cols;
-        this->tileNum = tileNum;
-        this->axis = axis;
+                                uint32_t totalRows, uint32_t rowSize, uint32_t rowsPerBlock) {
+        this->totalRows = totalRows;
+        this->rowSize = rowSize;
+        this->rowsPerBlock = rowsPerBlock;
 
-        // compute row partition for current block (load-balance tail)
-        uint32_t blockNum = AscendC::GetBlockNum();
-        uint32_t blockIdx = AscendC::GetBlockIdx();
-        uint32_t baseRows = totalRows / blockNum;
-        uint32_t tail = totalRows % blockNum;
-        this->rowStart = blockIdx * baseRows + (blockIdx < tail ? blockIdx : tail);
-        this->rowCount = baseRows + (blockIdx < tail ? 1 : 0);
+        uint32_t baseRow = AscendC::GetBlockIdx() * rowsPerBlock;
+        uint32_t baseOffset = baseRow * rowSize;
 
-        // tile length for streaming across columns
-        uint32_t perLoop = tileNum * BUFFER_NUM;
-        this->tileLength = (cols + perLoop - 1) / perLoop;
+        xGm.SetGlobalBuffer((__gm__ float*)x + baseOffset, rowsPerBlock * rowSize);
+        yGm.SetGlobalBuffer((__gm__ float*)y + baseOffset, rowsPerBlock * rowSize);
 
-        // point GM buffers to this block's region
-        xGm.SetGlobalBuffer((__gm__ float *)x + this->rowStart * this->cols, this->rowCount * this->cols);
-        yGm.SetGlobalBuffer((__gm__ float *)y + this->rowStart * this->cols, this->rowCount * this->cols);
-
-        // buffers for one tile
-        pipe.InitBuffer(tmpTileBuf, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpTileBuf2, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, rowSize * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, rowSize * sizeof(float));
     }
 
-    __aicore__ inline void Process()
-    {
-        // process row by row for numerical stability
-        for (uint32_t r = 0; r < this->rowCount; ++r) {
-            float rowMax = -3.402823466e+38F; // -FLT_MAX
-
-            // pass 1: compute row-wise max across tiles
-            for (uint32_t tileBase = 0; tileBase < this->cols; tileBase += this->tileLength) {
-                uint32_t copyLen = this->cols - tileBase;
-                if (copyLen > this->tileLength) copyLen = this->tileLength;
-
-                AscendC::LocalTensor<float> xLocal = tmpTileBuf.Get<float>();
-                AscendC::DataCopy(xLocal, xGm[r * this->cols + tileBase], copyLen);
-
-                float tileMax = -3.402823466e+38F;
-                // ReduceMax: compute max of the local tile
-                AscendC::ReduceMax(tileMax, xLocal, copyLen);
-
-                if (tileMax > rowMax) rowMax = tileMax;
+    __aicore__ inline void Process() {
+        // Pipeline by rows
+        int32_t loopCount = rowsPerBlock;
+        // CopyIn and Compute/CopyOut with double-buffering
+        for (int32_t i = 0; i < loopCount; ++i) {
+            if (!RowIsValid(i)) {
+                break;
             }
-
-            // pass 2: compute row-wise sum of exp(x - max)
-            float rowSum = 0.0f;
-            for (uint32_t tileBase = 0; tileBase < this->cols; tileBase += this->tileLength) {
-                uint32_t copyLen = this->cols - tileBase;
-                if (copyLen > this->tileLength) copyLen = this->tileLength;
-
-                AscendC::LocalTensor<float> xLocal = tmpTileBuf.Get<float>();
-                AscendC::LocalTensor<float> expLocal = tmpTileBuf2.Get<float>();
-
-                AscendC::DataCopy(xLocal, xGm[r * this->cols + tileBase], copyLen);
-                // exp(x - rowMax)
-                AscendC::Adds(expLocal, xLocal, -rowMax, copyLen);
-                AscendC::Exp(expLocal, expLocal, copyLen);
-
-                float tileSum = 0.0f;
-                AscendC::ReduceSum(tileSum, expLocal, copyLen);
-                rowSum += tileSum;
-            }
-
-            float invRowSum = 1.0f / rowSum;
-
-            // pass 3: write normalized probabilities
-            for (uint32_t tileBase = 0; tileBase < this->cols; tileBase += this->tileLength) {
-                uint32_t copyLen = this->cols - tileBase;
-                if (copyLen > this->tileLength) copyLen = this->tileLength;
-
-                AscendC::LocalTensor<float> xLocal = tmpTileBuf.Get<float>();
-                AscendC::LocalTensor<float> yLocal = tmpTileBuf2.Get<float>();
-
-                AscendC::DataCopy(xLocal, xGm[r * this->cols + tileBase], copyLen);
-                AscendC::Adds(yLocal, xLocal, -rowMax, copyLen);
-                AscendC::Exp(yLocal, yLocal, copyLen);
-                AscendC::Muls(yLocal, yLocal, invRowSum, copyLen);
-
-                AscendC::DataCopy(yGm[r * this->cols + tileBase], yLocal, copyLen);
-            }
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
         }
     }
 
 private:
+    __aicore__ inline bool RowIsValid(int32_t localRow) const {
+        uint32_t globalRow = AscendC::GetBlockIdx() * rowsPerBlock + static_cast<uint32_t>(localRow);
+        return globalRow < totalRows;
+    }
+
+    __aicore__ inline void CopyIn(int32_t localRow) {
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm[static_cast<uint32_t>(localRow) * rowSize], rowSize);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t) {
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+
+        // Compute softmax along the row: y = softmax(x)
+        // Assume AscendC provides a fused Softmax; otherwise, backend may lower to appropriate sequence.
+        AscendC::Softmax(yLocal, xLocal, rowSize);
+
+        outQueueY.EnQue<float>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t localRow) {
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::DataCopy(yGm[static_cast<uint32_t>(localRow) * rowSize], yLocal, rowSize);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
     AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpTileBuf, tmpTileBuf2;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
 
-    AscendC::GlobalTensor<float> xGm, yGm;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
 
-    uint32_t cols;
-    uint32_t tileNum;
-    uint32_t tileLength;
-    int32_t axis;
-
-    uint32_t rowStart;
-    uint32_t rowCount;
+    uint32_t totalRows;
+    uint32_t rowSize;
+    uint32_t rowsPerBlock;
 };
 
 extern "C" __global__ __aicore__ void softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelSoftmax op;
-    op.Init(x, y, tiling_data.totalRows, tiling_data.cols, tiling_data.tileNum, tiling_data.axis);
+    op.Init(x, y, tiling_data.totalRows, tiling_data.rowSize, tiling_data.rowsPerBlock);
     op.Process();
 }

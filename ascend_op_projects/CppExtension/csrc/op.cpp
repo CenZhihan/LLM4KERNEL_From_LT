@@ -4,16 +4,20 @@
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor hardtanh_impl_npu(const at::Tensor& self, double min_val, double max_val) {
-    at::Tensor result = at::empty_like(self);
-    EXEC_NPU_CMD(aclnnHardtanhCustom, self, min_val, max_val, result);
+at::Tensor conv2d_add_scale_sigmoid_group_norm_custom_impl_npu(const at::Tensor& x,
+                                                               const at::Tensor& bias,
+                                                               const at::Tensor& scale,
+                                                               const at::Tensor& gamma,
+                                                               const at::Tensor& beta) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnConv2dAddScaleSigmoidGroupNormCustom, x, bias, scale, gamma, beta, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("hardtanh_custom", &hardtanh_impl_npu);
+    m.impl("conv2d_add_scale_sigmoid_group_norm_custom", &conv2d_add_scale_sigmoid_group_norm_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("hardtanh_custom", &hardtanh_impl_npu, "HardTanh activation");
+    m.def("conv2d_add_scale_sigmoid_group_norm_custom", &conv2d_add_scale_sigmoid_group_norm_custom_impl_npu, "conv2d add+scale+sigmoid+groupnorm (fused, custom)");
 }

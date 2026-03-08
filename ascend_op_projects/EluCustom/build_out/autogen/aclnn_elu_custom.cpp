@@ -119,7 +119,7 @@ extern aclnnStatus __attribute__((weak)) NnopbaseSetFormatMatchMode(void *execut
 
 aclnnStatus aclnnEluCustomGetWorkspaceSize(
     const aclTensor *x,
-    double alpha,
+    bool alpha,
     const aclTensor *out,
     uint64_t *workspaceSize,
     aclOpExecutor **executor)
@@ -132,7 +132,7 @@ aclnnStatus aclnnEluCustomGetWorkspaceSize(
     const char *opType = "EluCustom";
     char inputDesc[] = {1};
     char outputDesc[] = {1};
-    char attrDesc[] = {0};
+    char attrDesc[] = {1};
 
     NNOPBASE_ASSERT_NOTNULL_RETVAL(x);
     NNOPBASE_ASSERT_NOTNULL_RETVAL(out);
@@ -147,8 +147,7 @@ aclnnStatus aclnnEluCustomGetWorkspaceSize(
     *executor = reinterpret_cast<aclOpExecutor *>(nnopExecutor);
     NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddTilingId(*executor, &tilingId));
     NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddInput(*executor, x, 0));
-    float tmp0 = static_cast<float>(alpha);
-    NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddAttrWithDtype(*executor, static_cast<void*>(&tmp0), sizeof(float), 0, kNnopbaseFloat));
+    NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddAttrWithDtype(*executor, static_cast<void*>(&alpha), sizeof(bool), 0, kNnopbaseBool));
     NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddOutput(*executor, out, 0));
     if (NnopbaseAddParamName != NULL) {
         NNOPBASE_ASSERT_OK_RETVAL(NnopbaseAddParamName(*executor, 0, "x", true));

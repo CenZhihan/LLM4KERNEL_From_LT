@@ -4,43 +4,50 @@
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 16;
+const uint32_t TILE_NUM = 8;
 
-static ge::graphStatus TilingFunc(gert::TilingContext *context)
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     LeakyReluCustomTilingData tiling;
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
-    const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    const float *negativeSlope = attrs->GetAttrPointer<float>(0);
+
+    float negativeSlope = 0.01f;
+    if (context->GetAttrs() != nullptr) {
+        auto attrs = context->GetAttrs();
+        // Try get float attribute; ignore failure and keep default
+        (void)attrs->GetFloat("negative_slope", negativeSlope);
+    }
 
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-    tiling.set_negativeSlope(*negativeSlope);
+    tiling.set_negativeSlope(negativeSlope);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
-} // namespace optiling
+}
 
 namespace ge {
-static ge::graphStatus InferShape(gert::InferShapeContext *context)
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape *x1_shape = context->GetInputShape(0);
-    gert::Shape *y_shape = context->GetOutputShape(0);
-    *y_shape = *x1_shape;
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const ge::DataType x1_dtype = context->GetInputDataType(0);
-    context->SetOutputDataType(0, x1_dtype);
-    return GRAPH_SUCCESS;
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
 }
-} // namespace ge
+}
 
 namespace ops {
 class LeakyReluCustom : public OpDef {
@@ -52,17 +59,18 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Attr("negative_slope").AttrType(OPTIONAL).Float(0.01);
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };

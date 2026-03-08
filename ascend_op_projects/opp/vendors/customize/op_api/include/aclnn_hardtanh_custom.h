@@ -15,8 +15,6 @@ extern "C" {
 /* funtion: aclnnHardtanhCustomGetWorkspaceSize
  * parameters :
  * x : required
- * minVal : optional
- * maxVal : optional
  * out : required
  * workspaceSize : size of workspace(output).
  * executor : executor context(output).
@@ -24,8 +22,6 @@ extern "C" {
 __attribute__((visibility("default")))
 aclnnStatus aclnnHardtanhCustomGetWorkspaceSize(
     const aclTensor *x,
-    double minVal,
-    double maxVal,
     const aclTensor *out,
     uint64_t *workspaceSize,
     aclOpExecutor **executor);
