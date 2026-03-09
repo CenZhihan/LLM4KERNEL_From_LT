@@ -33,4 +33,5 @@ ascendc_official_api_doc_path = f'{project_root_path}/prompts/ascendc_official_a
 # Ascend compile related
 op_engineer_dir = f'{project_root_path}/ascend_op_projects'
 deploy_path = f'{op_engineer_dir}/opp'
-ascendc_device = 'ai_core-Ascend910B2'
+# ascendc_device = 'ai_core-Ascend910B2'
+ascendc_device = 'ai_core-Ascend910B4'

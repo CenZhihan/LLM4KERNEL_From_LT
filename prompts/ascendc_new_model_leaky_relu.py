@@ -45,8 +45,9 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(LeakyReluCustomTilingData)
-TILING_DATA_FIELD_DEF(uint32_t, totalLength);
-TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+TILING_DATA_FIELD_DEF(uint32_t, blockLength);
+TILING_DATA_FIELD_DEF(uint32_t, lastBlockLength);
+TILING_DATA_FIELD_DEF(uint32_t, tileLength);
 TILING_DATA_FIELD_DEF(float, negativeSlope);
 END_TILING_DATA_DEF;
 
@@ -54,15 +55,15 @@ REGISTER_TILING_DATA_CLASS(LeakyReluCustom, LeakyReluCustomTilingData)
 }
 """
 
-host_operator_src="""
 
+host_operator_src="""
 #include "leaky_relu_custom_tiling.h"
 #include "register/op_def_registry.h"
 
-
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 16;
+const uint32_t BLOCK_DIM = 48;
+const uint32_t ALIGN_NUM = 8;
+const uint32_t MAX_TILE_LENGTH = 8192; 
 
 static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
@@ -70,10 +71,15 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
     const gert::RuntimeAttrs *attrs = context->GetAttrs();
     const float *negativeSlope = attrs->GetAttrPointer<float>(0);
-
+    
+    uint32_t blockLength = totalLength / BLOCK_DIM;
+    blockLength = (blockLength / ALIGN_NUM) * ALIGN_NUM;
+    uint32_t lastBlockLength = totalLength - blockLength * (BLOCK_DIM - 1);
+    
     context->SetBlockDim(BLOCK_DIM);
-    tiling.set_totalLength(totalLength);
-    tiling.set_tileNum(TILE_NUM);
+    tiling.set_blockLength(blockLength);
+    tiling.set_lastBlockLength(lastBlockLength);
+    tiling.set_tileLength(MAX_TILE_LENGTH);
     tiling.set_negativeSlope(*negativeSlope);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
@@ -100,7 +106,6 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 }
 } // namespace ge
 
-
 namespace ops {
 class LeakyReluCustom : public OpDef {
 public:
@@ -117,20 +122,15 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
         this->Attr("negative_slope").AttrType(OPTIONAL).Float(0.1);
-
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
-
     }
 };
-
 OP_ADD(LeakyReluCustom);
 }
-
 """
+
 
 kernel_src="""
 #include "kernel_operator.h"
@@ -142,17 +142,26 @@ constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 class KernelLeakyRelu {
 public:
     __aicore__ inline KernelLeakyRelu() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum, float negativeSlope)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t blockLength, uint32_t lastBlockLength, uint32_t tileLength, float negativeSlope)
     {
-        this->blockLength = totalLength / AscendC::GetBlockNum();
-        this->tileNum = tileNum;
         this->negativeSlope = static_cast<float>(negativeSlope);
-        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->tileLength = tileLength;
+        
+        if (AscendC::GetBlockIdx() == AscendC::GetBlockNum() - 1) {
+            this->blockLength = lastBlockLength;
+        } else {
+            this->blockLength = blockLength;
+        }
+        
+        if (this->blockLength == 0) return;
+        
+        this->tileNum = this->blockLength / this->tileLength;
+        this->tailLength = this->blockLength % this->tileLength;
 
-        // get start index for current core, core parallel
-        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        // pipe alloc memory to queue, the unit is Bytes
+        uint32_t offset = blockLength * AscendC::GetBlockIdx();
+        xGm.SetGlobalBuffer((__gm__ float *)x + offset, this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y + offset, this->blockLength);
+        
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float));
@@ -160,63 +169,60 @@ public:
     }
     __aicore__ inline void Process()
     {
-        // loop count need to be doubled, due to double buffer
-        int32_t loopCount = this->tileNum * BUFFER_NUM;
-        // tiling strategy, pipeline parallel
-        for (int32_t i = 0; i < loopCount; i++) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
+        if (this->blockLength == 0) return;
+        for (int32_t i = 0; i < this->tileNum; i++) {
+            CopyIn(i, this->tileLength);
+            Compute(i, this->tileLength);
+            CopyOut(i, this->tileLength);
+        }
+        if (this->tailLength > 0) {
+            CopyIn(this->tileNum, this->tailLength);
+            Compute(this->tileNum, this->tailLength);
+            CopyOut(this->tileNum, this->tailLength);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress)
+    __aicore__ inline void CopyIn(int32_t progress, uint32_t length)
     {
-        // alloc tensor from queue memory
         AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        // copy progress_th tile from global tensor to local tensor
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
-        // enque input tensors to VECIN queue
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], length);
         inQueueX.EnQue(xLocal);
     }
-    __aicore__ inline void Compute(int32_t progress)
+    __aicore__ inline void Compute(int32_t progress, uint32_t length)
     {
-        // deque input tensors from VECIN queue
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
         AscendC::LocalTensor<float> tmpTensor1 = tmpBuffer1.Get<float>();
         AscendC::LocalTensor<float> tmpTensor2 = tmpBuffer2.Get<float>();
         float inputVal = 0.0;
-        AscendC::Maxs(tmpTensor1, xLocal, inputVal, this->tileLength);
-        AscendC::Mins(tmpTensor2, xLocal, inputVal, this->tileLength);
-        AscendC::Muls(tmpTensor2, tmpTensor2, this->negativeSlope, this->tileLength);
-        AscendC::Add(yLocal, tmpTensor1, tmpTensor2, this->tileLength);
-        // enque the output tensor to VECOUT queue
+        
+        // Pad length to multiple of 8 (or 16 bytes for float, 32 bytes for datamove) for computation if needed
+        // but Maxs/Mins support length
+        AscendC::Maxs(tmpTensor1, xLocal, inputVal, length);
+        AscendC::Mins(tmpTensor2, xLocal, inputVal, length);
+        AscendC::Muls(tmpTensor2, tmpTensor2, this->negativeSlope, length);
+        AscendC::Add(yLocal, tmpTensor1, tmpTensor2, length);
+        
         outQueueY.EnQue<float>(yLocal);
-        // free input tensors for reuse
         inQueueX.FreeTensor(xLocal);
     }
-    __aicore__ inline void CopyOut(int32_t progress)
+    __aicore__ inline void CopyOut(int32_t progress, uint32_t length)
     {
-        // deque output tensor from VECOUT queue
         AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
-        // copy progress_th tile from local tensor to global tensor
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
-        // free output tensor for reuse
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, length);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2;
-    // create queues for input, in this case depth is equal to buffer num
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
-    // create queue for output, in this case depth is equal to buffer num
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::GlobalTensor<float> xGm, yGm;
     uint32_t blockLength;
     uint32_t tileNum;
+    uint32_t tailLength;
     uint32_t tileLength;
     float negativeSlope;
 };
@@ -224,10 +230,11 @@ private:
 extern "C" __global__ __aicore__ void leaky_relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelLeakyRelu op;
-    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum, tiling_data.negativeSlope);
+    op.Init(x, y, tiling_data.blockLength, tiling_data.lastBlockLength, tiling_data.tileLength, tiling_data.negativeSlope);
     op.Process();
 }
 """
+
 
 python_bind_src="""
 #include <torch/library.h>
