@@ -24,6 +24,12 @@ seed_num=1024
 arch_list = ['Ada']
 arch_list_xpu = ['dg2']
 
+# Ascend C API reference for add_shot_with_doc strategy
+ascendc_api_reference_path = f'{project_root_path}/prompts/ascendc_api_reference.md'
+
+# Huawei official API doc for RAG four-ops experiment (generate_rag_four_ops.py)
+ascendc_official_api_doc_path = f'{project_root_path}/prompts/ascendc_official_api_doc.md'
+
 # Ascend compile related
 op_engineer_dir = f'{project_root_path}/ascend_op_projects'
 deploy_path = f'{op_engineer_dir}/opp'
