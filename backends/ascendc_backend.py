@@ -15,6 +15,7 @@ class AscendBackend(Backend):
         self.context = {}
         self.device = self.get_device()
         self.current_op = None  # 当前评测的 op，用于用完后删除工程目录
+
     def get_device(self):
         return torch.device('npu:6')
 
@@ -56,11 +57,18 @@ class AscendBackend(Backend):
         op_capital = underscore_to_pascalcase(op_custom)
         project_dir = os.path.join(op_engineer_dir, op_capital)
         json_path = os.path.join(op_engineer_dir, op_custom + '.json')
+        cpp_ext_dir = os.path.join(op_engineer_dir, f'CppExtension_{op_custom}')
+        opp_dir = os.path.join(op_engineer_dir, f'opp_{op_custom}')
+        
         try:
             if os.path.isdir(project_dir):
                 shutil.rmtree(project_dir, ignore_errors=True)
             if os.path.isfile(json_path):
                 os.remove(json_path)
+            if os.path.isdir(cpp_ext_dir):
+                shutil.rmtree(cpp_ext_dir, ignore_errors=True)
+            if os.path.isdir(opp_dir):
+                shutil.rmtree(opp_dir, ignore_errors=True)
         except Exception:
             pass
         self.current_op = None

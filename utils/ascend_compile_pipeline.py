@@ -134,8 +134,28 @@ def ascend_compile(generated_code, op, context, extra_kernel_include_paths=None)
     with open(os.path.join(target_directory, 'op_kernel', f'{op}.cpp'), 'w') as f:
         f.write(kernel_src)
 
-    with open(os.path.join(op_engineer_dir, 'CppExtension', 'csrc', f'op.cpp'), 'w') as f:
-        f.write(context.get('python_bind_src'))
+    # isolated deploy path
+    deploy_path_abs = os.path.abspath(os.path.join(op_engineer_dir, f'opp_{op}'))
+    
+    # dynamically rename custom_ops_lib to custom_ops_lib_{op} to prevent parallel pip install conflicts
+    python_bind_src_patched = context.get('python_bind_src', '').replace('custom_ops_lib', f'custom_ops_lib_{op}')
+    model_src_patched = context.get('model_src', '').replace('custom_ops_lib', f'custom_ops_lib_{op}')
+    
+    # write pybind
+    cpp_ext_dir = os.path.join(op_engineer_dir, f'CppExtension_{op}')
+    if os.path.exists(cpp_ext_dir):
+        shutil.rmtree(cpp_ext_dir, ignore_errors=True)
+        
+    os.makedirs(cpp_ext_dir, exist_ok=True)
+    shutil.copy2(os.path.join(op_engineer_dir, 'CppExtension', 'build_and_run.sh'), cpp_ext_dir)
+    shutil.copy2(os.path.join(op_engineer_dir, 'CppExtension', 'setup.py'), cpp_ext_dir)
+    os.makedirs(os.path.join(cpp_ext_dir, 'csrc'), exist_ok=True)
+    shutil.copy2(os.path.join(op_engineer_dir, 'CppExtension', 'csrc', 'pytorch_npu_helper.hpp'), os.path.join(cpp_ext_dir, 'csrc'))
+    if os.path.exists(os.path.join(op_engineer_dir, 'CppExtension', 'csrc', 'CMakeLists.txt')):
+        shutil.copy2(os.path.join(op_engineer_dir, 'CppExtension', 'csrc', 'CMakeLists.txt'), os.path.join(cpp_ext_dir, 'csrc'))
+        
+    with open(os.path.join(cpp_ext_dir, 'csrc', f'op.cpp'), 'w') as f:
+        f.write(python_bind_src_patched)
 
     # 生成 kernel 用 tiling_data.h 到 op_kernel/，build 时 cp op_kernel/*.* 会拷到 binary/.../src，避免 'add_custom_tiling_data.h' file not found
     _gen_tiling_data_header(target_directory, op)
@@ -146,7 +166,6 @@ def ascend_compile(generated_code, op, context, extra_kernel_include_paths=None)
     try:
         # build.sh 在打包后会执行 ./cust*.run 且不传参，install.sh 会读 ASCEND_CUSTOM_OPP_PATH 或退回到 /usr/local
         # 必须让这次执行安装到项目内 opp，否则会报 create /usr/local/Ascend/.../framework failed
-        deploy_path_abs = os.path.abspath(deploy_path)
         os.makedirs(deploy_path_abs, exist_ok=True)
         build_env = os.environ.copy()
         build_env["ASCEND_CUSTOM_OPP_PATH"] = deploy_path_abs
@@ -179,7 +198,6 @@ def ascend_compile(generated_code, op, context, extra_kernel_include_paths=None)
         print("[INFO] Begin deploy")
         os.chdir(os.path.join(target_directory, 'build_out'))
         # install.sh 要求 --install-path 必须是绝对路径，否则会退回使用 /usr/local/Ascend/opp 导致无权限
-        deploy_path_abs = os.path.abspath(deploy_path)
         os.makedirs(deploy_path_abs, exist_ok=True)
         # 避免安装脚本使用环境变量中的系统路径（ASCEND_CUSTOM_OPP_PATH/ASCEND_OPP_PATH）
         deploy_env = os.environ.copy()
@@ -204,8 +222,10 @@ def ascend_compile(generated_code, op, context, extra_kernel_include_paths=None)
 
     try:
         print("[INFO] Begin pybind")
-        os.chdir(os.path.join(op_engineer_dir, 'CppExtension'))
-        result = subprocess.run(['bash', "build_and_run.sh"], check=True, capture_output=True, text=True)
+        os.chdir(cpp_ext_dir)
+        env_with_op = os.environ.copy()
+        env_with_op['CUSTOM_OP_NAME'] = op
+        result = subprocess.run(['bash', "build_and_run.sh"], check=True, capture_output=True, text=True, env=env_with_op)
         print("[INFO] Pybind succeeded\n")
     except subprocess.CalledProcessError as e:
         # Print error if build.sh fails
@@ -214,18 +234,18 @@ def ascend_compile(generated_code, op, context, extra_kernel_include_paths=None)
         raise Exception(feedback)
 
     # Update ASCEND_CUSTOM_OPP_PATH
-    custom_opp_path = f"{project_root_path}/ascend_op_projects/opp/vendors/customize"
+    custom_opp_path = f"{deploy_path_abs}/vendors/customize"
     os.environ["ASCEND_CUSTOM_OPP_PATH"] = custom_opp_path
 
     # Update LD_LIBRARY_PATH
-    if 'ascend_op_projects' not in os.environ["LD_LIBRARY_PATH"]:
-        custom_lib_path = f"{project_root_path}/ascend_op_projects/opp/vendors/customize/op_api/lib/"
+    custom_lib_path = f"{deploy_path_abs}/vendors/customize/op_api/lib/"
+    if custom_lib_path not in os.environ.get("LD_LIBRARY_PATH", ""):
         existing_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
         os.environ["LD_LIBRARY_PATH"] = f"{custom_lib_path}:{existing_ld_path}"
     
     try:
-        compile(context['model_src'], "<string>", "exec")
-        exec(context['model_src'], context)  # For Python, use exec() (be careful with untrusted code)
+        compile(model_src_patched, "<string>", "exec")
+        exec(model_src_patched, context)  # For Python, use exec() (be careful with untrusted code)
     except Exception as e:
         raise Exception(f'Error in generated code {e}')
 

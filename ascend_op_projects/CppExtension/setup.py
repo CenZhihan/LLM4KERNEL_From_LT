@@ -1,6 +1,7 @@
 import os
 import glob
 import torch
+import sys
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension
 
@@ -13,9 +14,12 @@ BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 
 source_files = glob.glob(os.path.join(BASE_DIR, "csrc", "*.cpp"), recursive=True)
 
+# 动态获取 op name（如果通过环境变量传递的话）
+op_name = os.getenv('CUSTOM_OP_NAME', '')
+
 exts = []
 ext = NpuExtension(
-    name="custom_ops_lib",
+    name=f"custom_ops_lib_{op_name}" if op_name else "custom_ops_lib",
     sources=source_files,
     extra_compile_args = [
         '-I' + os.path.join(PYTORCH_NPU_INSTALL_PATH, "include/third_party/acl/inc"),
@@ -24,7 +28,7 @@ ext = NpuExtension(
 exts.append(ext)
 
 setup(
-    name="custom_ops",
+    name=f"custom_ops_{op_name}" if op_name else "custom_ops",
     version='1.0',
     keywords='custom_ops',
     ext_modules=exts,

@@ -45,7 +45,12 @@ def execute_template(synchronize, device, context):
                 if ref_output.shape != new_output.shape:
                     feedback = f"[FAIL] Output shape mismatch: Expected {ref_output.shape}, got {new_output.shape}"
                 elif not torch.allclose(ref_output, new_output, atol=1e-04, rtol=1e-04):
-                    feedback = f"[FAIL] Output mismatch"
+                    max_diff = torch.max(torch.abs(ref_output - new_output))
+                    detail = f"\n---> Max difference: {max_diff.item():.6f}\n" \
+                             f"---> Ref  (first 10): {ref_output.flatten()[:10].tolist()}\n" \
+                             f"---> New  (first 10): {new_output.flatten()[:10].tolist()}\n"
+                    print(detail)
+                    feedback = f"[FAIL] Output mismatch {detail}"
                 if feedback is not None:
                     correctness = False
                     correctness_information = feedback

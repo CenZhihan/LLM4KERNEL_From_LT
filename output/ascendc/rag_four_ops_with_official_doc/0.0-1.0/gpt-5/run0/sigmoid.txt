@@ -38,6 +38,12 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(SigmoidCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, ALIGN_NUM);
+  TILING_DATA_FIELD_DEF(uint32_t, block_dim);
+  TILING_DATA_FIELD_DEF(uint32_t, blockLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+  TILING_DATA_FIELD_DEF(uint32_t, lastBlockLength);
+  TILING_DATA_FIELD_DEF(uint32_t, lastTileLength);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(SigmoidCustom, SigmoidCustomTilingData)
@@ -49,16 +55,41 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 8;
+const uint32_t BUFFER_NUM = 2;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     SigmoidCustomTilingData tiling;
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
-    context->SetBlockDim(BLOCK_DIM);
+    
+    // 32-byte alignment for float (8 elements)
+    uint32_t ALIGN_NUM = 8;
+    uint32_t core_num = 1; 
+
+    // We keep it single-core for simplicity and correctness here
+    uint32_t block_dim = core_num;
+    uint32_t blockLength = totalLength; 
+    uint32_t lastBlockLength = totalLength;
+
+    // Tile size logic
+    uint32_t tileLength = 2048; // Must be multiple of ALIGN_NUM (8)
+    uint32_t tileNum = (blockLength + tileLength - 1) / tileLength;
+    uint32_t lastTileLength = blockLength - (tileNum - 1) * tileLength;
+    // ensure lastTileLength is not 0
+    if (lastTileLength == 0) {
+        lastTileLength = tileLength;
+    }
+
+    context->SetBlockDim(block_dim);
     tiling.set_totalLength(totalLength);
-    tiling.set_tileNum(TILE_NUM);
+    tiling.set_tileNum(tileNum);
+    tiling.set_ALIGN_NUM(ALIGN_NUM);
+    tiling.set_block_dim(block_dim);
+    tiling.set_blockLength(blockLength);
+    tiling.set_tileLength(tileLength);
+    tiling.set_lastBlockLength(lastBlockLength);
+    tiling.set_lastTileLength(lastTileLength);
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
@@ -121,23 +152,31 @@ constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 class KernelSigmoid {
 public:
     __aicore__ inline KernelSigmoid() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t ALIGN_NUM, uint32_t block_dim, uint32_t tileNum, uint32_t blockLength, uint32_t tileLength, uint32_t lastBlockLength, uint32_t lastTileLength)
     {
-        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->totalLength = totalLength;
+        this->ALIGN_NUM = ALIGN_NUM;
+        this->block_dim = block_dim;
         this->tileNum = tileNum;
-        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->blockLength = blockLength;
+        this->tileLength = tileLength;
+        this->lastBlockLength = lastBlockLength;
+        this->lastTileLength = lastTileLength;
+        
+        // Ensure allocations are aligned
+        uint32_t allocLength = (this->tileLength + ALIGN_NUM - 1) / ALIGN_NUM * ALIGN_NUM;
+        uint32_t alignedBlockLength = (this->blockLength + ALIGN_NUM - 1) / ALIGN_NUM * ALIGN_NUM;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, alignedBlockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y, alignedBlockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, allocLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, allocLength * sizeof(DTYPE_Y));
     }
 
     __aicore__ inline void Process()
     {
-        int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; i++) {
+        for (int32_t i = 0; i < this->tileNum; i++) {
             CopyIn(i);
             Compute(i);
             CopyOut(i);
@@ -148,20 +187,35 @@ private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        uint32_t currentLength = this->tileLength;
+        if (progress == this->tileNum - 1) {
+            currentLength = this->lastTileLength;
+        }
+        
+        uint32_t alignedLength = (currentLength + this->ALIGN_NUM - 1) / this->ALIGN_NUM * this->ALIGN_NUM;
+        
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], alignedLength);
+            
         inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/)
+    __aicore__ inline void Compute(int32_t progress)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
         AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        
+        uint32_t currentLength = this->tileLength;
+        if (progress == this->tileNum - 1) {
+            currentLength = this->lastTileLength;
+        }
+        
+        uint32_t alignedLength = (currentLength + this->ALIGN_NUM - 1) / this->ALIGN_NUM * this->ALIGN_NUM;
 
         // y = 1 / (1 + exp(-x))
-        AscendC::Muls(yLocal, xLocal, static_cast<DTYPE_Y>(-1.0f), this->tileLength);  // y = -x
-        AscendC::Exp(yLocal, yLocal, this->tileLength);                                 // y = exp(-x)
-        AscendC::Adds(yLocal, yLocal, static_cast<DTYPE_Y>(1.0f), this->tileLength);    // y = 1 + exp(-x)
-        AscendC::Reciprocal(yLocal, yLocal, this->tileLength);                          // y = 1 / y
+        AscendC::Muls(yLocal, xLocal, static_cast<DTYPE_Y>(-1.0f), alignedLength);  // y = -x
+        AscendC::Exp(yLocal, yLocal, alignedLength);                                 // y = exp(-x)
+        AscendC::Adds(yLocal, yLocal, static_cast<DTYPE_Y>(1.0f), alignedLength);    // y = 1 + exp(-x)
+        AscendC::Reciprocal(yLocal, yLocal, alignedLength);                          // y = 1 / y
 
         outQueueY.EnQue<DTYPE_Y>(yLocal);
         inQueueX.FreeTensor(xLocal);
@@ -170,7 +224,14 @@ private:
     __aicore__ inline void CopyOut(int32_t progress)
     {
         AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        uint32_t currentLength = this->tileLength;
+        if (progress == this->tileNum - 1) {
+            currentLength = this->lastTileLength;
+        }
+        
+        uint32_t alignedLength = (currentLength + this->ALIGN_NUM - 1) / this->ALIGN_NUM * this->ALIGN_NUM;
+        
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, alignedLength);
         outQueueY.FreeTensor(yLocal);
     }
 
@@ -182,15 +243,20 @@ private:
     AscendC::GlobalTensor<DTYPE_X> xGm;
     AscendC::GlobalTensor<DTYPE_Y> yGm;
 
-    uint32_t blockLength;
+    uint32_t totalLength;
     uint32_t tileNum;
+    uint32_t ALIGN_NUM;
+    uint32_t block_dim;
+    uint32_t blockLength;
     uint32_t tileLength;
+    uint32_t lastBlockLength;
+    uint32_t lastTileLength;
 };
 
 extern "C" __global__ __aicore__ void sigmoid_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelSigmoid op;
-    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum);
+    op.Init(x, y, tiling_data.totalLength, tiling_data.ALIGN_NUM, tiling_data.block_dim, tiling_data.tileNum, tiling_data.blockLength, tiling_data.tileLength, tiling_data.lastBlockLength, tiling_data.lastTileLength);
     op.Process();
 }
 """

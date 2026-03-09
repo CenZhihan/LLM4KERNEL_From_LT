@@ -47,7 +47,9 @@ host_tiling_src="""
 namespace optiling {
 BEGIN_TILING_DATA_DEF(PowerBroadcastCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, alignedLength);
   TILING_DATA_FIELD_DEF(uint32_t, innerSize);
+  TILING_DATA_FIELD_DEF(uint32_t, alignedInnerSize);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(PowerBroadcastCustom, PowerBroadcastCustomTilingData)
@@ -59,20 +61,25 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 
 namespace optiling {
-const uint32_t MAX_BLOCK_DIM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     PowerBroadcastCustomTilingData tiling;
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
     uint32_t innerSize = context->GetInputShape(1)->GetOriginShape().GetShapeSize();
 
-    // rows across the leading dimensions
-    uint32_t rows = innerSize == 0 ? 0 : totalLength / innerSize;
-    uint32_t usedBlockDim = rows == 0 ? 1 : (rows < MAX_BLOCK_DIM ? rows : MAX_BLOCK_DIM);
-    context->SetBlockDim(usedBlockDim);
+    uint32_t alignedLength = (totalLength + 7) / 8 * 8;
+    uint32_t alignedInnerSize = (innerSize + 7) / 8 * 8;
+    
+    if (alignedInnerSize == 0) {
+        alignedInnerSize = 8;
+    }
+    
+    context->SetBlockDim(1);
 
     tiling.set_totalLength(totalLength);
+    tiling.set_alignedLength(alignedLength);
     tiling.set_innerSize(innerSize);
+    tiling.set_alignedInnerSize(alignedInnerSize);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
@@ -136,85 +143,119 @@ kernel_src="""
 #define __NPU_TILING__
 #include "power_broadcast_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 1; // single-buffering per row
+constexpr int32_t BUFFER_NUM = 2; // single-buffering per row
 
 class KernelPowerBroadcast {
 public:
     __aicore__ inline KernelPowerBroadcast() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR exponent, GM_ADDR y, uint32_t totalLength, uint32_t innerSize)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR exponent, GM_ADDR y, uint32_t totalLength, uint32_t alignedLength, uint32_t innerSize, uint32_t alignedInnerSize)
     {
+        this->totalLength = totalLength;
         this->innerSize = innerSize;
-        this->blockLength = totalLength / AscendC::GetBlockNum();
-        // rows assigned to this block; we choose blockDim as min(rows, MAX_BLOCK_DIM) in host tiling
-        this->rowsPerBlock = (innerSize == 0) ? 0 : (this->blockLength / innerSize);
+        this->alignedInnerSize = alignedInnerSize;
+        
+        // Single core processing
+        this->tileLength = 2048; // Must be multiple of 8
+        this->tileNum = (alignedLength + this->tileLength - 1) / this->tileLength;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        eGm.SetGlobalBuffer((__gm__ DTYPE_EXPONENT *)exponent, this->innerSize);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        uint32_t alignedBlockLength = (this->totalLength + 7) / 8 * 8;
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, alignedBlockLength);
+        eGm.SetGlobalBuffer((__gm__ DTYPE_EXPONENT *)exponent, alignedInnerSize);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y, alignedBlockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->innerSize * sizeof(DTYPE_X));
-        pipe.InitBuffer(inQueueE, BUFFER_NUM, this->innerSize * sizeof(DTYPE_EXPONENT));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->innerSize * sizeof(DTYPE_Y));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueE, 1, this->alignedInnerSize * sizeof(DTYPE_EXPONENT));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
     }
 
     __aicore__ inline void Process()
     {
-        for (uint32_t r = 0; r < this->rowsPerBlock; ++r) {
-            CopyIn(r);
-            Compute(r);
-            CopyOut(r);
+        // Load e to UB first (broadcast target)
+        AscendC::LocalTensor<DTYPE_EXPONENT> eLocal = inQueueE.AllocTensor<DTYPE_EXPONENT>();
+        AscendC::DataCopy(eLocal, eGm[0], this->alignedInnerSize);
+        inQueueE.EnQue(eLocal);
+
+        AscendC::LocalTensor<DTYPE_EXPONENT> eLocalCompute = inQueueE.DeQue<DTYPE_EXPONENT>();
+
+        for (int32_t i = 0; i < this->tileNum; i++) {
+            CopyIn(i);
+            Compute(i, eLocalCompute);
+            CopyOut(i);
         }
+        
+        // Free e
+        inQueueE.FreeTensor(eLocalCompute);
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t rowIdx)
+    __aicore__ inline void CopyIn(int32_t progress)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_EXPONENT> eLocal = inQueueE.AllocTensor<DTYPE_EXPONENT>();
-        AscendC::DataCopy(xLocal, xGm[rowIdx * this->innerSize], this->innerSize);
-        AscendC::DataCopy(eLocal, eGm[0], this->innerSize);
+        uint32_t currentLength = this->tileLength;
+        if (progress == this->tileNum - 1) {
+            currentLength = this->totalLength - progress * this->tileLength;
+        }
+        uint32_t alignedLength = (currentLength + 7) / 8 * 8; // align for vector ops
+        
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], alignedLength);
         inQueueX.EnQue(xLocal);
-        inQueueE.EnQue(eLocal);
     }
 
-    __aicore__ inline void Compute(uint32_t /*rowIdx*/)
+    __aicore__ inline void Compute(int32_t progress, AscendC::LocalTensor<DTYPE_EXPONENT>& eLocal)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_EXPONENT> eLocal = inQueueE.DeQue<DTYPE_EXPONENT>();
         AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
         
-        AscendC::Ln(xLocal, xLocal, this->innerSize);
-        AscendC::Mul(xLocal, xLocal, eLocal, this->innerSize);
-        AscendC::Exp(yLocal, xLocal, this->innerSize);
+        uint32_t currentLength = this->tileLength;
+        if (progress == this->tileNum - 1) {
+            currentLength = this->totalLength - progress * this->tileLength;
+        }
+        uint32_t alignedLength = (currentLength + 7) / 8 * 8;
+
+        uint32_t innerOffset = (progress * this->tileLength) % this->innerSize;
+        
+        AscendC::Ln(yLocal, xLocal, alignedLength);
+        AscendC::Mul(yLocal, yLocal, eLocal[innerOffset], alignedLength);
+        AscendC::Exp(yLocal, yLocal, alignedLength);
         
         outQueueY.EnQue<DTYPE_Y>(yLocal);
         inQueueX.FreeTensor(xLocal);
-        inQueueE.FreeTensor(eLocal);
     }
 
-    __aicore__ inline void CopyOut(uint32_t rowIdx)
+    __aicore__ inline void CopyOut(int32_t progress)
     {
         AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
-        AscendC::DataCopy(yGm[rowIdx * this->innerSize], yLocal, this->innerSize);
+        uint32_t currentLength = this->tileLength;
+        if (progress == this->tileNum - 1) {
+            currentLength = this->totalLength - progress * this->tileLength;
+        }
+        
+        uint32_t alignedLength = (currentLength + 7) / 8 * 8; // align for vector ops
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, alignedLength);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueE;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueE;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
     AscendC::GlobalTensor<DTYPE_X> xGm;
     AscendC::GlobalTensor<DTYPE_EXPONENT> eGm;
     AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t totalLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
     uint32_t innerSize;
-    uint32_t blockLength;
-    uint32_t rowsPerBlock;
+    uint32_t alignedInnerSize;
 };
 
 extern "C" __global__ __aicore__ void power_broadcast_custom(GM_ADDR x, GM_ADDR exponent, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelPowerBroadcast op;
-    op.Init(x, exponent, y, tiling_data.totalLength, tiling_data.innerSize);
+    op.Init(x, exponent, y, tiling_data.totalLength, tiling_data.alignedLength, tiling_data.innerSize, tiling_data.alignedInnerSize);
     op.Process();
 }
 """
