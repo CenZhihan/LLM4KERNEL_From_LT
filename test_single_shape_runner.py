@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import importlib
+import importlib.util
 import traceback
 
 # Ensure project root is in path
@@ -20,7 +21,11 @@ def test_matmul_add(device, custom_ops_lib):
     out = custom_ops_lib.matmul_add_custom(A, B, bias)
     expected = torch.matmul(A, B) + bias
     if not torch.allclose(out.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3):
-        return False, "matmul_add_custom(A, B, bias) != A@B + bias"
+        max_diff = torch.max(torch.abs(out.cpu() - expected.cpu()))
+        detail = f"\n---> Max difference: {max_diff.item():.6f}\n" \
+                 f"---> Ref  (first 10): {expected.flatten().cpu()[:10].tolist()}\n" \
+                 f"---> New  (first 10): {out.flatten().cpu()[:10].tolist()}\n"
+        return False, f"matmul_add_custom(A, B, bias) != A@B + bias {detail}"
     return True, "matmul_add_custom 结果正确"
 
 def test_leaky_relu(device, custom_ops_lib):
@@ -29,7 +34,11 @@ def test_leaky_relu(device, custom_ops_lib):
     out = custom_ops_lib.leaky_relu_custom(x, negative_slope)
     expected = torch.nn.functional.leaky_relu(x.cpu(), negative_slope).to(device)
     if not torch.allclose(out.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3):
-        return False, "leaky_relu_custom 结果不一致"
+        max_diff = torch.max(torch.abs(out.cpu() - expected.cpu()))
+        detail = f"\n---> Max difference: {max_diff.item():.6f}\n" \
+                 f"---> Ref  (first 10): {expected.flatten().cpu()[:10].tolist()}\n" \
+                 f"---> New  (first 10): {out.flatten().cpu()[:10].tolist()}\n"
+        return False, f"leaky_relu_custom 结果不一致 {detail}"
     return True, "leaky_relu_custom 结果正确"
 
 def test_mse_loss(device, custom_ops_lib):
@@ -38,7 +47,11 @@ def test_mse_loss(device, custom_ops_lib):
     out = custom_ops_lib.mse_loss_custom(x, y)
     expected = torch.nn.functional.mse_loss(x.cpu(), y.cpu()).to(device)
     if not torch.allclose(out.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3):
-        return False, "mse_loss_custom 结果不一致"
+        max_diff = torch.max(torch.abs(out.cpu() - expected.cpu()))
+        detail = f"\n---> Max difference: {max_diff.item():.6f}\n" \
+                 f"---> Ref  (first 10): {expected.flatten().cpu()[:10].tolist()}\n" \
+                 f"---> New  (first 10): {out.flatten().cpu()[:10].tolist()}\n"
+        return False, f"mse_loss_custom 结果不一致 {detail}"
     return True, "mse_loss_custom 结果正确"
 
 def test_layer_norm(device, custom_ops_lib):
@@ -49,7 +62,11 @@ def test_layer_norm(device, custom_ops_lib):
     out = custom_ops_lib.layer_norm_custom(x, gamma, beta, epsilon)
     expected = torch.nn.functional.layer_norm(x.cpu(), (1024,), weight=gamma.cpu(), bias=beta.cpu(), eps=epsilon).to(device)
     if not torch.allclose(out.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3):
-        return False, "layer_norm_custom 结果不一致"
+        max_diff = torch.max(torch.abs(out.cpu() - expected.cpu()))
+        detail = f"\n---> Max difference: {max_diff.item():.6f}\n" \
+                 f"---> Ref  (first 10): {expected.flatten().cpu()[:10].tolist()}\n" \
+                 f"---> New  (first 10): {out.flatten().cpu()[:10].tolist()}\n"
+        return False, f"layer_norm_custom 结果不一致 {detail}"
     return True, "layer_norm_custom 结果正确"
 
 def test_reduce_sum(device, custom_ops_lib):
@@ -58,7 +75,11 @@ def test_reduce_sum(device, custom_ops_lib):
     ref = x.sum()
     out_val = out.sum() if out.numel() > 1 else out
     if not torch.allclose(out_val.cpu(), ref.cpu(), rtol=1e-3, atol=1e-3):
-        return False, "reduce_sum_custom 结果不一致"
+        max_diff = torch.max(torch.abs(out_val.cpu() - ref.cpu()))
+        detail = f"\n---> Max difference: {max_diff.item():.6f}\n" \
+                 f"---> Ref  (first 10): {ref.flatten().cpu()[:10].tolist()}\n" \
+                 f"---> New  (first 10): {out_val.flatten().cpu()[:10].tolist()}\n"
+        return False, f"reduce_sum_custom 结果不一致 {detail}"
     return True, "reduce_sum_custom 结果正确"
 
 tests = {
@@ -99,7 +120,29 @@ def run():
         if module_name in sys.modules:
             del sys.modules[module_name]
         
-        custom_ops_lib = importlib.import_module(module_name)
+        # NOTE: dynamically load the .so file which is placed by ascend_compile in a custom directory
+        # The deploy path was added to LD_LIBRARY_PATH but the Python module itself might only be available in standard paths
+        # Actually it was pip installed in the compile step. Let's try to reload standard paths.
+        import site
+        importlib.reload(site)
+        
+        try:
+            custom_ops_lib = importlib.import_module(module_name)
+        except ModuleNotFoundError:
+            # Maybe the wheel installed a different name or to a path not yet in sys.path
+            import glob
+            # Try to directly load the extension if import fails
+            cpp_ext_dir = os.path.join(project_root, "ascend_op_projects", f"CppExtension_{op_name}_custom")
+            wheel_dir = os.path.join(cpp_ext_dir, "dist")
+            # If we need to directly find the .so:
+            so_files = glob.glob(os.path.join(cpp_ext_dir, "build", "lib*", "*.so"))
+            if so_files:
+                spec = importlib.util.spec_from_file_location(module_name, so_files[0])
+                custom_ops_lib = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = custom_ops_lib
+                spec.loader.exec_module(custom_ops_lib)
+            else:
+                raise
         ok, msg = tests[op_name](device, custom_ops_lib)
         result['correctness'] = ok
         result['correctness_info'] = msg
