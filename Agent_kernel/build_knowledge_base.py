@@ -14,7 +14,8 @@ import shutil
 COLLECTION_NAME = os.environ.get("KB_COLLECTION", "ascend_c_knowledge")
 PERSIST_DIR = Path(os.environ.get("KB_PERSIST_DIR", str(Path(__file__).resolve().parent / "chroma_db"))).resolve()
 # 重建：1 表示先删掉持久化目录
-REBUILD = os.environ.get("KB_REBUILD", "0") in ("1", "true", "True", "yes", "YES")
+# 这里如果不传入参数，则默认重建
+REBUILD = os.environ.get("KB_REBUILD", "1") in ("1", "true", "True", "yes", "YES")
 KNOWLEDGE_DIR = Path(__file__).resolve().parent / "Knowledge"
 # 本地 BGE-M3 路径（hidden_size=1024）
 BGE_M3_PATH = Path(__file__).resolve().parent / "models" / "bge-m3"
