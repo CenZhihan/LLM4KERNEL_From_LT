@@ -4,7 +4,7 @@
 MAX_QUERY_ROUNDS = 3
 # 是否允许使用知识库查询 / 网页搜索（两者可独立开关）
 ENABLE_KB_QUERY = True
-ENABLE_WEB_SEARCH = True
+ENABLE_WEB_SEARCH = False
 
 from typing import TypedDict, List, Annotated
 
@@ -356,6 +356,7 @@ if __name__ == "__main__":
     # 使用更容易触发搜索的问题（实时/事实类）；若用「我是谁」等身份问题，模型常判为不需搜索
     initial_state = {
         "messages": [HumanMessage(content="Ascend C的softmax怎么写？")]
+        #"messages": [HumanMessage(content="今天适不适合去北京旅游？")]
     }
     try:
         final_state = app.invoke(initial_state)
@@ -369,7 +370,7 @@ if __name__ == "__main__":
         raise
 
     # 到达 END 后：先按顺序输出知识库返回（每段约 200 token），再输出网页搜索返回
-    MAX_TOKEN_PER_SEGMENT = 200
+    MAX_TOKEN_PER_SEGMENT =  200
     _approx_chars = MAX_TOKEN_PER_SEGMENT * 4  # 约 4 字符/token
 
     print("\n" + "=" * 60)
