@@ -1,0 +1,169 @@
+import torch
+import torch.nn as nn
+import math
+
+# 六个字符串
+OP_NAME = "min_gpt_new_gelu_custom"
+OP_NAME_PASCAL = "MinGptNewGeluCustom"
+
+AICORE_KERNEL_SRC = r"""
+#include "kernel_operator.h"
+
+// 使用 AscendC 提供的 FasterGeluV2，高性能地实现 tanh 近似 GELU：
+// y = 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
+
+template <typename srcType>
+class KernelFasterGelu
+{
+public:
+    __aicore__ inline KernelFasterGelu() {}
+    __aicore__ inline void Init(GM_ADDR srcGm, GM_ADDR dstGm, uint32_t inputSize)
+    {
+        dataSize = inputSize;
+        src_global.SetGlobalBuffer(reinterpret_cast<__gm__ srcType *>(srcGm), dataSize);
+        dst_global.SetGlobalBuffer(reinterpret_cast<__gm__ srcType *>(dstGm), dataSize);
+        pipe.InitBuffer(inQueueX, 1, dataSize * sizeof(srcType));
+        pipe.InitBuffer(outQueue, 1, dataSize * sizeof(srcType));
+    }
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<srcType> srcLocal = inQueueX.AllocTensor<srcType>();
+        AscendC::DataCopy(srcLocal, src_global, dataSize);
+        inQueueX.EnQue(srcLocal);
+    }
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<srcType> dstLocal = outQueue.AllocTensor<srcType>();
+        AscendC::LocalTensor<srcType> srcLocal = inQueueX.DeQue<srcType>();
+        AscendC::FasterGeluV2(dstLocal, srcLocal, dataSize);
+        outQueue.EnQue<srcType>(dstLocal);
+        inQueueX.FreeTensor(srcLocal);
+    }
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<srcType> dstLocal = outQueue.DeQue<srcType>();
+        AscendC::DataCopy(dst_global, dstLocal, dataSize);
+        outQueue.FreeTensor(dstLocal);
+    }
+private:
+    AscendC::GlobalTensor<srcType> src_global;
+    AscendC::GlobalTensor<srcType> dst_global;
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue;
+    uint32_t dataSize = 0;
+};
+
+// Kernel 入口
+extern "C" __global__ __aicore__ void min_gpt_new_gelu_custom_kernel(GM_ADDR srcGm, GM_ADDR dstGm, uint32_t dataSize)
+{
+    // 以 half 为主，Ascend 上常用半精度计算
+    KernelFasterGelu<half> op;
+    op.Init(srcGm, dstGm, dataSize);
+    op.Process();
+}
+"""
+
+HOST_STUB_SRC = r"""
+// 该文件为占位的 Host 侧示例，具体工程中请集成到自定义算子构建系统：
+// - 负责准备grid/block、设置参数、Launch AICore Kernel
+// - 与 PyTorch NPU 框架绑定
+// 这里仅提供接口示意。
+
+#include <cstdint>
+#include <cstddef>
+
+// AscendC runtime/driver 相关头文件与实际工程环境有关
+// 需在真实环境中包含相应 CANN 头文件并完成 Launch 逻辑。
+
+extern "C" void LaunchMinGptNewGeluCustom(void* stream, void* src, void* dst, uint32_t elem_num);
+
+// 伪代码：在实际注册时，包装为框架可调用的 Host 接口
+extern "C" void MinGptNewGeluCustomRun(void* stream, void* src, void* dst, uint32_t elem_num)
+{
+    // 实际项目中：完成 gridDim/blockDim 设置、tiling（若需要）、rtKernelLaunch 等
+    LaunchMinGptNewGeluCustom(stream, src, dst, elem_num);
+}
+"""
+
+OP_INFO_YAML = r"""
+# 自定义算子元信息（示例）
+# 实际集成需要符合 CANN 自定义算子规范
+op_list:
+  - op_name: min_gpt_new_gelu_custom
+    impl_path: .
+    input_desc:
+      - name: x
+        dtype: [float16]
+        shape: all
+        param_type: required
+    output_desc:
+      - name: y
+        dtype: [float16]
+        shape: all
+    attributes: []
+    kernel:
+      name: MinGptNewGeluCustom
+      block_dim: 1
+"""
+
+PYTORCH_OP_WRAPPER = r"""
+# 该文件为占位的 PyTorch 封装示例。真实工程需：
+# - 使用 torch_npu / CANN 提供的自定义 op 注册机制
+# - 通过 load_library 或安装的 wheel 自动注册算子
+#
+# 这里仅示意：暴露一个 Python 可调用的 API
+
+import torch
+
+def min_gpt_new_gelu_custom(x: torch.Tensor) -> torch.Tensor:
+    # 期望在实际环境里由 C++/So 提供 torch.ops 接口
+    # 这里先做一个占位，如果 C++ 扩展未注册，则抛异常
+    return torch.ops.ascend_custom.min_gpt_new_gelu_custom(x)
+"""
+
+BUILD_INSTRUCTIONS = r"""
+# 构建说明（示例）：
+# 1. 将 AICORE_KERNEL_SRC、HOST_STUB_SRC 写入工程源码，配合 CANN 工具链编译生成自定义算子 so。
+# 2. 依据 OP_INFO_YAML 注册算子元信息。
+# 3. 在 Python 侧通过 torch.ops.ascend_custom.min_gpt_new_gelu_custom(x) 调用。
+# 注意：此处仅提供示意，实际工程需参考 Ascend CANN 自定义算子开发流程。
+"""
+
+# 原始模型
+class Model(nn.Module):
+    def __init__(self):
+        super(Model, self).__init__()
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+# 新模型：用自定义 AscendC Kernel 替换
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self._fast_const = math.sqrt(2.0 / math.pi)
+    def forward(self, x: torch.Tensor):
+        # 期望使用自定义 AscendC 内核
+        try:
+            return torch.ops.ascend_custom.min_gpt_new_gelu_custom(x)
+        except Exception:
+            # 回退实现（当自定义算子不可用时）
+            return 0.5 * x * (1.0 + torch.tanh(self._fast_const * (x + 0.044715 * torch.pow(x, 3.0))))
+
+# batch_size = 8192
+# dim = 8192
+batch_size = 512
+dim = 4096
+
+def get_inputs():
+    return [torch.rand(batch_size, dim)]
+
+def get_init_inputs():
+    return []

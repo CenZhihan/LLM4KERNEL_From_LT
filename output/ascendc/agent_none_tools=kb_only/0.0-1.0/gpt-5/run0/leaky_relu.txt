@@ -1,0 +1,217 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# 六个字符串：内核名、小驼峰/帕斯卡命名、AscendC核源码、宿主包装源码、tiling源码、构建元信息
+KERNEL_NAME = "leaky_relu_custom"
+KERNEL_NAME_PASCAL = "LeakyReluCustom"
+
+AICORE_KERNEL_SOURCE = r"""
+// Copyright
+#include "kernel_operator.h"
+
+// LeakyReLU AscendC 实现：y = max(x, 0) + alpha * (x - max(x, 0))
+namespace LeakyReluAscendC {
+
+struct VecTiling {
+  uint32_t totalLength = 0; // 向量总长度（按元素计）
+  float alpha = 0.01f;      // negative_slope
+};
+
+class KernelLeakyRelu {
+public:
+  __aicore__ inline KernelLeakyRelu() {}
+  __aicore__ inline void Init(GM_ADDR xGm, GM_ADDR yGm, const VecTiling& tilingData) {
+    totalLen_ = tilingData.totalLength;
+    alpha_ = tilingData.alpha;
+
+    xGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(xGm), totalLen_);
+    yGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(yGm), totalLen_);
+
+    // 简单一次性搬运（需满足UB容量，实际工程可基于Tiling拆分并用TBufPool复用）
+    pipe_.InitBuffer(inQ_, 1, sizeof(float) * totalLen_);
+    pipe_.InitBuffer(outQ_, 1, sizeof(float) * totalLen_);
+    pipe_.InitBuffer(tmpQ0_, 1, sizeof(float) * totalLen_);
+    pipe_.InitBuffer(tmpQ1_, 1, sizeof(float) * totalLen_);
+  }
+
+  __aicore__ inline void Process() {
+    CopyIn();
+    Compute();
+    CopyOut();
+  }
+
+private:
+  __aicore__ inline void CopyIn() {
+    auto xLocal = inQ_.AllocTensor<float>();
+    AscendC::DataCopy(xLocal, xGlobal_, totalLen_);
+    inQ_.EnQue(xLocal);
+  }
+
+  __aicore__ inline void Compute() {
+    auto xLocal = inQ_.DeQue<float>();
+    auto yLocal = outQ_.AllocTensor<float>();
+
+    auto posLocal = tmpQ0_.AllocTensor<float>();
+    auto negLocal = tmpQ1_.AllocTensor<float>();
+
+    // pos = ReLU(x)
+    AscendC::Relu(posLocal, xLocal, totalLen_);
+    // neg = x - pos  (<= 0)
+    AscendC::Sub(negLocal, xLocal, posLocal, totalLen_);
+    // neg = alpha * neg
+    AscendC::Muls(negLocal, negLocal, alpha_, totalLen_);
+    // y = pos + neg
+    AscendC::Add(yLocal, posLocal, negLocal, totalLen_);
+
+    outQ_.EnQue(yLocal);
+    inQ_.FreeTensor(xLocal);
+    tmpQ0_.FreeTensor(posLocal);
+    tmpQ1_.FreeTensor(negLocal);
+  }
+
+  __aicore__ inline void CopyOut() {
+    auto yLocal = outQ_.DeQue<float>();
+    AscendC::DataCopy(yGlobal_, yLocal, totalLen_);
+    outQ_.FreeTensor(yLocal);
+  }
+
+private:
+  AscendC::GlobalTensor<float> xGlobal_;
+  AscendC::GlobalTensor<float> yGlobal_;
+  AscendC::TPipe pipe_;
+  AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQ_;
+  AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQ_;
+  AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpQ0_;
+  AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpQ1_;
+  uint32_t totalLen_ = 0;
+  float alpha_ = 0.01f;
+};
+
+} // namespace LeakyReluAscendC
+
+// AscendC 核入口
+extern "C" __global__ __aicore__ void leaky_relu_custom(GM_ADDR xGm, GM_ADDR yGm, GM_ADDR workspace, GM_ADDR tiling) {
+  if ASCEND_IS_AIC {
+    return;
+  }
+  LeakyReluAscendC::VecTiling t;
+  // 将host侧计算好的tiling信息拷贝到UB使用
+  CopyTiling(&t, tiling);
+
+  LeakyReluAscendC::KernelLeakyRelu op;
+  op.Init(xGm, yGm, t);
+  op.Process();
+}
+"""
+
+HOST_WRAPPER_SOURCE = r"""
+// 该文件示例性展示如何从Host侧准备tiling并发射内核，实际工程请对接CANN Runtime或PyTorch NPU后端
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <string>
+
+extern "C" {
+  typedef void* GM_ADDR;
+  // runtime 发射接口由平台提供，这里仅示意
+  int LaunchKernel(const char* kernelName, void** args, size_t argsSize, void* stream);
+}
+
+struct VecTilingHost {
+  uint32_t totalLength;
+  float alpha;
+};
+
+extern "C" int LaunchLeakyReluKernel(void* stream, void* xGm, void* yGm, uint32_t totalLength, float alpha) {
+  // 准备tiling缓冲
+  VecTilingHost tiling;
+  tiling.totalLength = totalLength;
+  tiling.alpha = alpha;
+
+  // 将tiling传给设备侧
+  void* tilingDev = nullptr; // 申请并拷贝到device，实际工程替换为aclrtMalloc/aclrtMemcpy
+  // void* workspace = nullptr; // 可选工作区
+
+  // 打包参数
+  void* args[] = {
+    &xGm,
+    &yGm,
+    /*workspace*/ nullptr,
+    &tilingDev
+  };
+
+  // 发射内核
+  return LaunchKernel("leaky_relu_custom", (void**)args, sizeof(args), stream);
+}
+"""
+
+TILING_SOURCE = r"""
+// 简单Tiling：全量一次处理（需确保对齐与UB容量，工程中可切片并使用TBufPool复用，参考AscendC API手册 4.3.3）
+#include <cstdint>
+
+extern "C" void LeakyReluTiling(uint32_t nElem, float alpha, void* tilingBuf, uint32_t tilingBufBytes) {
+  // 与设备侧 VecTiling 对齐
+  struct VecTiling {
+    uint32_t totalLength;
+    float alpha;
+  };
+  if (tilingBufBytes < sizeof(VecTiling)) {
+    return;
+  }
+  VecTiling* t = reinterpret_cast<VecTiling*>(tilingBuf);
+  t->totalLength = nElem;
+  t->alpha = alpha;
+}
+"""
+
+BUILD_META_JSON = r"""
+{
+  "kernel_name": "leaky_relu_custom",
+  "pascal_name": "LeakyReluCustom",
+  "op_interface": {
+    "inputs": ["x"],
+    "outputs": ["y"],
+    "attrs": [{"name": "negative_slope", "type": "float", "default": 0.01}]
+  },
+  "compile": {
+    "block_dim": 1,
+    "ub_bytes_hint": 131072,
+    "align_bytes": 32
+  }
+}
+"""
+
+def _custom_leaky_relu_dispatch(x: torch.Tensor, negative_slope: float):
+    """
+    优先调用自定义AscendC内核；若当前环境未注册对应OP，则回退到PyTorch实现。
+    说明：该包装仅做演示，实际工程需将上述源码编译并通过torch.ops注册为自定义算子。
+    """
+    try:
+        return torch.ops.custom_ascend.leaky_relu_custom(x, negative_slope)
+    except Exception:
+        return F.leaky_relu(x, negative_slope=negative_slope)
+
+
+class ModelNew(nn.Module):
+    """
+    使用自定义AscendC内核替换LeakyReLU的优化版模型。
+    """
+    def __init__(self, negative_slope: float = 0.01):
+        super(ModelNew, self).__init__()
+        self.negative_slope = negative_slope
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _custom_leaky_relu_dispatch(x, self.negative_slope)
+
+
+# 与原始示例保持一致的输入生成函数
+batch_size = 512
+dim = 32768
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # 无特殊初始化输入

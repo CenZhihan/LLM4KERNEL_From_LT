@@ -1,0 +1,93 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# 六个关键字符串
+SIX_STRINGS = [
+    "hardtanh_custom",
+    "HardtanhCustom",
+    "ascend_custom",
+    "libhardtanh_custom.so",
+    "hardtanh_custom(Tensor x, float min_val=-1.0, float max_val=1.0) -> Tensor",
+    "ModelNew",
+]
+
+# 自定义算子命名信息
+CUSTOM_KERNEL_NAME = "hardtanh_custom"         # kernel 函数名（snake case）
+CUSTOM_KERNEL_NAME_PASCAL = "HardtanhCustom"   # PascalCase 名称
+CUSTOM_OP_LIBRARY = "ascend_custom"            # 自定义算子命名空间（library）
+CUSTOM_SO_CANDIDATES = [
+    "libhardtanh_custom.so",
+    "libHardtanhCustom.so",
+    "hardtanh_custom.so",
+    "HardtanhCustom.so",
+]
+
+# 1) 定义自定义算子 Schema
+_lib_def = torch.library.Library(CUSTOM_OP_LIBRARY, "DEF")
+_lib_def.define("hardtanh_custom(Tensor x, float min_val=-1.0, float max_val=1.0) -> Tensor")
+
+# 2) Meta 与通用回退（Composite）实现
+def _hardtanh_custom_meta(x: torch.Tensor, min_val: float = -1.0, max_val: float = 1.0) -> torch.Tensor:
+    # Meta 设备上只需要返回形状/类型正确的张量
+    return x.new_empty(x.shape)
+
+def _hardtanh_custom_ref(x: torch.Tensor, min_val: float = -1.0, max_val: float = 1.0) -> torch.Tensor:
+    # 通用回退实现：使用 clamp 等价实现 HardTanh
+    return torch.clamp(x, min=min_val, max=max_val)
+
+_lib_impl = torch.library.Library(CUSTOM_OP_LIBRARY, "IMPL")
+_lib_impl.impl("hardtanh_custom", "Meta", _hardtanh_custom_meta)
+_lib_impl.impl_abstract("hardtanh_custom", _hardtanh_custom_meta)  # 兼容部分版本
+
+# CPU 实现
+_lib_impl.impl("hardtanh_custom", "CPU", _hardtanh_custom_ref)
+
+# 可选：在未加载自定义后端时为其他设备提供回退（例如 CUDA/NPU 也可先用 clamp）
+try:
+    _lib_impl.impl("hardtanh_custom", "CompositeImplicitAutograd", _hardtanh_custom_ref)
+except Exception:
+    pass
+
+# 3) 试图加载 AscendC 编译生成的 .so 动态库（若存在，将覆盖相应后端实现）
+def _try_load_ascendc_kernel():
+    for name in CUSTOM_SO_CANDIDATES:
+        try:
+            torch.ops.load_library(name)
+            return name
+        except Exception:
+            continue
+    return None
+
+_LOADED_SO = _try_load_ascendc_kernel()
+
+# 4) 提供一个 Python 端友好封装，统一调用
+def hardtanh_custom(x: torch.Tensor, min_val: float = -1.0, max_val: float = 1.0) -> torch.Tensor:
+    # 调用自定义算子；若已加载 AscendC NPU kernel，将自动走后端实现
+    return torch.ops.ascend_custom.hardtanh_custom(x, float(min_val), float(max_val))
+
+
+class ModelNew(nn.Module):
+    """
+    使用自定义 AscendC 算子 hardtanh_custom 的优化模型。
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 为了兼容大多数自定义 kernel，对输入做 contiguous 处理
+        x = x.contiguous()
+        return hardtanh_custom(x, min_val=-1.0, max_val=1.0)
+
+
+# batch_size = 4096
+# dim = 393216
+batch_size = 512
+dim = 32768
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed

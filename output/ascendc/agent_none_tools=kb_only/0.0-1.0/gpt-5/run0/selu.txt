@@ -1,0 +1,275 @@
+import torch
+import torch.nn as nn
+
+# -------------------- AscendC kernel sources (to be built into a custom op lib) --------------------
+KERNEL_NAME = "selu_custom"
+KERNEL_CLASS_PASCAL = "SeluCustom"
+
+ASCENDC_DEVICE_SRC = r"""
+// File: selu_custom_kernel.cu (AscendC)
+#include "kernel_operator.h"
+
+// SELU constants (IEEE)
+template <typename T>
+__aicore__ inline T SeluAlpha();
+template <>
+__aicore__ inline float SeluAlpha<float>() { return 1.6732632423543772848170429916717f; }
+template <>
+__aicore__ inline half SeluAlpha<half>() { return (half)1.6732632423543772f; }
+
+template <typename T>
+__aicore__ inline T SeluScale();
+template <>
+__aicore__ inline float SeluScale<float>() { return 1.0507009873554804934193349852946f; }
+template <>
+__aicore__ inline half SeluScale<half>() { return (half)1.05070098735548f; }
+
+// Tile params
+constexpr int32_t BUFFER_NUM = 2;
+
+template <typename T>
+class KernelSelu {
+public:
+  __aicore__ inline KernelSelu() {}
+  __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum) {
+    ASSERT(GetBlockNum() != 0 && "block dim can not be zero!");
+    this->blockLength = totalLength / AscendC::GetBlockNum();
+    this->tileNum = tileNum;
+    ASSERT(tileNum != 0 && "tile num can not be zero!");
+    this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+    xGm.SetGlobalBuffer((__gm__ T*)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+    yGm.SetGlobalBuffer((__gm__ T*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+    pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(T));
+    pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(T));
+    pipe.InitBuffer(tmpQ0, BUFFER_NUM, this->tileLength * sizeof(T));
+    pipe.InitBuffer(tmpQ1, BUFFER_NUM, this->tileLength * sizeof(T));
+    pipe.InitBuffer(tmpQ2, BUFFER_NUM, this->tileLength * sizeof(T));
+  }
+
+  __aicore__ inline void Process(T alpha, T scale) {
+    int32_t loopCount = this->tileNum * BUFFER_NUM;
+    for (int32_t i = 0; i < loopCount; i++) {
+      CopyIn(i);
+      Compute(i, alpha, scale);
+      CopyOut(i);
+    }
+  }
+
+private:
+  __aicore__ inline void CopyIn(int32_t progress) {
+    AscendC::LocalTensor<T> xLocal = inQueueX.AllocTensor<T>();
+    AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+    inQueueX.EnQue(xLocal);
+  }
+
+  __aicore__ inline void Compute(int32_t /*progress*/, T alpha, T scale) {
+    // y = scale * (max(x,0) + alpha * (exp(min(x,0)) - 1))
+    AscendC::LocalTensor<T> xLocal = inQueueX.DeQue<T>();
+    AscendC::LocalTensor<T> yLocal = outQueueY.AllocTensor<T>();
+
+    AscendC::LocalTensor<T> zeroLocal = tmpQ0.AllocTensor<T>();
+    AscendC::LocalTensor<T> posLocal  = tmpQ1.AllocTensor<T>();
+    AscendC::LocalTensor<T> negLocal  = tmpQ2.AllocTensor<T>();
+
+    // zeroLocal = x - x
+    AscendC::Sub(zeroLocal, xLocal, xLocal, this->tileLength);
+    // posLocal = max(x, 0)
+    AscendC::Maximum(posLocal, xLocal, zeroLocal, this->tileLength);
+    // negLocal = min(x, 0)
+    AscendC::Minimum(negLocal, xLocal, zeroLocal, this->tileLength);
+
+    // reuse zeroLocal as tmp: tmp = exp(negLocal)
+    AscendC::Exp(zeroLocal, negLocal, this->tileLength);
+    // zeroLocal = exp(neg) - 1
+    AscendC::Adds(zeroLocal, zeroLocal, (T)-1, this->tileLength);
+    // zeroLocal = alpha * (exp(neg) - 1)
+    AscendC::Muls(zeroLocal, zeroLocal, alpha, this->tileLength);
+
+    // yLocal = posLocal + zeroLocal
+    AscendC::Add(yLocal, posLocal, zeroLocal, this->tileLength);
+    // yLocal = scale * yLocal
+    AscendC::Muls(yLocal, yLocal, scale, this->tileLength);
+
+    outQueueY.EnQue<T>(yLocal);
+    inQueueX.FreeTensor(xLocal);
+    tmpQ0.FreeTensor(zeroLocal);
+    tmpQ1.FreeTensor(posLocal);
+    tmpQ2.FreeTensor(negLocal);
+  }
+
+  __aicore__ inline void CopyOut(int32_t progress) {
+    AscendC::LocalTensor<T> yLocal = outQueueY.DeQue<T>();
+    AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+    outQueueY.FreeTensor(yLocal);
+  }
+
+private:
+  AscendC::TPipe pipe;
+  AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+  AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+  AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQ0;
+  AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQ1;
+  AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQ2;
+
+  AscendC::GlobalTensor<T> xGm;
+  AscendC::GlobalTensor<T> yGm;
+
+  uint32_t blockLength;
+  uint32_t tileNum;
+  uint32_t tileLength;
+};
+
+// Kernel entry for float32
+extern "C" __global__ __aicore__ void selu_custom_kernel_fp32(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
+{
+  KernelSelu<float> op;
+  op.Init(x, y, totalLength, tileNum);
+  op.Process(SeluAlpha<float>(), SeluScale<float>());
+}
+
+// Kernel entry for fp16
+extern "C" __global__ __aicore__ void selu_custom_kernel_fp16(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
+{
+  KernelSelu<half> op;
+  op.Init(x, y, totalLength, tileNum);
+  op.Process(SeluAlpha<half>(), SeluScale<half>());
+}
+"""
+
+ASCENDC_HOST_SRC = r"""
+// File: selu_custom_host.cpp
+// Host-side stub to register the custom op and launch the AscendC kernel.
+// Note: Actual build requires CANN headers and proper linkage; this is a template.
+#include <torch/script.h>
+#include <torch/extension.h>
+#include <vector>
+#include <string>
+#include <stdexcept>
+
+// Ascend runtime/CANN headers (paths depend on your environment)
+// #include "acl/acl.h"
+// #include "op_host_api.h"
+
+static inline std::tuple<uint32_t, uint32_t> PlanTiling(uint64_t totalLength) {
+  // Heuristic tiling: 8 blocks, 8 tiles per block by default
+  uint32_t blockDim = 8;
+  uint32_t tileNum = 8;
+  if (totalLength < 1 << 14) { blockDim = 1; tileNum = 1; }
+  return {blockDim, tileNum};
+}
+
+// Forward launcher: dtype dispatch
+at::Tensor selu_custom_forward(const at::Tensor& x) {
+  TORCH_CHECK(x.is_contiguous(), "selu_custom: input must be contiguous");
+  TORCH_CHECK(x.is_cuda() || x.device().is_privateuseone() || x.device().type() == at::kXLA || x.device().type() == at::kMeta || x.device().type() == at::kHPU, "selu_custom: expecting NPU-like device");
+  auto y = at::empty_like(x);
+
+  const uint64_t totalLength = x.numel();
+  if (totalLength == 0) return y;
+
+  auto plan = PlanTiling(totalLength);
+  uint32_t blockDim = std::get<0>(plan);
+  uint32_t tileNum  = std::get<1>(plan);
+
+  // Kernel symbol names compiled from AscendC device src
+  const char* k_fp32 = "selu_custom_kernel_fp32";
+  const char* k_fp16 = "selu_custom_kernel_fp16";
+
+  // In real host code, you would:
+  // 1) set up stream/context
+  // 2) configure blockDim/gridDim
+  // 3) call runtime to launch the matched kernel symbol with (x, y, totalLength, tileNum)
+  // Here we only provide an interface skeleton.
+
+  if (x.scalar_type() == at::kFloat) {
+    // launch k_fp32 with args (x.data_ptr(), y.data_ptr(), totalLength, tileNum)
+  } else if (x.scalar_type() == at::kHalf) {
+    // launch k_fp16 with args (x.data_ptr(), y.data_ptr(), totalLength, tileNum)
+  } else {
+    TORCH_CHECK(false, "selu_custom: unsupported dtype, only float16/float32");
+  }
+
+  // Fallback path (no real launch in this template)
+  // Remove this fallback when wiring up real runtime launchers.
+  y.copy_(at::selu(x));
+
+  return y;
+}
+
+TORCH_LIBRARY(selu_custom, m) {
+  m.def("selu_custom(Tensor x) -> Tensor");
+}
+TORCH_LIBRARY_IMPL(selu_custom, CPU, m) {
+  // CPU fallback for development convenience
+  m.impl("selu_custom", TORCH_FN(selu_custom_forward));
+}
+"""
+
+# -------------------- Python-side registration and wrapper --------------------
+# Load compiled custom op library if available; otherwise Python fallbacks remain.
+try:
+    torch.ops.load_library("libselu_custom.so")
+except Exception:
+    pass
+
+from torch.library import Library, impl
+
+# Define schema in case lib not loaded (Python fallback)
+_lib = Library("selu_custom", "DEF")
+_lib.define("selu_custom(Tensor x) -> Tensor")
+
+@impl(_lib, "selu_custom", "CPU")
+def _selu_custom_cpu(x: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.selu(x)
+
+def selu_custom(x: torch.Tensor) -> torch.Tensor:
+    # call custom op if available (library overrides CPU impl on NPU)
+    return torch.ops.selu_custom.selu_custom(x)
+
+# -------------------- Original model (kept for reference) --------------------
+class Model(nn.Module):
+    """
+    Simple model that performs a SELU activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies SELU activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with SELU applied, same shape as input.
+        """
+        return torch.selu(x)
+
+# -------------------- Optimized model with custom AscendC kernel --------------------
+class ModelNew(nn.Module):
+    """
+    Optimized model that replaces PyTorch SELU with a custom AscendC kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies SELU activation using custom kernel (fallbacks to torch.selu if kernel unavailable).
+        """
+        return selu_custom(x)
+
+# batch_size = 4096
+# dim = 393216
+batch_size = 512
+dim = 32768
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed

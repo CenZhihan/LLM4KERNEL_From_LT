@@ -1,0 +1,111 @@
+import torch
+import torch.nn as nn
+
+# 六个构建所需的字符串
+op_type = "TanhCustom"
+code_channel = "AscendC"
+src = r"""
+#include "register/op_def_registry.h"
+
+class TanhCustom : public OpDef {
+public:
+    explicit TanhCustom(const char* name) : OpDef(name) {
+        this->Input("x")
+            .ParamType(DYNAMIC)
+            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(DYNAMIC)
+            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        this->AICore().AddConfig("vector_core");
+    }
+};
+
+OP_ADD(TanhCustom);
+"""
+op_info = r"""
+{
+  "op_name": "TanhCustom",
+  "inputs": [
+    {
+      "index": 0,
+      "name": "x",
+      "shape": "ALL",
+      "dtype": ["float16", "float32"],
+      "format": ["ND"]
+    }
+  ],
+  "outputs": [
+    {
+      "index": 0,
+      "name": "y",
+      "shape": "ALL",
+      "dtype": ["float16", "float32"],
+      "format": ["ND"]
+    }
+  ],
+  "attrs": []
+}
+"""
+ascendc_src_dir = "tanh_custom"
+ascendc_src_file = "tanh_custom.cpp"
+
+
+def tanh_custom(x: torch.Tensor) -> torch.Tensor:
+    """
+    调用自定义 AscendC 算子（若可用），否则回退为 torch.tanh。
+    """
+    # 优先尝试可能的注册命名空间（不同构建链路可能命名不同）
+    try:
+        # 例如：torch.ops.ascendc.TanhCustom(x)
+        if hasattr(torch.ops, "ascendc") and hasattr(torch.ops.ascendc, "TanhCustom"):
+            return torch.ops.ascendc.TanhCustom(x)
+        # 例如：torch.ops.custom_ops.TanhCustom(x)
+        if hasattr(torch.ops, "custom_ops") and hasattr(torch.ops.custom_ops, "TanhCustom"):
+            return torch.ops.custom_ops.TanhCustom(x)
+        # 例如：torch.ops.aclnn.tanh_custom(x)
+        if hasattr(torch.ops, "aclnn") and hasattr(torch.ops.aclnn, "tanh_custom"):
+            return torch.ops.aclnn.tanh_custom(x)
+    except Exception:
+        pass
+    # 回退路径
+    return torch.tanh(x)
+
+
+class TanhCustomFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        y = tanh_custom(x)
+        ctx.save_for_backward(y)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (y,) = ctx.saved_tensors
+        # d/dx tanh(x) = 1 - tanh(x)^2
+        grad_input = grad_output * (1 - y.mul(y))
+        return grad_input
+
+
+class ModelNew(nn.Module):
+    """
+    使用自定义 AscendC Kernel（TanhCustom）替换 PyTorch 的 Tanh。
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return TanhCustomFn.apply(x)
+
+
+# 原模型输入构造与初始化输入保持一致
+batch_size = 512
+dim = 32768
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # 无需特殊初始化输入

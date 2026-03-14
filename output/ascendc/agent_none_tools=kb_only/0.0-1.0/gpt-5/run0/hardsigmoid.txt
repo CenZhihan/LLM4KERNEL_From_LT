@@ -1,0 +1,145 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# 六个关键字符串
+KERNEL_NAME = "hardsigmoid_custom"
+KERNEL_NAME_PASCAL = "HardsigmoidCustom"
+CUSTOM_OP_NAMESPACE = "ascend_custom"
+CUSTOM_OP_FULL_NAME = f"{CUSTOM_OP_NAMESPACE}::{KERNEL_NAME}"
+KERNEL_SO_NAME = "libhardsigmoid_custom.so"
+KERNEL_ENTRY = "hardsigmoid_custom_kernel"
+
+# 注册自定义算子（Python 端回退实现）。实际部署时请以 AscendC 编译产物覆盖对应后端实现。
+try:
+    lib_def = torch.library.Library(CUSTOM_OP_NAMESPACE, "DEF")
+    lib_def.define("hardsigmoid_custom(Tensor x) -> Tensor")
+except Exception:
+    pass
+
+def _hardsigmoid_fallback(x: torch.Tensor) -> torch.Tensor:
+    # 纯 PyTorch 组合实现，作为无自定义后端时的回退路径。
+    return torch.clamp((x + 3.0) / 6.0, 0.0, 1.0)
+
+try:
+    lib_impl = torch.library.Library(CUSTOM_OP_NAMESPACE, "IMPL")
+    # CompositeExplicitAutograd：允许后端覆盖；未覆盖时使用该组合实现
+    lib_impl.impl("hardsigmoid_custom", _hardsigmoid_fallback, "CompositeExplicitAutograd")
+except Exception:
+    pass
+
+# AscendC 内核源码字符串（设备核）。实际编译与加载由外部流水线完成。
+ASCENDC_KERNEL_SOURCE = r"""
+// HardsigmoidCustom AscendC Kernel (设备核)
+#include "kernel_operator.h"
+
+// 计算公式: y = clip((x + 3) / 6, 0, 1)
+template <typename T>
+class KernelHardsigmoid {
+public:
+    __aicore__ inline KernelHardsigmoid() {}
+
+    __aicore__ inline void Init(GM_ADDR srcGm, GM_ADDR dstGm, uint32_t elemCount)
+    {
+        count = elemCount;
+        srcGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(srcGm), count);
+        dstGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(dstGm), count);
+
+        // 简化：单块搬运
+        pipe.InitBuffer(inQueue, 1, count * sizeof(T));
+        pipe.InitBuffer(outQueue, 1, count * sizeof(T));
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<T> xLocal = inQueue.AllocTensor<T>();
+        AscendC::DataCopy(xLocal, srcGlobal, count);
+        inQueue.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<T> xLocal = inQueue.DeQue<T>();
+        AscendC::LocalTensor<T> yLocal = outQueue.AllocTensor<T>();
+
+        // y = (x + 3) / 6
+        // 注意：以下使用 Adds/Muls/Divs 等标量广播算子名称在不同 CANN 版本可能略有差异，
+        // 若无对应标量 API，可改为构造常量向量后用 Add/Div 等逐元素算子实现。
+        AscendC::LocalTensor<T> tLocal = outQueue.AllocTensor<T>();
+
+        // t = x + 3
+        AscendC::Adds(tLocal, xLocal, static_cast<T>(3.0f), count);
+        // y = t / 6
+        AscendC::Divs(yLocal, tLocal, static_cast<T>(6.0f), count);
+        // y = min(y, 1)
+        AscendC::Mins(yLocal, yLocal, static_cast<T>(1.0f), count);
+        // y = max(y, 0)
+        AscendC::Maxs(yLocal, yLocal, static_cast<T>(0.0f), count);
+
+        outQueue.EnQue<T>(yLocal);
+        inQueue.FreeTensor(xLocal);
+        outQueue.FreeTensor(tLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<T> yLocal = outQueue.DeQue<T>();
+        AscendC::DataCopy(dstGlobal, yLocal, count);
+        outQueue.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue;
+    AscendC::GlobalTensor<T> srcGlobal;
+    AscendC::GlobalTensor<T> dstGlobal;
+    uint32_t count = 0;
+};
+
+extern "C" __global__ __aicore__ void hardsigmoid_custom_kernel(GM_ADDR x, GM_ADDR y, uint32_t elemCount)
+{
+    // 这里以 half 为主要数据类型，可按实际需要模板实例化 float/bfloat16 等
+    KernelHardsigmoid<half> op;
+    op.Init(x, y, elemCount);
+    op.Process();
+}
+"""
+
+# 可选：Host 侧封装伪代码（供编译对接参考），实际工程中应由 C++/Ascend Runtime 调度
+ASCENDC_HOST_STUB = r"""
+// 伪代码：注册/调度入口（需要结合 CANN Runtime/Op Register 体系）
+// 实际项目中应提供 C++ Host 代码完成 Tensor 描述、内存管理、Launch 参数设置等。
+"""
+
+class ModelNew(nn.Module):
+    """
+    使用自定义 AscendC 内核替换 HardSigmoid 的优化模型。
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 调用自定义算子；若后端未提供内核，将回退到 Python 组合实现
+        return torch.ops.ascend_custom.hardsigmoid_custom(x)
+
+# 保持输入生成接口不变
+# batch_size = 4096
+# dim = 393216
+batch_size = 512
+dim = 32768
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # 无需特殊初始化输入

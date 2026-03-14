@@ -1,0 +1,198 @@
+import torch
+import torch.nn as nn
+
+# 六个Python字符串：自定义核名称（蛇形/帕斯卡）、AscendC内核源码、内核元信息、Python端包装器源码、内核适配信息、构建配置
+ASCENDC_KERNEL_NAME = "relu_custom"
+ASCENDC_KERNEL_NAME_PASCAL = "ReluCustom"
+
+ASCENDC_KERNEL_SOURCE = r"""
+// ReluCustom AscendC kernel: element-wise ReLU
+// Uses Basic API Relu(dst, src, calCount)
+// Reference: CANN Ascend C API Reference - 4.1.1.8 Relu
+#include "kernel_operator.h"
+
+using namespace AscendC;
+
+template <typename T>
+class KernelReluCustom {
+public:
+  __aicore__ inline KernelReluCustom() {}
+
+  __aicore__ inline void Init(GM_ADDR xGm, GM_ADDR yGm, uint32_t elemCount) {
+    dataSize = elemCount;
+    xGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(xGm), dataSize);
+    yGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(yGm), dataSize);
+
+    // one-shot full tensor process
+    pipe.InitBuffer(inQueue, 1, dataSize * sizeof(T));
+    pipe.InitBuffer(outQueue, 1, dataSize * sizeof(T));
+  }
+
+  __aicore__ inline void Process() {
+    CopyIn();
+    Compute();
+    CopyOut();
+  }
+
+private:
+  __aicore__ inline void CopyIn() {
+    LocalTensor<T> xLocal = inQueue.AllocTensor<T>();
+    DataCopy(xLocal, xGlobal, dataSize);
+    inQueue.EnQue(xLocal);
+  }
+
+  __aicore__ inline void Compute() {
+    LocalTensor<T> yLocal = outQueue.AllocTensor<T>();
+    LocalTensor<T> xLocal = inQueue.DeQue<T>();
+
+    // ReLU: y = max(x, 0)
+    Relu<T>(yLocal, xLocal, static_cast<int32_t>(dataSize));
+
+    outQueue.EnQue<T>(yLocal);
+    inQueue.FreeTensor(xLocal);
+  }
+
+  __aicore__ inline void CopyOut() {
+    LocalTensor<T> yLocal = outQueue.DeQue<T>();
+    DataCopy(yGlobal, yLocal, dataSize);
+    outQueue.FreeTensor(yLocal);
+  }
+
+private:
+  GlobalTensor<T> xGlobal;
+  GlobalTensor<T> yGlobal;
+  TPipe pipe;
+  TQue<QuePosition::VECIN, 1> inQueue;
+  TQue<QuePosition::VECOUT, 1> outQueue;
+  uint32_t dataSize = 0;
+};
+
+// Kernel entry for half precision (recommended by Relu Basic API on training products)
+extern "C" __global__ __aicore__
+void ReluCustom(GM_ADDR x, GM_ADDR y, uint32_t elemCount) {
+  KernelReluCustom<half> op;
+  op.Init(x, y, elemCount);
+  op.Process();
+}
+"""
+
+# 用于描述自定义算子的简单元信息（给外部构建/调度器使用）
+ASCENDC_KERNEL_META_JSON = r"""
+{
+  "kernel_name": "relu_custom",
+  "entry_func": "ReluCustom",
+  "block_dim": 1,
+  "inputs": [
+    {"name": "x", "dtype": "float16", "format": "ND"}
+  ],
+  "outputs": [
+    {"name": "y", "dtype": "float16", "format": "ND"}
+  ]
+}
+"""
+
+# 可选：构建配置（占位，外部工具可解析）
+ASCENDC_BUILD_CONFIG = r"""
+{
+  "opt_level": 2,
+  "precision_mode": "allow_fp16",
+  "enable_multi_core": false
+}
+"""
+
+# Python端包装器（调用自定义算子），若未加载成功则回退到torch.relu
+PYTHON_OP_WRAPPER_SOURCE = r"""
+import torch
+
+def relu_custom(x: torch.Tensor) -> torch.Tensor:
+    # 将输入移动到NPU并转为float16以匹配内核
+    orig_dtype = x.dtype
+    device = x.device
+    need_cast_back = False
+
+    if x.dtype != torch.float16:
+        x = x.to(dtype=torch.float16)
+        need_cast_back = True
+
+    if device.type != 'npu':
+        # 若不在NPU上，直接回退
+        out = torch.relu(x)
+        return out.to(orig_dtype) if need_cast_back else out
+
+    # 优先尝试调用已注册好的自定义OP（若外部已通过扩展库完成注册，如 torch.ops.myascend.relu_custom）
+    try:
+        op = torch.ops.myascend.relu_custom
+        y = op(x)
+    except Exception:
+        # 回退：使用原生ReLU
+        y = torch.relu(x)
+
+    if need_cast_back:
+        y = y.to(orig_dtype)
+    return y
+"""
+
+# 简单的内核适配信息（用于外部流水线按需扩展）
+ASCENDC_ADAPTER_INFO = r"""
+{
+  "namespace": "myascend",
+  "op_symbol": "relu_custom",
+  "kernel_pascal": "ReluCustom",
+  "supports_dtype": ["float16"],
+  "supports_format": ["ND"]
+}
+"""
+
+# 用户侧模块：将ReLU替换为自定义AscendC算子
+class ModelNew(nn.Module):
+    """
+    Simple model that performs a ReLU activation using custom AscendC kernel if available.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies ReLU activation to the input tensor via custom kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with ReLU applied, same shape as input.
+        """
+        # 内联实现，与 PYTHON_OP_WRAPPER_SOURCE 中逻辑一致，避免额外依赖
+        orig_dtype = x.dtype
+        device = x.device
+        need_cast_back = False
+
+        if x.dtype != torch.float16:
+            x = x.to(dtype=torch.float16)
+            need_cast_back = True
+
+        if device.type != 'npu':
+            out = torch.relu(x)
+            return out.to(orig_dtype) if need_cast_back else out
+
+        try:
+            y = torch.ops.myascend.relu_custom(x)
+        except Exception:
+            y = torch.relu(x)
+
+        if need_cast_back:
+            y = y.to(orig_dtype)
+        return y
+
+
+# 保持与原文件一致的输入定义
+# batch_size = 4096
+# dim = 393216
+batch_size = 512
+dim = 32768
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed

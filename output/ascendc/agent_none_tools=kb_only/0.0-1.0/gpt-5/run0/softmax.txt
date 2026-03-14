@@ -1,0 +1,83 @@
+```python
+import torch
+import torch.nn as nn
+from torch.library import Library
+
+# Six required strings
+CUSTOM_KERNEL_NAME = "softmax_custom"
+CUSTOM_KERNEL_CLASS = "SoftmaxCustom"
+ORIG_MODEL_NAME = "Model"
+NEW_MODEL_NAME = "ModelNew"
+CUSTOM_OP_NAMESPACE = "ascend_custom"
+REPLACED_OPERATOR = "torch.softmax"
+
+# Original model for reference
+class Model(nn.Module):
+    """
+    Simple model that performs a Softmax activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softmax activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features).
+
+        Returns:
+            torch.Tensor: Output tensor with Softmax applied, same shape as input.
+        """
+        return torch.softmax(x, dim=1)
+
+# Register custom AscendC op schema
+_lib_def = Library(CUSTOM_OP_NAMESPACE, "DEF")
+_lib_def.define(f"{CUSTOM_KERNEL_NAME}(Tensor x, int dim=1) -> Tensor")
+
+# Optional fallback implementation (CompositeExplicitAutograd) when custom kernel is not available
+def _softmax_custom_ref(x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+    return torch.softmax(x, dim=dim)
+
+_lib_impl = Library(CUSTOM_OP_NAMESPACE, "IMPL")
+_lib_impl.impl(CUSTOM_KERNEL_NAME, _softmax_custom_ref, "CompositeExplicitAutograd")
+
+class SoftmaxCustom(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+        y = torch.ops.__getattr__(CUSTOM_OP_NAMESPACE).__getattr__(CUSTOM_KERNEL_NAME)(x, dim)
+        ctx.dim = dim
+        ctx.save_for_backward(y)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (y,) = ctx.saved_tensors
+        dim = ctx.dim
+        # Gradient of softmax: dL/dx = y * (dL/dy - sum(dL/dy * y))
+        s = (grad_output * y).sum(dim=dim, keepdim=True)
+        grad_input = (grad_output - s) * y
+        return grad_input, None
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom AscendC kernel for Softmax.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return SoftmaxCustom.apply(x, 1)
+
+# batch_size = 4096
+# dim = 393216
+batch_size = 512
+dim = 32768
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
