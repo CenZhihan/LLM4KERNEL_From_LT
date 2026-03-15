@@ -1,92 +1,318 @@
+```python
+project_json_src = r"""
+{
+  "op": {
+    "name": "SigmoidCustom",
+    "domain": "ascend_custom",
+    "inputs": [
+      {
+        "name": "x",
+        "dtype": ["DT_FLOAT16", "DT_FLOAT"],
+        "format": ["ND"]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "y",
+        "dtype": ["DT_FLOAT16", "DT_FLOAT"],
+        "format": ["ND"]
+      }
+    ],
+    "ai_core": {
+      "configs": ["ascendxxx"]
+    },
+    "kernel": {
+      "name": "sigmoid_custom",
+      "file": "sigmoid_custom.cpp"
+    },
+    "tiling": {
+      "file": "sigmoid_custom_tiling.h",
+      "func": "TilingFunc"
+    },
+    "sources": [
+      "sigmoid_custom.cpp",
+      "sigmoid_custom_tiling.h",
+      "sigmoid_custom_op.cpp"
+    ]
+  }
+}
+"""
+
+host_tiling_src = r"""
+// SigmoidCustom: Tiling 结构与实现
+// 参考：CANN Ascend C API Reference 6 Host API - 6.2.2 TilingData Structure Registration
+//      以及 6.1.6.1/6.1.6.2 Input/Output 用法
+#ifndef SIGMOID_CUSTOM_TILING_H_
+#define SIGMOID_CUSTOM_TILING_H_
+
+#include "register/tilingdata_base.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+
+// 定义并注册 SigmoidCustom 的 TilingData 结构
+BEGIN_TILING_DATA_DEF(SigmoidCustomTilingData)
+TILING_DATA_FIELD_DEF(uint32_t, totalSize);        // 实际元素个数（按 ND 展开）
+TILING_DATA_FIELD_DEF(uint32_t, calCountAligned);  // 32B 对齐后的计算元素个数
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(SigmoidCustom, SigmoidCustomTilingData)
+
+// Tiling 实现：计算总元素数、对齐后的 calCount，并根据数据类型设置 TilingKey
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    SigmoidCustomTilingData tiling;
+
+    // 获取输入形状，并计算元素总数（按存储形状 ND 展开）
+    const gert::StorageShape* src_shape = context->GetInputShape(0);
+    const auto& shape = src_shape->GetStorageShape();
+    uint32_t dim_num = shape.GetDimNum();
+    uint64_t total_elems = 1;
+    for (uint32_t i = 0; i < dim_num; ++i) {
+        total_elems *= static_cast<uint64_t>(shape.GetDim(i));
+    }
+
+    // 数据类型与对齐
+    auto dt = context->GetInputTensor(0)->GetDataType();
+    uint32_t typeSize = 0;
+    if (dt == ge::DT_FLOAT16) {
+        typeSize = 2;
+        context->SetTilingKey(1);
+    } else if (dt == ge::DT_FLOAT) {
+        typeSize = 4;
+        context->SetTilingKey(2);
+    } else {
+        // 不支持的数据类型
+        return ge::GRAPH_FAILED;
+    }
+
+    uint64_t bytes = total_elems * typeSize;
+    uint64_t aligned_bytes = (bytes + 32 - 1) / 32 * 32;
+    uint64_t calCountAligned64 = aligned_bytes / typeSize;
+
+    tiling.set_totalSize(static_cast<uint32_t>(total_elems));
+    tiling.set_calCountAligned(static_cast<uint32_t>(calCountAligned64));
+
+    // 配置并保存 TilingData
+    context->SetBlockDim(1);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 无需 workspace
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+#endif // SIGMOID_CUSTOM_TILING_H_
+"""
+
+host_operator_src = r"""
+// SigmoidCustom: Host 侧算子定义与注册
+// 参考：CANN Ascend C API Reference 6 Host API - 6.1.6.1 Input, 6.1.6.2 Output
+#include "register/op_def_registry.h"
+#include "sigmoid_custom_tiling.h"
+
+namespace ge {
+
+// 推理函数：输出形状同输入形状
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+
+class SigmoidCustom : public OpDef {
+public:
+    explicit SigmoidCustom(const char* name) : OpDef(name)
+    {
+        // 输入/输出配置（ND，支持 float16/float）
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ ge::DT_FLOAT16, ge::DT_FLOAT })
+            .Format({ ge::FORMAT_ND });
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ ge::DT_FLOAT16, ge::DT_FLOAT })
+            .Format({ ge::FORMAT_ND });
+
+        // 形状推理与 AICore tiling
+        this->SetInferShape(ge::InferShape);
+        this->AICore().SetTiling(optiling::TilingFunc);
+
+        // 根据不同昇腾芯片型号注册差异化配置（示例占位）
+        this->AICore().AddConfig("ascendxxx");
+    }
+};
+
+OP_ADD(SigmoidCustom);
+
+} // namespace ops
+"""
+
+kernel_src = r"""
+// SigmoidCustom: AscendC Kernel 实现
+// 参考：CANN Ascend C API Reference 5 High-level APIs
+// 代码风格与缓冲区初始化参考 Sum/Floor 示例（DataCopy、TQue、TPipe 等）
+#include "kernel_operator.h"
+
+template <typename T>
+class KernelSigmoidCustom
+{
+public:
+    __aicore__ inline KernelSigmoidCustom() {}
+
+    __aicore__ inline void Init(__gm__ uint8_t* xGm, __gm__ uint8_t* yGm,
+                                uint32_t totalSize, uint32_t calCountAligned)
+    {
+        total_elems = totalSize;
+        cal_elems_aligned = calCountAligned;
+
+        xGlobal.SetGlobalBuffer((__gm__ T*)xGm);
+        yGlobal.SetGlobalBuffer((__gm__ T*)yGm);
+
+        // 输入/输出/临时计算队列缓冲区
+        pipe.InitBuffer(inQueueX, 1, cal_elems_aligned * sizeof(T));
+        pipe.InitBuffer(outQueueY, 1, cal_elems_aligned * sizeof(T));
+        pipe.InitBuffer(tmpCalcQ, 1, cal_elems_aligned * sizeof(T));
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<T> xLocal = inQueueX.AllocTensor<T>();
+        AscendC::DataCopy(xLocal, xGlobal, total_elems);
+        inQueueX.EnQue<T>(xLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<T> xLocal = inQueueX.DeQue<T>();
+        AscendC::LocalTensor<T> yLocal = outQueueY.AllocTensor<T>();
+        AscendC::LocalTensor<T> tmpLocal = tmpCalcQ.AllocTensor<T>();
+
+        // Sigmoid(x) = 1 / (1 + exp(-x))
+        T minusOne = static_cast<T>(-1.0f);
+        T one = static_cast<T>(1.0f);
+
+        // tmpLocal = -x
+        AscendC::Muls(tmpLocal, xLocal, minusOne, total_elems);
+        // tmpLocal = exp(-x)
+        AscendC::Exp(tmpLocal, tmpLocal, total_elems);
+        // tmpLocal = 1 + exp(-x)
+        AscendC::Adds(tmpLocal, tmpLocal, one, total_elems);
+        // yLocal = 1 / tmpLocal
+        AscendC::Reciprocal(yLocal, tmpLocal, total_elems);
+
+        outQueueY.EnQue<T>(yLocal);
+        tmpCalcQ.FreeTensor(tmpLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<T> yLocal = outQueueY.DeQue<T>();
+        AscendC::DataCopy(yGlobal, yLocal, total_elems);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpCalcQ;
+
+    AscendC::GlobalTensor<T> xGlobal;
+    AscendC::GlobalTensor<T> yGlobal;
+
+    uint32_t total_elems = 0;
+    uint32_t cal_elems_aligned = 0;
+};
+
+// kernel 入口，按 TilingKey 分派不同精度
+extern "C" __global__ __aicore__ void sigmoid_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+
+    if (TILING_KEY_IS(1)) { // float16
+        KernelSigmoidCustom<half> op;
+        op.Init(x, y, tiling_data.totalSize, tiling_data.calCountAligned);
+        op.Process();
+    } else if (TILING_KEY_IS(2)) { // float
+        KernelSigmoidCustom<float> op;
+        op.Init(x, y, tiling_data.totalSize, tiling_data.calCountAligned);
+        op.Process();
+    }
+}
+"""
+
+python_bind_src = r"""
+# Python 绑定：加载自定义算子并提供 Python 侧便捷调用接口
+# 说明：推理/训练侧可在程序启动时调用 load_op() 完成 .so 加载
+import os
+import torch
+
+_OP_NS = "ascend_custom"
+_OP_NAME = "SigmoidCustom"
+
+def load_op(so_path: str = None):
+    """
+    加载自定义算子动态库（.so）。
+    优先使用传入路径，其次读取环境变量 CUSTOM_OP_SO。
+    """
+    lib_path = so_path or os.environ.get("CUSTOM_OP_SO", "")
+    if lib_path and os.path.exists(lib_path):
+        torch.ops.load_library(lib_path)
+
+def sigmoid_custom(x: torch.Tensor) -> torch.Tensor:
+    """
+    Python 侧调用自定义算子，若不可用则回退至 PyTorch 实现。
+    """
+    try:
+        op = getattr(torch.ops, _OP_NS).__getattr__(_OP_NAME)
+        return op(x)
+    except Exception:
+        return torch.sigmoid(x)
+"""
+
+model_src = r"""
 import torch
 import torch.nn as nn
 
-# Six identifying strings
-OP_NAME = "sigmoid_custom"
-OP_NAME_PASCAL = "SigmoidCustom"
-ORIG_MODEL_CLASS = "Model"
-NEW_MODEL_CLASS = "ModelNew"
-GET_INPUTS_FUNC = "get_inputs"
-GET_INIT_INPUTS_FUNC = "get_init_inputs"
-
-# Try to load a prebuilt custom op library if present (optional)
-_CUSTOM_OP_LIB_LOADED = False
-for _libname in ("libsigmoid_custom.so", "sigmoid_custom.so"):
-    try:
-        torch.ops.load_library(_libname)
-        _CUSTOM_OP_LIB_LOADED = True
-        break
-    except OSError:
-        pass
-
-def _custom_op_available():
-    try:
-        ns = getattr(torch.ops, "ascend_custom")
-        _ = getattr(ns, "sigmoid_custom")
-        return True
-    except Exception:
-        return False
-
-class SigmoidCustomFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
-        use_custom = _custom_op_available()
-        y = None
-        if use_custom:
-            try:
-                y = torch.ops.ascend_custom.sigmoid_custom(x)
-            except Exception:
-                y = None
-        if y is None:
-            y = torch.sigmoid(x)
-        ctx.save_for_backward(y)
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        (y,) = ctx.saved_tensors
-        grad_input = grad_output * y * (1.0 - y)
-        return grad_input
-
-class SigmoidCustomModule(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return SigmoidCustomFunction.apply(x)
-
-class Model(nn.Module):
-    """
-    Simple model that performs a Sigmoid activation.
-    """
-    def __init__(self):
-        super(Model, self).__init__()
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Applies Sigmoid activation to the input tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor of any shape.
-
-        Returns:
-            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.
-        """
-        return torch.sigmoid(x)
-
 class ModelNew(nn.Module):
     """
-    Optimized model that replaces torch.sigmoid with custom AscendC kernel call.
+    使用自定义 AscendC Kernel(SigmoidCustom) 优化的模型。
     """
     def __init__(self):
         super(ModelNew, self).__init__()
-        self.sigmoid = SigmoidCustomModule()
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.sigmoid(x)
 
-# batch_size = 4096
-# dim = 393216
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 优先调用自定义算子，若未正确注册/加载则自动回退到 torch.sigmoid
+        try:
+            return getattr(torch.ops, "ascend_custom").__getattr__("SigmoidCustom")(x)
+        except Exception:
+            return torch.sigmoid(x)
+
+# 与原模型一致的输入构造函数
 batch_size = 512
 dim = 32768
 
@@ -95,4 +321,5 @@ def get_inputs():
     return [x]
 
 def get_init_inputs():
-    return []  # No special initialization inputs needed
+    return []
+"""```

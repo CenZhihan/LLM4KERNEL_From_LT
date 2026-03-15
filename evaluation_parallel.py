@@ -54,6 +54,13 @@ def eval_single_op(op, out_dir, language):
                         if '[ERROR]' in line or 'error:' in line:
                             detailed_compiler_error += line + '\n'
                     result_item['compile_info'] = result_item.get('compile_info', '') + detailed_compiler_error
+                tools_path = os.path.join(out_dir, f'{op}.tools.json')
+                if os.path.exists(tools_path):
+                    try:
+                        with open(tools_path, 'r', encoding='utf-8') as f:
+                            result_item['agent_tool_usage'] = json.load(f)
+                    except Exception:
+                        pass
                 print(f'[INFO] Evaluating op {op} -> {result_item}')
                 return op, result_item
             except subprocess.CalledProcessError as e:

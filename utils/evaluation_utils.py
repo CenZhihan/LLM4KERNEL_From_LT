@@ -9,26 +9,48 @@ from config import temperature, top_p, num_perf_trials
 
 def extract_first_code(output_string: str, code_language_types: list[str]) -> str:
     """
-    Extract first code block from model output, specified by code_language_type
+    Extract first code block from model output. Prefer blocks with explicit
+    language tag (```python / ```cpp) so that leading description blocks
+    (e.g. "、、、" or text in ``` without tag) from none-strategy outputs
+    are not mistaken for code.
     """
     trimmed = output_string.strip()
 
-    # Extracting the first occurrence of content between backticks
+    # 1) Prefer explicit ```python or ```cpp block (avoids taking a "description" block first)
+    for code_type in code_language_types:
+        pattern = rf"```{re.escape(code_type)}\s*\n(.*?)```"
+        match = re.search(pattern, trimmed, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+
+    # 2) Fallback: first generic ```...``` and strip optional language from first line
     code_match = re.search(r"```(.*?)```", trimmed, re.DOTALL)
-
     if code_match:
-        # Strip leading and trailing whitespace from the extracted code
         code_block = code_match.group(1).strip()
-
-        # depends on code_language_type: cpp, python, etc.
-        # sometimes the block of code is ```cpp ... ``` instead of ``` ... ```
-        # in this case strip the cpp out
         for code_type in code_language_types:
             if code_block.startswith(code_type):
                 code_block = code_block[len(code_type) :].strip()
         return code_block
 
     return None
+
+
+def _normalize_fullwidth_in_code(code: str) -> str:
+    """Replace common fullwidth punctuation with ASCII so Python compile does not raise invalid character (e.g. model wrote Chinese in docstrings)."""
+    if not code:
+        return code
+    replacements = [
+        ("\uff08", "("),   # fullwidth (
+        ("\uff09", ")"),   # fullwidth )
+        ("\uff0c", ","),   # fullwidth ,
+        ("\u3002", "."),   # Chinese period
+        ("\uff1b", ";"),   # fullwidth ;
+        ("\uff1a", ":"),   # fullwidth :
+    ]
+    for full, half in replacements:
+        code = code.replace(full, half)
+    return code
+
 
 def eval_single(response_txt:str, op, language):
     # Try to dynamically import the backend if it's not yet registered
@@ -47,6 +69,7 @@ def eval_single(response_txt:str, op, language):
         generated_code = extract_first_code(response_txt, ['python', 'cpp'])
         if generated_code is None:
             generated_code = response_txt
+        generated_code = _normalize_fullwidth_in_code(generated_code)
         compiled, compile_info = backend.compile(generated_code, op)
         if not compiled:
             result['compile_info'] = compile_info

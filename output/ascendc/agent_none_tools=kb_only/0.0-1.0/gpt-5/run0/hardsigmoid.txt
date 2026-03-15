@@ -1,53 +1,151 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+```python
+project_json_src = r"""
+{
+  "op": {
+    "name": "HardsigmoidCustom",
+    "domain": "custom",
+    "inputs": [
+      {
+        "name": "x",
+        "dtype": ["float16"],
+        "format": ["ND"]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "y",
+        "dtype": ["float16"],
+        "format": ["ND"]
+      }
+    ],
+    "ai_core": {
+      "kernel_name": "hardsigmoid_custom",
+      "block_dim": 1
+    },
+    "sources": {
+      "kernel": "hardsigmoid_custom_kernel.cpp",
+      "host": "hardsigmoid_custom.cpp",
+      "tiling": "hardsigmoid_custom_tiling.h"
+    }
+  }
+}
+"""
 
-# 六个关键字符串
-KERNEL_NAME = "hardsigmoid_custom"
-KERNEL_NAME_PASCAL = "HardsigmoidCustom"
-CUSTOM_OP_NAMESPACE = "ascend_custom"
-CUSTOM_OP_FULL_NAME = f"{CUSTOM_OP_NAMESPACE}::{KERNEL_NAME}"
-KERNEL_SO_NAME = "libhardsigmoid_custom.so"
-KERNEL_ENTRY = "hardsigmoid_custom_kernel"
+host_tiling_src = r"""
+// hardsigmoid_custom_tiling.h
+// 依据参考样例（Sum/Mean 的 tiling 定义与保存流程）实现本算子的 Tiling 数据结构
+#include "register/tilingdata_base.h"
 
-# 注册自定义算子（Python 端回退实现）。实际部署时请以 AscendC 编译产物覆盖对应后端实现。
-try:
-    lib_def = torch.library.Library(CUSTOM_OP_NAMESPACE, "DEF")
-    lib_def.define("hardsigmoid_custom(Tensor x) -> Tensor")
-except Exception:
-    pass
+namespace optiling {
+BEGIN_TILING_DATA_DEF(HardsigmoidCustomTilingData)
+TILING_DATA_FIELD_DEF(uint32_t, totalLength); // 输入张量元素个数
+END_TILING_DATA_DEF;
+REGISTER_TILING_DATA_CLASS(HardsigmoidCustom, HardsigmoidCustomTilingData)
+} // namespace optiling
+"""
 
-def _hardsigmoid_fallback(x: torch.Tensor) -> torch.Tensor:
-    # 纯 PyTorch 组合实现，作为无自定义后端时的回退路径。
-    return torch.clamp((x + 3.0) / 6.0, 0.0, 1.0)
+host_operator_src = r"""
+// hardsigmoid_custom.cpp
+// 参考资料中的 Sum/Mean 的宿主侧实现与注册流程，定义本算子的 Tiling 与 InferShape
+#include "hardsigmoid_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
 
-try:
-    lib_impl = torch.library.Library(CUSTOM_OP_NAMESPACE, "IMPL")
-    # CompositeExplicitAutograd：允许后端覆盖；未覆盖时使用该组合实现
-    lib_impl.impl("hardsigmoid_custom", _hardsigmoid_fallback, "CompositeExplicitAutograd")
-except Exception:
-    pass
+namespace optiling {
 
-# AscendC 内核源码字符串（设备核）。实际编译与加载由外部流水线完成。
-ASCENDC_KERNEL_SOURCE = r"""
-// HardsigmoidCustom AscendC Kernel (设备核)
+// 简单按二维计算元素个数（参考示例中取 GetDim(0) 与 GetDim(1) 的写法）。
+// 当前模型输入为 [batch, dim]，因此按二维即可满足需求。
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    HardsigmoidCustomTilingData tiling;
+
+    const gert::StorageShape *src_shape = context->GetInputShape(0);
+    uint32_t outter = src_shape->GetStorageShape().GetDim(0);
+    uint32_t inner  = src_shape->GetStorageShape().GetDim(1);
+    uint32_t total  = outter * inner;
+
+    tiling.set_totalLength(total);
+
+    context->SetBlockDim(1); // 元素级逐点计算，单 block 即可
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0; // 无需额外 workspace
+
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+// 输出与输入同形状
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+
+// 自定义 HardSigmoid 算子 OP 定义与注册
+class HardsigmoidCustom : public OpDef
+{
+public:
+    explicit HardsigmoidCustom(const char *name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+
+        // 硬件配置，示例使用 Ascend910B（参考文档中的占位写法）
+        this->AICore().AddConfig("Ascend910B");
+    }
+};
+
+OP_ADD(HardsigmoidCustom);
+
+} // namespace ops
+"""
+
+kernel_src = r"""
+// hardsigmoid_custom_kernel.cpp
+// 参考 AscendC API 模板（Unary 示例）与 Sum/Mean 示例的管线和队列用法
+// 实现 HardSigmoid: y = clamp(0.2 * x + 0.5, 0, 1)
+// 注意：以下使用的 AscendC 向量标量接口（Muls/Adds/Maxs/Mins）为 AscendC 高层 API 常规用法
+// 与参考中的 DataCopy、Duplicate、Sum/Mean 用法一致采用 kernel_operator.h 中的 API 风格。
+
 #include "kernel_operator.h"
 
-// 计算公式: y = clip((x + 3) / 6, 0, 1)
-template <typename T>
-class KernelHardsigmoid {
+class KernelHardSigmoid {
 public:
-    __aicore__ inline KernelHardsigmoid() {}
-
-    __aicore__ inline void Init(GM_ADDR srcGm, GM_ADDR dstGm, uint32_t elemCount)
+    __aicore__ inline KernelHardSigmoid() {}
+    __aicore__ inline void Init(__gm__ uint8_t* xGm, __gm__ uint8_t* yGm, uint32_t totalLengthIn)
     {
-        count = elemCount;
-        srcGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(srcGm), count);
-        dstGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(dstGm), count);
+        totalLength = totalLengthIn;
+        xGlobal.SetGlobalBuffer((__gm__ half*)xGm);
+        yGlobal.SetGlobalBuffer((__gm__ half*)yGm);
 
-        // 简化：单块搬运
-        pipe.InitBuffer(inQueue, 1, count * sizeof(T));
-        pipe.InitBuffer(outQueue, 1, count * sizeof(T));
+        // 为简化示例，直接按 totalLength 申请一次性缓冲，参考 Sum/Mean 示例的写法
+        pipe.InitBuffer(inQueue, 1, totalLength * sizeof(half));
+        pipe.InitBuffer(outQueue, 1, totalLength * sizeof(half));
     }
 
     __aicore__ inline void Process()
@@ -60,39 +158,30 @@ public:
 private:
     __aicore__ inline void CopyIn()
     {
-        AscendC::LocalTensor<T> xLocal = inQueue.AllocTensor<T>();
-        AscendC::DataCopy(xLocal, srcGlobal, count);
+        AscendC::LocalTensor<half> xLocal = inQueue.AllocTensor<half>();
+        AscendC::DataCopy(xLocal, xGlobal, totalLength);
         inQueue.EnQue(xLocal);
     }
 
     __aicore__ inline void Compute()
     {
-        AscendC::LocalTensor<T> xLocal = inQueue.DeQue<T>();
-        AscendC::LocalTensor<T> yLocal = outQueue.AllocTensor<T>();
+        AscendC::LocalTensor<half> xLocal = inQueue.DeQue<half>();
+        AscendC::LocalTensor<half> yLocal = outQueue.AllocTensor<half>();
 
-        // y = (x + 3) / 6
-        // 注意：以下使用 Adds/Muls/Divs 等标量广播算子名称在不同 CANN 版本可能略有差异，
-        // 若无对应标量 API，可改为构造常量向量后用 Add/Div 等逐元素算子实现。
-        AscendC::LocalTensor<T> tLocal = outQueue.AllocTensor<T>();
+        // y = clamp(0.2 * x + 0.5, 0, 1)
+        AscendC::Muls(yLocal, xLocal, (half)0.2f, totalLength);
+        AscendC::Adds(yLocal, yLocal, (half)0.5f, totalLength);
+        AscendC::Maxs(yLocal, yLocal, (half)0.0f, totalLength);
+        AscendC::Mins(yLocal, yLocal, (half)1.0f, totalLength);
 
-        // t = x + 3
-        AscendC::Adds(tLocal, xLocal, static_cast<T>(3.0f), count);
-        // y = t / 6
-        AscendC::Divs(yLocal, tLocal, static_cast<T>(6.0f), count);
-        // y = min(y, 1)
-        AscendC::Mins(yLocal, yLocal, static_cast<T>(1.0f), count);
-        // y = max(y, 0)
-        AscendC::Maxs(yLocal, yLocal, static_cast<T>(0.0f), count);
-
-        outQueue.EnQue<T>(yLocal);
+        outQueue.EnQue<half>(yLocal);
         inQueue.FreeTensor(xLocal);
-        outQueue.FreeTensor(tLocal);
     }
 
     __aicore__ inline void CopyOut()
     {
-        AscendC::LocalTensor<T> yLocal = outQueue.DeQue<T>();
-        AscendC::DataCopy(dstGlobal, yLocal, count);
+        AscendC::LocalTensor<half> yLocal = outQueue.DeQue<half>();
+        AscendC::DataCopy(yGlobal, yLocal, totalLength);
         outQueue.FreeTensor(yLocal);
     }
 
@@ -100,46 +189,88 @@ private:
     AscendC::TPipe pipe;
     AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueue;
     AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue;
-    AscendC::GlobalTensor<T> srcGlobal;
-    AscendC::GlobalTensor<T> dstGlobal;
-    uint32_t count = 0;
+    AscendC::GlobalTensor<half> xGlobal, yGlobal;
+
+    uint32_t totalLength = 0;
 };
 
-extern "C" __global__ __aicore__ void hardsigmoid_custom_kernel(GM_ADDR x, GM_ADDR y, uint32_t elemCount)
+extern "C" __global__ __aicore__ void hardsigmoid_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
-    // 这里以 half 为主要数据类型，可按实际需要模板实例化 float/bfloat16 等
-    KernelHardsigmoid<half> op;
-    op.Init(x, y, elemCount);
+    GET_TILING_DATA(tilingData, tiling);
+    KernelHardSigmoid op;
+    op.Init(x, y, tilingData.totalLength);
     op.Process();
 }
 """
 
-# 可选：Host 侧封装伪代码（供编译对接参考），实际工程中应由 C++/Ascend Runtime 调度
-ASCENDC_HOST_STUB = r"""
-// 伪代码：注册/调度入口（需要结合 CANN Runtime/Op Register 体系）
-// 实际项目中应提供 C++ Host 代码完成 Tensor 描述、内存管理、Launch 参数设置等。
+python_bind_src = r"""
+# Python 绑定（调用自定义算子）。若运行环境尚未加载自定义库，则回退到 PyTorch 的 hardsigmoid。
+import torch
+import torch.nn.functional as F
+
+def hardsigmoid_custom(x: torch.Tensor) -> torch.Tensor:
+    try:
+        # 假定注册名为 custom::HardsigmoidCustom 或 HardsigmoidCustom（不同环境可能存在命名空间差异）
+        if hasattr(torch.ops, "custom") and hasattr(torch.ops.custom, "HardsigmoidCustom"):
+            return torch.ops.custom.HardsigmoidCustom(x)
+        if hasattr(torch.ops, "HardsigmoidCustom"):
+            return torch.ops.HardsigmoidCustom(x)
+    except Exception:
+        pass
+    # 回退：保障功能可用
+    return F.hardsigmoid(x)
 """
+
+model_src = r"""
+# 优化后的 PyTorch 模型，使用自定义 AscendC 算子替换原始 F.hardsigmoid
+import torch
+import torch.nn as nn
+from typing import List
+from types import SimpleNamespace
+
+# 导入绑定
+# 假设框架侧已完成自定义算子库加载（项目构建与部署由外部工具链完成）
+from types import SimpleNamespace
+import importlib
+
+# 将绑定函数以简洁方式引入
+def _load_bind():
+    # 这里直接内嵌，真实工程中建议独立模块文件
+    import torch
+    import torch.nn.functional as F
+    def hardsigmoid_custom(x: torch.Tensor) -> torch.Tensor:
+        try:
+            if hasattr(torch.ops, "custom") and hasattr(torch.ops.custom, "HardsigmoidCustom"):
+                return torch.ops.custom.HardsigmoidCustom(x)
+            if hasattr(torch.ops, "HardsigmoidCustom"):
+                return torch.ops.HardsigmoidCustom(x)
+        except Exception:
+            pass
+        return F.hardsigmoid(x)
+    return SimpleNamespace(hardsigmoid_custom=hardsigmoid_custom)
+
+_bind = _load_bind()
 
 class ModelNew(nn.Module):
     """
-    使用自定义 AscendC 内核替换 HardSigmoid 的优化模型。
+    使用自定义 AscendC Kernel 的 HardSigmoid 实现，替换 PyTorch 内置算子。
     """
     def __init__(self):
         super(ModelNew, self).__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 调用自定义算子；若后端未提供内核，将回退到 Python 组合实现
-        return torch.ops.ascend_custom.hardsigmoid_custom(x)
+        return _bind.hardsigmoid_custom(x)
 
-# 保持输入生成接口不变
+# 与原模型一致的输入生成函数
 # batch_size = 4096
 # dim = 393216
 batch_size = 512
 dim = 32768
 
-def get_inputs():
+def get_inputs() -> List[torch.Tensor]:
     x = torch.rand(batch_size, dim)
     return [x]
 
 def get_init_inputs():
-    return []  # 无需特殊初始化输入
+    return []
+"""

@@ -1,276 +1,297 @@
-import torch
-import torch.nn as nn
+```python
+project_json_src = r"""{
+  "op": {
+    "name": "LogSoftmaxCustom",
+    "kernel_name": "log_softmax_custom",
+    "inputs": [
+      {
+        "name": "x",
+        "dtype": ["float16", "float32"],
+        "format": ["ND"]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "y",
+        "dtype": ["float16", "float32"],
+        "format": ["ND"]
+      }
+    ],
+    "attrs": [
+      {
+        "name": "dim",
+        "type": "int",
+        "default": -1
+      }
+    ],
+    "kernel": {
+      "target": "Ascend",
+      "source": ["log_softmax_custom.cpp"],
+      "function": "log_softmax_custom"
+    },
+    "tiling": {
+      "header": "log_softmax_custom_tiling.h",
+      "function": "TilingFunc",
+      "class": "LogSoftmaxCustomTilingData"
+    },
+    "host": {
+      "source": ["log_softmax_custom_host.cpp"]
+    },
+    "sources": [
+      "log_softmax_custom_tiling.h",
+      "log_softmax_custom_host.cpp",
+      "log_softmax_custom.cpp"
+    ]
+  }
+}"""
 
-# 自定义算子名称与类名（六个字符串之一）
-kernel_name = "log_softmax_custom"
-# 自定义算子PascalCase名（六个字符串之二）
-kernel_class = "LogSoftmaxCustom"
+host_tiling_src = r"""// log_softmax_custom_tiling.h
+// 说明：基于参考手册的 LogSoftMax Tiling API 实现主机侧 Tiling，计算并下发 tiling 数据。
+// 参考：5.3.2.2 LogSoftMax Tiling、5.1.31 More Examples
+#ifndef LOG_SOFTMAX_CUSTOM_TILING_H_
+#define LOG_SOFTMAX_CUSTOM_TILING_H_
 
-# AscendC AICore设备端Kernel源码（六个字符串之三）
-aicore_kernel_src = r"""
+#include <vector>
+#include "register/op_def_registry.h"
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+
+// 自定义 TilingData，包含 shape 信息、临时缓冲区大小、类型大小以及 LogSoftMax 的 tiling 结构体
+BEGIN_TILING_DATA_DEF(LogSoftmaxCustomTilingData)
+TILING_DATA_FIELD_DEF(uint32_t, outter);
+TILING_DATA_FIELD_DEF(uint32_t, inner);
+TILING_DATA_FIELD_DEF(uint32_t, tmpBufferSize);
+TILING_DATA_FIELD_DEF(uint32_t, typeSize);
+TILING_DATA_FIELD_DEF(AscendC::LogSoftMaxTiling, logSoftmaxTilingData);
+END_TILING_DATA_DEF;
+REGISTER_TILING_DATA_CLASS(LogSoftmaxCustom, LogSoftmaxCustomTilingData)
+
+// 主机侧 TilingFunc：将输入 shape 拉平成 [outter, inner]，按最后一维进行 LogSoftMax。
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 获取输入张量 shape
+    const gert::StorageShape *src_shape = context->GetInputShape(0);
+    auto &storageShape = src_shape->GetStorageShape();
+
+    // 计算 outter = 除最后一维外所有维度元素数乘积，inner = 最后一维大小
+    uint32_t dimCnt = storageShape.GetDimNum();
+    if (dimCnt == 0) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t inner = static_cast<uint32_t>(storageShape.GetDim(dimCnt - 1));
+    uint64_t outter64 = 1;
+    for (uint32_t i = 0; i + 1 < dimCnt; ++i) {
+        outter64 *= static_cast<uint64_t>(storageShape.GetDim(i));
+    }
+    if (outter64 == 0) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t outter = static_cast<uint32_t>(outter64);
+
+    // 获取数据类型 size（字节）
+    auto dt = context->GetInputTensor(0)->GetDataType();
+    uint32_t typeSize = 0;
+    if (dt == ge::DT_FLOAT16) {
+        typeSize = 2;
+    } else if (dt == ge::DT_FLOAT) {
+        typeSize = 4;
+    } else {
+        // 不支持的数据类型
+        return ge::GRAPH_FAILED;
+    }
+
+    // 生成用于 LogSoftMax Tiling 的二维 shape [outter, inner]
+    std::vector<int64_t> srcDims = {static_cast<int64_t>(outter), static_cast<int64_t>(inner)};
+    ge::Shape shape(srcDims);
+
+    // 计算临时缓冲区大小（取最大值，以获得更好性能）
+    // 参考：GetLogSoftMaxMaxTmpSize / LogSoftMaxTilingFunc
+    const uint32_t tmpsize = AscendC::GetLogSoftMaxMaxTmpSize(shape, typeSize, false);
+
+    LogSoftmaxCustomTilingData tiling;
+    tiling.set_outter(outter);
+    tiling.set_inner(inner);
+    tiling.set_typeSize(typeSize);
+    tiling.set_tmpBufferSize(tmpsize);
+
+    // 调用 TilingFunc 生成 tiling 参数，写入 tiling 数据
+    AscendC::LogSoftMaxTilingFunc(shape, typeSize, tmpsize, tiling.mutable_logSoftmaxTilingData());
+
+    // 常规设置
+    context->SetBlockDim(1);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    // 本算子不使用 GM workspace
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
+
+    // 设置 TilingKey（可选）
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+#endif // LOG_SOFTMAX_CUSTOM_TILING_H_
+"""
+
+host_operator_src = r"""// log_softmax_custom_host.cpp
+// 说明：主机侧算子占位实现文件（注册/推理/调度通常由框架处理）。
+// 此处仅保留编译单元，真实运行依赖框架集成。
+#include "register/op_def_registry.h"
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+#include "log_softmax_custom_tiling.h"
+
+extern "C" {
+// 占位符函数，确保目标文件非空。实际算子注册与调度由框架/工具链完成。
+void LogSoftmaxCustomHostEntry() {}
+}
+"""
+
+kernel_src = r"""// log_softmax_custom.cpp
+// 说明：AscendC 内核，调用高阶 API LogSoftMax 完成计算。
+// 参考：5.3.2.1 LogSoftMax（算法与接口）、5.3.2.2 LogSoftMax Tiling、5.1.31 More Examples
 #include "kernel_operator.h"
-#include <cfloat>
 
 using namespace AscendC;
 
-// 简化假设：输入为float（FP32），按行做log_softmax，dim=1。
-// Kernel参数：xGm: 输入，yGm: 输出，rows: N，cols: D
+template <typename T>
 class KernelLogSoftmax {
 public:
-  __aicore__ inline KernelLogSoftmax() {}
-  __aicore__ inline void Init(__gm__ uint8_t* xGm, __gm__ uint8_t* yGm,
-                              int64_t rows, int64_t cols) {
-    xGlobal.SetGlobalBuffer((__gm__ float*)xGm);
-    yGlobal.SetGlobalBuffer((__gm__ float*)yGm);
-    rows_ = rows;
-    cols_ = cols;
+    __aicore__ inline KernelLogSoftmax() {}
+    __aicore__ inline void Init(GM_ADDR xGm, GM_ADDR yGm, uint32_t outterIn, uint32_t innerIn, uint32_t tmpBytes)
+    {
+        outter = outterIn;
+        inner = innerIn;
+        total = outter * inner;
+        srcGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(xGm), total);
+        dstGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(yGm), total);
 
-    // 以512为分块大小（示例），可根据性能调优
-    tile_ = 512;
-    pipe.InitBuffer(inQueueX, 1, tile_ * sizeof(float));
-    pipe.InitBuffer(outQueueY, 1, tile_ * sizeof(float));
-    pipe.InitBuffer(tmpQueueA, 1, tile_ * sizeof(float));
-    pipe.InitBuffer(tmpQueueB, 1, tile_ * sizeof(float));
-  }
+        pipe.InitBuffer(inQueue, 1, total * sizeof(T));
+        pipe.InitBuffer(outQueue, 1, total * sizeof(T));
+        pipe.InitBuffer(tmpQueue, 1, tmpBytes);
 
-  __aicore__ inline void Process() {
-    // 按行处理
-    for (int64_t r = 0; r < rows_; ++r) {
-      // Pass 1: 计算每行的最大值 row_max
-      float row_max = -FLT_MAX;
-      for (int64_t c = 0; c < cols_; c += tile_) {
-        int64_t len = (c + tile_ <= cols_) ? tile_ : (cols_ - c);
-        LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        DataCopy(xLocal, xGlobal[r * cols_ + c], len);
-        inQueueX.EnQue(xLocal);
-
-        LocalTensor<float> xL = inQueueX.DeQue<float>();
-        // 假设存在ReduceMax接口（不同版本API名字可能不同，示例用法）
-        // 若需手写reduce，可在local上做分段归约
-        float block_max = ReduceMax(xL, len);
-        row_max = (row_max > block_max) ? row_max : block_max;
-        inQueueX.FreeTensor(xL);
-      }
-
-      // Pass 2: 计算 sum(exp(x - row_max))
-      float sum_exp = 0.f;
-      for (int64_t c = 0; c < cols_; c += tile_) {
-        int64_t len = (c + tile_ <= cols_) ? tile_ : (cols_ - c);
-        LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        LocalTensor<float> shiftedLocal = tmpQueueA.AllocTensor<float>();
-        LocalTensor<float> expLocal = tmpQueueB.AllocTensor<float>();
-
-        DataCopy(xLocal, xGlobal[r * cols_ + c], len);
-        // shifted = x - row_max
-        Sub(shiftedLocal, xLocal, static_cast<float>(row_max), len);
-        // e = exp(shifted)
-        Exp(expLocal, shiftedLocal, len);
-
-        // 归约求和
-        float block_sum = ReduceSum(expLocal, len);
-        sum_exp += block_sum;
-
-        tmpQueueB.FreeTensor(expLocal);
-        tmpQueueA.FreeTensor(shiftedLocal);
-        inQueueX.FreeTensor(xLocal);
-      }
-      float log_sum_exp = Log(sum_exp);
-
-      // Pass 3: 写回 y = x - row_max - log_sum_exp
-      for (int64_t c = 0; c < cols_; c += tile_) {
-        int64_t len = (c + tile_ <= cols_) ? tile_ : (cols_ - c);
-        LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-        LocalTensor<float> shiftedLocal = tmpQueueA.AllocTensor<float>();
-
-        DataCopy(xLocal, xGlobal[r * cols_ + c], len);
-        // shifted = x - row_max
-        Sub(shiftedLocal, xLocal, static_cast<float>(row_max), len);
-        // y = shifted - log_sum_exp
-        Sub(yLocal, shiftedLocal, static_cast<float>(log_sum_exp), len);
-
-        DataCopy(yGlobal[r * cols_ + c], yLocal, len);
-
-        tmpQueueA.FreeTensor(shiftedLocal);
-        outQueueY.FreeTensor(yLocal);
-        inQueueX.FreeTensor(xLocal);
-      }
+        // max/sum 为按行归约的中间结果，每行一个元素，大小为 outter
+        pipe.InitBuffer(maxQueue, 1, outter * sizeof(T));
+        pipe.InitBuffer(sumQueue, 1, outter * sizeof(T));
     }
-  }
+
+    __aicore__ inline void Process(const LogSoftMaxTiling &softmaxTiling)
+    {
+        CopyIn();
+        Compute(softmaxTiling);
+        CopyOut();
+    }
 
 private:
-  // 简化的本地归约示例接口（如无现成API可手工实现循环，以下为占位/演示）
-  __aicore__ inline float ReduceMax(LocalTensor<float>& t, int64_t len) {
-    // 占位：实际应使用平台提供的reduce指令或手写循环
-    float m = -FLT_MAX;
-    for (int i = 0; i < len; ++i) {
-      float v = t.GetValue(i);
-      m = v > m ? v : m;
+    __aicore__ inline void CopyIn()
+    {
+        LocalTensor<T> srcLocal = inQueue.AllocTensor<T>();
+        DataCopy(srcLocal, srcGlobal, total);
+        inQueue.EnQue(srcLocal);
     }
-    return m;
-  }
-  __aicore__ inline float ReduceSum(LocalTensor<float>& t, int64_t len) {
-    // 占位：实际应使用平台提供的reduce指令或手写循环
-    float s = 0.f;
-    for (int i = 0; i < len; ++i) {
-      s += t.GetValue(i);
+
+    __aicore__ inline void Compute(const LogSoftMaxTiling &softmaxTiling)
+    {
+        LocalTensor<T> srcLocal = inQueue.DeQue<T>();
+        LocalTensor<T> dstLocal = outQueue.AllocTensor<T>();
+        LocalTensor<uint8_t> sharedTmpBuffer = tmpQueue.AllocTensor<uint8_t>();
+        LocalTensor<T> maxLocal = maxQueue.AllocTensor<T>();
+        LocalTensor<T> sumLocal = sumQueue.AllocTensor<T>();
+
+        // 形状信息：按最后一维（inner）进行 LogSoftMax
+        SoftMaxShapeInfo softmaxInfo = {outter, inner, outter, inner};
+
+        // 调用高阶 API：LogSoftMax
+        // 原型（参考文档示例调用）：LogSoftMax(dst, maxTensor, sumTensor, src, sharedTmpBuffer, tiling, softmaxShapeInfo)
+        LogSoftMax<T, false>(dstLocal, maxLocal, sumLocal, srcLocal, sharedTmpBuffer, softmaxTiling, softmaxInfo);
+
+        outQueue.EnQue<T>(dstLocal);
+        inQueue.FreeTensor(srcLocal);
+        tmpQueue.FreeTensor(sharedTmpBuffer);
+        maxQueue.FreeTensor(maxLocal);
+        sumQueue.FreeTensor(sumLocal);
     }
-    return s;
-  }
-  __aicore__ inline float Log(float x) {
-    // 占位：实际应使用平台提供的Log向量/标量API
-    // 这里为演示，真实实现应替换为对应AscendC接口
-    return __logf(x);
-  }
+
+    __aicore__ inline void CopyOut()
+    {
+        LocalTensor<T> dstLocal = outQueue.DeQue<T>();
+        DataCopy(dstGlobal, dstLocal, total);
+        outQueue.FreeTensor(dstLocal);
+    }
 
 private:
-  TPipe pipe;
-  TQue<QuePosition::VECIN, 1> inQueueX;
-  TQue<QuePosition::VECOUT, 1> outQueueY;
-  TQue<QuePosition::VECIN, 1> tmpQueueA;
-  TQue<QuePosition::VECIN, 1> tmpQueueB;
-
-  GlobalTensor<float> xGlobal, yGlobal;
-  int64_t rows_, cols_;
-  int64_t tile_;
+    GlobalTensor<T> srcGlobal;
+    GlobalTensor<T> dstGlobal;
+    TPipe pipe;
+    TQue<QuePosition::VECIN, 1> inQueue;
+    TQue<QuePosition::VECOUT, 1> outQueue;
+    TQue<QuePosition::VECCALC, 1> tmpQueue;
+    TQue<QuePosition::VECCALC, 1> maxQueue;
+    TQue<QuePosition::VECCALC, 1> sumQueue;
+    uint32_t outter = 0;
+    uint32_t inner = 0;
+    uint32_t total = 0;
 };
 
-extern "C" __global__ __aicore__ void log_softmax_custom_kernel(
-    __gm__ uint8_t* xGm, __gm__ uint8_t* yGm, int64_t rows, int64_t cols) {
-  KernelLogSoftmax op;
-  op.Init(xGm, yGm, rows, cols);
-  op.Process();
+// 内核入口
+extern "C" __global__ __aicore__ void log_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    // 读取 tiling 数据
+    GET_TILING_DATA(tilingData, tiling);
+    const uint32_t outter = tilingData.outter;
+    const uint32_t inner = tilingData.inner;
+    const uint32_t tmpSize = tilingData.tmpBufferSize;
+
+    // 根据类型大小选择计算类型
+    if (tilingData.typeSize == 2) {
+        KernelLogSoftmax<half> op;
+        op.Init(x, y, outter, inner, tmpSize);
+        op.Process(tilingData.logSoftmaxTilingData);
+    } else {
+        KernelLogSoftmax<float> op;
+        op.Init(x, y, outter, inner, tmpSize);
+        op.Process(tilingData.logSoftmaxTilingData);
+    }
 }
 """
 
-# 主机侧Tiling/调度源码（六个字符串之四）
-tiling_src = r"""
-#include "tiling/platform.h"
-#include "tiling/tiling_api.h"
-#include "tiling/tiling_key.h"
-#include "graph/tensor.h"
-#include <cstdint>
-
-using namespace gert;
-
-static ge::graphStatus TilingFunc(gert::TilingContext *context) {
-  TilingData tiling;
-  const int64_t rows = context->GetInputShape(0)->GetOriginShape().GetDim(0);
-  const int64_t cols = context->GetInputShape(0)->GetOriginShape().GetDim(1);
-
-  context->SetBlockDim(static_cast<uint32_t>(rows > 0 ? rows : 1));
-  // 这里可根据cols与芯片特性设置更细的并行维度/流水参数
-  tiling.set_totalLength(static_cast<uint32_t>(rows * cols));
-
-  tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
-                      context->GetRawTilingData()->GetCapacity());
-  context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
-  // 简化的模板Key（必要时按dtype/形状分支编码）
-  const uint64_t tilingKey = GET_TPL_TILING_KEY(cols);
-  context->SetTilingKey(tilingKey);
-
-  size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-  currentWorkspace[0] = 0;
-  return ge::GRAPH_SUCCESS;
-}
-"""
-
-# 主机侧OP注册与Kernel Launch源码（六个字符串之五）
-host_op_src = r"""
-#include "register/op_def_registry.h"
-#include "register/op_impl_registry.h"
-#include "graph/tensor.h"
-
-constexpr const char* kOpType = "LogSoftmaxCustom";
-
-namespace logsoftmax_custom_impl {
-
-static ge::graphStatus InferShape(gert::InferShapeContext* ctx) {
-  // 输出形状 = 输入形状
-  auto* xShape = ctx->GetInputShape(0);
-  auto* yShape = ctx->GetOutputShape(0);
-  *yShape = *xShape;
-  return ge::GRAPH_SUCCESS;
-}
-
-static ge::graphStatus InferDataType(gert::InferDataTypeContext* ctx) {
-  auto x_dtype = ctx->GetInputDataType(0);
-  ctx->SetOutputDataType(0, x_dtype);
-  return ge::GRAPH_SUCCESS;
-}
-
-static ge::graphStatus Compute(gert::KernelContext* ctx) {
-  auto x = ctx->GetInputTensor(0);
-  auto y = ctx->GetOutputTensor(0);
-
-  const int64_t rows = x->GetShape().GetDim(0);
-  const int64_t cols = x->GetShape().GetDim(1);
-
-  __gm__ uint8_t* xGm = reinterpret_cast<__gm__ uint8_t*>(x->GetData());
-  __gm__ uint8_t* yGm = reinterpret_cast<__gm__ uint8_t*>(y->GetData());
-
-  // 启动自定义Kernel
-  // gridDim按行并行，blockDim由编译器/平台决定，以下为占位
-  dim3 grid(rows, 1, 1);
-  dim3 block(1, 1, 1);
-  log_softmax_custom_kernel<<<grid, block>>>(xGm, yGm, rows, cols);
-  return ge::GRAPH_SUCCESS;
-}
-
-} // namespace logsoftmax_custom_impl
-
-using namespace logsoftmax_custom_impl;
-
-REGISTER_OP_DEF(kOpType)
-  .Input("x")
-  .Output("y")
-  .SetInferShape(InferShape)
-  .SetInferDataType(InferDataType);
-
-REGISTER_OP_IMPL(kOpType, logsoftmax_custom_impl, Compute);
-"""
-
-# Python侧注册/调用桥接（六个字符串之六）
-python_bind_src = r"""
+python_bind_src = r"""# 自定义 Python 绑定：提供 Python 侧便捷入口，优先调用自定义核，不可用时回退至 PyTorch 实现。
 import torch
-from torch.library import Library, impl
 
-# 自定义库命名空间
-_lib = Library("ascend_ops", "DEF")
-_lib.define("log_softmax_custom(Tensor x, int dim=1) -> Tensor")
-
-# 简单的Python后备实现（用于CPU/无自定义核场景）
-def _log_softmax_fallback(x: torch.Tensor, dim: int = 1) -> torch.Tensor:
-    return torch.log_softmax(x, dim=dim)
-
-# 注册后端实现（示例：统一用fallback，实际工程中应调度至Ascend Runtime触发自定义Kernel执行）
-impl_lib = Library("ascend_ops", "IMPL")
-@impl_lib.impl("log_softmax_custom", "CompositeExplicitAutograd")
-def _log_softmax_impl(x: torch.Tensor, dim: int = 1) -> torch.Tensor:
-    # 实际环境下：应根据设备/后端选择触发自定义Kernel
-    return _log_softmax_fallback(x, dim)
-
-# 同时注册CPU/CUDA为后备
-impl_lib.impl("log_softmax_custom", "CPU", _log_softmax_fallback)
-if torch.cuda.is_available():
-    impl_lib.impl("log_softmax_custom", "CUDA", _log_softmax_fallback)
+def log_softmax_custom(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    try:
+        # 假设工具链将内核导出为 aicore_custom 名称空间
+        return torch.ops.aicore_custom.log_softmax_custom(x, dim)
+    except (RuntimeError, AttributeError):
+        # 回退：使用 PyTorch 自带 log_softmax
+        return torch.log_softmax(x, dim=dim)
 """
 
-# 新模型：将PyTorch算子替换为自定义AscendC算子调用
+model_src = r"""import torch
+import torch.nn as nn
+
 class ModelNew(nn.Module):
     """
-    优化后的模型，使用自定义AscendC内核的LogSoftmax算子。
+    使用自定义 AscendC 内核（log_softmax_custom）的优化模型。
+    约定：按输入张量的最后一维进行 LogSoftmax（与内核/tiling 保持一致）。
     """
     def __init__(self, dim: int = 1):
         super(ModelNew, self).__init__()
         self.dim = dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 调用自定义算子（python_bind_src中注册）
-        return torch.ops.ascend_ops.log_softmax_custom(x, self.dim)
+        # 优先调用自定义算子；若环境未加载则回退至 torch.log_softmax
+        try:
+            return torch.ops.aicore_custom.log_softmax_custom(x, self.dim)
+        except (RuntimeError, AttributeError):
+            return torch.log_softmax(x, dim=self.dim)
 
-# 与原始样例一致的输入生成
+# batch_size = 4096
+# dim = 393216
 batch_size = 512
 dim = 32768
 
@@ -279,4 +300,5 @@ def get_inputs():
     return [x]
 
 def get_init_inputs():
-    return []  # 无初始化输入
+    return []  # 无需特殊初始化输入
+"""

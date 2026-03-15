@@ -1,4 +1,4 @@
-from typing import List, Annotated
+from typing import Any, Dict, List, Annotated
 
 from typing_extensions import NotRequired
 
@@ -32,9 +32,16 @@ def _add_list(left: List[str], right: List[str]) -> List[str]:
     return (left or []) + (right or [])
 
 
+def _add_tool_calls(
+    left: List[Dict[str, Any]], right: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    return (left or []) + (right or [])
+
+
 class AgentKernelState(MessagesState):
     search_results: Annotated[List[str], _add_list]
     kb_results: Annotated[List[str], _add_list]
+    tool_calls_log: Annotated[List[Dict[str, Any]], _add_tool_calls]
     query_round_count: NotRequired[int]
     next_action: NotRequired[str]
     current_query: NotRequired[str]
@@ -109,6 +116,17 @@ def build_agent_app(tool_mode: AgentToolMode):
             hint = ""
         kb_rule = "查知识库时，你必须用英文写出查询句（第二行）。" if enable_kb else ""
 
+        # Few-shot 示例：明确两行格式，避免模型输出 "[" 等无效内容
+        examples: List[str] = []
+        if enable_kb:
+            examples.append("示例1（查知识库）：\nKB\nAscend C GELU kernel implementation")
+        if enable_web:
+            examples.append(
+                "示例2（网页搜索）：\nWEB\nAscend C custom operator development documentation"
+            )
+        examples.append("示例3（直接回答）：\nANSWER")
+        few_shot = "\n\n".join(examples)
+
         existing = ""
         if kb_results or search_results:
             if kb_results:
@@ -119,15 +137,16 @@ def build_agent_app(tool_mode: AgentToolMode):
         prompt = (
             f"用户问题：\n{user_question}\n\n"
             f"当前你可选工具：{tools_line}，或直接回答（ANSWER）。{hint}\n"
-            "规则：只输出第一行动作，取值为 KB、WEB、ANSWER 之一。"
-            "若选 KB 或 WEB，第二行写出本轮的查询内容（KB 必须英文）。"
-            f"{kb_rule}\n"
+            "规则：只输出两行。第一行为动作，取值为 KB、WEB、ANSWER 之一；"
+            "若选 KB 或 WEB，第二行必须是一句完整的英文查询（不要只输出符号或单字）。"
+            f"{kb_rule}\n\n"
+            f"格式参考：\n{few_shot}\n\n"
         )
         if existing:
             prompt += f"已有检索内容：\n{existing}\n"
         if at_max:
             prompt += f"已达最大查询轮数（{MAX_QUERY_ROUNDS}），本回合只能选 ANSWER。\n"
-        prompt += "第一行只输出：KB 或 WEB 或 ANSWER。"
+        prompt += "请按上述格式输出（第一行 KB/WEB/ANSWER，若选 KB 或 WEB 则第二行写一句完整查询）："
 
         resp = llm.invoke([{"role": "user", "content": prompt}])
         raw = (resp.content or "").strip()
@@ -162,16 +181,22 @@ def build_agent_app(tool_mode: AgentToolMode):
     def kb_query_node(state: AgentKernelState) -> dict:
         from .db_related.knowledge_query import query_knowledge
 
-        query = state.get("current_query") or ""
+        query = (state.get("current_query") or "").strip()
         user_msgs = [m for m in state["messages"] if isinstance(m, HumanMessage)]
         user_question = user_msgs[0].content if user_msgs else state["messages"][-1].content
-        if not query:
-            query = user_question
-        if not query.strip().replace(" ", "").isascii():
+        # 若模型第二行输出无意义（如 "["、空、过短），用用户问题作为查询
+        if not query or len(query) < 3:
+            query = (user_question or "").strip()
+        if query and not query.replace(" ", "").isascii():
             query = _ensure_english_for_kb(llm, query)
         chunks = query_knowledge(query, top_k=3)
         round_num = state.get("query_round_count", 0) + 1
-        return {"kb_results": chunks, "query_round_count": round_num}
+        log_entry = {"round": round_num, "tool": "KB", "query": query}
+        return {
+            "kb_results": chunks,
+            "query_round_count": round_num,
+            "tool_calls_log": [log_entry],
+        }
 
     def search_node(state: AgentKernelState) -> dict:
         user_msgs = [m for m in state["messages"] if isinstance(m, HumanMessage)]
@@ -195,7 +220,12 @@ def build_agent_app(tool_mode: AgentToolMode):
         if not results:
             results = ["(未找到相关结果)"]
         round_num = state.get("query_round_count", 0) + 1
-        return {"search_results": results, "query_round_count": round_num}
+        log_entry = {"round": round_num, "tool": "WEB", "query": query}
+        return {
+            "search_results": results,
+            "query_round_count": round_num,
+            "tool_calls_log": [log_entry],
+        }
 
     def answer_node(state: AgentKernelState) -> dict:
         kb_results = state.get("kb_results", [])

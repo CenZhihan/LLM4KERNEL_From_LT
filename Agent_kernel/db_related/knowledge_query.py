@@ -2,10 +2,15 @@
 知识库查询接口：从已建好的 Chroma 知识库检索（本地持久化），返回完整文本列表。
 供后续「知识库节点」调用，与 search_results 类似的契约。
 使用本地 models/bge-m3 作为 embedding，与建库一致。
+
+注意：多线程（如 generate_and_write_parallel）会并发调用本接口，ChromaDB 对同一 path
+只能有一个 PersistentClient 实例，因此使用进程内单例 client/collection，避免
+AttributeError: bindings / KeyError / tenant 等并发问题。
 """
 import os
+import threading
 from pathlib import Path
-from typing import List
+from typing import List, Tuple, Any
 
 COLLECTION_NAME = os.environ.get("KB_COLLECTION", "ascend_c_knowledge")
 PERSIST_DIR = Path(
@@ -17,6 +22,24 @@ PERSIST_DIR = Path(
 BGE_M3_PATH = Path(__file__).resolve().parent.parent / "models" / "bge-m3"
 EMBEDDING_DIM = 1024
 
+_chroma_client: Any = None
+_chroma_collection: Any = None
+_chroma_lock = threading.Lock()
+
+
+def _get_chroma_client_and_collection() -> Tuple[Any, Any]:
+    """进程内单例：同一进程内只创建一个 PersistentClient 和 collection，供多线程复用。"""
+    global _chroma_client, _chroma_collection
+    with _chroma_lock:
+        if _chroma_client is None:
+            import chromadb
+            path = str(PERSIST_DIR)
+            if not os.path.isdir(path):
+                os.makedirs(path, exist_ok=True)
+            _chroma_client = chromadb.PersistentClient(path=path)
+            _chroma_collection = _chroma_client.get_or_create_collection(COLLECTION_NAME)
+    return _chroma_client, _chroma_collection
+
 
 def query_knowledge(question: str, top_k: int = 5) -> List[str]:
     """根据问题在本地持久化知识库中检索，返回「匹配到的 chunk_seq 下所有物理块」的文本列表。
@@ -27,10 +50,8 @@ def query_knowledge(question: str, top_k: int = 5) -> List[str]:
     from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
     from llama_index.vector_stores.chroma import ChromaVectorStore
     from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-    import chromadb
 
-    chroma_client = chromadb.PersistentClient(path=str(PERSIST_DIR))
-    chroma_collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
+    chroma_client, chroma_collection = _get_chroma_client_and_collection()
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 
     embed_model = HuggingFaceEmbedding(

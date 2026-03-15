@@ -1,81 +1,259 @@
+```python
+project_json_src = r"""
+{
+  "op": {
+    "name": "SwishCustom",
+    "kernel_name": "swish_custom",
+    "inputs": [
+      {
+        "name": "x",
+        "dtype": ["float16", "float32"],
+        "format": ["ND"]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "y",
+        "dtype": ["float16", "float32"],
+        "format": ["ND"]
+      }
+    ],
+    "sources": {
+      "kernel": ["swish_custom_kernel.cpp"],
+      "host": ["swish_custom.cpp", "swish_custom_tiling.h"]
+    },
+    "tiling_header": "swish_custom_tiling.h",
+    "block_dim": 1
+  }
+}
+"""
+
+host_tiling_src = r"""
+#ifndef SWISH_CUSTOM_TILING_H_
+#define SWISH_CUSTOM_TILING_H_
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(SwishCustomTilingData)
+    TILING_DATA_FIELD_DEF(uint32_t, srcSize);
+END_TILING_DATA_DEF;
+REGISTER_TILING_DATA_CLASS(SwishCustom, SwishCustomTilingData)
+} // namespace optiling
+
+#endif // SWISH_CUSTOM_TILING_H_
+"""
+
+host_operator_src = r"""
+#include "swish_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    SwishCustomTilingData tiling;
+
+    const gert::StorageShape* src_shape = context->GetInputShape(0);
+    // 针对模型中的二维输入 [batch, dim]
+    uint32_t outer = src_shape->GetStorageShape().GetDim(0);
+    uint32_t inner = src_shape->GetStorageShape().GetDim(1);
+    uint32_t srcSize = outer * inner;
+
+    tiling.set_srcSize(srcSize);
+
+    auto dt = context->GetInputTensor(0)->GetDataType();
+    if (dt == ge::DT_FLOAT16) {
+        context->SetTilingKey(1);
+    } else {
+        context->SetTilingKey(2);
+    }
+
+    context->SetBlockDim(1);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+
+class SwishCustom : public OpDef {
+public:
+    explicit SwishCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(SwishCustom);
+
+} // namespace ops
+"""
+
+kernel_src = r"""
+#include "kernel_operator.h"
+
+template <typename srcType>
+class KernelSwish {
+public:
+    __aicore__ inline KernelSwish() {}
+    __aicore__ inline void Init(GM_ADDR srcGm, GM_ADDR dstGm, uint32_t inputSize, srcType scalar)
+    {
+        dataSize = inputSize;
+        scalarValue = scalar;
+        srcGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ srcType*>(srcGm), dataSize);
+        dstGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ srcType*>(dstGm), dataSize);
+        pipe.InitBuffer(inQueueX, 1, dataSize * sizeof(srcType));
+        pipe.InitBuffer(outQueue, 1, dataSize * sizeof(srcType));
+    }
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<srcType> srcLocal = inQueueX.AllocTensor<srcType>();
+        AscendC::DataCopy(srcLocal, srcGlobal, dataSize);
+        inQueueX.EnQue(srcLocal);
+    }
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<srcType> dstLocal = outQueue.AllocTensor<srcType>();
+        AscendC::LocalTensor<srcType> srcLocal = inQueueX.DeQue<srcType>();
+        AscendC::Swish(dstLocal, srcLocal, dataSize, scalarValue);
+        outQueue.EnQue<srcType>(dstLocal);
+        inQueueX.FreeTensor(srcLocal);
+    }
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<srcType> dstLocal = outQueue.DeQue<srcType>();
+        AscendC::DataCopy(dstGlobal, dstLocal, dataSize);
+        outQueue.FreeTensor(dstLocal);
+    }
+private:
+    AscendC::GlobalTensor<srcType> srcGlobal;
+    AscendC::GlobalTensor<srcType> dstGlobal;
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue;
+    uint32_t dataSize = 0;
+    srcType scalarValue = 0;
+};
+
+extern "C" __global__ __aicore__ void swish_custom(GM_ADDR srcGm, GM_ADDR dstGm, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    const uint32_t size = tilingData.srcSize;
+    // beta=1.0 对应 PyTorch 的 SiLU/Swish
+    if (TILING_KEY_IS(1)) {
+        KernelSwish<half> op;
+        half beta = (half)1.0f;
+        op.Init(srcGm, dstGm, size, beta);
+        op.Process();
+    } else if (TILING_KEY_IS(2)) {
+        KernelSwish<float> op;
+        float beta = 1.0f;
+        op.Init(srcGm, dstGm, size, beta);
+        op.Process();
+    } else {
+        // 默认按 float 处理
+        KernelSwish<float> op;
+        float beta = 1.0f;
+        op.Init(srcGm, dstGm, size, beta);
+        op.Process();
+    }
+}
+"""
+
+python_bind_src = r"""
 import os
 import torch
-import torch.nn as nn
 
-# ===== Six required Python strings =====
-CUSTOM_KERNEL_NAME_SNAKE = "swish_custom"
-CUSTOM_KERNEL_NAME_PASCAL = "SwishCustom"
-CUSTOM_OP_LIB_NAME = "libswish_custom.so"
-CUSTOM_OP_NAMESPACE = "ascendc_custom"
-CUSTOM_OP_FUNC_NAME = "swish_custom"
-CUSTOM_OP_FULL_NAME = f"{CUSTOM_OP_NAMESPACE}::{CUSTOM_OP_FUNC_NAME}"
 
-# ===== Helper: load custom op library if available =====
-def _try_load_custom_op_library():
-    candidates = [
-        os.environ.get("ASCENDC_CUSTOM_OP_SO", ""),
-        os.path.join(os.getcwd(), CUSTOM_OP_LIB_NAME),
-        CUSTOM_OP_LIB_NAME,
-    ]
-    for p in candidates:
-        if not p:
-            continue
+def _try_load_custom_lib():
+    lib_path = os.environ.get("ASCEND_CUSTOM_OP_LIB", "")
+    if lib_path and os.path.exists(lib_path):
         try:
-            if os.path.exists(p) or os.path.basename(p) == p:
-                torch.ops.load_library(p)
-                return True
+            torch.ops.load_library(lib_path)
         except Exception:
-            continue
-    return False
+            pass
 
-def _has_custom_op():
+
+_try_load_custom_lib()
+
+
+def swish_custom(x: torch.Tensor) -> torch.Tensor:
     try:
-        ns = getattr(torch.ops, CUSTOM_OP_NAMESPACE)
-        getattr(ns, CUSTOM_OP_FUNC_NAME)
-        return True
-    except AttributeError:
-        return False
+        return torch.ops.custom_ascend.SwishCustom(x)
+    except Exception:
+        return x * torch.sigmoid(x)
+"""
 
-_CUSTOM_OP_AVAILABLE = _has_custom_op() or _try_load_custom_op_library() or _has_custom_op()
+model_src = r"""
+import torch
+import torch.nn as nn
+from typing import List
+from types import SimpleNamespace
 
-class SwishCustomFunc(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
-        if _CUSTOM_OP_AVAILABLE:
-            y = getattr(getattr(torch.ops, CUSTOM_OP_NAMESPACE), CUSTOM_OP_FUNC_NAME)(x)
-        else:
-            y = x * torch.sigmoid(x)
-        # Save input for backward to avoid extra forward-time ops
-        ctx.save_for_backward(x)
-        return y
+# 假定已构建并加载自定义算子库后，可通过 python 绑定调用
+# 绑定函数名 swish_custom 与算子名 SwishCustom 对应
+try:
+    from custom_op_binding import swish_custom  # 若用户将绑定文件命名为 custom_op_binding.py
+except Exception:
+    # 兜底：在独立使用本文件时，提供纯 PyTorch 回退
+    def swish_custom(x: torch.Tensor) -> torch.Tensor:
+        return x * torch.sigmoid(x)
 
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        (x,) = ctx.saved_tensors
-        # Swish' = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
-        sig = torch.sigmoid(x)
-        grad = grad_output * (sig + x * sig * (1.0 - sig))
-        return grad
 
 class ModelNew(nn.Module):
-    """
-    Optimized model that applies Swish via custom AscendC kernel when available.
-    Falls back to PyTorch ops if the custom kernel is not found.
-    """
     def __init__(self):
         super(ModelNew, self).__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return SwishCustomFunc.apply(x)
+        return swish_custom(x)
+
 
 # batch_size = 4096
 # dim = 393216
 batch_size = 512
 dim = 32768
 
-def get_inputs():
+def get_inputs() -> List[torch.Tensor]:
     x = torch.rand(batch_size, dim)
     return [x]
 
 def get_init_inputs():
-    return []  # No special initialization inputs needed
+    return []
+"""

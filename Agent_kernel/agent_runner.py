@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage
 
@@ -20,6 +20,7 @@ class AgentResult:
     op: str
     raw_answer: str
     reasoning: Optional[str] = None
+    tool_usage: Optional[List[Dict[str, Any]]] = None
 
 
 def _build_prompt(language: str, strategy_name: str, op: str) -> str:
@@ -36,6 +37,13 @@ def generate_kernel_with_agent(
     tool_mode: AgentToolMode,
 ) -> AgentResult:
     prompt = _build_prompt(task.language, task.strategy_name, task.op)
+    # 启用知识库时，在任务描述前鼓励先查知识库再作答，避免模型过于自信直接回答
+    if tool_mode in (AgentToolMode.KB_ONLY, AgentToolMode.KB_AND_WEB):
+        prompt = (
+            "【说明】请先使用知识库检索与本题相关的文档、API 说明或示例，再基于检索结果作答；"
+            "不要仅凭已有知识直接写代码。\n\n"
+            + prompt
+        )
 
     app = build_agent_app(tool_mode)
     initial_state: AgentKernelState = {
@@ -52,5 +60,7 @@ def generate_kernel_with_agent(
         last = messages[-1]
         raw_answer = getattr(last, "content", "") or ""
 
-    return AgentResult(op=task.op, raw_answer=raw_answer)
+    tool_calls = final_state.get("tool_calls_log", [])
+    tool_usage = tool_calls if tool_calls else None
+    return AgentResult(op=task.op, raw_answer=raw_answer, tool_usage=tool_usage)
 

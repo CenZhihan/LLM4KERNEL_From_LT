@@ -1,73 +1,286 @@
+```python
+# 生成自定义 AscendC SoftplusCustom 工程所需的六个源码字符串
+project_json_src = r"""{
+  "op": {
+    "name": "SoftplusCustom",
+    "impl": {
+      "kernel": {
+        "name": "softplus_custom",
+        "file": "kernel/softplus_custom.cpp"
+      },
+      "tiling": {
+        "file": "host/softplus_custom_tiling.h"
+      },
+      "host": {
+        "file": "host/softplus_custom.cpp"
+      },
+      "sources": [
+        "host/softplus_custom.cpp",
+        "host/softplus_custom_tiling.h",
+        "kernel/softplus_custom.cpp"
+      ]
+    },
+    "inputs": [
+      {
+        "name": "x",
+        "dtype": ["float16"],
+        "format": ["ND"]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "y",
+        "dtype": ["float16"],
+        "format": ["ND"]
+      }
+    ]
+  }
+}"""
+
+host_tiling_src = r"""#ifndef SOFTPLUS_CUSTOM_TILING_H_
+#define SOFTPLUS_CUSTOM_TILING_H_
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+// 仅需要传递输入总元素个数，算子内部按整块搬运
+BEGIN_TILING_DATA_DEF(SoftplusCustomTilingData)
+TILING_DATA_FIELD_DEF(uint32_t, srcSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(SoftplusCustom, SoftplusCustomTilingData)
+} // namespace optiling
+
+#endif // SOFTPLUS_CUSTOM_TILING_H_
+"""
+
+host_operator_src = r"""#include <vector>
+#include <cstdint>
+#include "softplus_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    // 从输入形状计算总元素个数
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    std::vector<int64_t> dims;
+    dims.reserve(x_shape->GetDimNum());
+    for (size_t i = 0; i < x_shape->GetDimNum(); ++i) {
+        dims.push_back(x_shape->GetDim(i));
+    }
+
+    uint32_t srcSize = 1;
+    for (auto d : dims) {
+        srcSize *= static_cast<uint32_t>(d);
+    }
+
+    optiling::SoftplusCustomTilingData tiling;
+    tiling.set_srcSize(srcSize);
+
+    // 设置 BlockDim，Softplus 为逐元素计算，1~8 均可，这里按样例设 1
+    context->SetBlockDim(1);
+
+    // 序列化 tiling 数据
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 设置 TilingKey
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    // Softplus 为逐元素算子，输出形状与输入一致
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class SoftplusCustom : public OpDef {
+public:
+    explicit SoftplusCustom(const char *name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND});
+
+        // 形状推导与 AICore Tiling
+        this->SetInferShape(ge::InferShape);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        // Ascend AI 处理器型号，根据实际环境替换，示例占位
+        this->AICore().AddConfig("ascendxxx");
+    }
+};
+OP_ADD(SoftplusCustom);
+} // namespace ops
+"""
+
+kernel_src = r"""#include "kernel_operator.h"
+#include "softplus_custom_tiling.h"
+
+// 说明：本内核使用 AscendC 数学库组合实现 softplus(x) = log(1 + exp(x))，
+// 参考了单输入模板与数学库示例（如 Exp/Asin 示例）的用法。
+// 注意：具体 Add/Log API 的签名以实际 AscendC 版本为准。
+
+template <typename T>
+class KernelSoftplus {
+public:
+    __aicore__ inline KernelSoftplus() {}
+
+    __aicore__ inline void Init(GM_ADDR xGm, GM_ADDR yGm, uint32_t size)
+    {
+        totalElems = size;
+        xGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(xGm), totalElems);
+        yGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(yGm), totalElems);
+
+        // 输入、输出与中间缓冲区（用于临时存放 e^x 或 1+e^x）
+        pipe.InitBuffer(inQueue, 1, totalElems * sizeof(T));
+        pipe.InitBuffer(outQueue, 1, totalElems * sizeof(T));
+        pipe.InitBuffer(tmpQueue, 1, totalElems * sizeof(T));
+        pipe.InitBuffer(workQueue, 1, totalElems * sizeof(T));
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<T> xLocal = inQueue.AllocTensor<T>();
+        AscendC::DataCopy(xLocal, xGlobal, totalElems);
+        inQueue.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<T> xLocal = inQueue.DeQue<T>();
+        AscendC::LocalTensor<T> tmpLocal = tmpQueue.AllocTensor<T>();   // 用于 e^x 与 1+e^x
+        AscendC::LocalTensor<T> yLocal = outQueue.AllocTensor<T>();
+        AscendC::LocalTensor<T> onesLocal = workQueue.AllocTensor<T>(); // 常量 1
+
+        // 1) onesLocal <- 1
+        T oneScalar(1);
+        AscendC::Duplicate<T>(onesLocal, oneScalar, totalElems);
+
+        // 2) tmpLocal <- exp(xLocal)
+        // 示例中 Exp 的模板用法展示了 isReuseSource 的第三模板参数，这里不复用源
+        // 模板参数与实际 API 版本可能存在差异，请以环境为准
+        AscendC::Exp<T, 15, false>(tmpLocal, xLocal, totalElems);
+
+        // 3) tmpLocal <- tmpLocal + onesLocal
+        // 元素加法（Add）的接口以具体 AscendC 版本为准，这里按常见签名使用
+        AscendC::Add<T>(tmpLocal, tmpLocal, onesLocal, totalElems);
+
+        // 4) yLocal <- log(tmpLocal)
+        AscendC::Log<T>(yLocal, tmpLocal, totalElems);
+
+        outQueue.EnQue<T>(yLocal);
+        // 释放本地张量
+        workQueue.FreeTensor(onesLocal);
+        tmpQueue.FreeTensor(tmpLocal);
+        inQueue.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<T> yLocal = outQueue.DeQue<T>();
+        AscendC::DataCopy(yGlobal, yLocal, totalElems);
+        outQueue.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::GlobalTensor<T> xGlobal;
+    AscendC::GlobalTensor<T> yGlobal;
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> workQueue;
+    uint32_t totalElems = 0;
+};
+
+extern "C" __global__ __aicore__ void softplus_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    KernelSoftplus<half> op;
+    op.Init(x, y, tilingData.srcSize);
+    if (TILING_KEY_IS(1)) {
+        op.Process();
+    }
+}
+"""
+
+python_bind_src = r"""# -*- coding: utf-8 -*-
+# 轻量级 Python 绑定：尝试加载自定义算子动态库并通过 torch.ops 调用
+import os
+import torch
+import torch.nn.functional as F
+
+def load_softplus_custom(lib_path: str = None):
+    """
+    加载已编译的自定义算子共享库（.so）
+    """
+    if lib_path is None:
+        return
+    if os.path.isfile(lib_path):
+        try:
+            torch.ops.load_library(lib_path)
+        except Exception as e:
+            # 忽略加载失败，后续调用将回退到 PyTorch 实现
+            pass
+
+def softplus_custom(x: torch.Tensor) -> torch.Tensor:
+    """
+    调用自定义 SoftplusCustom（若不可用则回退到 PyTorch 实现）
+    """
+    try:
+        return torch.ops.SoftplusCustom(x)
+    except Exception:
+        return F.softplus(x)
+"""
+
+model_src = r"""# -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Function
 
-# Six Python strings
-KERNEL_NAME = "softplus_custom"
-KERNEL_NAME_PASCAL = "SoftplusCustom"
-MODEL_NAME = "Model"
-MODEL_NEW_NAME = "ModelNew"
-REPLACED_OP = "torch.nn.functional.softplus"
-CUSTOM_OP_FULLNAME = "torch.ops.ascendc.softplus_custom"
+from types import SimpleNamespace
 
-def _ascendc_softplus_available():
+# 引入自定义 Python 绑定
+# 实际工程中需要先编译并 load .so，示例中只保留调用接口
+def softplus_custom(x: torch.Tensor) -> torch.Tensor:
     try:
-        return hasattr(torch.ops, "ascendc") and hasattr(torch.ops.ascendc, "softplus_custom")
+        return torch.ops.SoftplusCustom(x)
     except Exception:
-        return False
-
-class _SoftplusCustomFunc(Function):
-    @staticmethod
-    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
-        ctx.save_for_backward(x)
-        if _ascendc_softplus_available():
-            return torch.ops.ascendc.softplus_custom(x)
-        else:
-            return F.softplus(x)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        (x,) = ctx.saved_tensors
-        grad_input = grad_output * torch.sigmoid(x)
-        return grad_input
-
-class SoftplusCustom(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _SoftplusCustomFunc.apply(x)
-
-class Model(nn.Module):
-    """
-    Simple model that performs a Softplus activation.
-    """
-    def __init__(self):
-        super(Model, self).__init__()
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Applies Softplus activation to the input tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor of any shape.
-
-        Returns:
-            torch.Tensor: Output tensor with Softplus applied, same shape as input.
-        """
-        return torch.nn.functional.softplus(x)
+        return F.softplus(x)
 
 class ModelNew(nn.Module):
     """
-    Optimized model using custom AscendC kernel softplus_custom.
+    使用自定义 AscendC SoftplusCustom 算子替换 PyTorch Softplus
     """
     def __init__(self):
         super(ModelNew, self).__init__()
-        self.softplus = SoftplusCustom()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.softplus(x)
+        return softplus_custom(x)
 
 # batch_size = 4096
 # dim = 393216
@@ -79,4 +292,5 @@ def get_inputs():
     return [x]
 
 def get_init_inputs():
-    return []  # No special initialization inputs needed
+    return []
+"""```

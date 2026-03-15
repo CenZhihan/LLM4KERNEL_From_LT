@@ -2,7 +2,6 @@ import os
 import config
 import re
 from dataset import dataset
-import torch
 
 def _load_api_config():
     """若设置 USE_API_CONFIG=1 且存在 api_config.py，则返回 (api_key, base_url, model)；否则返回 None。"""

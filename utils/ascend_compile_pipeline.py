@@ -106,7 +106,7 @@ def ascend_compile(generated_code, op, context, extra_kernel_include_paths=None)
         print("[INFO] Operator project already exists, deleted")
         shutil.rmtree(os.path.join(op_engineer_dir, op_capital))
     with open(os.path.join(op_engineer_dir, f'{op}.json'), 'w') as f:
-        f.write(context.get('project_json_src'))
+        f.write(context.get('project_json_src') or '')
     try:
         print("[INFO] Begin create operator project")
         os.chdir(op_engineer_dir)
@@ -122,10 +122,10 @@ def ascend_compile(generated_code, op, context, extra_kernel_include_paths=None)
 
     # write code to specific location
     with open(os.path.join(target_directory, 'op_host', f'{op}_tiling.h'), 'w') as f:
-        f.write(context.get('host_tiling_src'))
+        f.write(context.get('host_tiling_src') or '')
 
     with open(os.path.join(target_directory, 'op_host', f'{op}.cpp'), 'w') as f:
-        f.write(context.get('host_operator_src'))
+        f.write(context.get('host_operator_src') or '')
 
     _inject_kernel_include_paths(target_directory, extra_kernel_include_paths)
 
