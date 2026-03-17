@@ -1,0 +1,283 @@
+project_json_src='''
+[
+    {
+        "op": "GatherCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "idx",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GatherCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, srcCols);
+  TILING_DATA_FIELD_DEF(uint32_t, idxCols);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GatherCustom, GatherCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gather_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GatherCustomTilingData tiling;
+
+    const gert::StorageShape *x_shape = context->GetInputShape(0);
+    const gert::StorageShape *idx_shape = context->GetInputShape(1);
+
+    // Expect 2D shapes: [N, C] for x and [N, K] for idx
+    uint32_t batch = x_shape->GetStorageShape().GetDim(0);
+    uint32_t srcCols = x_shape->GetStorageShape().GetDim(1);
+    uint32_t idxCols = idx_shape->GetStorageShape().GetDim(1);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_batch(batch);
+    tiling.set_srcCols(srcCols);
+    tiling.set_idxCols(idxCols);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* idx_shape = context->GetInputShape(1);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *idx_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto xType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, xType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GatherCustom : public OpDef {
+public:
+    explicit GatherCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("idx")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(GatherCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "gather_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelGather {
+public:
+    __aicore__ inline KernelGather() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR idx, GM_ADDR y, uint32_t batch, uint32_t srcCols, uint32_t idxCols)
+    {
+        this->batch = batch;
+        this->srcCols = srcCols;
+        this->idxCols = idxCols;
+
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->rowsPerBlock = (batch + blockNum - 1) / blockNum;
+        this->rowStart = this->rowsPerBlock * blockIdx;
+        uint32_t rowEnd = this->rowStart + this->rowsPerBlock;
+        if (rowEnd > batch) rowEnd = batch;
+        this->myRows = (rowEnd > this->rowStart) ? (rowEnd - this->rowStart) : 0;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + static_cast<uint64_t>(this->rowStart) * this->srcCols,
+                            static_cast<uint64_t>(this->myRows) * this->srcCols);
+        idxGm.SetGlobalBuffer((__gm__ int32_t *)idx + static_cast<uint64_t>(this->rowStart) * this->idxCols,
+                              static_cast<uint64_t>(this->myRows) * this->idxCols);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + static_cast<uint64_t>(this->rowStart) * this->idxCols,
+                            static_cast<uint64_t>(this->myRows) * this->idxCols);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->srcCols * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueIdx, BUFFER_NUM, this->idxCols * sizeof(int32_t));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->idxCols * sizeof(DTYPE_Y));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = 0; r < myRows; ++r) {
+            CopyInRow(r);
+            ComputeRow();
+            CopyOutRow(r);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyInRow(uint32_t r)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.AllocTensor<int32_t>();
+        AscendC::DataCopy(xLocal, xGm[r * this->srcCols], this->srcCols);
+        AscendC::DataCopy(idxLocal, idxGm[r * this->idxCols], this->idxCols);
+        inQueueX.EnQue(xLocal);
+        inQueueIdx.EnQue(idxLocal);
+    }
+
+    __aicore__ inline void ComputeRow()
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.DeQue<int32_t>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+
+        // Gather along dim=1 per row: y[j] = x[idx[j]]
+        for (uint32_t j = 0; j < this->idxCols; ++j) {
+            int32_t index = idxLocal.GetValue(j); // read index from local tensor
+            // bound check to avoid invalid access
+            if (index < 0) index = 0;
+            if (index >= static_cast<int32_t>(this->srcCols)) index = static_cast<int32_t>(this->srcCols) - 1;
+            AscendC::DataCopy(yLocal[j], xLocal[static_cast<uint32_t>(index)], 1);
+        }
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueIdx.FreeTensor(idxLocal);
+    }
+
+    __aicore__ inline void CopyOutRow(uint32_t r)
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[r * this->idxCols], yLocal, this->idxCols);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueIdx;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<int32_t> idxGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t batch;
+    uint32_t srcCols;
+    uint32_t idxCols;
+
+    uint32_t rowsPerBlock;
+    uint32_t rowStart;
+    uint32_t myRows;
+};
+
+extern "C" __global__ __aicore__ void gather_custom(GM_ADDR x, GM_ADDR idx, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGather op;
+    op.Init(x, idx, y, tiling_data.batch, tiling_data.srcCols, tiling_data.idxCols);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gather_custom_impl_npu(const at::Tensor& x, const at::Tensor& idx) {
+    at::Tensor result = at::empty({x.size(0), idx.size(1)}, x.options());
+    EXEC_NPU_CMD(aclnnGatherCustom, x, idx, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gather_custom", &gather_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gather_custom", &gather_custom_impl_npu, "gather along dim=1");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, idx):
+        return custom_ops_lib.gather_custom(x, idx)
+'''

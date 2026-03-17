@@ -1,0 +1,354 @@
+project_json_src='''
+[
+    {
+        "op": "CrossEntropyLossCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "predictions",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "targets",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["int32"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "loss",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "graph/tensor.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CrossEntropyLossCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, classes);
+  TILING_DATA_FIELD_DEF_STRUCT(SoftMaxTiling, softmaxTilingData);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CrossEntropyLossCustom, CrossEntropyLossCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cross_entropy_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "graph/tensor.h"
+#include "optiling/tiling.h"
+#include "register/op_impl_registry.h"
+#include "graph/utils/type_utils.h"
+#include "register/op_impl_registry.h"
+
+namespace optiling {
+
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CrossEntropyLossCustomTilingData tiling;
+
+    // 推断输入形状: predictions -> [N, C]
+    const gert::Shape* pred_shape = context->GetInputShape(0);
+    auto ori = pred_shape->GetOriginShape();
+    uint32_t batch = static_cast<uint32_t>(ori.GetDim(0));
+    uint32_t classes = static_cast<uint32_t>(ori.GetDim(1));
+
+    tiling.set_batch(batch);
+    tiling.set_classes(classes);
+
+    // SoftMax Tiling参数与临时空间估算
+    std::vector<int64_t> shapeVec = {static_cast<int64_t>(batch), static_cast<int64_t>(classes)};
+    ge::Shape srcShape(shapeVec);
+
+    const uint32_t localWorkSpaceSize = AscendC::GetSoftMaxMinTmpSize(srcShape, sizeof(float), false);
+    AscendC::SoftMaxTilingFunc(srcShape, sizeof(float), localWorkSpaceSize, tiling.softmaxTilingData());
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 无需额外workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输入0: predictions [N, C], 输入1: targets [N]
+    const gert::Shape* targets_shape = context->GetInputShape(1);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *targets_shape; // 输出逐样本损失 [N]
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // 输出与predictions同为float
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+
+namespace ops {
+
+class CrossEntropyLossCustom : public OpDef {
+public:
+    explicit CrossEntropyLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("predictions")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("targets")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("loss")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CrossEntropyLossCustom);
+
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "cross_entropy_loss_custom_tiling_data.h"
+
+using data_t = float;
+using index_t = int32_t;
+
+constexpr int32_t BUFFER_NUM = 1;
+
+inline __aicore__ uint32_t AlignToBlock32BCount(uint32_t typeSize)
+{
+    constexpr uint32_t ONE_BLK_SIZE = 32;
+    return ONE_BLK_SIZE / typeSize; // float -> 8
+}
+
+template <typename T>
+inline __aicore__ T local_read_first(const AscendC::LocalTensor<T>& t)
+{
+    // 假设LocalTensor支持GetValue接口读取标量
+    return t.GetValue(0);
+}
+
+class KernelCrossEntropyLoss {
+public:
+    __aicore__ inline KernelCrossEntropyLoss() {}
+
+    __aicore__ inline void Init(GM_ADDR predictions, GM_ADDR targets, GM_ADDR loss,
+                                const uint32_t batch, const uint32_t classes,
+                                const AscendC::SoftMaxTiling& softmaxTilingIn)
+    {
+        this->batch = batch;
+        this->classes = classes;
+        this->softmaxTiling = softmaxTilingIn;
+
+        // 块内按样本分片
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+
+        uint32_t rowsPerBlock = batch / blockNum;
+        uint32_t remain = batch % blockNum;
+        // 处理不均匀划分：前remain个block多处理1行
+        this->startRow = blockIdx * rowsPerBlock + AscendC::Min(blockIdx, remain);
+        this->rowsThisBlock = rowsPerBlock + (blockIdx < remain ? 1 : 0);
+
+        predsGm.SetGlobalBuffer(reinterpret_cast<__gm__ data_t *>(predictions), static_cast<uint64_t>(batch) * classes);
+        targsGm.SetGlobalBuffer(reinterpret_cast<__gm__ index_t *>(targets), batch);
+        lossGm.SetGlobalBuffer(reinterpret_cast<__gm__ data_t *>(loss), batch);
+
+        // 队列与本地缓存
+        // 每次处理1行，长度为classes
+        pipe.InitBuffer(inPredQueue, BUFFER_NUM, classes * sizeof(data_t));
+        pipe.InitBuffer(outLossQueue, BUFFER_NUM, 1 * sizeof(data_t));
+
+        // SoftMax中间sum/max的本地缓冲，每行的最后轴固定为32字节 -> 32/sizeof(float)=8
+        uint32_t blkElems = AlignToBlock32BCount(sizeof(data_t));
+        pipe.InitBuffer(sumQueue, BUFFER_NUM, blkElems * sizeof(data_t));
+        pipe.InitBuffer(maxQueue, BUFFER_NUM, blkElems * sizeof(data_t));
+
+        // SoftMax输出dst的本地缓冲（尽管不使用，但API需要）
+        pipe.InitBuffer(dstQueue, BUFFER_NUM, classes * sizeof(data_t));
+
+        // 目标索引本地缓存
+        pipe.InitBuffer(targQueue, BUFFER_NUM, 1 * sizeof(index_t));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t i = 0; i < rowsThisBlock; ++i) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t localRowIdx)
+    {
+        // 读取一行预测
+        AscendC::LocalTensor<data_t> predLocal = inPredQueue.AllocTensor<data_t>();
+        AscendC::DataCopy(predLocal, predsGm[(startRow + localRowIdx) * classes], classes);
+        inPredQueue.EnQue(predLocal);
+
+        // 读取对应标签
+        AscendC::LocalTensor<index_t> targLocal = targQueue.AllocTensor<index_t>();
+        AscendC::DataCopy(targLocal, targsGm[startRow + localRowIdx], 1);
+        targQueue.EnQue(targLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t localRowIdx)
+    {
+        AscendC::LocalTensor<data_t> predLocal = inPredQueue.DeQue<data_t>();
+        AscendC::LocalTensor<index_t> targLocal = targQueue.DeQue<index_t>();
+
+        AscendC::LocalTensor<data_t> sumLocal = sumQueue.AllocTensor<data_t>();
+        AscendC::LocalTensor<data_t> maxLocal = maxQueue.AllocTensor<data_t>();
+        AscendC::LocalTensor<data_t> dstLocal = dstQueue.AllocTensor<data_t>(); // dummy
+
+        // SoftMax需要的形状信息，[m=1, k=classes]
+        AscendC::SoftMaxShapeInfo srcShape = {1, classes, 1, classes};
+        // 调用SoftMax，得到sum/max（按最后轴reduce，长度固定32B），dst计算但不使用
+        AscendC::SoftMax<data_t>(dstLocal, sumLocal, maxLocal, predLocal, softmaxTiling, srcShape);
+
+        // 读取sum/max（取块内第一个值即可）
+        data_t sumVal = local_read_first(sumLocal);
+        data_t maxVal = local_read_first(maxLocal);
+
+        // 读取目标索引与对应logit
+        index_t yi = targLocal.GetValue(0);
+        data_t yiLogit = predLocal.GetValue(static_cast<uint32_t>(yi));
+
+        // loss_i = -x_yi + max + log(sum)
+        data_t lossVal = -yiLogit + maxVal + AscendC::Log(sumVal);
+
+        AscendC::LocalTensor<data_t> lossLocal = outLossQueue.AllocTensor<data_t>();
+        lossLocal.SetValue(0, lossVal);
+
+        // 释放本地张量
+        dstQueue.FreeTensor(dstLocal);
+        maxQueue.FreeTensor(maxLocal);
+        sumQueue.FreeTensor(sumLocal);
+        targQueue.FreeTensor(targLocal);
+        inPredQueue.FreeTensor(predLocal);
+
+        outLossQueue.EnQue(lossLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t localRowIdx)
+    {
+        AscendC::LocalTensor<data_t> lossLocal = outLossQueue.DeQue<data_t>();
+        AscendC::DataCopy(lossGm[startRow + localRowIdx], lossLocal, 1);
+        outLossQueue.FreeTensor(lossLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inPredQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> sumQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> maxQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> dstQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> targQueue;
+
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outLossQueue;
+
+    AscendC::GlobalTensor<data_t> predsGm;
+    AscendC::GlobalTensor<index_t> targsGm;
+    AscendC::GlobalTensor<data_t> lossGm;
+
+    uint32_t batch;
+    uint32_t classes;
+    uint32_t startRow;
+    uint32_t rowsThisBlock;
+    AscendC::SoftMaxTiling softmaxTiling;
+};
+
+extern "C" __global__ __aicore__ void cross_entropy_loss_custom(GM_ADDR predictions, GM_ADDR targets, GM_ADDR loss, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCrossEntropyLoss op;
+    op.Init(predictions, targets, loss, tiling_data.batch, tiling_data.classes, tiling_data.softmaxTilingData);
+    if (TILING_KEY_IS(1)) {
+        op.Process();
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cross_entropy_loss_custom_impl_npu(const at::Tensor& predictions, const at::Tensor& targets) {
+    // 输出逐样本损失，形状与targets一致
+    auto tgt_i32 = targets.to(torch::kInt32);
+    at::Tensor result = at::empty_like(tgt_i32, predictions.options().dtype(torch::kFloat));
+    EXEC_NPU_CMD(aclnnCrossEntropyLossCustom, predictions, tgt_i32, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cross_entropy_loss_custom", &cross_entropy_loss_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cross_entropy_loss_custom", &cross_entropy_loss_custom_impl_npu, "cross entropy per-sample loss");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, predictions, targets):
+        # 自定义核计算逐样本交叉熵，随后在PyTorch侧求平均以与F.cross_entropy保持一致
+        per_sample_loss = custom_ops_lib.cross_entropy_loss_custom(predictions, targets.int())
+        return per_sample_loss.mean()
+'''

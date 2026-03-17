@@ -1,0 +1,312 @@
+project_json_src='''
+[
+    {
+        "op": "InstanceNormCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(InstanceNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, bLength);         // N * C
+  TILING_DATA_FIELD_DEF(uint32_t, sLength);         // fixed 1
+  TILING_DATA_FIELD_DEF(uint32_t, hLength);         // H * W
+  TILING_DATA_FIELD_DEF(float, epsilon);            // eps
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(InstanceNormCustom, InstanceNormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "instance_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+// 根据输入 NCHW 计算 B=S=1 的 LayerNorm 形状，使每个 (N,C) 通道在 H*W 上归一化
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    InstanceNormCustomTilingData tiling;
+
+    const gert::StorageShape* in_shape = context->GetInputShape(0);
+    // 形状为 N, C, H, W
+    auto origin = in_shape->GetOriginShape();
+    int64_t dim_num = origin.GetDimNum();
+    if (dim_num != 4) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    uint32_t N = static_cast<uint32_t>(origin.GetDim(0));
+    uint32_t C = static_cast<uint32_t>(origin.GetDim(1));
+    uint32_t H = static_cast<uint32_t>(origin.GetDim(2));
+    uint32_t W = static_cast<uint32_t>(origin.GetDim(3));
+
+    uint32_t B = N * C;
+    uint32_t S = 1;
+    uint32_t HH = H * W;
+
+    // 配置并序列化
+    tiling.set_bLength(B);
+    tiling.set_sLength(S);
+    tiling.set_hLength(HH);
+    // 常见 eps
+    tiling.set_epsilon(1e-5f);
+
+    // 设置 block 数
+    // 让每个 core 处理多个 (N*C) 行
+    uint32_t blockDim = (B >= 8) ? 8 : (B == 0 ? 1 : B);
+    context->SetBlockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 无需额外 workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+
+namespace ops {
+class InstanceNormCustom : public OpDef {
+public:
+    explicit InstanceNormCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(InstanceNormCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "instance_norm_custom_tiling_data.h"
+
+// 使用 LayerNorm 高阶 API 完成 InstanceNorm：
+// 将输入视为 [B=N*C, S=1, H=H*W]，在最后一维 H 上归一化。
+// 传入 gamma=1、beta=0，使其等价于 InstanceNorm2d(affine=False)。
+
+class KernelInstanceNorm {
+public:
+    __aicore__ inline KernelInstanceNorm() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t bLen, uint32_t sLen, uint32_t hLen, float eps)
+    {
+        bLength = bLen;
+        sLength = sLen;
+        hLength = hLen;
+        epsilon = (DTYPE_X)eps;
+
+        bshLength = bLength * sLength * hLength;
+        bsLength  = bLength * sLength;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x, bshLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y, bshLength);
+
+        // 分配队列缓冲区
+        // 注意：示例中一次性搬运 B*S*H，真实大规模场景需分片/tiling
+        pipe.InitBuffer(inQueueX, 1, sizeof(DTYPE_X) * bshLength);
+        pipe.InitBuffer(outQueueY, 1, sizeof(DTYPE_Y) * bshLength);
+        pipe.InitBuffer(tmpMeanQ, 1, sizeof(DTYPE_X) * bsLength);
+        pipe.InitBuffer(tmpVarQ,  1, sizeof(DTYPE_X) * bsLength);
+        pipe.InitBuffer(gammaQ,   1, sizeof(DTYPE_X) * hLength);
+        pipe.InitBuffer(betaQ,    1, sizeof(DTYPE_X) * hLength);
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm, bshLength);
+        inQueueX.EnQue(xLocal);
+
+        // gamma=1, beta=0
+        AscendC::LocalTensor<DTYPE_X> gammaLocal = gammaQ.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> betaLocal  = betaQ.AllocTensor<DTYPE_X>();
+        DTYPE_X one = (DTYPE_X)1.0f;
+        DTYPE_X zero = (DTYPE_X)0.0f;
+        AscendC::Duplicate<DTYPE_X>(gammaLocal, one, hLength);
+        AscendC::Duplicate<DTYPE_X>(betaLocal, zero, hLength);
+        gammaQ.EnQue(gammaLocal);
+        betaQ.EnQue(betaLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal     = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> gammaLocal = gammaQ.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> betaLocal  = betaQ.DeQue<DTYPE_X>();
+
+        AscendC::LocalTensor<DTYPE_Y> yLocal     = outQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_X> meanLocal  = tmpMeanQ.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> varLocal   = tmpVarQ.AllocTensor<DTYPE_X>();
+
+        // 构造 LayerNormTiling
+        LayerNormTiling lnTiling;
+        lnTiling.bLength = bLength;
+        lnTiling.sLength = sLength;
+        lnTiling.hLength = hLength;
+
+        // 直接调用 LayerNorm 高阶 API
+        AscendC::LayerNorm<DTYPE_X, false>(
+            yLocal, meanLocal, varLocal,
+            xLocal, gammaLocal, betaLocal,
+            (DTYPE_X)epsilon, lnTiling
+        );
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        tmpMeanQ.FreeTensor(meanLocal);
+        tmpVarQ.FreeTensor(varLocal);
+        inQueueX.FreeTensor(xLocal);
+        gammaQ.FreeTensor(gammaLocal);
+        betaQ.FreeTensor(betaLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm, yLocal, bshLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  tmpMeanQ;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  tmpVarQ;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  gammaQ;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  betaQ;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t bLength;
+    uint32_t sLength;
+    uint32_t hLength;
+    uint32_t bshLength;
+    uint32_t bsLength;
+    DTYPE_X  epsilon;
+};
+
+extern "C" __global__ __aicore__ void instance_norm_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelInstanceNorm op;
+    op.Init(x, y, tiling_data.bLength, tiling_data.sLength, tiling_data.hLength, tiling_data.epsilon);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor instance_norm_custom_impl_npu(const at::Tensor& x) {
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnInstanceNormCustom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("instance_norm_custom", &instance_norm_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("instance_norm_custom", &instance_norm_custom_impl_npu, "InstanceNorm2d via LayerNorm");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    InstanceNorm2d by custom AscendC op (maps to LayerNorm over H*W per (N,C)).
+    """
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = 1e-5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [N, C, H, W], contiguous NCHW
+        return custom_ops_lib.instance_norm_custom(x)
+'''

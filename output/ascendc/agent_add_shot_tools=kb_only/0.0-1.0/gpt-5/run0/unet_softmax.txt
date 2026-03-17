@@ -1,0 +1,374 @@
+project_json_src='''
+[
+    {
+        "op": "UnetSoftmaxCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+
+// 参考文档 5.3.1.8/5.3.1.9：需要把 SoftMaxTiling 嵌入到 TilingData，并在 Host 侧计算 tmp 空间与 tiling
+BEGIN_TILING_DATA_DEF(UnetSoftmaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);                  // 输入总元素数
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);                      // 每核 tile 数（占位字段）
+  TILING_DATA_FIELD_DEF(uint32_t, lastAxisK);                    // 最后一个维度长度（softmax axis）
+  TILING_DATA_FIELD_DEF_STRUCT(SoftMaxTiling, softmaxTilingData);// SoftMax 高级 API 需要的 tiling
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(UnetSoftmaxCustom, UnetSoftmaxCustomTilingData)
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    UnetSoftmaxCustomTilingData tiling;
+    // 获取原始输入形状
+    const gert::Shape* inShape = context->GetInputShape(0);
+    auto origin = inShape->GetOriginShape();
+
+    // 计算总元素数与最后一维长度
+    uint32_t totalLength = static_cast<uint32_t>(origin.GetShapeSize());
+    uint32_t dimNum = static_cast<uint32_t>(origin.GetDimNum());
+    uint32_t lastAxisK = static_cast<uint32_t>(origin.GetDim(dimNum - 1));
+
+    // 将 4D/ND 形状折叠为 [m, n] 形式：m = prod(all dims except last), n = lastAxisK
+    uint32_t m = (lastAxisK == 0) ? 0 : (totalLength / lastAxisK);
+    std::vector<int64_t> shapeVec = {static_cast<int64_t>(m), static_cast<int64_t>(lastAxisK)};
+    ge::Shape srcShape(shapeVec);
+
+    // 参考 5.3.1.9：先获取 SoftMax 计算所需临时空间的最小值（可保证功能正确）
+    // 本算子使用 float32，max/sum 的 dataTypeSize = 4；isReuseSource=false
+    const uint32_t localWorkSpaceSize = AscendC::GetSoftMaxMinTmpSize(srcShape, sizeof(float), false);
+
+    // 计算 SoftMax tiling 参数
+    AscendC::SoftMaxTilingFunc(srcShape, sizeof(float), localWorkSpaceSize, tiling.softmaxTilingData);
+
+    // 其余常规 tiling 字段
+    const uint32_t BLOCK_DIM = 8;
+    const uint32_t TILE_NUM = 8; // 示例占位
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_lastAxisK(lastAxisK);
+
+    // 保存 tiling 数据
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    context->SetTilingKey(1);
+
+    // 无需额外 workspace
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+// 形状推理：输出与输入一致
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+// 数据类型推理：输出 dtype 与输入一致
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class UnetSoftmaxCustom : public OpDef {
+public:
+    explicit UnetSoftmaxCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(UnetSoftmaxCustom);
+} // namespace ops
+"""
+
+host_operator_src="""
+#include "unet_softmax_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+// 在 host_tiling_src 中已实现 TilingFunc/InferShape/InferDataType/OpDef，
+// 该文件仅需确保链接包含定义（若项目模板需要单独源文件，可保留空壳）。
+
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "unet_softmax_custom_tiling_data.h"
+
+// 参考文档 5.3.1.1/5.3.1.8/5.3.1.9：SoftMax 高级 API + Tiling 用法
+// 本核对输入按最后一维（width/最后轴）执行逐行 softmax：将 ND 折叠为 [m, n]，其中 n=lastAxisK
+
+constexpr int32_t BUFFER_NUM = 2; // pipeline 队列深度
+
+class KernelUnetSoftmax {
+public:
+    __aicore__ inline KernelUnetSoftmax() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t lastAxisK)
+    {
+        this->totalLength = totalLength;
+        this->K = lastAxisK;
+        this->M = (K == 0) ? 0 : (totalLength / K);
+
+        // 按行分片到各个核：每核处理部分 M
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        // 简单均分（最后一核可能少一些）
+        uint32_t rowsPerBlock = (M + blockNum - 1) / blockNum;
+        rowStart = rowsPerBlock * blockIdx;
+        rowEnd = AscendC::min(rowStart + rowsPerBlock, M);
+
+        xGm.SetGlobalBuffer((__gm__ float*)x, totalLength);
+        yGm.SetGlobalBuffer((__gm__ float*)y, totalLength);
+
+        // 每次处理 1 行（为保证 UB 与对齐简单），可按需扩大行为多行以提升吞吐
+        tileRows = 1;
+        tileElems = tileRows * K;
+
+        pipe.InitBuffer(inQueue,  BUFFER_NUM, tileElems * sizeof(float));
+        pipe.InitBuffer(outQueue, BUFFER_NUM, tileElems * sizeof(float));
+    }
+
+    __aicore__ inline void Process(const optiling::SoftMaxTiling &softmaxTilingData)
+    {
+        if (rowStart >= rowEnd || K == 0) {
+            return;
+        }
+        int32_t loopCount = (rowEnd - rowStart) * BUFFER_NUM;
+        int32_t progress = 0;
+        for (uint32_t r = rowStart; r < rowEnd; ++r) {
+            CopyIn(progress, r);
+            Compute(progress, softmaxTilingData);
+            CopyOut(progress, r);
+            progress++;
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t /*progress*/, uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueue.AllocTensor<float>();
+        // 每行连续 K 元素
+        AscendC::DataCopy(xLocal, xGm[rowIdx * K], K);
+        inQueue.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/, const optiling::SoftMaxTiling &softmaxTilingData)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueue.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueue.AllocTensor<float>();
+
+        // 使用 SoftMax 高级 API，按最后轴（长度 K）做逐行 softmax
+        // isReuseSource=false（与 Host 侧 GetSoftMaxMinTmpSize 一致）
+        AscendC::SoftMax<float, false>(yLocal, xLocal, softmaxTilingData);
+
+        outQueue.EnQue<float>(yLocal);
+        inQueue.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t /*progress*/, uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueue.DeQue<float>();
+        AscendC::DataCopy(yGm[rowIdx * K], yLocal, K);
+        outQueue.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t totalLength = 0;
+    uint32_t K = 0;                 // 最后轴长度
+    uint32_t M = 0;                 // 折叠后的行数
+    uint32_t rowStart = 0, rowEnd = 0;
+
+    uint32_t tileRows = 1;          // 每次处理的行数
+    uint32_t tileElems = 0;         // tileRows * K
+};
+
+extern "C" __global__ __aicore__ void unet_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    KernelUnetSoftmax op;
+    op.Init(x, y, tilingData.totalLength, tilingData.lastAxisK);
+    if (TILING_KEY_IS(1)) {
+        op.Process(tilingData.softmaxTilingData);
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor unet_softmax_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    // 调用自定义算子（Ascend NPU）
+    EXEC_NPU_CMD(aclnnUnetSoftmaxCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("unet_softmax_custom", &unet_softmax_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("unet_softmax_custom", &unet_softmax_custom_impl_npu, "Softmax along last axis");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+import torch.nn as nn
+
+# 用自定义 AscendC Softmax（最后一维）替换 nn.Softmax(dim=-1)
+def unet_softmax_lastdim(x: torch.Tensor) -> torch.Tensor:
+    return custom_ops_lib.unet_softmax_custom(x)
+
+class DoubleConvNew(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = unet_softmax_lastdim(x)  # 自定义算子：沿最后一维 softmax
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = unet_softmax_lastdim(x)  # 自定义算子：沿最后一维 softmax
+        return x
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, features):
+        super(ModelNew, self).__init__()
+        self.encoder1 = DoubleConvNew(in_channels, features)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder2 = DoubleConvNew(features, features * 2)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder3 = DoubleConvNew(features * 2, features * 4)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.encoder4 = DoubleConvNew(features * 4, features * 8)
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.bottleneck = DoubleConvNew(features * 8, features * 16)
+
+        self.upconv4 = nn.ConvTranspose2d(features * 16, features * 8, kernel_size=2, stride=2)
+        self.decoder4 = DoubleConvNew(features * 16, features * 8)
+        self.upconv3 = nn.ConvTranspose2d(features * 8, features * 4, kernel_size=2, stride=2)
+        self.decoder3 = DoubleConvNew(features * 8, features * 4)
+        self.upconv2 = nn.ConvTranspose2d(features * 4, features * 2, kernel_size=2, stride=2)
+        self.decoder2 = DoubleConvNew(features * 4, features * 2)
+        self.upconv1 = nn.ConvTranspose2d(features * 2, features, kernel_size=2, stride=2)
+        self.decoder1 = DoubleConvNew(features * 2, features)
+
+        self.final_conv = nn.Conv2d(features, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        enc1 = self.encoder1(x)
+        enc2 = self.encoder2(self.pool1(enc1))
+        enc3 = self.encoder3(self.pool2(enc2))
+        enc4 = self.encoder4(self.pool3(enc3))
+
+        bottleneck = self.bottleneck(self.pool4(enc4))
+
+        dec4 = self.upconv4(bottleneck)
+        dec4 = torch.cat((dec4, enc4), dim=1)
+        dec4 = self.decoder4(dec4)
+        dec3 = self.upconv3(dec4)
+        dec3 = torch.cat((dec3, enc3), dim=1)
+        dec3 = self.decoder3(dec3)
+        dec2 = self.upconv2(dec3)
+        dec2 = torch.cat((dec2, enc2), dim=1)
+        dec2 = self.decoder2(dec2)
+        dec1 = self.upconv1(dec2)
+        dec1 = torch.cat((dec1, enc1), dim=1)
+        dec1 = self.decoder1(dec1)
+
+        return self.final_conv(dec1)
+
+# 输入生成接口与原模型保持一致
+batch_size = 8
+in_channels = 8
+out_channels = 4
+height = 64
+width = 512
+features = 64
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, features]
+'''

@@ -1,0 +1,245 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulForSymmetricMatricesCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "A",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "B",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "C",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+// 对于Matmul，使用系统提供的TCubeTiling结构，无需自定义tiling数据结构。
+// 具体tiling参数由matmul_tiling API在host侧计算并通过RawTilingData传入kernel。
+"""
+
+host_operator_src="""
+#include <cstring>
+#include "register/op_def_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/matmul_tiling.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 获取平台信息
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+
+    // 读取输入/输出形状
+    const gert::StorageShape *a_shape = context->GetInputShape(0);
+    const gert::StorageShape *b_shape = context->GetInputShape(1);
+
+    // 假定为2D矩阵乘法：A(M,K) x B(K,N) = C(M,N)
+    // 本题为对称矩阵，形状均为(N,N)，因此M=N=K
+    uint64_t M = a_shape->GetStorageShape().GetDim(0);
+    uint64_t K = a_shape->GetStorageShape().GetDim(1);
+    uint64_t N = b_shape->GetStorageShape().GetDim(1);
+
+    // Multi-core Matmul tiling
+    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
+    // 参与计算的核心数：可设置为AICore数量
+    tiling.SetDim(ascendcPlatform.GetCoreNumAic());
+
+    // 设置A/B/C类型信息（位置、格式、数据类型）
+    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+
+    // 不使用bias
+    tiling.SetBias(false);
+
+    // 设置单次Matmul形状与完整原始形状
+    tiling.SetShape(static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K));
+    tiling.SetSingleShape(static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K));
+    tiling.SetOrgShape(static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K));
+
+    // 默认使用全部可用的L1/L0C/UB空间
+    tiling.SetBufferSpace(-1, -1, -1);
+
+    // 获取tiling参数（TCubeTiling）
+    optiling::TCubeTiling tilingData;
+    int ret = tiling.GetTiling(tilingData);
+    if (ret == -1) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 设置blockDim为多核tiling后使用的核数
+    context->SetBlockDim(tiling.GetCoreNum());
+
+    // 将tiling写入Runtime的RawTilingData
+    auto rawTiling = context->GetRawTilingData();
+    std::memcpy(rawTiling->GetData(), &tilingData, sizeof(tilingData));
+    rawTiling->SetDataSize(sizeof(tilingData));
+
+    // 无需workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输出形状与A相同（N,N）
+    const gert::Shape* a_shape = context->GetInputShape(0);
+    gert::Shape* c_shape = context->GetOutputShape(0);
+    *c_shape = *a_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+
+namespace ops {
+
+class MatmulForSymmetricMatricesCustom : public OpDef {
+public:
+    explicit MatmulForSymmetricMatricesCustom(const char* name) : OpDef(name)
+    {
+        this->Input("A")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("B")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("C")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulForSymmetricMatricesCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "matmul_base.h" // 若编译环境无此头，可由工具链提供；用于演示
+
+// 使用系统TCubeTiling，不需要自定义tiling数据头
+// REGIST_MATMUL_OBJ宏与TCubeTiling配合使用
+
+using DTYPE = float;
+
+extern "C" __global__ __aicore__ void matmul_for_symmetric_matrices_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, GM_ADDR tiling)
+{
+    AscendC::TPipe pipe;
+
+    // 将tiling地址视为系统的TCubeTiling结构（内核侧通常为无命名空间的TCubeTiling）
+    const TCubeTiling* cubeTiling = reinterpret_cast<const TCubeTiling*>(tiling);
+
+    // 注册并初始化Matmul对象
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, cubeTiling);
+    mm.Init(cubeTiling, &pipe);
+
+    // 设置全局Tensor
+    AscendC::GlobalTensor<DTYPE> aGM;
+    AscendC::GlobalTensor<DTYPE> bGM;
+    AscendC::GlobalTensor<DTYPE> cGM;
+    aGM.SetGlobalBuffer((__gm__ DTYPE *)A);
+    bGM.SetGlobalBuffer((__gm__ DTYPE *)B);
+    cGM.SetGlobalBuffer((__gm__ DTYPE *)C);
+
+    // 运行Matmul（具体接口由高阶API提供，以下为示意）
+    // 一般流程：根据tiling在内核内部完成分块拷入/计算/写回
+    mm.SetTensorA(aGM);
+    mm.SetTensorB(bGM);
+    mm.SetTensorC(cGM);
+    mm.Compute();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_for_symmetric_matrices_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    auto M = A.size(0);
+    auto N = B.size(1);
+    at::Tensor C = at::empty({M, N}, A.options());
+    EXEC_NPU_CMD(aclnnMatmulForSymmetricMatricesCustom, A, B, C);
+    return C;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_for_symmetric_matrices_custom", &matmul_for_symmetric_matrices_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_for_symmetric_matrices_custom", &matmul_for_symmetric_matrices_custom_impl_npu, "Matmul for symmetric matrices");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A, B):
+        return custom_ops_lib.matmul_for_symmetric_matrices_custom(A, B)
+'''

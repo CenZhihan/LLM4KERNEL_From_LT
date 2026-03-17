@@ -1,0 +1,316 @@
+project_json_src='''
+[
+    {
+        "op": "MeanReductionOverADimensionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MeanReductionOverADimensionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, size);    // tmp buffer size (min)
+  TILING_DATA_FIELD_DEF(uint32_t, outter);  // rows
+  TILING_DATA_FIELD_DEF(uint32_t, inner);   // aligned last-dim length
+  TILING_DATA_FIELD_DEF(uint32_t, n);       // actual last-dim length
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MeanReductionOverADimensionCustom, MeanReductionOverADimensionCustomTilingData)
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MeanReductionOverADimensionCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    // 输入按 ND 连续内存。我们在模型侧已将需要规约的维度放到最后一维，这里仅对最后一维做规约。
+    int64_t dim_cnt = in_shape->GetOriginShape().GetDimNum();
+    if (dim_cnt <= 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 计算 outter、n 和 inner
+    uint32_t outter = 1;
+    for (int64_t i = 0; i < dim_cnt - 1; ++i) {
+        outter *= static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(i));
+    }
+    uint32_t n = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(dim_cnt - 1));
+
+    // 仅支持 float
+    uint32_t dtypeSize = 4;
+    // inner 为 32 字节对齐后的 last-dim 长度
+    uint32_t inner = ((n * dtypeSize + 32 - 1) / 32) * 32 / dtypeSize;
+
+    // 计算 Sum 所需的最小临时缓冲区
+    uint32_t maxValue = 0;
+    uint32_t minValue = 0;
+    AscendC::GetSumMaxMinTmpSize(n, dtypeSize, false, maxValue, minValue);
+
+    tiling.set_outter(outter);
+    tiling.set_inner(inner);
+    tiling.set_n(n);
+    tiling.set_size(minValue);
+
+    context->SetBlockDim(8);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 无 workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输出形状为输入去掉最后一维
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    std::vector<int64_t> dims;
+    const auto& origin = x_shape->GetOriginShape();
+    int64_t dim_cnt = origin.GetDimNum();
+    dims.reserve(dim_cnt > 0 ? dim_cnt - 1 : 0);
+    for (int64_t i = 0; i < dim_cnt - 1; ++i) {
+        dims.push_back(origin.GetDim(i));
+    }
+    y_shape->SetDimNum(dims.size());
+    for (size_t i = 0; i < dims.size(); ++i) {
+        y_shape->SetDim(i, dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MeanReductionOverADimensionCustom : public OpDef {
+public:
+    explicit MeanReductionOverADimensionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MeanReductionOverADimensionCustom);
+}
+"""
+
+host_operator_src="""
+#include "mean_reduction_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+// 仅引用上面 host_tiling_src 中已实现的 TilingFunc 与算子注册
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "mean_reduction_over_a_dimension_custom_tiling_data.h"
+
+using dtype = DTYPE_X; // 输入/输出均为 float
+
+class KernelMeanReduceLastDim {
+public:
+    __aicore__ inline KernelMeanReduceLastDim() {}
+
+    __aicore__ inline void Init(GM_ADDR xGm, GM_ADDR yGm, uint32_t tmpSize, uint32_t outter, uint32_t inner, uint32_t n)
+    {
+        this->outter = outter;
+        this->inner = inner;
+        this->n = n;
+
+        xGlobal.SetGlobalBuffer((__gm__ dtype*)xGm);
+        yGlobal.SetGlobalBuffer((__gm__ dtype*)yGm);
+
+        // 输入需要能容纳对齐后的 inner * outter
+        pipe.InitBuffer(inQueueX, 1, outter * inner * sizeof(dtype));
+        // 输出按 32B 对齐行数写回
+        uint32_t alignedOutNum = (outter * sizeof(dtype) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(dtype);
+        pipe.InitBuffer(outQueueY, 1, alignedOutNum * sizeof(dtype));
+        // 临时缓冲区给 Sum 使用
+        pipe.InitBuffer(workQueue, 1, tmpSize);
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<dtype> xLocal = inQueueX.AllocTensor<dtype>();
+        AscendC::DataCopy(xLocal, xGlobal, outter * inner);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<dtype> xLocal = inQueueX.DeQue<dtype>();
+        AscendC::LocalTensor<uint8_t> tmpLocal = workQueue.AllocTensor<uint8_t>();
+
+        // 输出 buffer（对齐到 32B）
+        uint32_t alignedOutNum = (outter * sizeof(dtype) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(dtype);
+        AscendC::LocalTensor<dtype> yLocal = outQueueY.AllocTensor<dtype>();
+        // 先清零对齐区域
+        dtype zero(0);
+        AscendC::Duplicate<dtype>(yLocal, zero, alignedOutNum);
+
+        // 调用高阶 Sum API：对最后一维求和
+        AscendC::SumParams params{outter, inner, n};
+        AscendC::Sum<dtype>(yLocal, xLocal, params);
+
+        // 计算均值：yLocal = yLocal * (1.0 / n)
+        // 使用标量倒数系数
+        dtype scale = static_cast<dtype>(1.0f / static_cast<float>(n));
+        AscendC::Muls<dtype>(yLocal, yLocal, scale, outter); // 按行数进行标量乘
+
+        outQueueY.EnQue(yLocal);
+        workQueue.FreeTensor(tmpLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<dtype> yLocal = outQueueY.DeQue<dtype>();
+        uint32_t alignedOutNum = (outter * sizeof(dtype) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(dtype);
+        AscendC::DataCopy(yGlobal, yLocal, alignedOutNum);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> workQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY;
+
+    AscendC::GlobalTensor<dtype> xGlobal;
+    AscendC::GlobalTensor<dtype> yGlobal;
+
+    uint32_t outter = 0;
+    uint32_t inner = 0;
+    uint32_t n = 0;
+};
+
+extern "C" __global__ __aicore__ void mean_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMeanReduceLastDim op;
+    op.Init(x, y, tiling_data.size, tiling_data.outter, tiling_data.inner, tiling_data.n);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor mean_reduction_over_a_dimension_custom_impl_npu(const at::Tensor& self) {
+    TORCH_CHECK(self.dim() >= 1, "Input must have at least 1 dimension");
+    // 该算子对最后一维做 Mean。输出形状为去掉最后一维。
+    std::vector<int64_t> out_sizes;
+    out_sizes.reserve(self.dim() - 1);
+    for (int i = 0; i < self.dim() - 1; ++i) out_sizes.push_back(self.size(i));
+    at::Tensor result = at::empty(out_sizes, self.options());
+    EXEC_NPU_CMD(aclnnMeanReductionOverADimensionCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("mean_reduction_over_a_dimension_custom", &mean_reduction_over_a_dimension_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mean_reduction_over_a_dimension_custom", &mean_reduction_over_a_dimension_custom_impl_npu, "Reduce-Mean over last dim");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    使用自定义 AscendC 算子对指定维度做均值规约。
+    内部先把指定的维度移动到最后一维，再调用自定义算子（其对最后一维规约）。
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dim = self.dim
+        ndim = x.dim()
+        if dim < 0:
+            dim += ndim
+        assert 0 <= dim < ndim, "Invalid reduction dim"
+
+        # 将目标维度移动到最后一维
+        if dim != ndim - 1:
+            order = list(range(ndim))
+            order.append(order.pop(dim))  # 其他维度保持原顺序
+            x = x.permute(order)
+
+        # 自定义算子对最后一维做 mean
+        y = custom_ops_lib.mean_reduction_over_a_dimension_custom(x)
+
+        # 因为上面构造的 permute 保留了其他轴的原始顺序（仅把目标轴挪到末尾后被规约掉），
+        # 此时 y 的轴顺序已与原张量去掉被规约维后的一致，无需再 permute 回来。
+        return y
+'''

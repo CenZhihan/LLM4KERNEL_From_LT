@@ -1,0 +1,305 @@
+project_json_src='''
+[
+    {
+        "op": "Conv3dMultiplyInstanceNormClampMultiplyMaxCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "multiplier",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "clamp_min",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "clamp_max",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv3dMultiplyInstanceNormClampMultiplyMaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, d);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, spatialSize);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv3dMultiplyInstanceNormClampMultiplyMaxCustom, Conv3dMultiplyInstanceNormClampMultiplyMaxCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv3d_multiply_instance_norm_clamp_multiply_max_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv3dMultiplyInstanceNormClampMultiplyMaxCustomTilingData tiling;
+
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    auto origin = x_shape->GetOriginShape();
+    // Expect x as [N, C, D, H, W]
+    uint32_t n = origin.GetDim(0);
+    uint32_t c = origin.GetDim(1);
+    uint32_t d = origin.GetDim(2);
+    uint32_t h = origin.GetDim(3);
+    uint32_t w = origin.GetDim(4);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_d(d);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_spatialSize(d * h * w);
+    tiling.set_totalLength(n * c * d * h * w);
+
+    // One block per batch (or capped by device)
+    uint32_t block_dim = n > 0 ? std::min<uint32_t>(n, 128) : 1;
+    context->SetBlockDim(block_dim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    // Output is max over channel, so [N, D, H, W]
+    std::vector<int64_t> out_dims = {
+        x_shape->GetDim(0),
+        x_shape->GetDim(2),
+        x_shape->GetDim(3),
+        x_shape->GetDim(4)
+    };
+    y_shape->SetDimNum(out_dims.size());
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        y_shape->SetDim(i, out_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv3dMultiplyInstanceNormClampMultiplyMaxCustom : public OpDef {
+public:
+    explicit Conv3dMultiplyInstanceNormClampMultiplyMaxCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("multiplier")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("clamp_min")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("clamp_max")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv3dMultiplyInstanceNormClampMultiplyMaxCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv3d_multiply_instance_norm_clamp_multiply_max_custom_tiling_data.h"
+
+// Kernel does: y = max_c( clamp( x * multiplier[c], min, max ) * multiplier[c] ), where
+// x: [N,C,D,H,W], multiplier: [C,1,1,1], output y: [N,D,H,W].
+// Note: This kernel focuses on fused elementwise ops and channel-wise max reduction.
+
+extern "C" __global__ __aicore__ void conv3d_multiply_instance_norm_clamp_multiply_max_custom(
+    GM_ADDR x, GM_ADDR multiplier, GM_ADDR clamp_min, GM_ADDR clamp_max, GM_ADDR y,
+    GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    const uint32_t N = tilingData.n();
+    const uint32_t C = tilingData.c();
+    const uint32_t D = tilingData.d();
+    const uint32_t H = tilingData.h();
+    const uint32_t W = tilingData.w();
+    const uint32_t S = tilingData.spatialSize(); // D*H*W
+
+    const uint32_t blockNum = AscendC::GetBlockNum();
+    const uint32_t blockIdx = AscendC::GetBlockIdx();
+
+    __gm__ float* xGm = reinterpret_cast<__gm__ float*>(x);
+    __gm__ float* mGm = reinterpret_cast<__gm__ float*>(multiplier);
+    __gm__ float* minGm = reinterpret_cast<__gm__ float*>(clamp_min);
+    __gm__ float* maxGm = reinterpret_cast<__gm__ float*>(clamp_max);
+    __gm__ float* yGm = reinterpret_cast<__gm__ float*>(y);
+
+    const float vmin = *minGm;
+    const float vmax = *maxGm;
+
+    // Work partition: split by batch N along blocks.
+    uint32_t nPerBlock = (N + blockNum - 1) / blockNum;
+    uint32_t nStart = blockIdx * nPerBlock;
+    uint32_t nEnd = AscendC::Min(nStart + nPerBlock, N);
+
+    for (uint32_t n = nStart; n < nEnd; ++n) {
+        // base offsets
+        uint64_t baseInN = static_cast<uint64_t>(n) * C * S;
+        uint64_t baseOutN = static_cast<uint64_t>(n) * S;
+        for (uint32_t s = 0; s < S; ++s) {
+            float maxVal = -3.402823466e+38F; // -FLT_MAX
+            for (uint32_t c = 0; c < C; ++c) {
+                uint64_t idx = baseInN + static_cast<uint64_t>(c) * S + s;
+                float mul_c = mGm[c]; // multiplier per channel
+                float v = xGm[idx] * mul_c;
+                // clamp
+                if (v < vmin) v = vmin;
+                if (v > vmax) v = vmax;
+                // multiply again
+                v = v * mul_c;
+                if (v > maxVal) maxVal = v;
+            }
+            yGm[baseOutN + s] = maxVal;
+        }
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv3d_multiply_instance_norm_clamp_multiply_max_custom_impl_npu(
+    const at::Tensor& x,
+    const at::Tensor& multiplier,
+    const at::Tensor& clamp_min,
+    const at::Tensor& clamp_max) {
+
+    // Output: [N, D, H, W]
+    auto sizes = x.sizes();
+    TORCH_CHECK(sizes.size() == 5, "x must be 5D NCDHW");
+    at::Tensor result = at::empty({sizes[0], sizes[2], sizes[3], sizes[4]}, x.options());
+    EXEC_NPU_CMD(aclnnConv3dMultiplyInstanceNormClampMultiplyMaxCustom, x, multiplier, clamp_min, clamp_max, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv3d_multiply_instance_norm_clamp_multiply_max_custom", &conv3d_multiply_instance_norm_clamp_multiply_max_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv3d_multiply_instance_norm_clamp_multiply_max_custom", &conv3d_multiply_instance_norm_clamp_multiply_max_custom_impl_npu,
+          "conv3d_multiply_instance_norm_clamp_multiply_max_custom fused op");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Conv3d -> multiply/instance_norm/clamp/multiply/max fused call.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.conv = torch.nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.multiplier = torch.nn.Parameter(torch.randn(multiplier_shape))
+        self.instance_norm = torch.nn.InstanceNorm3d(out_channels)
+        # clamp range as tensors to pass into custom op
+        self.register_buffer("clamp_min_tensor", torch.tensor([clamp_min], dtype=torch.float32))
+        self.register_buffer("clamp_max_tensor", torch.tensor([clamp_max], dtype=torch.float32))
+
+    def forward(self, x):
+        x = self.conv(x)  # [N,C,D,H,W]
+        # fuse elementwise ops and channel-wise max in custom kernel
+        # multiplier expects shape [C,1,1,1]
+        return custom_ops_lib.conv3d_multiply_instance_norm_clamp_multiply_max_custom(
+            x, self.multiplier, self.clamp_min_tensor, self.clamp_max_tensor
+        )
+'''

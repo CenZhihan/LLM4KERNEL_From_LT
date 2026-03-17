@@ -1,0 +1,294 @@
+project_json_src='''
+[
+    {
+        "op": "Conv2dAvgPoolSigmoidSumCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float",
+                    "float16"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float",
+                    "float16"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv2dAvgPoolSigmoidSumCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, size);    // tmp buffer size for Sum
+  TILING_DATA_FIELD_DEF(uint32_t, outter);  // batch size
+  TILING_DATA_FIELD_DEF(uint32_t, inner);   // aligned CHW (elements)
+  TILING_DATA_FIELD_DEF(uint32_t, n);       // actual CHW (elements)
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv2dAvgPoolSigmoidSumCustom, Conv2dAvgPoolSigmoidSumCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv2d_avg_pool_sigmoid_sum_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv2dAvgPoolSigmoidSumCustomTilingData tiling;
+
+    // Input: [N, C, H, W] after sigmoid (ND format)
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto dt = context->GetInputTensor(0)->GetDataType();
+    uint32_t dtypesize = 4;
+    if (dt == ge::DT_FLOAT16) {
+        dtypesize = 2;
+    } else {
+        dtypesize = 4;
+    }
+
+    // Get N, C, H, W
+    int64_t N = 1, C = 1, H = 1, W = 1;
+    // Prefer origin shape when available
+    const auto& origin = in_shape->GetOriginShape();
+    if (origin.GetDimNum() >= 1) N = origin.GetDim(0);
+    if (origin.GetDimNum() >= 2) C = origin.GetDim(1);
+    if (origin.GetDimNum() >= 3) H = origin.GetDim(2);
+    if (origin.GetDimNum() >= 4) W = origin.GetDim(3);
+
+    uint32_t outter = static_cast<uint32_t>(N);
+    uint32_t n = static_cast<uint32_t>(C * H * W); // actual inner length
+
+    // inner aligned to 32 bytes: inner = ceil_align_32(n * sizeof(T)) / sizeof(T)
+    uint32_t inner = (n * dtypesize + 32 - 1) / 32 * 32 / dtypesize;
+
+    // Query Sum tmp buffer size using official API: GetSumMaxMinTmpSize
+    uint32_t maxValue = 0;
+    uint32_t minValue = 0;
+    AscendC::GetSumMaxMinTmpSize(n, dtypesize, false, maxValue, minValue);
+
+    tiling.set_outter(outter);
+    tiling.set_inner(inner);
+    tiling.set_n(n);
+    tiling.set_size(minValue);
+
+    // Set block dim
+    context->SetBlockDim(8);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // Output is per-batch reduction => [N]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const auto& origin = x_shape->GetOriginShape();
+    int64_t N = origin.GetDimNum() > 0 ? origin.GetDim(0) : 1;
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    // Set 1-D shape [N]
+    std::vector<int64_t> y_dims = { N };
+    y_shape->SetDim(y_dims);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv2dAvgPoolSigmoidSumCustom : public OpDef {
+public:
+    explicit Conv2dAvgPoolSigmoidSumCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(Conv2dAvgPoolSigmoidSumCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv2d_avg_pool_sigmoid_sum_custom_tiling_data.h"
+
+// This kernel reduces the input tensor x of shape [N, C, H, W] along the last axis (CHW) per batch,
+// using AscendC::Sum per official API. Output y shape: [N].
+
+template <typename T>
+class KernelConv2dAvgPoolSigmoidSumCustom {
+public:
+    __aicore__ inline KernelConv2dAvgPoolSigmoidSumCustom() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t tmpSize, uint32_t outter, uint32_t inner, uint32_t n)
+    {
+        height = outter;    // N
+        width = inner;      // aligned CHW
+        nNum = n;           // actual CHW
+        // Bind GM
+        srcGlobal.SetGlobalBuffer((__gm__ T *)x);
+        dstGlobal.SetGlobalBuffer((__gm__ T *)y);
+        // Queues and buffers
+        pipe.InitBuffer(inQueueSrc, 1, static_cast<uint64_t>(height) * width * sizeof(T));
+        // Output buffer needs to be 32B aligned per API note
+        uint32_t outAligned = (height * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE;
+        pipe.InitBuffer(outQueueDst, 1, outAligned);
+        // tmp buffer for Sum API
+        pipe.InitBuffer(workQueue, 1, tmpSize);
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<T> srcLocal = inQueueSrc.AllocTensor<T>();
+        AscendC::DataCopy(srcLocal, srcGlobal, height * width);
+        inQueueSrc.EnQue(srcLocal);
+    }
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<T> srcLocal = inQueueSrc.DeQue<T>();
+        AscendC::LocalTensor<uint8_t> workLocal = workQueue.AllocTensor<uint8_t>();
+        AscendC::LocalTensor<T> dstLocal = outQueueDst.AllocTensor<T>();
+        AscendC::SumParams params{height, width, nNum}; // outter, inner, n
+        // Initialize dstLocal buffer (aligned length)
+        uint32_t outAlignedElems = (height * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(T);
+        T zero(0);
+        AscendC::Duplicate<T>(dstLocal, zero, outAlignedElems);
+        // Run Sum
+        AscendC::Sum(dstLocal, srcLocal, params);
+        outQueueDst.EnQue<T>(dstLocal);
+        workQueue.FreeTensor(workLocal);
+        inQueueSrc.FreeTensor(srcLocal);
+    }
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<T> dstLocal = outQueueDst.DeQue<T>();
+        uint32_t outAlignedElems = (height * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(T);
+        AscendC::DataCopy(dstGlobal, dstLocal, outAlignedElems);
+        outQueueDst.FreeTensor(dstLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueSrc;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> workQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueDst;
+
+    AscendC::GlobalTensor<T> srcGlobal, dstGlobal;
+    uint32_t width = 0;   // inner (aligned CHW)
+    uint32_t height = 0;  // outter (N)
+    uint32_t nNum = 0;    // actual CHW
+};
+
+extern "C" __global__ __aicore__ void conv2d_avg_pool_sigmoid_sum_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+#ifdef DTYPE_X
+    using DataType = DTYPE_X;
+#else
+    using DataType = float;
+#endif
+    KernelConv2dAvgPoolSigmoidSumCustom<DataType> op;
+    op.Init(x, y, tiling_data.size(), tiling_data.outter(), tiling_data.inner(), tiling_data.n());
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv2d_avg_pool_sigmoid_sum_custom_impl_npu(const at::Tensor& x) {
+    // Output is [N]
+    TORCH_CHECK(x.dim() >= 1, "Input must have at least 1 dimension");
+    auto options = x.options();
+    at::Tensor result = at::empty({x.size(0)}, options);
+    EXEC_NPU_CMD(aclnnConv2dAvgPoolSigmoidSumCustom, x, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv2d_avg_pool_sigmoid_sum_custom", &conv2d_avg_pool_sigmoid_sum_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv2d_avg_pool_sigmoid_sum_custom", &conv2d_avg_pool_sigmoid_sum_custom_impl_npu, "Sum over CHW per batch");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    This model keeps Conv2d and AvgPool in PyTorch, applies sigmoid,
+    then calls a custom AscendC kernel to sum over [C,H,W] per batch.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.avg_pool = torch.nn.AvgPool2d(pool_kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.avg_pool(x)
+        x = torch.sigmoid(x)
+        # custom kernel reduces along dims [1,2,3] => returns [N]
+        x = custom_ops_lib.conv2d_avg_pool_sigmoid_sum_custom(x)
+        return x
+'''

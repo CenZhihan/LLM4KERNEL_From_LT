@@ -1,0 +1,459 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulSwishScalingCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "half"
+                ]
+            },
+            {
+                "name": "weight",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "half"
+                ]
+            },
+            {
+                "name": "bias",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "scale",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulSwishScalingCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, reserve);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulSwishScalingCustom, MatmulSwishScalingCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "matmul_swish_scaling_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "graph/utils/type_utils.h"
+
+// Matmul tiling headers (according to AscendC API Reference 5.2.2.1.1 Instructions for Use)
+#include "register/tilingdata_base.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/optiling/tiling_api.h"
+#include "tiling/optiling/ai_core/op_tiling.h"
+#include "tiling/matmul_tiling.h"
+#include "external/ge/ge_api_types.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // Input shapes:
+    const gert::Shape* x_shape = context->GetInputShape(0);   // [M, K]
+    const gert::Shape* w_shape = context->GetInputShape(1);   // [N, K] (PyTorch weight)
+    const gert::Shape* b_shape = context->GetInputShape(2);   // [N]
+    (void)b_shape;
+
+    int64_t M = x_shape->GetOriginShape().GetDim(0);
+    int64_t K = x_shape->GetOriginShape().GetDim(1);
+    int64_t N = w_shape->GetOriginShape().GetDim(0);
+
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
+
+    // Types follow: A half, B half, C float, Bias float
+    tiling.SetDim(1);
+    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetShape((int32_t)M, (int32_t)N, (int32_t)K);
+    tiling.SetSingleShape((int32_t)M, (int32_t)N, (int32_t)K);
+    tiling.SetOrgShape((int32_t)M, (int32_t)N, (int32_t)K);
+    tiling.SetBias(true);
+    tiling.SetBufferSpace(-1, -1, -1);
+
+    optiling::TCubeTiling tilingData;
+    int ret = tiling.GetTiling(tilingData);
+    if (ret == -1) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Set block dim from tiling
+    context->SetBlockDim((uint32_t)tiling.GetCoreNum());
+
+    // Save TCubeTiling binary directly to RawTilingData
+    auto raw = context->GetRawTilingData();
+    if (raw->GetCapacity() < sizeof(optiling::TCubeTiling)) {
+        return ge::GRAPH_FAILED;
+    }
+    std::memcpy(raw->GetData(), &tilingData, sizeof(optiling::TCubeTiling));
+    raw->SetDataSize(sizeof(optiling::TCubeTiling));
+
+    // No extra GM workspace required (Matmul workspace set but size 0; Swish uses on-chip UB)
+    size_t *workspaces = context->GetWorkspaceSizes(1);
+    workspaces[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // x: [M,K], weight: [N,K] -> y: [M,N]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    auto x_origin = x_shape->GetOriginShape();
+    auto w_origin = w_shape->GetOriginShape();
+
+    int64_t M = x_origin.GetDim(0);
+    int64_t N = w_origin.GetDim(0);
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, M);
+    y_shape->SetDim(1, N);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // x: half, weight: half, bias: float, scale: float -> y: float
+    context->SetOutputDataType(0, ge::DT_FLOAT);
+    return GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+
+namespace ops {
+class MatmulSwishScalingCustom : public OpDef {
+public:
+    explicit MatmulSwishScalingCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("scale")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulSwishScalingCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+#include "op_tiling/tiling.h"
+#include <cstring>
+
+constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t TILE_NUM = 8;
+
+using A_T = half;   // x
+using B_T = half;   // weight
+using C_T = float;  // y (and bias type)
+using BiasT = float;
+
+class KernelMatmulSwishScaling {
+public:
+    __aicore__ inline KernelMatmulSwishScaling() {}
+
+    __aicore__ inline void Init(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR biasGM, GM_ADDR scaleGM,
+                                GM_ADDR cGM, GM_ADDR tilingGM, GM_ADDR workspaceGM)
+    {
+        // Rebuild TCubeTiling from tilingGM (as per Matmul example in API reference)
+        auto tempTilingGM = reinterpret_cast<__gm__ uint32_t*>(tilingGM);
+        auto tempTiling = reinterpret_cast<uint32_t*>(&tiling_);
+        for (int i = 0; i < (int)(sizeof(TCubeTiling) / sizeof(uint32_t)); ++i, ++tempTilingGM, ++tempTiling) {
+            *tempTiling = *tempTilingGM;
+        }
+
+        // Init GM tensors for full-core chunk
+        aGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(aGM), 
+                                 tiling_.ALayoutInfoB * tiling_.singleCoreM * tiling_.singleCoreK * sizeof(A_T));
+        bGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(bGM), 
+                                 tiling_.BLayoutInfoB * tiling_.singleCoreK * tiling_.singleCoreN * sizeof(B_T));
+        cGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(cGM), 
+                                 tiling_.CLayoutInfoB * tiling_.singleCoreM * tiling_.singleCoreN * sizeof(C_T));
+        biasGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(biasGM), 
+                                    tiling_.CLayoutInfoB * tiling_.singleCoreN * sizeof(BiasT));
+        scaleGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(scaleGM), sizeof(float));
+
+        // Per-core views
+        int offset_a = 0, offset_b = 0, offset_c = 0, offset_bias = 0;
+        gm_a_.SetGlobalBuffer(const_cast<__gm__ A_T*>(aGlobal_[offset_a].GetPhyAddr()),
+                              tiling_.singleCoreM * tiling_.singleCoreK);
+        gm_b_.SetGlobalBuffer(const_cast<__gm__ B_T*>(bGlobal_[offset_b].GetPhyAddr()),
+                              tiling_.singleCoreK * tiling_.singleCoreN);
+        gm_c_.SetGlobalBuffer(const_cast<__gm__ C_T*>(cGlobal_[offset_c].GetPhyAddr()),
+                              tiling_.singleCoreM * tiling_.singleCoreN);
+        gm_bias_.SetGlobalBuffer(const_cast<__gm__ BiasT*>(biasGlobal_[offset_bias].GetPhyAddr()),
+                                 tiling_.singleCoreN);
+
+        // Workspace pointer (size 0 set on host)
+        workspaceGM_ = workspaceGM;
+
+        // Prepare UB buffers for post-processing
+        blockLength_ = tiling_.singleCoreM * tiling_.singleCoreN;
+        tileLength_ = blockLength_ / (TILE_NUM * BUFFER_NUM);
+        if (tileLength_ == 0 && blockLength_ > 0) {
+            tileLength_ = blockLength_; // small blocks
+        }
+
+        pipe_.InitBuffer(inQueue_, BUFFER_NUM, tileLength_ * sizeof(C_T));
+        pipe_.InitBuffer(outQueue_, BUFFER_NUM, tileLength_ * sizeof(C_T));
+        pipe_.InitBuffer(scaleQueue_, 1, sizeof(float)); // for scalar scale
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Configure and run Matmul (reference: REGIST_MATMUL_OBJ and Init usage)
+        constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+        matmul::Matmul<
+            matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL>,
+            matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL>,
+            matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL>,
+            matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, BiasT>
+        , MM_CFG> mm;
+
+        REGIST_MATMUL_OBJ(&pipe_, GetSysWorkSpacePtr(), mm);
+        // Share sizes setting as example suggests
+        tiling_.shareMode = 0;
+        tiling_.shareL1Size = 512 * 1024;
+        tiling_.shareL0CSize = 128 * 1024;
+        tiling_.shareUbSize = 0;
+
+        mm.Init(&tiling_);
+        mm.SetTensorA(gm_a_, 0);   // not transposed
+        mm.SetTensorB(gm_b_, 1);   // weight [N,K], use transpose flag
+        mm.SetWorkspace(workspaceGM_, 0);
+        if (tiling_.isBias) {
+            mm.SetBias(gm_bias_);
+        }
+        // Non-batch compute
+        mm.IterateBatch(gm_c_, 1, 1, false);
+
+        // Load scaling factor (single float) into UB
+        AscendC::LocalTensor<float> scaleLocal = scaleQueue_.AllocTensor<float>();
+        AscendC::DataCopy(scaleLocal, scaleGlobal_, 1);
+        scaleQueue_.EnQue(scaleLocal);
+
+        // Swish + scaling on C in-place: y = swish(C) * scale
+        int32_t loopCount = (tileLength_ == 0) ? 0 : (blockLength_ / tileLength_);
+        int32_t tail = (tileLength_ == 0) ? 0 : (blockLength_ - loopCount * tileLength_);
+
+        for (int32_t i = 0; i < loopCount; ++i) {
+            CopyIn(i, tileLength_);
+            Compute(i, tileLength_);
+            CopyOut(i, tileLength_);
+        }
+        if (tail > 0) {
+            CopyIn(loopCount, tail);
+            Compute(loopCount, tail);
+            CopyOut(loopCount, tail);
+        }
+
+        // free scale local
+        scaleLocal = scaleQueue_.DeQue<float>();
+        scaleQueue_.FreeTensor(scaleLocal);
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t idx, uint32_t len)
+    {
+        AscendC::LocalTensor<C_T> cLocal = inQueue_.AllocTensor<C_T>();
+        AscendC::DataCopy(cLocal, gm_c_[idx * len], len);
+        inQueue_.EnQue(cLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*idx*/, uint32_t len)
+    {
+        AscendC::LocalTensor<C_T> inLocal = inQueue_.DeQue<C_T>();
+        AscendC::LocalTensor<C_T> outLocal = outQueue_.AllocTensor<C_T>();
+
+        // Swish with beta=1.0f: y = x * sigmoid(x)
+        Swish(outLocal, inLocal, len, static_cast<C_T>(1.0f));
+
+        // Multiply by scalar scale
+        AscendC::LocalTensor<float> scaleLocal = scaleQueue_.DeQue<float>();
+        float s = scaleLocal.GetValue(0);
+        scaleQueue_.EnQue(scaleLocal);
+        AscendC::Muls(outLocal, outLocal, s, len);
+
+        outQueue_.EnQue<C_T>(outLocal);
+        inQueue_.FreeTensor(inLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t idx, uint32_t len)
+    {
+        AscendC::LocalTensor<C_T> outLocal = outQueue_.DeQue<C_T>();
+        AscendC::DataCopy(gm_c_[idx * len], outLocal, len);
+        outQueue_.FreeTensor(outLocal);
+    }
+
+private:
+    // GM tensors (full, then per-core views)
+    AscendC::GlobalTensor<A_T> aGlobal_;
+    AscendC::GlobalTensor<B_T> bGlobal_;
+    AscendC::GlobalTensor<C_T> cGlobal_;
+    AscendC::GlobalTensor<BiasT> biasGlobal_;
+    AscendC::GlobalTensor<float> scaleGlobal_;
+
+    AscendC::GlobalTensor<A_T> gm_a_;
+    AscendC::GlobalTensor<B_T> gm_b_;
+    AscendC::GlobalTensor<C_T> gm_c_;
+    AscendC::GlobalTensor<BiasT> gm_bias_;
+
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue_;
+    AscendC::TQue<AscendC::TPosition::VECIN,  1>          scaleQueue_;
+
+    GM_ADDR workspaceGM_ = nullptr;
+    TCubeTiling tiling_;
+    uint32_t blockLength_ = 0;
+    uint32_t tileLength_ = 0;
+};
+
+extern "C" __global__ __aicore__ void matmul_swish_scaling_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR bias,
+                                                                  GM_ADDR scale, GM_ADDR y,
+                                                                  GM_ADDR workspace, GM_ADDR tiling)
+{
+    KernelMatmulSwishScaling op;
+    op.Init(x, weight, bias, scale, y, tiling, workspace);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_swish_scaling_custom_impl_npu(const at::Tensor& x,
+                                                const at::Tensor& weight,
+                                                const at::Tensor& bias,
+                                                const at::Tensor& scale) {
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [M,K]");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [N,K]");
+    TORCH_CHECK(bias.numel() == weight.size(0), "bias must be length N");
+    at::Tensor y = at::empty({x.size(0), weight.size(0)}, x.options().dtype(at::kFloat));
+    EXEC_NPU_CMD(aclnnMatmulSwishScalingCustom, x, weight, bias, scale, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_swish_scaling_custom", &matmul_swish_scaling_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_swish_scaling_custom", &matmul_swish_scaling_custom_impl_npu,
+          "Matmul + Swish + Scaling custom kernel");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model using custom AscendC kernel:
+      y = (x @ W^T + b) -> Swish -> scale
+      Swish(x) = x * sigmoid(x), with beta = 1.0
+    Input x and weight are computed in FP16; bias/output in FP32.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super().__init__()
+        self.matmul = torch.nn.Linear(in_features, out_features)
+        self.scaling_factor = float(scaling_factor)
+
+    def forward(self, x):
+        # Prepare tensors for custom kernel
+        x_half = x.to(torch.float16)
+        w_half = self.matmul.weight.to(torch.float16)  # [N, K]
+        b_float = self.matmul.bias.to(torch.float32)   # [N]
+        scale_tensor = torch.tensor(self.scaling_factor, device=x.device, dtype=torch.float32)
+
+        y = custom_ops_lib.matmul_swish_scaling_custom(x_half, w_half, b_float, scale_tensor)
+        return y.to(x.dtype)
+'''

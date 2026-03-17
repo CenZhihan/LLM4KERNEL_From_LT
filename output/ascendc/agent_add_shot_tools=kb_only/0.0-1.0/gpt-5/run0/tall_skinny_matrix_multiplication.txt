@@ -1,0 +1,294 @@
+project_json_src='''
+[
+    {
+        "op": "TallSkinnyMatrixMultiplicationCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "a",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "c",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+// 由于本算子直接在 RawTilingData 中写入 TCubeTiling 原始字节，这里仅做占位注册
+BEGIN_TILING_DATA_DEF(TallSkinnyMatrixMultiplicationCustomTilingData)
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(TallSkinnyMatrixMultiplicationCustom, TallSkinnyMatrixMultiplicationCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "register/op_def_registry.h"
+#include "register/tilingdata_base.h"
+#include "external/register/op_tiling_registry.h"
+
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/matmul_tiling.h"
+#include "tiling/matmul_utils.h"
+
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 基于输入形状推导 M,K,N
+    const gert::Shape* a_shape = context->GetInputShape(0);
+    const gert::Shape* b_shape = context->GetInputShape(1);
+    if (a_shape->GetOriginShape().GetDimNum() != 2 || b_shape->GetOriginShape().GetDimNum() != 2) {
+        return ge::GRAPH_FAILED;
+    }
+    int64_t M = a_shape->GetOriginShape().GetDim(0);
+    int64_t K = a_shape->GetOriginShape().GetDim(1);
+    int64_t Kb = b_shape->GetOriginShape().GetDim(0);
+    int64_t N = b_shape->GetOriginShape().GetDim(1);
+    if (K != Kb) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 选择多核 tiling，便于处理 Tall-Skinny 的大 M / 小 N 形状
+    auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    matmul_tiling::MultiCoreMatmulTiling tiling(platform);
+
+    // 设置参与计算的核数（让框架自动根据平台与形状在 GetTiling 过程中决定）
+    tiling.SetDim(1);
+
+    // 设置类型: A/B 使用 float16，C 使用 float（参考 AscendC Matmul 组合）
+    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBias(false);
+
+    // 设置形状（NORMAL 布局）
+    tiling.SetShape((uint32_t)M, (uint32_t)N, (uint32_t)K);
+    tiling.SetSingleShape((uint32_t)M, (uint32_t)N, (uint32_t)K);
+    tiling.SetOrgShape((uint32_t)M, (uint32_t)N, (uint32_t)K);
+
+    // 获取 tiling 数据
+    optiling::TCubeTiling tilingData;
+    int ret = tiling.GetTiling(tilingData);
+    if (ret != 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 设置 BlockDim
+    uint32_t blockDim = tiling.GetCoreNum();
+    if (blockDim == 0) blockDim = 1;
+    context->SetBlockDim(blockDim);
+
+    // 序列化 tiling 到 RawTilingData
+    auto raw = context->GetRawTilingData();
+    // 直接写入 TCubeTiling 原始字节
+    size_t needSize = sizeof(optiling::TCubeTiling);
+    if (raw->GetCapacity() < needSize) {
+        return ge::GRAPH_FAILED;
+    }
+    std::memcpy(raw->GetData(), &tilingData, needSize);
+    raw->SetDataSize(needSize);
+
+    // 工作空间
+    size_t *ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0; // 本例不使用 workspace
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* a_shape = context->GetInputShape(0);
+    const gert::Shape* b_shape = context->GetInputShape(1);
+    if (a_shape->GetOriginShape().GetDimNum() != 2 || b_shape->GetOriginShape().GetDimNum() != 2) {
+        return GRAPH_FAILED;
+    }
+    int64_t M = a_shape->GetOriginShape().GetDim(0);
+    int64_t N = b_shape->GetOriginShape().GetDim(1);
+    gert::Shape* c_shape = context->GetOutputShape(0);
+    c_shape->SetDimNum(2);
+    c_shape->SetDim(0, M);
+    c_shape->SetDim(1, N);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // 输出使用 float（fp32 累加）
+    context->SetOutputDataType(0, ge::DT_FLOAT);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+
+namespace ops {
+class TallSkinnyMatrixMultiplicationCustom : public OpDef {
+public:
+    explicit TallSkinnyMatrixMultiplicationCustom(const char* name) : OpDef(name)
+    {
+        this->Input("a")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("c")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(TallSkinnyMatrixMultiplicationCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+extern "C" __global__  __aicore__ void tall_skinny_matrix_multiplication_custom(GM_ADDR aGM, GM_ADDR bGM,
+                                                                                GM_ADDR cGM, GM_ADDR workspaceGM,
+                                                                                GM_ADDR tilingGM)
+{
+    // 读取 host 侧下发的 TCubeTiling 原始数据
+    TCubeTiling tiling;
+    auto src = (__gm__ uint32_t*)tilingGM;
+    auto dst = (uint32_t*)&tiling;
+    for (int i = 0; i < (int)(sizeof(TCubeTiling) / sizeof(uint32_t)); ++i, ++src, ++dst) {
+        *dst = *src;
+    }
+
+    // 定义 Matmul 类型：A/B half，C float，NORMAL 布局
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, half, false, LayoutMode::NORMAL> aType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, half, false, LayoutMode::NORMAL> bType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> cType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, float> biasType;
+
+    set_atomic_none();
+
+    // 初始化 GM Tensor
+    AscendC::GlobalTensor<half> aGlobal;
+    AscendC::GlobalTensor<half> bGlobal;
+    AscendC::GlobalTensor<float> cGlobal;
+
+    int32_t sizeA = tiling.singleCoreM * tiling.singleCoreK * sizeof(half);
+    int32_t sizeB = tiling.singleCoreK * tiling.singleCoreN * sizeof(half);
+    int32_t sizeC = tiling.singleCoreM * tiling.singleCoreN * sizeof(float);
+
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(aGM), sizeA);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(bGM), sizeB);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(cGM), sizeC);
+
+    AscendC::GlobalTensor<half> gm_a;
+    gm_a.SetGlobalBuffer(const_cast<__gm__ half*>(aGlobal[0].GetPhyAddr()),
+                         tiling.singleCoreM * tiling.singleCoreK);
+    AscendC::GlobalTensor<half> gm_b;
+    gm_b.SetGlobalBuffer(const_cast<__gm__ half*>(bGlobal[0].GetPhyAddr()),
+                         tiling.singleCoreK * tiling.singleCoreN);
+    AscendC::GlobalTensor<float> gm_c;
+    gm_c.SetGlobalBuffer(const_cast<__gm__ float*>(cGlobal[0].GetPhyAddr()),
+                         tiling.singleCoreM * tiling.singleCoreN);
+
+    // 创建并注册 Matmul 实例
+    matmul::Matmul<aType, bType, cType, biasType> mm;
+    AscendC::TPipe pipe;
+    g_cubeTPipePtr = &pipe;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
+
+    // 初始化
+    mm.Init(&tiling);
+
+    // 设置 A、B、Workspace（无 Bias）
+    mm.SetTensorA(gm_a);
+    mm.SetTensorB(gm_b);
+    mm.SetWorkspace(workspaceGM, 0);
+
+    // 执行（单次 batch）
+    mm.IterateBatch(gm_c, 1, 1, false);
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor tall_skinny_matrix_multiplication_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    // A/B 转为半精度，输出为 float32
+    at::Tensor A_half = A.to(torch::kHalf);
+    at::Tensor B_half = B.to(torch::kHalf);
+    at::Tensor C = at::empty({A.size(0), B.size(1)}, A.options().dtype(at::kFloat));
+
+    EXEC_NPU_CMD(aclnnTallSkinnyMatrixMultiplicationCustom, A_half, B_half, C);
+    return C;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("tall_skinny_matrix_multiplication_custom", &tall_skinny_matrix_multiplication_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("tall_skinny_matrix_multiplication_custom", &tall_skinny_matrix_multiplication_custom_impl_npu, "MatMul for Tall-Skinny case");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A, B):
+        return custom_ops_lib.tall_skinny_matrix_multiplication_custom(A, B)
+'''

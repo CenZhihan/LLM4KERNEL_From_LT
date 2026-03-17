@@ -143,108 +143,68 @@ kernel_src="""
 #define __NPU_TILING__
 #include "relu_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+constexpr int32_t BUFFER_NUM = 2;
 
 class KernelRelu {
 public:
     __aicore__ inline KernelRelu() {}
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t ALIGN_NUM, uint32_t block_dim, uint32_t tileNum, uint32_t blockLength, uint32_t tileLength, uint32_t lastBlockLength, uint32_t lastTileLength)
     {
-        this->totalLength = totalLength;
-        this->ALIGN_NUM = ALIGN_NUM;
-        this->block_dim = block_dim;
         this->tileNum = tileNum;
-        this->blockLength = blockLength;
         this->tileLength = tileLength;
-        this->lastBlockLength = lastBlockLength;
         this->lastTileLength = lastTileLength;
-        
-        uint32_t allocLength = (this->tileLength + ALIGN_NUM - 1) / ALIGN_NUM * ALIGN_NUM;
-        uint32_t alignedBlockLength = (this->blockLength + ALIGN_NUM - 1) / ALIGN_NUM * ALIGN_NUM;
+        uint32_t allocLength = (tileLength + ALIGN_NUM - 1) / ALIGN_NUM * ALIGN_NUM;
+        uint32_t alignedBlockLength = (blockLength + ALIGN_NUM - 1) / ALIGN_NUM * ALIGN_NUM;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, alignedBlockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y, alignedBlockLength);
+        xGm.SetGlobalBuffer((__gm__ float *)x, alignedBlockLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y, alignedBlockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, allocLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, allocLength * sizeof(DTYPE_Y));
-        pipe.InitBuffer(calcQueue, 1, allocLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, allocLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, allocLength * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
         for (int32_t i = 0; i < this->tileNum; i++) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
+            uint32_t length = (i == this->tileNum - 1) ? this->lastTileLength : this->tileLength;
+            CopyIn(i, length);
+            Compute(i, length);
+            CopyOut(i, length);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress)
+    __aicore__ inline void CopyIn(int32_t progress, uint32_t length)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        uint32_t currentLength = this->tileLength;
-        if (progress == this->tileNum - 1) {
-            currentLength = this->lastTileLength;
-        }
-        
-        uint32_t alignedLength = (currentLength + this->ALIGN_NUM - 1) / this->ALIGN_NUM * this->ALIGN_NUM;
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], alignedLength);
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], length);
         inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(int32_t progress)
+    __aicore__ inline void Compute(int32_t progress, uint32_t length)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
-        
-        uint32_t currentLength = this->tileLength;
-        if (progress == this->tileNum - 1) {
-            currentLength = this->lastTileLength;
-        }
-        
-        uint32_t alignedLength = (currentLength + this->ALIGN_NUM - 1) / this->ALIGN_NUM * this->ALIGN_NUM;
-
-
-        AscendC::LocalTensor<DTYPE_X> tempLocal = calcQueue.AllocTensor<DTYPE_X>();
-        AscendC::Duplicate(tempLocal, static_cast<DTYPE_X>(0.0f), alignedLength);
-        AscendC::Max(yLocal, xLocal, tempLocal, alignedLength);
-        calcQueue.FreeTensor(tempLocal);
-
-
-        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        AscendC::Relu(yLocal, xLocal, length);
+        outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
     }
 
-    __aicore__ inline void CopyOut(int32_t progress)
+    __aicore__ inline void CopyOut(int32_t progress, uint32_t length)
     {
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
-        uint32_t currentLength = this->tileLength;
-        if (progress == this->tileNum - 1) {
-            currentLength = this->lastTileLength;
-        }
-        
-        uint32_t alignedLength = (currentLength + this->ALIGN_NUM - 1) / this->ALIGN_NUM * this->ALIGN_NUM;
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, alignedLength);
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, length);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> calcQueue;
-
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> yGm;
-
-    uint32_t totalLength;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
     uint32_t tileNum;
-    uint32_t ALIGN_NUM;
-    uint32_t block_dim;
-    uint32_t blockLength;
     uint32_t tileLength;
-    uint32_t lastBlockLength;
     uint32_t lastTileLength;
 };
 

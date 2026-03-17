@@ -1,0 +1,263 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulForLowerTriangularMatricesCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "A",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "B",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "C",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulForLowerTriangularMatricesCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  // 保存Matmul的tiling信息，供内核侧使用
+  TILING_DATA_FIELD_DEF(TCubeTiling, tiling);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulForLowerTriangularMatricesCustom, MatmulForLowerTriangularMatricesCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "matmul_for_lower_triangular_matrices_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/matmul_tiling.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+
+    // 获取输入形状，A、B均为(N, N)
+    const auto* in_shape = context->GetInputShape(0);
+    const auto& origin = in_shape->GetOriginShape();
+    if (origin.GetDimNum() != 2) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t n = static_cast<uint32_t>(origin.GetDim(0));
+
+    // 使用Matmul多核tiling获取TCubeTiling
+    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
+    tiling.SetDim(-1); // 由tiling自动选择核心数
+    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBias(false);
+    tiling.SetShape(n, n, n);
+    tiling.SetSingleShape(n, n, n);
+    tiling.SetOrgShape(n, n, n);
+    tiling.SetBufferSpace(-1, -1, -1); // 默认使用全部可用空间
+
+    optiling::TCubeTiling cubeTilingHost;
+    int64_t ret = tiling.GetTiling(cubeTilingHost);
+    if (ret == -1) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 设置blockDim（核心数）
+    int32_t blockDim = tiling.GetCoreNum();
+    if (blockDim <= 0) {
+        blockDim = 1;
+    }
+    context->SetBlockDim(static_cast<uint32_t>(blockDim));
+
+    // 回填自定义TilingData
+    MatmulForLowerTriangularMatricesCustomTilingData td;
+    td.set_n(n);
+    td.set_tiling(cubeTilingHost);
+
+    // 保存tiling数据到上下文
+    td.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(td.GetDataSize());
+
+    // 无需额外workspace
+    size_t* workspaces = context->GetWorkspaceSizes(1);
+    workspaces[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* a_shape = context->GetInputShape(0);
+    const gert::Shape* b_shape = context->GetInputShape(1);
+    if (a_shape->GetDimNum() != 2 || b_shape->GetDimNum() != 2) {
+        return GRAPH_FAILED;
+    }
+    // 输出与输入A同形状(N,N)
+    gert::Shape* c_shape = context->GetOutputShape(0);
+    *c_shape = *a_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+
+namespace ops {
+class MatmulForLowerTriangularMatricesCustom : public OpDef {
+public:
+    explicit MatmulForLowerTriangularMatricesCustom(const char* name) : OpDef(name)
+    {
+        this->Input("A")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("B")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("C")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulForLowerTriangularMatricesCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "matmul_for_lower_triangular_matrices_custom_tiling_data.h"
+
+// 为简化演示，采用标量计算下三角矩阵乘法并写回下三角，严格保证上三角置零。
+// 在需要进一步性能优化时，可结合Matmul对象及GetTiling/REGIST_MATMUL_OBJ进行块级GEMM。
+
+using DTYPE_A = float;
+using DTYPE_B = float;
+using DTYPE_C = float;
+
+extern "C" __global__ __aicore__ void matmul_for_lower_triangular_matrices_custom(
+    GM_ADDR a, GM_ADDR b, GM_ADDR c, GM_ADDR workspace, GM_ADDR tiling_gm)
+{
+    GET_TILING_DATA(td, tiling_gm);
+    const uint32_t N = td.n();
+
+    __gm__ DTYPE_A* A = reinterpret_cast<__gm__ DTYPE_A*>(a);
+    __gm__ DTYPE_B* B = reinterpret_cast<__gm__ DTYPE_B*>(b);
+    __gm__ DTYPE_C* C = reinterpret_cast<__gm__ DTYPE_C*>(c);
+
+    // 多核分块：按行划分
+    const uint32_t blockNum = AscendC::GetBlockNum();
+    const uint32_t blockIdx = AscendC::GetBlockIdx();
+    const uint32_t rowsPerBlock = (N + blockNum - 1) / blockNum;
+    const uint32_t rowStart = blockIdx * rowsPerBlock;
+    const uint32_t rowEnd = AscendC::Min(rowStart + rowsPerBlock, N);
+
+    for (uint32_t i = rowStart; i < rowEnd; ++i) {
+        // 上三角部分直接置零
+        for (uint32_t j = i + 1; j < N; ++j) {
+            C[i * N + j] = static_cast<DTYPE_C>(0.0f);
+        }
+        // 下三角及对角（j <= i）
+        for (uint32_t j = 0; j <= i && j < N; ++j) {
+            DTYPE_C acc = static_cast<DTYPE_C>(0.0f);
+            // 利用下三角稀疏性，k范围为[j, i]
+            for (uint32_t k = j; k <= i; ++k) {
+                acc += static_cast<DTYPE_C>(A[i * N + k]) * static_cast<DTYPE_C>(B[k * N + j]);
+            }
+            C[i * N + j] = acc;
+        }
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_for_lower_triangular_matrices_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, \"Inputs must be 2D square matrices\");
+    TORCH_CHECK(A.size(0) == A.size(1) && B.size(0) == B.size(1), \"Inputs must be square\");
+    TORCH_CHECK(A.sizes() == B.sizes(), \"A and B must have the same shape\");
+
+    at::Tensor A_c = A.contiguous();
+    at::Tensor B_c = B.contiguous();
+    at::Tensor C = at::empty_like(A_c);
+
+    EXEC_NPU_CMD(aclnnMatmulForLowerTriangularMatricesCustom, A_c, B_c, C);
+    return C;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_for_lower_triangular_matrices_custom", &matmul_for_lower_triangular_matrices_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_for_lower_triangular_matrices_custom", &matmul_for_lower_triangular_matrices_custom_impl_npu, "Lower-triangular Matmul with tril");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A, B):
+        # 调用自定义AscendC算子：返回下三角的(A @ B)
+        return custom_ops_lib.matmul_for_lower_triangular_matrices_custom(A, B)
+'''

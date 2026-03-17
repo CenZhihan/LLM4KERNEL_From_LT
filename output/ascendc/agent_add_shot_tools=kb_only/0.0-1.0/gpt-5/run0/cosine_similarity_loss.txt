@@ -1,0 +1,365 @@
+project_json_src='''
+[
+    {
+        "op": "CosineSimilarityLossCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "predictions",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "targets",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "loss",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CosineSimilarityLossCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, outter);     // batch size
+  TILING_DATA_FIELD_DEF(uint32_t, inner);      // aligned vector length on last axis
+  TILING_DATA_FIELD_DEF(uint32_t, n);          // actual vector length on last axis
+  TILING_DATA_FIELD_DEF(uint32_t, tmpSize);    // tmp buffer size for Sum
+  TILING_DATA_FIELD_DEF(float, epsilon);       // numerical epsilon
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CosineSimilarityLossCustom, CosineSimilarityLossCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cosine_similarity_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CosineSimilarityLossCustomTilingData tiling;
+
+    // 读取输入shape，假定为 [B, H]
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    // 获取B、H
+    uint32_t outter = static_cast<uint32_t>(origin.GetDim(0));
+    uint32_t n = static_cast<uint32_t>(origin.GetDim(1));
+
+    // 计算inner按32字节对齐: inner = ceil_align32(n * sizeof(T)) / sizeof(T)
+    const uint32_t typeSize = 4; // float
+    uint32_t inner = ((n * typeSize + 32 - 1) / 32) * 32 / typeSize;
+
+    // 获取Sum需要的临时空间（最小值）
+    uint32_t maxValue = 0, minValue = 0;
+    AscendC::GetSumMaxMinTmpSize(n, typeSize, false, maxValue, minValue);
+
+    // 设置tiling
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_outter(outter);
+    tiling.set_inner(inner);
+    tiling.set_n(n);
+    tiling.set_tmpSize(minValue);
+    tiling.set_epsilon(1e-12f);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输出为标量（1）
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    std::vector<int64_t> out_dims = {1};
+    y_shape->SetDimNum(out_dims.size());
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        y_shape->SetDim(i, out_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CosineSimilarityLossCustom : public OpDef {
+public:
+    explicit CosineSimilarityLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("predictions")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("targets")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("loss")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CosineSimilarityLossCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "cosine_similarity_loss_custom_tiling_data.h"
+
+using dataType = DTYPE_X; // float
+
+class KernelCosineSimilarityLoss {
+public:
+    __aicore__ inline KernelCosineSimilarityLoss() {}
+    __aicore__ inline void Init(GM_ADDR predGm, GM_ADDR targGm, GM_ADDR lossGm,
+                                uint32_t tmpSize, uint32_t outter, uint32_t inner, uint32_t n,
+                                float epsilon)
+    {
+        this->outter = outter;
+        this->inner = inner;
+        this->n = n;
+        this->epsilon = epsilon;
+
+        const uint32_t totalElem = outter * inner;
+
+        predictionsGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(predGm), totalElem);
+        targetsGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(targGm), totalElem);
+        lossGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(lossGm), 1); // 标量输出
+
+        // 队列和缓冲区
+        pipe.InitBuffer(inQueuePred, 1, totalElem * sizeof(dataType));
+        pipe.InitBuffer(inQueueTarg, 1, totalElem * sizeof(dataType));
+        pipe.InitBuffer(tmpWorkQueue, 1, tmpSize);
+
+        // 中间结果/输出缓冲
+        // 行归约输出长度为 outter，需按32字节对齐
+        uint32_t outterAlignedElems = (outter * sizeof(dataType) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(dataType);
+        pipe.InitBuffer(vecQueue, 1, outterAlignedElems * sizeof(dataType));  // dot 或 sum向量
+        pipe.InitBuffer(vecQueue2, 1, outterAlignedElems * sizeof(dataType)); // 另一个向量缓冲
+        pipe.InitBuffer(outScalarQueue, 1, AscendC::ONE_BLK_SIZE); // 标量（对齐到32字节）
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        const uint32_t totalElem = outter * inner;
+        AscendC::LocalTensor<dataType> predLocal = inQueuePred.AllocTensor<dataType>();
+        AscendC::LocalTensor<dataType> targLocal = inQueueTarg.AllocTensor<dataType>();
+        AscendC::DataCopy(predLocal, predictionsGlobal, totalElem);
+        AscendC::DataCopy(targLocal, targetsGlobal, totalElem);
+        inQueuePred.EnQue(predLocal);
+        inQueueTarg.EnQue(targLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<dataType> predLocal = inQueuePred.DeQue<dataType>();
+        AscendC::LocalTensor<dataType> targLocal = inQueueTarg.DeQue<dataType>();
+        AscendC::LocalTensor<uint8_t> workLocal = tmpWorkQueue.AllocTensor<uint8_t>();
+
+        // 用于行归约输出的向量缓冲（长度 outter 对齐到32B）
+        uint32_t outterAlignedElems = (outter * sizeof(dataType) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(dataType);
+        AscendC::LocalTensor<dataType> vecLocal = vecQueue.AllocTensor<dataType>();   // 通用向量缓冲
+        AscendC::LocalTensor<dataType> vecLocal2 = vecQueue2.AllocTensor<dataType>(); // 通用向量缓冲2
+
+        // 计算行向量点积: dot_i = Sum_j (pred[i,j] * targ[i,j])
+        AscendC::LocalTensor<dataType> mulLocal = vecLocal; // 复用vecLocal作为中间矩阵缓存
+        AscendC::Mul(mulLocal, predLocal, targLocal, outter * inner);
+        AscendC::SumParams sumParams{outter, inner, n};
+
+        // dot向量输出到vecLocal2（长度=outter，对齐到32B）
+        AscendC::Duplicate<dataType>(vecLocal2, (dataType)0,
+            (outter * sizeof(dataType) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(dataType));
+        AscendC::Sum(vecLocal2, mulLocal, sumParams); // vecLocal2存放dot向量
+
+        // 计算 sum(pred^2) 行向量
+        AscendC::Mul(mulLocal, predLocal, predLocal, outter * inner); // mulLocal <- pred^2
+        AscendC::LocalTensor<dataType> sumPx2 = vecLocal; // 用vecLocal存放sum(pred^2)
+        AscendC::Duplicate<dataType>(sumPx2, (dataType)0,
+            (outter * sizeof(dataType) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(dataType));
+        AscendC::Sum(sumPx2, mulLocal, sumParams);
+
+        // 计算 sum(targ^2) 行向量
+        AscendC::Mul(mulLocal, targLocal, targLocal, outter * inner); // mulLocal <- targ^2
+        AscendC::LocalTensor<dataType> sumTy2 = vecLocal; // 复用vecLocal覆盖sum(pred^2)
+        AscendC::Duplicate<dataType>(sumTy2, (dataType)0,
+            (outter * sizeof(dataType) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(dataType));
+        AscendC::Sum(sumTy2, mulLocal, sumParams);
+
+        // sqrt(sum(pred^2)) 和 sqrt(sum(targ^2))
+        AscendC::Sqrt(sumPx2, sumPx2, outterAlignedElems);
+        AscendC::Sqrt(sumTy2, sumTy2, outterAlignedElems);
+
+        // denom = sqrt(sumPx2) * sqrt(sumTy2) + epsilon
+        AscendC::Mul(sumPx2, sumPx2, sumTy2, outterAlignedElems); // sumPx2 <- denom_without_eps
+        AscendC::Adds(sumPx2, sumPx2, (dataType)epsilon, outterAlignedElems); // +eps
+
+        // cos = dot / denom
+        AscendC::Div(vecLocal2, vecLocal2, sumPx2, outterAlignedElems); // vecLocal2 <- cos向量
+
+        // 对cos向量做均值: mean = Sum(cos)/outter
+        // 1D Sum: outter_1D=1, inner_1D=ceil_align(B*4)/4, n_1D=B
+        uint32_t inner1D = (outter * sizeof(dataType) + 32 - 1) / 32 * 32 / sizeof(dataType);
+        AscendC::SumParams meanParams{1, inner1D, outter};
+        AscendC::LocalTensor<dataType> sumCosLocal = outScalarQueue.AllocTensor<dataType>();
+        // 对齐到32B分配1个block空间
+        AscendC::Duplicate<dataType>(sumCosLocal, (dataType)0,
+            (1 * sizeof(dataType) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(dataType));
+        AscendC::Sum(sumCosLocal, vecLocal2, meanParams); // sumCosLocal[0] = sum(cos)
+
+        // meanCos = sumCos / outter
+        dataType invB = (dataType)(1.0f / (float)outter);
+        AscendC::Muls(sumCosLocal, sumCosLocal, invB, 1); // 就1个元素（标量内存按32B占位）
+
+        // loss = 1 - meanCos
+        AscendC::Adds(sumCosLocal, sumCosLocal, (dataType)(-1.0f), 1); // meanCos - 1
+        AscendC::Muls(sumCosLocal, sumCosLocal, (dataType)(-1.0f), 1); // 1 - meanCos
+
+        // 输出队列
+        outScalarQueue.EnQue(sumCosLocal);
+
+        // 释放
+        tmpWorkQueue.FreeTensor(workLocal);
+        inQueuePred.FreeTensor(predLocal);
+        inQueueTarg.FreeTensor(targLocal);
+        vecQueue.FreeTensor(vecLocal);
+        vecQueue2.FreeTensor(vecLocal2);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<dataType> lossLocal = outScalarQueue.DeQue<dataType>();
+        // 将1个元素拷回
+        AscendC::DataCopy(lossGlobal, lossLocal, 1);
+        outScalarQueue.FreeTensor(lossLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  inQueuePred;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  inQueueTarg;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  tmpWorkQueue; // Sum临时空间（由框架保留）
+
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> vecQueue;      // 行向量输出/中间向量
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> vecQueue2;     // 行向量输出/中间向量2
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outScalarQueue;// 标量输出
+
+    AscendC::GlobalTensor<dataType> predictionsGlobal;
+    AscendC::GlobalTensor<dataType> targetsGlobal;
+    AscendC::GlobalTensor<dataType> lossGlobal;
+
+    uint32_t outter = 0;
+    uint32_t inner = 0;
+    uint32_t n = 0;
+    float epsilon = 1e-12f;
+};
+
+extern "C" __global__ __aicore__ void cosine_similarity_loss_custom(GM_ADDR predictions, GM_ADDR targets, GM_ADDR loss, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCosineSimilarityLoss op;
+    op.Init(predictions, targets, loss,
+            tiling_data.tmpSize,
+            tiling_data.outter, tiling_data.inner, tiling_data.n,
+            tiling_data.epsilon);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cosine_similarity_loss_custom_impl_npu(const at::Tensor& predictions, const at::Tensor& targets) {
+    // 输出标量形状 [1]
+    at::Tensor result = at::empty({1}, predictions.options());
+    EXEC_NPU_CMD(aclnnCosineSimilarityLossCustom, predictions, targets, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cosine_similarity_loss_custom", &cosine_similarity_loss_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cosine_similarity_loss_custom", &cosine_similarity_loss_custom_impl_npu, "Cosine Similarity Loss");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, predictions, targets):
+        # 返回形状为 [1] 的张量
+        return custom_ops_lib.cosine_similarity_loss_custom(predictions, targets)
+'''

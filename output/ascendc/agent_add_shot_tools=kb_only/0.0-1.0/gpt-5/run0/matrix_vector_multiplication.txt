@@ -1,0 +1,303 @@
+project_json_src='''
+[
+    {
+        "op": "MatrixVectorMultiplicationCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "A",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "B",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "C",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+// 仅用于注册，具体 Matmul 的 tiling 使用 TCubeTiling 通过 RawTilingData 传递
+BEGIN_TILING_DATA_DEF(MatrixVectorMultiplicationCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, placeHolder);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatrixVectorMultiplicationCustom, MatrixVectorMultiplicationCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "register/op_def_registry.h"
+#include "register/tilingdata_base.h"
+
+// Matmul 静态/动态 tiling 获取（参考 Ascend C API Reference: MatmulConfig / GetMatmulApiTiling / GetTiling）
+#include "tiling/tiling_api.h"
+#include "tiling/matmul_tiling.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+// 基于知识库：通过 MatmulConfig 描述 M, N, K 以及布局，调用 GetMatmulApiTiling / GetTiling 拿到 TCubeTiling
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 读取输入形状
+    auto a_shape = context->GetInputShape(0)->GetOriginShape(); // A: [M, K]
+    auto b_shape = context->GetInputShape(1)->GetOriginShape(); // B: [K, 1]
+
+    if (a_shape.GetDimNum() != 2 || b_shape.GetDimNum() != 2) {
+        return ge::GRAPH_FAILED;
+    }
+
+    int64_t M = a_shape.GetDim(0);
+    int64_t K = a_shape.GetDim(1);
+    int64_t Kb = b_shape.GetDim(0);
+    int64_t N = b_shape.GetDim(1);
+
+    if (K != Kb) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 设置 Block 数
+    context->SetBlockDim(BLOCK_DIM);
+
+    // 配置 Matmul tiling（参考文档：5.2.1.1 Matmul 说明，静态/动态 tiling）
+    matmul::MatmulConfig config;
+    // 配置基础形状，使用 NORMAL/BMNK 布局
+    config.SetBaseShape((uint32_t)M, (uint32_t)N, (uint32_t)K);
+    config.SetSingleCoreShape((uint32_t)M, (uint32_t)N, (uint32_t)K);
+    config.SetLayoutMode((uint32_t)matmul::LayoutMode::NORMAL);
+    config.SetDataTypeA(ge::DT_FLOAT);
+    config.SetDataTypeB(ge::DT_FLOAT);
+    config.SetDataTypeC(ge::DT_FLOAT);
+    config.EnableTransposeA(false);
+    config.EnableTransposeB(false);
+
+    // 获取 tiling（优先使用静态模板，否则动态 GetTiling）
+    TCubeTiling tiling;
+    if (!matmul::GetMatmulApiTiling(config, tiling)) {
+        // 回退：在无法静态获取时从上下文动态获取
+        if (!matmul::GetTiling(context, config, tiling)) {
+            return ge::GRAPH_FAILED;
+        }
+    }
+
+    // 将 TCubeTiling 原始字节写入 RawTilingData
+    auto raw = context->GetRawTilingData();
+    size_t need = sizeof(TCubeTiling);
+    if (raw->GetCapacity() < need) {
+        return ge::GRAPH_FAILED;
+    }
+    // 拷贝 tiling 到 RawTilingData
+    std::memcpy(raw->GetData(), &tiling, need);
+    raw->SetDataSize(need);
+
+    // 设置 workspace（本算子无需额外 workspace）
+    size_t* workspaces = context->GetWorkspaceSizes(1);
+    workspaces[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* a_shape = context->GetInputShape(0); // [M, K]
+    const gert::Shape* b_shape = context->GetInputShape(1); // [K, 1]
+
+    if (a_shape->GetDimNum() != 2 || b_shape->GetDimNum() != 2) {
+        return GRAPH_FAILED;
+    }
+    if (a_shape->GetDim(1) != b_shape->GetDim(0)) {
+        return GRAPH_FAILED;
+    }
+
+    gert::Shape* c_shape = context->GetOutputShape(0);
+    c_shape->SetDimNum(2);
+    c_shape->SetDim(0, a_shape->GetDim(0)); // M
+    c_shape->SetDim(1, b_shape->GetDim(1)); // 1
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto dtA = context->GetInputDataType(0);
+    const auto dtB = context->GetInputDataType(1);
+    if (dtA != dtB) {
+        return GRAPH_FAILED;
+    }
+    context->SetOutputDataType(0, dtA);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MatrixVectorMultiplicationCustom : public OpDef {
+public:
+    explicit MatrixVectorMultiplicationCustom(const char* name) : OpDef(name)
+    {
+        this->Input("A")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("B")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("C")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        // 绑定 AICore 与 Tiling
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatrixVectorMultiplicationCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"  // 参考文档：5.2.1 Matmul 高级 API
+#include <cstring>
+
+using A_T = float;
+using B_T = float;
+using C_T = float;
+
+// 参考文档：5.2.1.11 REGIST_MATMUL_OBJ，用于初始化 Matmul 对象
+extern AscendC::TPipe* g_cubeTPipePtr;
+
+extern "C" __global__ __aicore__ void matrix_vector_multiplication_custom(
+    GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+{
+    // 从 tilingGM 读取 TCubeTiling（参考 5.2.1.24 示例中拷贝 tiling 的方式）
+    TCubeTiling tiling;
+    auto tgm = (__gm__ uint32_t*)tilingGM;
+    auto tl = (uint32_t*)&tiling;
+    for (int i = 0; i < (int)sizeof(TCubeTiling) / (int)sizeof(uint32_t); ++i, ++tgm, ++tl) {
+        *tl = *tgm;
+    }
+
+    // 初始化 GM Tensor
+    AscendC::GlobalTensor<A_T> aGlobal;
+    AscendC::GlobalTensor<B_T> bGlobal;
+    AscendC::GlobalTensor<C_T> cGlobal;
+
+    // 这里根据 tiling 中的布局信息计算大小（参考文档示例字段）
+    // A: [M, K], B: [K, 1], C: [M, 1]
+    int32_t sizeA = tiling.ALayoutInfoB * tiling.ALayoutInfoS * tiling.ALayoutInfoN * tiling.ALayoutInfoG * tiling.ALayoutInfoD * sizeof(A_T);
+    int32_t sizeB = tiling.BLayoutInfoB * tiling.BLayoutInfoS * tiling.BLayoutInfoN * tiling.BLayoutInfoG * tiling.BLayoutInfoD * sizeof(B_T);
+    int32_t sizeC = tiling.CLayoutInfoB * tiling.CLayoutInfoN * tiling.CLayoutInfoG * tiling.CLayoutInfoS2 * sizeof(C_T);
+
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(aGM), sizeA);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(bGM), sizeB);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(cGM), sizeC);
+
+    // 按照文档步骤：创建/初始化 Matmul 对象、设置 A/B/（可选）Bias、执行
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, A_T, true, LayoutMode::NORMAL> aType;
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, B_T, true, LayoutMode::NORMAL> bType;
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, C_T> biasType;
+
+    matmul::Matmul<aType, bType, cType, biasType> mm;
+    AscendC::TPipe pipe;
+    g_cubeTPipePtr = &pipe;
+
+    // 使用 REGIST_MATMUL_OBJ 注册，并传入 tiling（参考 5.2.1.11）
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm, &tiling);
+
+    // A/B/C GM 视图
+    AscendC::GlobalTensor<A_T> gm_a;
+    AscendC::GlobalTensor<B_T> gm_b;
+    AscendC::GlobalTensor<C_T> gm_c;
+
+    gm_a.SetGlobalBuffer(const_cast<__gm__ A_T*>(aGlobal[0].GetPhyAddr()),
+                         tiling.ALayoutInfoS * tiling.ALayoutInfoN * tiling.ALayoutInfoG * tiling.ALayoutInfoD);
+    gm_b.SetGlobalBuffer(const_cast<__gm__ B_T*>(bGlobal[0].GetPhyAddr()),
+                         tiling.BLayoutInfoS * tiling.BLayoutInfoN * tiling.BLayoutInfoG * tiling.BLayoutInfoD);
+    gm_c.SetGlobalBuffer(const_cast<__gm__ C_T*>(cGlobal[0].GetPhyAddr()),
+                         tiling.CLayoutInfoN * tiling.CLayoutInfoG * tiling.CLayoutInfoS2);
+
+    // 设置 A/B/C，未转置
+    mm.SetTensorA(gm_a[0], false);
+    mm.SetTensorB(gm_b[0], false);
+    // 若接口支持，设置输出 C
+    mm.SetTensorC(gm_c[0]);
+
+    // 设置工作区（若无则传 0）
+    mm.SetWorkspace(workspaceGM, 0);
+
+    // 执行（单次计算，使用同步模式）
+    mm.IterateNBatch(1, 1, 1, true);
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matrix_vector_multiplication_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    at::Tensor C = at::empty({A.size(0), B.size(1)}, A.options());
+    EXEC_NPU_CMD(aclnnMatrixVectorMultiplicationCustom, A, B, C);
+    return C;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matrix_vector_multiplication_custom", &matrix_vector_multiplication_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matrix_vector_multiplication_custom", &matrix_vector_multiplication_custom_impl_npu, "C = A @ B");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.matrix_vector_multiplication_custom(A, B)
+'''

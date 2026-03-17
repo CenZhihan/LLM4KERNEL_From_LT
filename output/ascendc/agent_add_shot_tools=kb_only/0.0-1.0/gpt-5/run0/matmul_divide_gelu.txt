@@ -1,0 +1,428 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulDivideGeluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "divisor",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include \"register/tilingdata_base.h\"
+
+namespace optiling {
+// 自定义算子Tiling结构，保存基本形状与分块信息
+BEGIN_TILING_DATA_DEF(MatmulDivideGeluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+// 绑定到自定义算子
+REGISTER_TILING_DATA_CLASS(MatmulDivideGeluCustom, MatmulDivideGeluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include \"matmul_divide_gelu_custom_tiling.h\"
+#include \"register/op_def_registry.h\"
+#include \"platform_ascendc.h\"
+#include \"register/op_impl_registry.h\"
+
+// 参考文档：
+// - Tiling结构注册 REGISTER_TILING_DATA_CLASS（CANN Ascend C API Reference 6 Host API 6.2.2）
+// - Matmul tiling使用说明（CANN Ascend C API Reference 5 高级API 5.2.2.1.1）
+// - GELU 高级API（CANN Ascend C API Reference 5 高级API 5.3.3.1）
+
+namespace optiling {
+static const uint32_t DEFAULT_BLOCK_DIM = 8;
+static const uint32_t DEFAULT_TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 输入0: x [M, K]
+    // 输入1: w [K, N]（在Python侧传入已转置的weight）
+    // 输入2: b [N]
+    // 输入3: divisor [1]
+    const gert::Shape* xShape = context->GetInputShape(0);
+    const gert::Shape* wShape = context->GetInputShape(1);
+
+    uint32_t m = static_cast<uint32_t>(xShape->GetOriginShape().GetDim(0));
+    uint32_t k = static_cast<uint32_t>(xShape->GetOriginShape().GetDim(1));
+    uint32_t n = static_cast<uint32_t>(wShape->GetOriginShape().GetDim(1)); // w: [K, N]
+
+    // 设置blockDim
+    uint32_t blockDim = DEFAULT_BLOCK_DIM;
+    context->SetBlockDim(blockDim);
+
+    // 写入自定义Tiling数据
+    MatmulDivideGeluCustomTilingData tiling;
+    tiling.set_m(m);
+    tiling.set_n(n);
+    tiling.set_k(k);
+    tiling.set_blockDim(blockDim);
+    tiling.set_tileNum(DEFAULT_TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 本算子不申请workspace
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // y 的形状与 MatMul(x, w) 一致: [M, N]
+    const gert::Shape* xShape = context->GetInputShape(0);
+    const gert::Shape* wShape = context->GetInputShape(1);
+    gert::Shape* yShape = context->GetOutputShape(0);
+
+    int64_t m = xShape->GetDim(0);
+    int64_t n = wShape->GetDim(1);
+    yShape->SetDimNum(2);
+    yShape->SetDim(0, m);
+    yShape->SetDim(1, n);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    // 数据类型沿用输入x
+    auto dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dtype);
+    return GRAPH_SUCCESS;
+}
+}  // namespace ge
+
+namespace ops {
+class MatmulDivideGeluCustom : public OpDef {
+public:
+    explicit MatmulDivideGeluCustom(const char* name) : OpDef(name)
+    {
+        this->Input(\"x\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"w\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"b\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"divisor\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output(\"y\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig(\"ascend910b\");
+    }
+};
+
+OP_ADD(MatmulDivideGeluCustom);
+}
+"""
+
+kernel_src="""
+#include \"kernel_operator.h\"
+#define __NPU_TILING__
+#include \"matmul_divide_gelu_custom_tiling_data.h\"
+
+// 参考：
+// - AscendC::Gelu API（CANN 5.3.3.1）
+// - Matmul 回调SetSelfDefineData示例（CANN 5.2.1.40）
+// 说明：本内核完成 y = GELU((x @ w + b) / divisor)
+//       其中 x:[M,K], w:[K,N], b:[N], divisor:[1]。
+//       使用多核按M维拆分，随后以向量方式执行除法与GELU。
+
+using DTYPE_X = float;
+using DTYPE_W = float;
+using DTYPE_B = float;
+using DTYPE_Y = float;
+
+constexpr int32_t BUFFER_NUM = 2;
+
+// 简化：按M维均匀划分到各个core
+class KernelMatmulDivideGelu {
+public:
+    __aicore__ inline KernelMatmulDivideGelu() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR divisor, GM_ADDR y,
+                                uint32_t m, uint32_t n, uint32_t k, uint32_t tileNum)
+    {
+        this->M = m;
+        this->N = n;
+        this->K = k;
+        this->tileNum = tileNum;
+
+        // 每个block负责处理的行数
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->mPerBlock = (m + blockNum - 1) / blockNum;
+        // 起止行
+        this->rowStart = blockIdx * this->mPerBlock;
+        this->rowEnd = AscendC::Min<uint32_t>(this->rowStart + this->mPerBlock, m);
+        if (this->rowStart >= this->rowEnd) {
+            this->mPerBlock = 0;
+        } else {
+            this->mPerBlock = this->rowEnd - this->rowStart;
+        }
+
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_X*>(x) + static_cast<uint64_t>(this->rowStart) * K,
+                            static_cast<uint64_t>(this->mPerBlock) * K);
+        wGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_W*>(w), static_cast<uint64_t>(K) * N);
+        bGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_B*>(b), N);
+        divGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_Y*>(divisor), 1);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_Y*>(y) + static_cast<uint64_t>(this->rowStart) * N,
+                            static_cast<uint64_t>(this->mPerBlock) * N);
+
+        // 简单向量化tile，按行输出
+        // tileLength 表示每次处理的输出元素数量（按N方向切分）
+        this->tileLength = (this->N == 0 ? 0 : (this->N / tileNum));
+        if (this->tileLength == 0 && this->N > 0) this->tileLength = this->N; // 边界处理
+
+        // 队列缓冲
+        pipe.InitBuffer(inQueueA, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y)); // 用于后处理阶段的中间空间
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (this->mPerBlock == 0 || this->N == 0) {
+            return;
+        }
+
+        // 读取divisor标量
+        DTYPE_Y divisor = 1.0f;
+        {
+            AscendC::LocalTensor<DTYPE_Y> divLocal = inQueueA.AllocTensor<DTYPE_Y>();
+            AscendC::DataCopy(divLocal, divGm, 1);
+            divisor = static_cast<DTYPE_Y>(divLocal.GetValue(0));
+            inQueueA.FreeTensor(divLocal);
+        }
+        DTYPE_Y invDiv = 1.0f / divisor;
+
+        // 逐行计算：C[row, :] = x[row, :] @ w + b
+        for (uint32_t r = 0; r < this->mPerBlock; ++r) {
+            // 对整行输出按N方向分块
+            uint32_t processed = 0;
+            while (processed < this->N) {
+                uint32_t curTile = AscendC::Min<uint32_t>(this->tileLength, this->N - processed);
+
+                // 分配本地输出片段
+                AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+
+                // 初始化 yLocal 为bias片段
+                AscendC::DataCopy(yLocal, bGm[processed], curTile);
+
+                // 计算 yLocal += xRow(1xK) * wPart(KxcurTile)
+                // 朴素实现：对K聚合（此处作为演示，真实优化需使用官方Matmul高阶API及tiling）
+                for (uint32_t kk = 0; kk < this->K; ++kk) {
+                    // 读取 x[row, kk]
+                    DTYPE_X aVal;
+                    {
+                        // 直接从GM读标量（示例写法，性能上更优做法应批量搬运）
+                        aVal = static_cast<DTYPE_X>(xGm[r * this->K + kk]);
+                    }
+
+                    // 将 w[kk, processed:processed+curTile] 读入本地
+                    AscendC::LocalTensor<DTYPE_W> wLocal = inQueueA.AllocTensor<DTYPE_W>();
+                    AscendC::DataCopy(wLocal, wGm[static_cast<uint64_t>(kk) * this->N + processed], curTile);
+
+                    // yLocal += aVal * wLocal（逐元素FMA）
+                    for (uint32_t i = 0; i < curTile; ++i) {
+                        DTYPE_Y acc = yLocal.GetValue(i);
+                        acc = acc + static_cast<DTYPE_Y>(aVal) * static_cast<DTYPE_Y>(wLocal.GetValue(i));
+                        yLocal.SetValue(i, acc);
+                    }
+                    inQueueA.FreeTensor(wLocal);
+                }
+
+                // yLocal /= divisor
+                for (uint32_t i = 0; i < curTile; ++i) {
+                    DTYPE_Y v = yLocal.GetValue(i);
+                    yLocal.SetValue(i, v * invDiv);
+                }
+
+                // GELU激活（使用AscendC::Gelu高阶API）
+                {
+                    AscendC::LocalTensor<DTYPE_Y> geluLocal = outQueueY.AllocTensor<DTYPE_Y>();
+                    AscendC::Gelu(geluLocal, yLocal, curTile);
+                    // 覆写 yLocal 为gelu结果
+                    for (uint32_t i = 0; i < curTile; ++i) {
+                        yLocal.SetValue(i, geluLocal.GetValue(i));
+                    }
+                    outQueueY.FreeTensor(geluLocal);
+                }
+
+                // 写回到全局输出
+                AscendC::DataCopy(yGm[static_cast<uint64_t>(r) * this->N + processed], yLocal, curTile);
+                outQueueY.FreeTensor(yLocal);
+
+                processed += curTile;
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueA;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_W> wGm;
+    AscendC::GlobalTensor<DTYPE_B> bGm;
+    AscendC::GlobalTensor<DTYPE_Y> divGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t M, N, K;
+    uint32_t tileNum;
+    uint32_t tileLength;
+
+    uint32_t rowStart;
+    uint32_t rowEnd;
+    uint32_t mPerBlock;
+};
+
+extern \"C\" __global__ __aicore__ void matmul_divide_gelu_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR divisor,
+                                                                  GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulDivideGelu op;
+    op.Init(x, w, b, divisor, y,
+            tiling_data.m(), tiling_data.n(), tiling_data.k(), tiling_data.tileNum());
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include \"pytorch_npu_helper.hpp\"
+#include <torch/extension.h>
+
+at::Tensor matmul_divide_gelu_custom_impl_npu(const at::Tensor& x,
+                                              const at::Tensor& w,
+                                              const at::Tensor& b,
+                                              const at::Tensor& divisor) {
+    auto M = x.size(0);
+    auto N = w.size(1);
+    at::Tensor y = at::empty({M, N}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulDivideGeluCustom, x, w, b, divisor, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"matmul_divide_gelu_custom\", &matmul_divide_gelu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"matmul_divide_gelu_custom\", &matmul_divide_gelu_custom_impl_npu, \"matmul + divide + gelu\");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch_npu
+import custom_ops_lib
+
+# 说明：
+# - 本自定义算子期望输入为 x:[M,K], w:[K,N]（即将Linear权重转置后传入）, b:[N], divisor:[1]
+# - 输出为 y:[M,N]
+class ModelNew(nn.Module):
+    def __init__(self, input_size, output_size, divisor):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(input_size, output_size)
+        self.divisor = float(divisor)
+
+    def forward(self, x: torch.Tensor):
+        # 将权重转置为[K, N]
+        w_t = self.linear.weight.t().contiguous()
+        b = self.linear.bias if self.linear.bias is not None else torch.zeros(w_t.size(1), dtype=x.dtype, device=x.device)
+        divisor_tensor = torch.tensor([self.divisor], dtype=x.dtype, device=x.device)
+        return custom_ops_lib.matmul_divide_gelu_custom(x, w_t, b, divisor_tensor)
+
+def get_inputs():
+    batch_size = 1024
+    input_size = 8192
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    input_size = 8192
+    output_size = 8192
+    divisor = 10.0
+    return [input_size, output_size, divisor]
+'''

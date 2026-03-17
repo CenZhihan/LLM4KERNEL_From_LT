@@ -1,0 +1,421 @@
+project_json_src='''
+[
+    {
+        "op": "MaxPooling3dCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MaxPooling3dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, d);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+
+  TILING_DATA_FIELD_DEF(uint32_t, k);       // kernel size (cube)
+  TILING_DATA_FIELD_DEF(uint32_t, s);       // stride
+  TILING_DATA_FIELD_DEF(uint32_t, p);       // padding
+  TILING_DATA_FIELD_DEF(uint32_t, ceilMode);
+
+  TILING_DATA_FIELD_DEF(uint32_t, od);
+  TILING_DATA_FIELD_DEF(uint32_t, oh);
+  TILING_DATA_FIELD_DEF(uint32_t, ow);
+
+  TILING_DATA_FIELD_DEF(uint32_t, inSize);
+  TILING_DATA_FIELD_DEF(uint32_t, outSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MaxPooling3dCustom, MaxPooling3dCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "max_pooling_3d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline int64_t div_floor(int64_t a, int64_t b) { return a / b; }
+inline int64_t div_ceil(int64_t a, int64_t b) { return (a + b - 1) / b; }
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MaxPooling3dCustomTilingData tiling;
+
+    // Read input shape: expect 5D [N, C, D, H, W]
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    int64_t N = in_shape->GetOriginShape().GetDim(0);
+    int64_t C = in_shape->GetOriginShape().GetDim(1);
+    int64_t D = in_shape->GetOriginShape().GetDim(2);
+    int64_t H = in_shape->GetOriginShape().GetDim(3);
+    int64_t W = in_shape->GetOriginShape().GetDim(4);
+
+    // Read attributes: kernel, stride, padding, ceil_mode
+    const gert::RuntimeAttrs* attrs = context->GetAttrs();
+    uint32_t k = *(attrs->GetAttrPointer<uint32_t>(0));
+    uint32_t s = *(attrs->GetAttrPointer<uint32_t>(1));
+    uint32_t p = *(attrs->GetAttrPointer<uint32_t>(2));
+    uint32_t ceil_mode_u32 = *(attrs->GetAttrPointer<uint32_t>(3));
+
+    if (s == 0) { s = k; } // PyTorch MaxPool3d default: stride = kernel_size when None.
+
+    int64_t outD = (ceil_mode_u32 != 0)
+        ? div_ceil((D + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s)
+        : div_floor((D + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s);
+    int64_t outH = (ceil_mode_u32 != 0)
+        ? div_ceil((H + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s)
+        : div_floor((H + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s);
+    int64_t outW = (ceil_mode_u32 != 0)
+        ? div_ceil((W + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s)
+        : div_floor((W + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s);
+
+    if (outD < 0) outD = 0;
+    if (outH < 0) outH = 0;
+    if (outW < 0) outW = 0;
+
+    tiling.set_n((uint32_t)N);
+    tiling.set_c((uint32_t)C);
+    tiling.set_d((uint32_t)D);
+    tiling.set_h((uint32_t)H);
+    tiling.set_w((uint32_t)W);
+
+    tiling.set_k(k);
+    tiling.set_s(s);
+    tiling.set_p(p);
+    tiling.set_ceilMode(ceil_mode_u32);
+
+    tiling.set_od((uint32_t)outD);
+    tiling.set_oh((uint32_t)outH);
+    tiling.set_ow((uint32_t)outW);
+
+    uint64_t inSize = (uint64_t)N * (uint64_t)C * (uint64_t)D * (uint64_t)H * (uint64_t)W;
+    uint64_t outSize = (uint64_t)N * (uint64_t)C * (uint64_t)outD * (uint64_t)outH * (uint64_t)outW;
+    tiling.set_inSize((uint32_t)inSize);
+    tiling.set_outSize((uint32_t)outSize);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::RuntimeAttrs* attrs = context->GetAttrs();
+    uint32_t k = *(attrs->GetAttrPointer<uint32_t>(0));
+    uint32_t s = *(attrs->GetAttrPointer<uint32_t>(1));
+    uint32_t p = *(attrs->GetAttrPointer<uint32_t>(2));
+    uint32_t ceil_mode_u32 = *(attrs->GetAttrPointer<uint32_t>(3));
+    if (s == 0) s = k;
+
+    int64_t N = x_shape->GetOriginShape().GetDim(0);
+    int64_t C = x_shape->GetOriginShape().GetDim(1);
+    int64_t D = x_shape->GetOriginShape().GetDim(2);
+    int64_t H = x_shape->GetOriginShape().GetDim(3);
+    int64_t W = x_shape->GetOriginShape().GetDim(4);
+
+    auto div_floor = [](int64_t a, int64_t b) { return a / b; };
+    auto div_ceil  = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+
+    int64_t outD = (ceil_mode_u32 != 0)
+        ? div_ceil((D + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s)
+        : div_floor((D + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s);
+    int64_t outH = (ceil_mode_u32 != 0)
+        ? div_ceil((H + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s)
+        : div_floor((H + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s);
+    int64_t outW = (ceil_mode_u32 != 0)
+        ? div_ceil((W + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s)
+        : div_floor((W + 2 * (int64_t)p - (int64_t)k + 1), (int64_t)s);
+
+    if (outD < 0) outD = 0;
+    if (outH < 0) outH = 0;
+    if (outW < 0) outW = 0;
+
+    std::vector<int64_t> y_dims = {N, C, outD, outH, outW};
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(5);
+    for (size_t i = 0; i < y_dims.size(); ++i) {
+        y_shape->SetDim(i, y_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+
+namespace ops {
+class MaxPooling3dCustom : public OpDef {
+public:
+    explicit MaxPooling3dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // Attributes: kernel, stride, padding, ceil_mode
+        this->Attr("kernel").AttrType(REQUIRED).Int(0);
+        this->Attr("stride").AttrType(REQUIRED).Int(0); // 0 means None -> will use kernel
+        this->Attr("padding").AttrType(REQUIRED).Int(0);
+        this->Attr("ceil_mode").AttrType(REQUIRED).Int(0); // 0/1
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MaxPooling3dCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "max_pooling_3d_custom_tiling_data.h"
+
+#include <cfloat>
+
+class KernelMaxPooling3d {
+public:
+    __aicore__ inline KernelMaxPooling3d() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t d, uint32_t h, uint32_t w,
+                                uint32_t k, uint32_t s, uint32_t p,
+                                uint32_t od, uint32_t oh, uint32_t ow,
+                                uint32_t inSize, uint32_t outSize)
+    {
+        this->n = n; this->c = c; this->d = d; this->h = h; this->w = w;
+        this->k = k; this->s = s; this->p = p;
+        this->od = od; this->oh = oh; this->ow = ow;
+        this->inSize = inSize; this->outSize = outSize;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x, inSize);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y, outSize);
+
+        // For simplicity, copy full tensors once (reference pattern similar to SoftMax example)
+        pipe.InitBuffer(inQueue, 1, inSize * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueue, 1, outSize * sizeof(DTYPE_Y));
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline uint64_t Index5D(uint32_t N, uint32_t C, uint32_t D, uint32_t H, uint32_t W,
+                                       uint32_t n_, uint32_t c_, uint32_t d_, uint32_t h_, uint32_t w_) const
+    {
+        return ((((uint64_t)n_ * C + c_) * D + d_) * H + h_) * W + w_;
+    }
+
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueue.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm, inSize);
+        inQueue.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueue.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueue.AllocTensor<DTYPE_Y>();
+
+        for (uint32_t bn = 0; bn < n; ++bn) {
+            for (uint32_t ch = 0; ch < c; ++ch) {
+                for (uint32_t z = 0; z < od; ++z) {
+                    int32_t d_start = (int32_t)z * (int32_t)s - (int32_t)p;
+                    int32_t d_end = d_start + (int32_t)k;
+
+                    int32_t kd0 = d_start < 0 ? -d_start : 0;
+                    int32_t kd1 = d_end > (int32_t)d ? (int32_t)d - d_start : (int32_t)k;
+
+                    for (uint32_t y = 0; y < oh; ++y) {
+                        int32_t h_start = (int32_t)y * (int32_t)s - (int32_t)p;
+                        int32_t h_end = h_start + (int32_t)k;
+
+                        int32_t kh0 = h_start < 0 ? -h_start : 0;
+                        int32_t kh1 = h_end > (int32_t)h ? (int32_t)h - h_start : (int32_t)k;
+
+                        for (uint32_t x = 0; x < ow; ++x) {
+                            int32_t w_start = (int32_t)x * (int32_t)s - (int32_t)p;
+                            int32_t w_end = w_start + (int32_t)k;
+
+                            int32_t kw0 = w_start < 0 ? -w_start : 0;
+                            int32_t kw1 = w_end > (int32_t)w ? (int32_t)w - w_start : (int32_t)k;
+
+                            float maxVal = -FLT_MAX;
+
+                            for (int32_t kd = kd0; kd < kd1; ++kd) {
+                                int32_t id = d_start + kd; // guaranteed in [0, d)
+                                for (int32_t kh = kh0; kh < kh1; ++kh) {
+                                    int32_t ih = h_start + kh; // in [0, h)
+                                    for (int32_t kw = kw0; kw < kw1; ++kw) {
+                                        int32_t iw = w_start + kw; // in [0, w)
+                                        uint64_t srcIdx = Index5D(n, c, d, h, w, bn, ch, (uint32_t)id, (uint32_t)ih, (uint32_t)iw);
+                                        float v = static_cast<float>(xLocal.GetValue(srcIdx));
+                                        maxVal = v > maxVal ? v : maxVal;
+                                    }
+                                }
+                            }
+
+                            uint64_t dstIdx = Index5D(n, c, od, oh, ow, bn, ch, z, y, x);
+                            yLocal.SetValue(dstIdx, static_cast<DTYPE_Y>(maxVal));
+                        }
+                    }
+                }
+            }
+        }
+
+        outQueue.EnQue(yLocal);
+        inQueue.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueue.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm, yLocal, outSize);
+        outQueue.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t n, c, d, h, w;
+    uint32_t k, s, p;
+    uint32_t od, oh, ow;
+    uint32_t inSize, outSize;
+};
+
+extern "C" __global__ __aicore__ void max_pooling_3d_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMaxPooling3d op;
+    op.Init(x, y,
+            tiling_data.n, tiling_data.c, tiling_data.d, tiling_data.h, tiling_data.w,
+            tiling_data.k, tiling_data.s, tiling_data.p,
+            tiling_data.od, tiling_data.oh, tiling_data.ow,
+            tiling_data.inSize, tiling_data.outSize);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor max_pooling_3d_custom_impl_npu(const at::Tensor& x, int64_t kernel, c10::optional<int64_t> stride_opt, int64_t padding, bool ceil_mode) {
+    int64_t stride = stride_opt.has_value() ? stride_opt.value() : kernel;
+    at::Tensor y = at::empty({x.size(0), x.size(1),
+                              (int64_t)((ceil_mode ? (x.size(2) + 2*padding - kernel + 1 + stride - 1) / stride
+                                                   : (x.size(2) + 2*padding - kernel + 1) / stride)),
+                              (int64_t)((ceil_mode ? (x.size(3) + 2*padding - kernel + 1 + stride - 1) / stride
+                                                   : (x.size(3) + 2*padding - kernel + 1) / stride)),
+                              (int64_t)((ceil_mode ? (x.size(4) + 2*padding - kernel + 1 + stride - 1) / stride
+                                                   : (x.size(4) + 2*padding - kernel + 1) / stride))},
+                              x.options());
+
+    // Attributes are passed after tensor args in EXEC_NPU_CMD
+    // kernel, stride (0 means None -> kernel), padding, ceil_mode (0/1)
+    int64_t stride_to_pass = stride_opt.has_value() ? stride : 0;
+    int64_t ceil_flag = ceil_mode ? 1 : 0;
+
+    EXEC_NPU_CMD(aclnnMaxPooling3dCustom, x, y, (int)kernel, (int)stride_to_pass, (int)padding, (int)ceil_flag);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("max_pooling_3d_custom", &max_pooling_3d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("max_pooling_3d_custom", &max_pooling_3d_custom_impl_npu, "MaxPooling3dCustom");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    MaxPool3d replaced by custom AscendC kernel.
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0, return_indices: bool = False, ceil_mode: bool = False):
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.stride = None if stride is None else int(stride)
+        self.padding = int(padding)
+        self.ceil_mode = bool(ceil_mode)
+        self.return_indices = return_indices
+        assert not self.return_indices, "return_indices=True is not supported in custom kernel."
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.max_pooling_3d_custom(x, self.kernel_size, self.stride, self.padding, self.ceil_mode)
+'''

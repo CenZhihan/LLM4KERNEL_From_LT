@@ -1,0 +1,337 @@
+project_json_src='''
+[
+    {
+        "op": "ScatterAddCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "idx",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["int32"]
+            },
+            {
+                "name": "updates",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ScatterAddCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, updatesPerRow);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ScatterAddCustom, ScatterAddCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "scatter_add_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ScatterAddCustomTilingData tiling;
+
+    const gert::Shape& xShape = context->GetInputShape(0)->GetOriginShape();
+    const gert::Shape& idxShape = context->GetInputShape(1)->GetOriginShape();
+
+    // 假设输入为二维 [rows, cols] / [rows, updatesPerRow]
+    uint32_t rows = static_cast<uint32_t>(xShape.GetDim(0));
+    uint32_t cols = static_cast<uint32_t>(xShape.GetDim(1));
+    uint32_t updatesPerRow = static_cast<uint32_t>(idxShape.GetDim(1));
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+    tiling.set_updatesPerRow(updatesPerRow);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ScatterAddCustom : public OpDef {
+public:
+    explicit ScatterAddCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("idx")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("updates")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(ScatterAddCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "scatter_add_custom_tiling_data.h"
+
+#define DTYPE_X float
+#define DTYPE_Z float
+#define DTYPE_UPD float
+#define DTYPE_IDX int32_t
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelScatterAdd {
+public:
+    __aicore__ inline KernelScatterAdd() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR idx, GM_ADDR updates, GM_ADDR z,
+                                uint32_t rows, uint32_t cols, uint32_t updatesPerRow, uint32_t tileNum)
+    {
+        this->rows = rows;
+        this->cols = cols;
+        this->updatesPerRow = updatesPerRow;
+        this->tileNum = tileNum;
+
+        this->totalZ = static_cast<uint64_t>(rows) * cols;
+        this->totalUpd = static_cast<uint64_t>(rows) * updatesPerRow;
+
+        // 按block划分两个阶段的数据范围
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+
+        // 阶段1：拷贝x到z（每块处理z的一段）
+        this->blockZStart = (this->totalZ / blockNum) * blockIdx;
+        uint64_t zEnd = (blockIdx == blockNum - 1) ? this->totalZ : (this->totalZ / blockNum) * (blockIdx + 1);
+        this->blockZLen = zEnd - this->blockZStart;
+
+        // 阶段2：处理updates（每块处理updates的一段）
+        this->blockUpdStart = (this->totalUpd / blockNum) * blockIdx;
+        uint64_t updEnd = (blockIdx == blockNum - 1) ? this->totalUpd : (this->totalUpd / blockNum) * (blockIdx + 1);
+        this->blockUpdLen = updEnd - this->blockUpdStart;
+
+        // 设置全局缓冲
+        xGmBlock.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->blockZStart, this->blockZLen);
+        zGmBlock.SetGlobalBuffer((__gm__ DTYPE_Z*)z + this->blockZStart, this->blockZLen);
+
+        idxGmBlock.SetGlobalBuffer((__gm__ DTYPE_IDX*)idx + this->blockUpdStart, this->blockUpdLen);
+        updGmBlock.SetGlobalBuffer((__gm__ DTYPE_UPD*)updates + this->blockUpdStart, this->blockUpdLen);
+
+        // 散射阶段需要对z的全局寻址
+        zGmAll.SetGlobalBuffer((__gm__ DTYPE_Z*)z, this->totalZ);
+
+        // 计算tile长度
+        this->tileLenZ = (this->blockZLen + (this->tileNum * BUFFER_NUM) - 1) / (this->tileNum * BUFFER_NUM);
+        this->tileLenUpd = (this->blockUpdLen + (this->tileNum * BUFFER_NUM) - 1) / (this->tileNum * BUFFER_NUM);
+
+        // 初始化队列
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLenZ * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueIdx, BUFFER_NUM, this->tileLenUpd * sizeof(DTYPE_IDX));
+        pipe.InitBuffer(inQueueUpd, BUFFER_NUM, this->tileLenUpd * sizeof(DTYPE_UPD));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Phase 1: z = x （按块拷贝）
+        {
+            uint64_t loopCount = (this->blockZLen + this->tileLenZ - 1) / this->tileLenZ;
+            for (uint64_t p = 0; p < loopCount; ++p) {
+                uint64_t curOff = p * this->tileLenZ;
+                uint64_t curLen = AscendC::min(this->tileLenZ, this->blockZLen - curOff);
+
+                AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xLocal, xGmBlock[curOff], curLen);
+                // 直接将x段写回z对应位置
+                AscendC::DataCopy(zGmBlock[curOff], xLocal, curLen);
+                inQueueX.FreeTensor(xLocal);
+            }
+        }
+
+        // 同步保障普通拷贝结束，再开启原子加
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+
+        // Phase 2: 原子加到z中，实现沿dim=1的scatter_add
+        {
+            uint64_t loopCount = (this->blockUpdLen + this->tileLenUpd - 1) / this->tileLenUpd;
+            for (uint64_t p = 0; p < loopCount; ++p) {
+                uint64_t curOff = p * this->tileLenUpd;
+                uint64_t curLen = AscendC::min(this->tileLenUpd, this->blockUpdLen - curOff);
+
+                AscendC::LocalTensor<DTYPE_IDX> idxLocal = inQueueIdx.AllocTensor<DTYPE_IDX>();
+                AscendC::LocalTensor<DTYPE_UPD> updLocal = inQueueUpd.AllocTensor<DTYPE_UPD>();
+                AscendC::DataCopy(idxLocal, idxGmBlock[curOff], curLen);
+                AscendC::DataCopy(updLocal, updGmBlock[curOff], curLen);
+
+                // 启用原子加（VECOUT->GM）
+                AscendC::SetAtomicAdd<DTYPE_Z>();
+
+                // 逐元素原子累加到z的对应列
+                for (uint64_t i = 0; i < curLen; ++i) {
+                    uint64_t g = this->blockUpdStart + curOff + i;       // updates的全局线性编号
+                    uint32_t row = static_cast<uint32_t>(g / this->updatesPerRow);
+
+                    // 获取当前更新的目标列索引与数值
+                    DTYPE_IDX col = idxLocal.GetValue(i);
+                    // 将当前更新值通过局部偏移拷贝1个元素到全局z目标位置，触发原子加
+                    AscendC::DataCopy(zGmAll[static_cast<uint64_t>(row) * this->cols + static_cast<uint32_t>(col)],
+                                      updLocal[i], 1);
+                }
+
+                // 关闭原子加，避免影响后续操作
+                AscendC::SetAtomicNone();
+
+                inQueueIdx.FreeTensor(idxLocal);
+                inQueueUpd.FreeTensor(updLocal);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+
+    // 阶段1（x->z）与阶段2（idx/updates）分块访问
+    AscendC::GlobalTensor<DTYPE_X>  xGmBlock;
+    AscendC::GlobalTensor<DTYPE_Z>  zGmBlock;
+    AscendC::GlobalTensor<DTYPE_IDX> idxGmBlock;
+    AscendC::GlobalTensor<DTYPE_UPD> updGmBlock;
+
+    // 散射阶段对z的全局寻址
+    AscendC::GlobalTensor<DTYPE_Z> zGmAll;
+
+    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> inQueueIdx;
+    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> inQueueUpd;
+
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t updatesPerRow;
+    uint32_t tileNum;
+
+    uint64_t totalZ;
+    uint64_t totalUpd;
+
+    uint64_t blockZStart;
+    uint64_t blockZLen;
+
+    uint64_t blockUpdStart;
+    uint64_t blockUpdLen;
+
+    uint64_t tileLenZ;
+    uint64_t tileLenUpd;
+};
+
+extern "C" __global__ __aicore__ void scatter_add_custom(GM_ADDR x, GM_ADDR idx, GM_ADDR updates, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelScatterAdd op;
+    op.Init(x, idx, updates, z,
+            tiling_data.rows,
+            tiling_data.cols,
+            tiling_data.updatesPerRow,
+            tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor scatter_add_custom_impl_npu(const at::Tensor& x,
+                                       const at::Tensor& idx,
+                                       const at::Tensor& updates) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnScatterAddCustom, x, idx, updates, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("scatter_add_custom", &scatter_add_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("scatter_add_custom", &scatter_add_custom_impl_npu, "x.scatter_add(dim=1, index=idx, src=updates)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def forward(self, x, idx, updates):
+        # 自定义AscendC算子：沿dim=1执行scatter_add
+        return custom_ops_lib.scatter_add_custom(x, idx, updates)
+'''

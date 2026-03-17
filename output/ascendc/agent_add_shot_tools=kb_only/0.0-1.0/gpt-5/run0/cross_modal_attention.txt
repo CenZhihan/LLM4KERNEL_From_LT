@@ -1,0 +1,410 @@
+project_json_src='''
+[
+    {
+        "op": "CrossModalAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "k",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CrossModalAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, heads);
+  TILING_DATA_FIELD_DEF(uint32_t, seqQ);
+  TILING_DATA_FIELD_DEF(uint32_t, seqKV);
+  TILING_DATA_FIELD_DEF(uint32_t, headDim);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CrossModalAttentionCustom, CrossModalAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cross_modal_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t Clamp(uint32_t v, uint32_t lo, uint32_t hi) { return v < lo ? lo : (v > hi ? hi : v); }
+}
+
+namespace optiling {
+const uint32_t DEFAULT_BLOCK_DIM = 8;
+const uint32_t DEFAULT_TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 输入形状：q:[B, Lq, D], k:[B, Lk, D], v:[B, Lk, D]
+    auto qShape = context->GetInputShape(0)->GetOriginShape();
+    auto kShape = context->GetInputShape(1)->GetOriginShape();
+
+    if (qShape.GetDimNum() != 3 || kShape.GetDimNum() != 3) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t B = static_cast<uint32_t>(qShape.GetDim(0));
+    uint32_t Lq = static_cast<uint32_t>(qShape.GetDim(1));
+    uint32_t D  = static_cast<uint32_t>(qShape.GetDim(2));
+    uint32_t Lk = static_cast<uint32_t>(kShape.GetDim(1));
+
+    // 头数：若无法从属性读取，则按常见配置8推断；也可从D整除关系推断。
+    uint32_t heads = 8;
+    if (D % heads != 0) {
+        // 简单回退：若8不整除，则根据D大小选择一个可整除头数
+        if (D % 16 == 0) heads = 16;
+        else if (D % 4 == 0) heads = 4;
+        else heads = 1;
+    }
+    uint32_t headDim = D / heads;
+
+    // 设置BlockDim（简化设定）
+    context->SetBlockDim(Clamp(DEFAULT_BLOCK_DIM, 1, 32));
+
+    CrossModalAttentionCustomTilingData tiling;
+    tiling.set_batch(B);
+    tiling.set_heads(heads);
+    tiling.set_seqQ(Lq);
+    tiling.set_seqKV(Lk);
+    tiling.set_headDim(headDim);
+    tiling.set_tileNum(DEFAULT_TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // workspace大小（本示例无需workspace）
+    size_t* workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输出形状与q一致
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *q_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CrossModalAttentionCustom : public OpDef {
+public:
+    explicit CrossModalAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("k")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("v")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("out")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CrossModalAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "cross_modal_attention_custom_tiling_data.h"
+
+// 简化实现：在核函数中按(B, H, Lq, Lk, Dh)三重循环完成Scaled Dot-Product Attention
+// 数据类型统一使用float
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelCrossModalAttention {
+public:
+    __aicore__ inline KernelCrossModalAttention() {}
+
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out,
+                                uint32_t batch, uint32_t heads,
+                                uint32_t seqQ, uint32_t seqKV, uint32_t headDim, uint32_t tileNum)
+    {
+        this->B = batch;
+        this->H = heads;
+        this->Lq = seqQ;
+        this->Lk = seqKV;
+        this->Dh = headDim;
+        this->tileNum = tileNum;
+
+        // 计算每个block处理的batch分片（简化：按batch维度均分）
+        this->batchPerBlock = (B + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
+        this->batchStart = AscendC::GetBlockIdx() * this->batchPerBlock;
+        this->batchEnd = AscendC::Min(this->batchStart + this->batchPerBlock, B);
+
+        qGm.SetGlobalBuffer((__gm__ float*)q, static_cast<uint32_t>(B) * Lq * H * Dh); // 实际总元素>此值，SetGlobalBuffer只需>=访问范围
+        kGm.SetGlobalBuffer((__gm__ float*)k, static_cast<uint32_t>(B) * Lk * H * Dh);
+        vGm.SetGlobalBuffer((__gm__ float*)v, static_cast<uint32_t>(B) * Lk * H * Dh);
+        outGm.SetGlobalBuffer((__gm__ float*)out, static_cast<uint32_t>(B) * Lq * H * Dh);
+
+        // 初始化本地队列缓冲
+        pipe.InitBuffer(qBuf, BUFFER_NUM, Dh * sizeof(float));
+        pipe.InitBuffer(kBuf, BUFFER_NUM, Dh * sizeof(float));
+        pipe.InitBuffer(vBuf, BUFFER_NUM, Dh * sizeof(float));
+        pipe.InitBuffer(oBuf, BUFFER_NUM, Dh * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // 注意：输入/输出布局为[B, L, D]，D按H份头维切分，每头维度Dh = D/H
+        // 为避免额外变形，直接通过偏移在GM上寻址到对应head slice
+        const float scale = 1.0f / AscendC::sqrt((float)Dh);
+
+        for (uint32_t b = batchStart; b < batchEnd; ++b) {
+            for (uint32_t h = 0; h < H; ++h) {
+                for (uint32_t iq = 0; iq < Lq; ++iq) {
+                    // 读入q(b, iq, h, :)
+                    AscendC::LocalTensor<float> qLocal = qBuf.AllocTensor<float>();
+                    GlobalLoadQ(b, iq, h, qLocal);
+
+                    // pass1: 计算max logit
+                    float maxLogit = -1e30f;
+                    for (uint32_t jk = 0; jk < Lk; ++jk) {
+                        AscendC::LocalTensor<float> kLocal = kBuf.AllocTensor<float>();
+                        GlobalLoadK(b, jk, h, kLocal);
+                        float dot = Dot(qLocal, kLocal);
+                        dot *= scale;
+                        maxLogit = dot > maxLogit ? dot : maxLogit;
+                        kBuf.FreeTensor(kLocal);
+                    }
+
+                    // pass2: 计算sum(exp(logit - max))
+                    float sumExp = 0.0f;
+                    for (uint32_t jk = 0; jk < Lk; ++jk) {
+                        AscendC::LocalTensor<float> kLocal = kBuf.AllocTensor<float>();
+                        GlobalLoadK(b, jk, h, kLocal);
+                        float dot = Dot(qLocal, kLocal);
+                        dot = (dot * scale) - maxLogit;
+                        sumExp += AscendC::exp(dot);
+                        kBuf.FreeTensor(kLocal);
+                    }
+                    float invSum = 1.0f / (sumExp + 1e-6f);
+
+                    // pass3: 聚合输出  out = softmax(QK^T)V
+                    AscendC::LocalTensor<float> oLocal = oBuf.AllocTensor<float>();
+                    VecSet(oLocal, 0.0f);
+
+                    for (uint32_t jk = 0; jk < Lk; ++jk) {
+                        AscendC::LocalTensor<float> kLocal = kBuf.AllocTensor<float>();
+                        AscendC::LocalTensor<float> vLocal = vBuf.AllocTensor<float>();
+                        GlobalLoadK(b, jk, h, kLocal);
+                        GlobalLoadV(b, jk, h, vLocal);
+                        float dot = Dot(qLocal, kLocal);
+                        float w = AscendC::exp((dot * scale) - maxLogit) * invSum;
+                        Axpy(oLocal, vLocal, w);
+                        kBuf.FreeTensor(kLocal);
+                        vBuf.FreeTensor(vLocal);
+                    }
+
+                    // 写回 out(b, iq, h, :)
+                    GlobalStoreOut(b, iq, h, oLocal);
+
+                    oBuf.FreeTensor(oLocal);
+                    qBuf.FreeTensor(qLocal);
+                }
+            }
+        }
+    }
+
+private:
+    // GM寻址辅助：输入/输出均为[B, L, D]，D = H * Dh
+    __aicore__ inline uint64_t OffsetBLH(uint32_t b, uint32_t l, uint32_t h, uint32_t d_in_head, uint32_t L, uint32_t H, uint32_t Dh) {
+        // offset = ((b * L + l) * (H*Dh) + h*Dh + d)
+        return (uint64_t)(((uint64_t)b * L + l) * (uint64_t)(H * Dh) + (uint64_t)h * Dh + d_in_head);
+    }
+
+    __aicore__ inline void GlobalLoadQ(uint32_t b, uint32_t lq, uint32_t h, AscendC::LocalTensor<float>& qLocal) {
+        // 连续拷贝Dh长度
+        AscendC::DataCopy(qLocal, qGm[OffsetBLH(b, lq, h, 0, Lq, H, Dh)], Dh);
+    }
+    __aicore__ inline void GlobalLoadK(uint32_t b, uint32_t lk, uint32_t h, AscendC::LocalTensor<float>& kLocal) {
+        AscendC::DataCopy(kLocal, kGm[OffsetBLH(b, lk, h, 0, Lk, H, Dh)], Dh);
+    }
+    __aicore__ inline void GlobalLoadV(uint32_t b, uint32_t lk, uint32_t h, AscendC::LocalTensor<float>& vLocal) {
+        AscendC::DataCopy(vLocal, vGm[OffsetBLH(b, lk, h, 0, Lk, H, Dh)], Dh);
+    }
+    __aicore__ inline void GlobalStoreOut(uint32_t b, uint32_t lq, uint32_t h, AscendC::LocalTensor<float>& oLocal) {
+        AscendC::DataCopy(outGm[OffsetBLH(b, lq, h, 0, Lq, H, Dh)], oLocal, Dh);
+    }
+
+    __aicore__ inline float Dot(AscendC::LocalTensor<float>& a, AscendC::LocalTensor<float>& b) {
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < Dh; ++i) {
+            acc += a.GetValue(i) * b.GetValue(i);
+        }
+        return acc;
+    }
+
+    __aicore__ inline void Axpy(AscendC::LocalTensor<float>& y, AscendC::LocalTensor<float>& x, float alpha) {
+        for (uint32_t i = 0; i < Dh; ++i) {
+            float v = y.GetValue(i) + alpha * x.GetValue(i);
+            y.SetValue(i, v);
+        }
+    }
+
+    __aicore__ inline void VecSet(AscendC::LocalTensor<float>& y, float v) {
+        for (uint32_t i = 0; i < Dh; ++i) {
+            y.SetValue(i, v);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> qBuf, kBuf, vBuf;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> oBuf;
+
+    AscendC::GlobalTensor<float> qGm;
+    AscendC::GlobalTensor<float> kGm;
+    AscendC::GlobalTensor<float> vGm;
+    AscendC::GlobalTensor<float> outGm;
+
+    uint32_t B;
+    uint32_t H;
+    uint32_t Lq;
+    uint32_t Lk;
+    uint32_t Dh;
+    uint32_t tileNum;
+
+    uint32_t batchPerBlock;
+    uint32_t batchStart;
+    uint32_t batchEnd;
+};
+
+// 核函数入口
+extern "C" __global__ __aicore__ void cross_modal_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCrossModalAttention op;
+    op.Init(q, k, v, out,
+            tiling_data.batch, tiling_data.heads,
+            tiling_data.seqQ, tiling_data.seqKV,
+            tiling_data.headDim, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cross_modal_attention_custom_impl_npu(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3, "Inputs must be [B, L, D]");
+    TORCH_CHECK(q.size(0) == k.size(0) && k.size(0) == v.size(0), "Batch sizes must match");
+    TORCH_CHECK(k.size(1) == v.size(1), "Key/Value sequence length must match");
+    TORCH_CHECK(q.size(2) == k.size(2) && k.size(2) == v.size(2), "Feature dim must match");
+
+    at::Tensor out = at::empty_like(q);
+    EXEC_NPU_CMD(aclnnCrossModalAttentionCustom, q, k, v, out);
+    return out;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cross_modal_attention_custom", &cross_modal_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cross_modal_attention_custom", &cross_modal_attention_custom_impl_npu, "Cross-modal Attention (Q,K,V)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Cross-modal attention: text queries, visual keys/values.
+    Replace nn.MultiheadAttention with custom AscendC kernel.
+    """
+    def __init__(self, d_model_text=256, d_model_img=512, num_heads=8):
+        super().__init__()
+        self.q_proj = torch.nn.Linear(d_model_text, d_model_text)
+        self.kv_proj = torch.nn.Linear(d_model_img, d_model_text)
+        self.num_heads = num_heads
+
+    def forward(self, text, img):
+        q = self.q_proj(text)           # [B, Lq, D]
+        kv = self.kv_proj(img)          # [B, Lk, D]
+        # 自定义算子：内部实现Scaled Dot-Product Attention
+        out = custom_ops_lib.cross_modal_attention_custom(q, kv, kv)
+        return out
+'''

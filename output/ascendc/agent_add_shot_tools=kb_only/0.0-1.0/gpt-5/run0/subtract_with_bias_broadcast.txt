@@ -1,0 +1,265 @@
+project_json_src='''
+[
+    {
+        "op": "SubtractWithBiasBroadcastCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "bias",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(SubtractWithBiasBroadcastCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, bsLength);   // B*S
+  TILING_DATA_FIELD_DEF(uint32_t, hLength);    // H
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(SubtractWithBiasBroadcastCustom, SubtractWithBiasBroadcastCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "subtract_with_bias_broadcast_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    SubtractWithBiasBroadcastCustomTilingData tiling;
+
+    // x is expected to be [B, H] (or [B*S, H] in general)
+    const gert::StorageShape *x_shape = context->GetInputShape(0);
+    uint32_t bsLength = x_shape->GetStorageShape().GetDim(0);
+    uint32_t hLength  = x_shape->GetStorageShape().GetDim(1);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_bsLength(bsLength);
+    tiling.set_hLength(hLength);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    *z_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class SubtractWithBiasBroadcastCustom : public OpDef {
+public:
+    explicit SubtractWithBiasBroadcastCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(SubtractWithBiasBroadcastCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "subtract_with_bias_broadcast_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 1; // 简化：每次处理一行（长度为H）
+
+class KernelSubBiasBroadcast {
+public:
+    __aicore__ inline KernelSubBiasBroadcast() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR z, uint32_t bsLength, uint32_t hLength)
+    {
+        this->bsLength = bsLength;   // 行数（B*S）
+        this->hLength  = hLength;    // 每行长度（H）
+
+        // 每个核心均匀分配若干行
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->rowsPerBlock = this->bsLength / blockNum;
+        this->offsetRows   = blockIdx * this->rowsPerBlock;
+
+        // 设置全局Tensor范围
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->offsetRows * this->hLength, this->rowsPerBlock * this->hLength);
+        biasGm.SetGlobalBuffer((__gm__ DTYPE_Y *)bias, this->hLength);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + this->offsetRows * this->hLength, this->rowsPerBlock * this->hLength);
+
+        // 分配本地缓冲
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->hLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueBias, 1, this->hLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->hLength * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // 预取并缓存bias一行（H）
+        AscendC::LocalTensor<DTYPE_Y> biasLocal = inQueueBias.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(biasLocal, biasGm, this->hLength);
+        inQueueBias.EnQue(biasLocal);
+        AscendC::LocalTensor<DTYPE_Y> biasCached = inQueueBias.DeQue<DTYPE_Y>();
+
+        // 逐行处理：每次取一行的x，与同一行的bias做逐元素相减
+        for (uint32_t r = 0; r < this->rowsPerBlock; ++r) {
+            CopyInRow(r);
+            ComputeRow(biasCached);
+            CopyOutRow(r);
+        }
+
+        inQueueBias.FreeTensor(biasCached);
+    }
+
+private:
+    __aicore__ inline void CopyInRow(uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[rowIdx * this->hLength], this->hLength);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void ComputeRow(const AscendC::LocalTensor<DTYPE_Y>& biasLocal)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+
+        // 逐元素：z = x - bias
+        AscendC::Sub(zLocal, xLocal, biasLocal, this->hLength);
+
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOutRow(uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(zGm[rowIdx * this->hLength], zLocal, this->hLength);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueBias;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> biasGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+
+    uint32_t bsLength;
+    uint32_t hLength;
+    uint32_t rowsPerBlock;
+    uint32_t offsetRows;
+};
+
+extern "C" __global__ __aicore__ void subtract_with_bias_broadcast_custom(GM_ADDR x, GM_ADDR bias, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelSubBiasBroadcast op;
+    op.Init(x, bias, z, tiling_data.bsLength, tiling_data.hLength);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor subtract_with_bias_broadcast_custom_impl_npu(const at::Tensor& x, const at::Tensor& bias) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnSubtractWithBiasBroadcastCustom, x, bias, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("subtract_with_bias_broadcast_custom", &subtract_with_bias_broadcast_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("subtract_with_bias_broadcast_custom", &subtract_with_bias_broadcast_custom_impl_npu, "x - bias (broadcast on leading dims)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, bias):
+        return custom_ops_lib.subtract_with_bias_broadcast_custom(x, bias)
+'''

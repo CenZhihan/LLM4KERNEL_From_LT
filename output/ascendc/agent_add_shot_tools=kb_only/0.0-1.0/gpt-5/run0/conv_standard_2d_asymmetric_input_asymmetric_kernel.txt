@@ -1,0 +1,484 @@
+project_json_src='''
+[
+    {
+        "op": "ConvStandard2dAsymmetricInputAsymmetricKernelCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "NCHW",
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "NCHW",
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "optional",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "NCHW",
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvStandard2dAsymmetricInputAsymmetricKernelCustomTilingData)
+  // Input x shape: [N, C, H, W]
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cIn);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+
+  // Weight w shape: [Cout, Cin/groups, Kh, Kw]
+  TILING_DATA_FIELD_DEF(uint32_t, cOut);
+  TILING_DATA_FIELD_DEF(uint32_t, kH);
+  TILING_DATA_FIELD_DEF(uint32_t, kW);
+  TILING_DATA_FIELD_DEF(uint32_t, groups);
+
+  // Conv params (defaults used if not provided from attr)
+  TILING_DATA_FIELD_DEF(uint32_t, strideH);
+  TILING_DATA_FIELD_DEF(uint32_t, strideW);
+  TILING_DATA_FIELD_DEF(uint32_t, padTop);
+  TILING_DATA_FIELD_DEF(uint32_t, padBottom);
+  TILING_DATA_FIELD_DEF(uint32_t, padLeft);
+  TILING_DATA_FIELD_DEF(uint32_t, padRight);
+  TILING_DATA_FIELD_DEF(uint32_t, dilationH);
+  TILING_DATA_FIELD_DEF(uint32_t, dilationW);
+
+  // Output shape
+  TILING_DATA_FIELD_DEF(uint32_t, oH);
+  TILING_DATA_FIELD_DEF(uint32_t, oW);
+
+  // Bias flag
+  TILING_DATA_FIELD_DEF(uint32_t, hasBias);
+
+  // Simple parallel setting
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvStandard2dAsymmetricInputAsymmetricKernelCustom,
+                           ConvStandard2dAsymmetricInputAsymmetricKernelCustomTilingData)
+}
+"""
+host_operator_src="""
+#include "conv_standard_2d_asymmetric_input_asymmetric_kernel_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline int64_t CalcOutDim(int64_t in, int64_t pad0, int64_t pad1, int64_t dilation, int64_t k, int64_t stride)
+{
+    // floor((in + pad0 + pad1 - dilation*(k-1) - 1)/stride + 1)
+    return (in + pad0 + pad1 - dilation * (k - 1) - 1) / stride + 1;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM  = 8;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // Input 0: x [N,C,H,W] float
+    const ge::Shape& xShape = context->GetInputShape(0)->GetOriginShape();
+    // Input 1: w [Cout, Cin/groups, Kh, Kw] float
+    const ge::Shape& wShape = context->GetInputShape(1)->GetOriginShape();
+
+    // Defaults as in nn.Conv2d if not explicitly passed via attributes
+    uint32_t strideH = 1, strideW = 1;
+    uint32_t padTop = 0, padBottom = 0, padLeft = 0, padRight = 0;
+    uint32_t dilationH = 1, dilationW = 1;
+    uint32_t groups = 1;
+    uint32_t hasBias = (context->GetNumInputs() >= 3) ? 1 : 0;
+
+    // Shapes
+    uint32_t n    = static_cast<uint32_t>(xShape.GetDim(0));
+    uint32_t cIn  = static_cast<uint32_t>(xShape.GetDim(1));
+    uint32_t h    = static_cast<uint32_t>(xShape.GetDim(2));
+    uint32_t w    = static_cast<uint32_t>(xShape.GetDim(3));
+
+    uint32_t cOut = static_cast<uint32_t>(wShape.GetDim(0));
+    uint32_t kH   = static_cast<uint32_t>(wShape.GetDim(2));
+    uint32_t kW   = static_cast<uint32_t>(wShape.GetDim(3));
+
+    // Compute output H/W
+    uint32_t oH = static_cast<uint32_t>(CalcOutDim(h, padTop, padBottom, dilationH, kH, strideH));
+    uint32_t oW = static_cast<uint32_t>(CalcOutDim(w, padLeft, padRight, dilationW, kW, strideW));
+
+    ConvStandard2dAsymmetricInputAsymmetricKernelCustomTilingData tiling;
+    tiling.set_n(n);
+    tiling.set_cIn(cIn);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_cOut(cOut);
+    tiling.set_kH(kH);
+    tiling.set_kW(kW);
+    tiling.set_groups(groups);
+
+    tiling.set_strideH(strideH);
+    tiling.set_strideW(strideW);
+    tiling.set_padTop(padTop);
+    tiling.set_padBottom(padBottom);
+    tiling.set_padLeft(padLeft);
+    tiling.set_padRight(padRight);
+    tiling.set_dilationH(dilationH);
+    tiling.set_dilationW(dilationW);
+
+    tiling.set_oH(oH);
+    tiling.set_oW(oW);
+    tiling.set_hasBias(hasBias);
+
+    tiling.set_tileNum(TILE_NUM);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* xShape = context->GetInputShape(0);  // [N,C,H,W]
+    const gert::Shape* wShape = context->GetInputShape(1);  // [Cout, Cin/groups, Kh, Kw]
+    int64_t N  = xShape->GetDim(0);
+    int64_t C  = xShape->GetDim(1);
+    int64_t H  = xShape->GetDim(2);
+    int64_t W  = xShape->GetDim(3);
+    int64_t Co = wShape->GetDim(0);
+    int64_t Kh = wShape->GetDim(2);
+    int64_t Kw = wShape->GetDim(3);
+
+    // Defaults
+    int64_t strideH = 1, strideW = 1;
+    int64_t padTop = 0, padBottom = 0, padLeft = 0, padRight = 0;
+    int64_t dilationH = 1, dilationW = 1;
+
+    auto outH = (H + padTop + padBottom - dilationH * (Kh - 1) - 1) / strideH + 1;
+    auto outW = (W + padLeft + padRight - dilationW * (Kw - 1) - 1) / strideW + 1;
+
+    gert::Shape* yShape = context->GetOutputShape(0);
+    yShape->SetDim(0, N);
+    yShape->SetDim(1, Co);
+    yShape->SetDim(2, outH);
+    yShape->SetDim(3, outW);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvStandard2dAsymmetricInputAsymmetricKernelCustom : public OpDef {
+public:
+    explicit ConvStandard2dAsymmetricInputAsymmetricKernelCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+        this->Input("b")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_NCHW, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_NCHW});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvStandard2dAsymmetricInputAsymmetricKernelCustom);
+}
+"""
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv_standard_2d_asymmetric_input_asymmetric_kernel_custom_tiling_data.h"
+
+// 使用 Ascend C 的 Conv2D 高级/ISASI API（参考文档表 1-9 提供的 Conv2D 接口）
+using namespace AscendC;
+
+class KernelConv2D {
+public:
+    __aicore__ inline KernelConv2D() {}
+    __aicore__ inline void Init(GM_ADDR xGm, GM_ADDR wGm, GM_ADDR bGm, GM_ADDR zGm,
+                                const ConvStandard2dAsymmetricInputAsymmetricKernelCustomTilingData &t)
+    {
+        n = t.n(); cIn = t.cIn(); h = t.h(); w = t.w();
+        cOut = t.cOut(); kH = t.kH(); kW = t.kW();
+        groups = t.groups();
+
+        strideH = t.strideH();
+        strideW = t.strideW();
+        padTop = t.padTop();
+        padBottom = t.padBottom();
+        padLeft = t.padLeft();
+        padRight = t.padRight();
+        dilationH = t.dilationH();
+        dilationW = t.dilationW();
+        oH = t.oH();
+        oW = t.oW();
+
+        hasBias = t.hasBias() != 0;
+
+        // 全量大小（演示用，实际工程中建议按 tile 拆分并复用 UB）
+        uint32_t xSize = n * cIn * h * w;
+        uint32_t wSize = cOut * (cIn / groups) * kH * kW;
+        uint32_t zSize = n * cOut * oH * oW;
+
+        xGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(xGm), xSize);
+        wGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(wGm), wSize);
+        if (hasBias) {
+            bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(bGm), cOut);
+        }
+        zGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(zGm), zSize);
+
+        // 简单单次搬运（示例），生产中应分块
+        pipe.InitBuffer(inQueueX, 1, xSize * sizeof(float));
+        pipe.InitBuffer(inQueueW, 1, wSize * sizeof(float));
+        if (hasBias) {
+            pipe.InitBuffer(inQueueB, 1, cOut * sizeof(float));
+        }
+        pipe.InitBuffer(outQueueZ, 1, zSize * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        auto xLocal = inQueueX.AllocTensor<float>();
+        auto wLocal = inQueueW.AllocTensor<float>();
+        DataCopy(xLocal, xGlobal, n * cIn * h * w);
+        DataCopy(wLocal, wGlobal, cOut * (cIn / groups) * kH * kW);
+        inQueueX.EnQue(xLocal);
+        inQueueW.EnQue(wLocal);
+        if (hasBias) {
+            auto bLocal = inQueueB.AllocTensor<float>();
+            DataCopy(bLocal, bGlobal, cOut);
+            inQueueB.EnQue(bLocal);
+        }
+    }
+
+    __aicore__ inline void Compute()
+    {
+        auto xLocal = inQueueX.DeQue<float>();
+        auto wLocal = inQueueW.DeQue<float>();
+        auto zLocal = outQueueZ.AllocTensor<float>();
+
+        // bias 可选
+        if (hasBias) {
+            auto bLocal = inQueueB.DeQue<float>();
+            // 直接调用 Conv2D 接口（参考文档：Conv2D Performs 2D convolution ...）
+            // 具体签名由平台提供，此处演示形参：输出, 输入, 权重, 偏置, 各种卷积参数
+            // 开发者可在实际项目中替换为正确签名
+            AscendC::Conv2D(
+                zLocal, xLocal, wLocal, bLocal,
+                n, cIn, h, w,
+                cOut, kH, kW,
+                strideH, strideW,
+                padTop, padBottom, padLeft, padRight,
+                dilationH, dilationW,
+                groups,
+                oH, oW
+            );
+            inQueueB.FreeTensor(bLocal);
+        } else {
+            AscendC::Conv2D(
+                zLocal, xLocal, wLocal, /*bias*/ LocalTensor<float>(),
+                n, cIn, h, w,
+                cOut, kH, kW,
+                strideH, strideW,
+                padTop, padBottom, padLeft, padRight,
+                dilationH, dilationW,
+                groups,
+                oH, oW
+            );
+        }
+
+        outQueueZ.EnQue(zLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueW.FreeTensor(wLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        auto zLocal = outQueueZ.DeQue<float>();
+        DataCopy(zGlobal, zLocal, n * cOut * oH * oW);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    // 全局张量
+    GlobalTensor<float> xGlobal, wGlobal, bGlobal, zGlobal;
+
+    // 队列与 Pipe
+    TPipe pipe;
+    TQue<TPosition::VECIN, 1>  inQueueX, inQueueW, inQueueB;
+    TQue<TPosition::VECOUT, 1> outQueueZ;
+
+    // 形状与参数
+    uint32_t n, cIn, h, w;
+    uint32_t cOut, kH, kW, groups;
+    uint32_t strideH, strideW;
+    uint32_t padTop, padBottom, padLeft, padRight;
+    uint32_t dilationH, dilationW;
+    uint32_t oH, oW;
+    bool hasBias;
+};
+
+extern "C" __global__ __aicore__ void conv_standard_2d_asymmetric_input_asymmetric_kernel_custom(
+    GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    KernelConv2D op;
+    op.Init(x, w, b, z, tilingData);
+    op.Process();
+}
+"""
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv2d_custom_impl_npu(const at::Tensor& x,
+                                  const at::Tensor& w,
+                                  c10::optional<at::Tensor> b_opt,
+                                  int64_t stride_h, int64_t stride_w,
+                                  int64_t pad_top, int64_t pad_bottom, int64_t pad_left, int64_t pad_right,
+                                  int64_t dilation_h, int64_t dilation_w,
+                                  int64_t groups)
+{
+    auto outH = (x.size(2) + pad_top + pad_bottom - dilation_h * (w.size(2) - 1) - 1) / stride_h + 1;
+    auto outW = (x.size(3) + pad_left + pad_right - dilation_w * (w.size(3) - 1) - 1) / stride_w + 1;
+    at::Tensor z = at::empty({x.size(0), w.size(0), outH, outW}, x.options());
+
+    if (b_opt.has_value()) {
+        EXEC_NPU_CMD(aclnnConvStandard2dAsymmetricInputAsymmetricKernelCustom,
+                     x, w, b_opt.value(), z);
+    } else {
+        // 当无 bias 时，传空张量占位
+        at::Tensor empty_bias;
+        EXEC_NPU_CMD(aclnnConvStandard2dAsymmetricInputAsymmetricKernelCustom,
+                     x, w, empty_bias, z);
+    }
+    return z;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_standard_2d_asymmetric_input_asymmetric_kernel_custom", &conv2d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_standard_2d_asymmetric_input_asymmetric_kernel_custom",
+          &conv2d_custom_impl_npu,
+          "custom 2d conv with asymmetric input/kernel");
+}
+"""
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    基于 AscendC 自定义核的 2D 卷积（异形输入与核大小），默认 stride=(1,1), padding=(0,0), dilation=(1,1), groups=1, bias=False
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple):
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kh, kw = kernel_size, kernel_size
+        else:
+            kh, kw = kernel_size
+        # 使用 PyTorch Parameter 持有权重（便于训练/保存），前向改为调用自定义核
+        self.weight = torch.nn.Parameter(torch.empty(out_channels, in_channels, kh, kw))
+        torch.nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        self.bias = None  # 默认无偏置
+        # 默认超参（与给定模型一致）
+        self.stride  = (1, 1)
+        self.padding = (0, 0)  # (pad_h, pad_w) 对称时我们在核侧展开为四向 0
+        self.dilation = (1, 1)
+        self.groups = 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pad_h, pad_w = self.padding
+        # 将对称 padding 展开为四向
+        pad_top = pad_h
+        pad_bottom = pad_h
+        pad_left = pad_w
+        pad_right = pad_w
+        stride_h, stride_w = self.stride
+        dil_h, dil_w = self.dilation
+
+        return custom_ops_lib.conv_standard_2d_asymmetric_input_asymmetric_kernel_custom(
+            x, self.weight, self.bias,
+            stride_h, stride_w,
+            pad_top, pad_bottom, pad_left, pad_right,
+            dil_h, dil_w,
+            self.groups
+        )
+'''

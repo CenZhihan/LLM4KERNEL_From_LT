@@ -1,0 +1,410 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTransposed2dSquareInputSquareKernelCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "weight",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTransposed2dSquareInputSquareKernelCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, Cin);
+  TILING_DATA_FIELD_DEF(uint32_t, Co);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint32_t, K);   // square kernel size
+  TILING_DATA_FIELD_DEF(uint32_t, OH);
+  TILING_DATA_FIELD_DEF(uint32_t, OW);
+  TILING_DATA_FIELD_DEF(uint32_t, tileOH);
+  TILING_DATA_FIELD_DEF(uint32_t, tileOW);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTransposed2dSquareInputSquareKernelCustom, ConvTransposed2dSquareInputSquareKernelCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transposed_2d_square_input_square_kernel_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 1; // 单核演示，确保无输出tile重叠写，避免原子加
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTransposed2dSquareInputSquareKernelCustomTilingData tiling;
+
+    const gert::Shape* x_shape = context->GetInputShape(0);      // N, Cin, H, W
+    const gert::Shape* w_shape = context->GetInputShape(1);      // Cin, Co, K, K  (PyTorch ConvTranspose2d 权重布局)
+
+    uint32_t N  = static_cast<uint32_t>(x_shape->GetDim(0));
+    uint32_t Cin = static_cast<uint32_t>(x_shape->GetDim(1));
+    uint32_t H  = static_cast<uint32_t>(x_shape->GetDim(2));
+    uint32_t W  = static_cast<uint32_t>(x_shape->GetDim(3));
+
+    uint32_t Co = static_cast<uint32_t>(w_shape->GetDim(1));
+    uint32_t K  = static_cast<uint32_t>(w_shape->GetDim(2)); // square kernel
+
+    // 仅支持 stride=1, padding=0, output_padding=0, groups=1
+    uint32_t OH = H + K - 1;
+    uint32_t OW = W + K - 1;
+
+    // 简单tile策略：固定空间tile，单核计算，行列tile 16x16
+    const uint32_t tileOH = 16;
+    const uint32_t tileOW = 16;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_N(N);
+    tiling.set_Cin(Cin);
+    tiling.set_Co(Co);
+    tiling.set_H(H);
+    tiling.set_W(W);
+    tiling.set_K(K);
+    tiling.set_OH(OH);
+    tiling.set_OW(OW);
+    tiling.set_tileOH(tileOH);
+    tiling.set_tileOW(tileOW);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0; // 无额外workspace
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+// 输出shape推理：仅支持 stride=1, padding=0, output_padding=0
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x = context->GetInputShape(0); // N,Cin,H,W
+    const gert::Shape* w = context->GetInputShape(1); // Cin,Co,K,K
+    gert::Shape* y = context->GetOutputShape(0);
+
+    int64_t N = x->GetDim(0);
+    int64_t Cin = x->GetDim(1);
+    int64_t H = x->GetDim(2);
+    int64_t W = x->GetDim(3);
+
+    int64_t Co = w->GetDim(1);
+    int64_t K = w->GetDim(2);
+
+    // 仅支持方形输入和方形kernel
+    (void)Cin; // 未用到，仅校验布局
+    int64_t OH = H + K - 1;
+    int64_t OW = W + K - 1;
+    y->SetDimNum(4);
+    y->SetDim(0, N);
+    y->SetDim(1, Co);
+    y->SetDim(2, OH);
+    y->SetDim(3, OW);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTransposed2dSquareInputSquareKernelCustom : public OpDef {
+public:
+    explicit ConvTransposed2dSquareInputSquareKernelCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(ConvTransposed2dSquareInputSquareKernelCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv_transposed_2d_square_input_square_kernel_custom_tiling_data.h"
+
+// 仅支持 float, ND，stride=1, padding=0, output_padding=0, groups=1
+// 参考文档：LocalTensor 管理、DataCopy、TQue/TPipe的使用（CANN Ascend C API Reference）
+
+using DTYPE = float;
+constexpr int32_t IN_BUF_NUM = 1;
+constexpr int32_t OUT_BUF_NUM = 1;
+
+class KernelConvTransposed2D {
+public:
+    __aicore__ inline KernelConvTransposed2D() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                uint32_t N, uint32_t Cin, uint32_t Co,
+                                uint32_t H, uint32_t W, uint32_t K,
+                                uint32_t OH, uint32_t OW,
+                                uint32_t tileOH, uint32_t tileOW)
+    {
+        this->N_ = N; this->Cin_ = Cin; this->Co_ = Co;
+        this->H_ = H; this->W_ = W; this->K_ = K;
+        this->OH_ = OH; this->OW_ = OW;
+        this->tileOH_ = tileOH; this->tileOW_ = tileOW;
+
+        xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(x), (uint64_t)N_*Cin_*H_*W_);
+        wGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(w), (uint64_t)Cin_*Co_*K_*K_);
+        yGm_.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(y), (uint64_t)N_*Co_*OH_*OW_);
+
+        // 最大patch: (tileOH + K - 1) * (tileOW + K - 1)
+        maxPatchH_ = tileOH_ + K_ - 1;
+        maxPatchW_ = tileOW_ + K_ - 1;
+        maxPatchSize_ = maxPatchH_ * maxPatchW_;
+        maxYTileSize_ = tileOH_ * tileOW_;
+
+        // 分配本地buffer
+        pipe_.InitBuffer(inQueueX_, IN_BUF_NUM, maxPatchSize_ * sizeof(DTYPE));
+        pipe_.InitBuffer(inQueueW_, IN_BUF_NUM, K_ * K_ * sizeof(DTYPE));
+        pipe_.InitBuffer(outQueueY_, OUT_BUF_NUM, maxYTileSize_ * sizeof(DTYPE));
+
+        // 仅单Block执行，避免输出写冲突
+        // 如果需要并行，需要对输出空间做无重叠分块
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (AscendC::GetBlockIdx() != 0) {
+            return;
+        }
+        for (uint32_t n = 0; n < N_; ++n) {
+            for (uint32_t co = 0; co < Co_; ++co) {
+                for (uint32_t oh0 = 0; oh0 < OH_; oh0 += tileOH_) {
+                    for (uint32_t ow0 = 0; ow0 < OW_; ow0 += tileOW_) {
+                        uint32_t curTileH = AscendC::Min(tileOH_, OH_ - oh0);
+                        uint32_t curTileW = AscendC::Min(tileOW_, OW_ - ow0);
+
+                        // 分配y tile并清零
+                        AscendC::LocalTensor<DTYPE> yTile = outQueueY_.AllocTensor<DTYPE>();
+                        for (uint32_t i = 0; i < curTileH * curTileW; ++i) {
+                            yTile[i] = static_cast<DTYPE>(0.0f);
+                        }
+
+                        // 遍历输入通道，累加
+                        for (uint32_t ci = 0; ci < Cin_; ++ci) {
+                            // 拷贝权重 [ci, co, :, :]
+                            AscendC::LocalTensor<DTYPE> wLocal = inQueueW_.AllocTensor<DTYPE>();
+                            uint64_t wBase = ((uint64_t)ci * Co_ + co) * (uint64_t)K_ * (uint64_t)K_;
+                            AscendC::DataCopy(wLocal, wGm_[wBase], K_ * K_);
+                            inQueueW_.EnQue(wLocal);
+                            wLocal = inQueueW_.DeQue<DTYPE>();
+
+                            // 针对该输出tile需要的输入patch范围
+                            // 输出oh in [oh0, oh0+curTileH-1], ow in [ow0, ow0+curTileW-1]
+                            // 对应输入位置ih = oh - kh, iw = ow - kw
+                            int32_t ihStart = static_cast<int32_t>(oh0) - static_cast<int32_t>(K_) + 1;
+                            int32_t iwStart = static_cast<int32_t>(ow0) - static_cast<int32_t>(K_) + 1;
+                            int32_t ihEnd   = static_cast<int32_t>(oh0 + curTileH - 1);
+                            int32_t iwEnd   = static_cast<int32_t>(ow0 + curTileW - 1);
+
+                            // 有效输入边界裁剪到 [0, H_-1]/[0, W_-1]
+                            int32_t ihCopyBeg = AscendC::Max(0, ihStart);
+                            int32_t iwCopyBeg = AscendC::Max(0, iwStart);
+                            int32_t ihCopyEnd = AscendC::Min((int32_t)H_ - 1, ihEnd);
+                            int32_t iwCopyEnd = AscendC::Min((int32_t)W_ - 1, iwEnd);
+
+                            uint32_t patchH = (ihCopyEnd >= ihCopyBeg) ? (ihCopyEnd - ihCopyBeg + 1) : 0;
+                            uint32_t patchW = (iwCopyEnd >= iwCopyBeg) ? (iwCopyEnd - iwCopyBeg + 1) : 0;
+
+                            AscendC::LocalTensor<DTYPE> xPatch = inQueueX_.AllocTensor<DTYPE>();
+                            // 先清零patch，方便边界外当0处理
+                            for (uint32_t i = 0; i < maxPatchSize_; ++i) {
+                                xPatch[i] = static_cast<DTYPE>(0.0f);
+                            }
+
+                            // 将有效区域复制到patch对应偏移
+                            if (patchH > 0 && patchW > 0) {
+                                uint32_t rowOffset = (uint32_t)(ihCopyBeg - ihStart); // patch中起始行偏移
+                                uint32_t colOffset = (uint32_t)(iwCopyBeg - iwStart); // patch中起始列偏移
+                                for (uint32_t r = 0; r < patchH; ++r) {
+                                    uint64_t xRowBase = ((((uint64_t)n * Cin_ + ci) * H_) + (uint64_t)(ihCopyBeg + (int32_t)r)) * (uint64_t)W_;
+                                    AscendC::DataCopy(
+                                        xPatch[(rowOffset + r) * maxPatchW_ + colOffset],
+                                        xGm_[xRowBase + (uint64_t)iwCopyBeg],
+                                        patchW
+                                    );
+                                }
+                            }
+                            inQueueX_.EnQue(xPatch);
+                            xPatch = inQueueX_.DeQue<DTYPE>();
+
+                            // 计算：yTile += convT(xPatch, wLocal)（stride=1, padding=0）
+                            // 对于输出tile内每个像素 (th, tw)
+                            for (uint32_t th = 0; th < curTileH; ++th) {
+                                for (uint32_t tw = 0; tw < curTileW; ++tw) {
+                                    DTYPE acc = 0.0f;
+                                    // 卷积反卷积对应：ih = th - (K-1) + kh  -> 已经将x按补零方式放入patch
+                                    // 直接遍历权重并从patch读取
+                                    for (uint32_t kh = 0; kh < K_; ++kh) {
+                                        for (uint32_t kw = 0; kw < K_; ++kw) {
+                                            uint32_t pr = th + kh; // patch中的行位置
+                                            uint32_t pc = tw + kw; // patch中的列位置
+                                            DTYPE xv = xPatch[pr * maxPatchW_ + pc];
+                                            DTYPE wv = wLocal[kh * K_ + kw];
+                                            acc += xv * wv;
+                                        }
+                                    }
+                                    yTile[th * curTileW + tw] += acc;
+                                }
+                            }
+
+                            inQueueW_.FreeTensor(wLocal);
+                            inQueueX_.FreeTensor(xPatch);
+                        } // for ci
+
+                        // 写回y tile -> GM
+                        for (uint32_t th = 0; th < curTileH; ++th) {
+                            uint64_t yRowBase = ((((uint64_t)n * Co_) + co) * OH_ + (oh0 + th)) * (uint64_t)OW_;
+                            AscendC::DataCopy(yGm_[yRowBase + ow0], yTile[th * curTileW], curTileW);
+                        }
+                        outQueueY_.FreeTensor(yTile);
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::QuePosition::VECIN, IN_BUF_NUM>  inQueueX_, inQueueW_;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, OUT_BUF_NUM> outQueueY_;
+    AscendC::GlobalTensor<DTYPE> xGm_, wGm_, yGm_;
+
+    uint32_t N_, Cin_, Co_;
+    uint32_t H_, W_, K_;
+    uint32_t OH_, OW_;
+    uint32_t tileOH_, tileOW_;
+    uint32_t maxPatchH_, maxPatchW_, maxPatchSize_, maxYTileSize_;
+};
+
+extern "C" __global__ __aicore__ void conv_transposed_2d_square_input_square_kernel_custom(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConvTransposed2D op;
+    op.Init(x, weight, y,
+            tiling_data.N, tiling_data.Cin, tiling_data.Co,
+            tiling_data.H, tiling_data.W, tiling_data.K,
+            tiling_data.OH, tiling_data.OW,
+            tiling_data.tileOH, tiling_data.tileOW);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+// 仅支持 float、ND、stride=1、padding=0、output_padding=0、groups=1、方形输入和方形kernel
+at::Tensor conv_transposed_2d_square_input_square_kernel_custom_impl_npu(const at::Tensor& x, const at::Tensor& weight) {
+    // x: [N, Cin, H, W], weight: [Cin, Co, K, K]
+    auto N = x.size(0);
+    auto Co = weight.size(1);
+    auto H = x.size(2);
+    auto W = x.size(3);
+    auto K = weight.size(2);
+    auto OH = H + K - 1;
+    auto OW = W + K - 1;
+    at::Tensor y = at::empty({N, Co, OH, OW}, x.options());
+    EXEC_NPU_CMD(aclnnConvTransposed2dSquareInputSquareKernelCustom, x, weight, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transposed_2d_square_input_square_kernel_custom", &conv_transposed_2d_square_input_square_kernel_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transposed_2d_square_input_square_kernel_custom", &conv_transposed_2d_square_input_square_kernel_custom_impl_npu, "ConvTranspose2d square input/kernel (stride=1,pad=0)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    使用AscendC自定义算子替换 ConvTranspose2d：
+    约束：
+      - 仅支持 float32
+      - 输入为 NCHW，方形输入 (H==W) 与方形kernel (K==K)
+      - stride=1, padding=0, output_padding=0
+      - groups=1
+      - bias=False（如需bias，可在外部额外加到输出上）
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, output_padding: int = 0, groups: int = 1, bias: bool = False):
+        super().__init__()
+        # 仅用于权重和参数校验/管理
+        assert stride == 1 and padding == 0 and output_padding == 0 and groups == 1, "Only stride=1, padding=0, output_padding=0, groups=1 are supported"
+        assert not bias, "bias=False is required"
+        assert isinstance(kernel_size, int), "Only square kernel size supported"
+        self.conv_transpose2d = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding, groups=groups, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        N, C, H, W = x.shape
+        K = self.conv_transpose2d.kernel_size[0]
+        assert H == W, "Only square input supported"
+        assert self.conv_transpose2d.kernel_size[0] == self.conv_transpose2d.kernel_size[1], "Only square kernel supported"
+        # 权重布局为 [Cin, Co, K, K]
+        weight = self.conv_transpose2d.weight
+        y = custom_ops_lib.conv_transposed_2d_square_input_square_kernel_custom(x, weight)
+        return y
+'''

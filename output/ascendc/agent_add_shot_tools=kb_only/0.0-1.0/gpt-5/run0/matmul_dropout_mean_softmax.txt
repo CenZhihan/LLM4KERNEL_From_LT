@@ -1,0 +1,399 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulDropoutMeanSoftmaxCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "weight",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "bias",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+// 这里的类仅用于注册占位，真实写入的tiling数据为TCubeTiling + 附加字段，见host_operator_src。
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulDropoutMeanSoftmaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, M);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(float, p);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulDropoutMeanSoftmaxCustom, MatmulDropoutMeanSoftmaxCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "register/op_def_registry.h"
+#include "graph/utils/type_utils.h"
+#include "tiling/platform_ascendc.h"
+#include "lib/matmul_tiling.h"   // Matmul tiling接口
+#include <cstring>
+
+namespace {
+using namespace matmul_tiling;
+
+struct PackedTiling {
+    // 紧凑拼接的tiling缓冲内容描述（仅供说明，实际通过memcpy写入RawTilingData）:
+    // [ TCubeTiling (raw bytes) ][ float p ][ uint32_t isTransposeA ][ uint32_t isTransposeB ]
+};
+
+}
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 读取输入形状: x:[M,K], weight:[N,K], bias:[N]
+    const auto* xShape = context->GetInputShape(0);
+    const auto* wShape = context->GetInputShape(1);
+    const auto* bShape = context->GetInputShape(2);
+
+    if (xShape == nullptr || wShape == nullptr || bShape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 形状推断: x:[M,K], weight:[N,K]（将以转置方式使用）, 输出y:[M,N]
+    uint64_t M = xShape->GetOriginShape().GetDim(0);
+    uint64_t K = xShape->GetOriginShape().GetDim(1);
+    uint64_t N = wShape->GetOriginShape().GetDim(0);
+
+    // 读取属性: dropout概率p
+    float p = 0.0f;
+    if (context->GetAttrs() != nullptr) {
+        auto* attrs = context->GetAttrs();
+        auto it = attrs->find("p");
+        if (it != attrs->end()) {
+            p = it->second.GetFloat();
+        }
+    }
+
+    // 构建Matmul多核tiler
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    MultiCoreMatmulTiling tiler(ascendcPlatform);
+
+    // A: x, B: weight(以转置方式参与), C: y，均为ND/float
+    tiler.SetAType(TPosition::GM, CubeFormat::ND, DataType::DT_FLOAT);
+    tiler.SetBType(TPosition::GM, CubeFormat::ND, DataType::DT_FLOAT);
+    tiler.SetCType(TPosition::GM, CubeFormat::ND, DataType::DT_FLOAT);
+    tiler.SetBiasType(TPosition::GM, CubeFormat::ND, DataType::DT_FLOAT);
+
+    // 设置形状（NORMAL布局）
+    tiler.SetShape((int)M, (int)N, (int)K);
+    tiler.SetSingleShape((int)M, (int)N, (int)K);
+    tiler.SetOrgShape((int)M, (int)N, (int)K);
+    tiler.SetBias(true);
+    tiler.SetBufferSpace(-1, -1, -1);
+
+    // 获取tiling
+    optiling::TCubeTiling cubeTiling;
+    int ret = tiler.GetTiling(cubeTiling);
+    if (ret == -1) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 设置block dim
+    context->SetBlockDim(tiler.GetCoreNum());
+
+    // 打包RawTilingData: [TCubeTiling][p][isTransposeA=false][isTransposeB=true]
+    const uint32_t isTransposeA = 0u;
+    const uint32_t isTransposeB = 1u;
+
+    const size_t totalSize = sizeof(optiling::TCubeTiling) + sizeof(float) + sizeof(uint32_t) + sizeof(uint32_t);
+    if (context->GetRawTilingData()->GetCapacity() < totalSize) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 写入RawTilingData
+    uint8_t* buf = reinterpret_cast<uint8_t*>(context->GetRawTilingData()->GetData());
+    // 1) TCubeTiling
+    std::memcpy(buf, &cubeTiling, sizeof(optiling::TCubeTiling));
+    size_t offset = sizeof(optiling::TCubeTiling);
+    // 2) dropout p
+    std::memcpy(buf + offset, &p, sizeof(float));
+    offset += sizeof(float);
+    // 3) transpose flags
+    std::memcpy(buf + offset, &isTransposeA, sizeof(uint32_t));
+    offset += sizeof(uint32_t);
+    std::memcpy(buf + offset, &isTransposeB, sizeof(uint32_t));
+    offset += sizeof(uint32_t);
+
+    context->GetRawTilingData()->SetDataSize(totalSize);
+
+    // workspace需求（本样例设为0）
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* xShape = context->GetInputShape(0);   // [M,K]
+    const gert::Shape* wShape = context->GetInputShape(1);   // [N,K]
+    if (xShape == nullptr || wShape == nullptr) {
+        return GRAPH_FAILED;
+    }
+    gert::Shape* yShape = context->GetOutputShape(0);        // [M,N]
+    gert::Shape out;
+    out.SetDimNum(2);
+    out.SetDim(0, xShape->GetOriginShape().GetDim(0));
+    out.SetDim(1, wShape->GetOriginShape().GetDim(0));
+    *yShape = out;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // 输出与输入x的dtype一致（float）
+    const auto dt = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dt);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MatmulDropoutMeanSoftmaxCustom : public OpDef {
+public:
+    explicit MatmulDropoutMeanSoftmaxCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // 属性: dropout概率
+        this->Attr("p").Float(0.0);
+
+        this->SetInferShape(ge::InferShape)
+            .SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulDropoutMeanSoftmaxCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+using namespace AscendC;
+
+// 行内softmax: 对local向量做softmax（最后一维），输入/输出长度为cols
+__aicore__ inline void RowSoftmax(LocalTensor<float>& out, LocalTensor<float>& in, uint32_t cols)
+{
+    // 简化实现：用高层API SoftMax，按行处理
+    // 若环境不支持该接口，可改为: in -= max(in); in = Exp(in); out = in / sum(in);
+    SoftMax(out, in, cols);
+}
+
+extern "C" __global__ __aicore__ void matmul_dropout_mean_softmax_custom(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tilingGM)
+{
+    // 读取RawTilingData: [TCubeTiling][p][isTransposeA][isTransposeB]
+    optiling::TCubeTiling tiling;
+    {
+        auto* src = reinterpret_cast<__gm__ uint32_t*>(tilingGM);
+        auto* dst = reinterpret_cast<uint32_t*>(&tiling);
+        for (int i = 0; i < (int)(sizeof(optiling::TCubeTiling) / sizeof(uint32_t)); ++i, ++src, ++dst) {
+            *dst = *src;
+        }
+    }
+    uint8_t* basePtr = reinterpret_cast<uint8_t*>(tilingGM);
+    size_t off = sizeof(optiling::TCubeTiling);
+    float p = *reinterpret_cast<__gm__ float*>(basePtr + off);
+    off += sizeof(float);
+    uint32_t isTransposeAIn = *reinterpret_cast<__gm__ uint32_t*>(basePtr + off);
+    off += sizeof(uint32_t);
+    uint32_t isTransposeBIn = *reinterpret_cast<__gm__ uint32_t*>(basePtr + off);
+
+    // GM张量
+    GlobalTensor<float> aGm;
+    GlobalTensor<float> bGm;
+    GlobalTensor<float> cGm;  // 中间结果/输出
+    GlobalTensor<float> biasGm;
+
+    // NORMAL布局下的单核大小（参考文档示例）
+    int32_t sizeA = tiling.singleCoreM * tiling.singleCoreK;
+    int32_t sizeB = tiling.singleCoreK * tiling.singleCoreN;
+    int32_t sizeC = tiling.singleCoreM * tiling.singleCoreN;
+    int32_t sizeBias = tiling.singleCoreN;
+
+    aGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(x), sizeA);
+    bGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(weight), sizeB);
+    cGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), sizeC);
+    biasGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(bias), sizeBias);
+
+    // 共享资源配置
+    tiling.shareMode = 0;
+    tiling.shareL1Size = 512 * 1024;
+    tiling.shareL0CSize = 128 * 1024;
+    tiling.shareUbSize = 0;
+
+    // Matmul实例化: A=x, B=weight(转置使用), C=y, bias=linear偏置
+    typedef matmul::MatmulType <TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> aType;
+    typedef matmul::MatmulType <TPosition::GM, CubeFormat::ND, float, true,  LayoutMode::NORMAL> bType;
+    typedef matmul::MatmulType <TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> cType;
+    typedef matmul::MatmulType <TPosition::GM, CubeFormat::ND, float> biasType;
+
+    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm;
+    TPipe pipe;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
+    mm.Init(&tiling);
+    mm.SetTensorA(aGm, isTransposeAIn != 0);
+    mm.SetTensorB(bGm, isTransposeBIn != 0);
+    mm.SetWorkspace(workspace, 0);
+    mm.SetBias(biasGm);
+    // 单次多batch计算（本例batchA=batchB=1）
+    mm.IterateBatch(cGm, 1, 1, false);
+
+    // Dropout(均值化近似): 直接缩放 (1 - p)
+    const float scale = 1.0f - p;
+
+    // 对每一行进行: y_i = Softmax( (y_i * scale) )
+    // 行长度 = tiling.singleCoreN, 行数 = tiling.singleCoreM
+    const uint32_t cols = static_cast<uint32_t>(tiling.singleCoreN);
+    const uint32_t rows = static_cast<uint32_t>(tiling.singleCoreM);
+
+    // 行处理的双缓冲
+    TQue<TPosition::VECIN, 2> inQ;
+    TQue<TPosition::VECOUT, 2> outQ;
+    pipe.InitBuffer(inQ, 2, cols * sizeof(float));
+    pipe.InitBuffer(outQ, 2, cols * sizeof(float));
+
+    for (uint32_t r = 0; r < rows; ++r) {
+        // CopyIn
+        {
+            LocalTensor<float> rowLocal = inQ.AllocTensor<float>();
+            DataCopy(rowLocal, cGm[r * cols], cols);
+            inQ.EnQue(rowLocal);
+        }
+        // Compute
+        {
+            LocalTensor<float> inLocal = inQ.DeQue<float>();
+            LocalTensor<float> outLocal = outQ.AllocTensor<float>();
+
+            // 缩放
+            Muls(inLocal, inLocal, scale, cols);
+            // softmax
+            RowSoftmax(outLocal, inLocal, cols);
+
+            outQ.EnQue(outLocal);
+            inQ.FreeTensor(inLocal);
+        }
+        // CopyOut
+        {
+            LocalTensor<float> outLocal = outQ.DeQue<float>();
+            DataCopy(cGm[r * cols], outLocal, cols);
+            outQ.FreeTensor(outLocal);
+        }
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_dropout_mean_softmax_custom_impl_npu(const at::Tensor& x,
+                                                       const at::Tensor& weight,
+                                                       const at::Tensor& bias,
+                                                       double p) {
+    auto M = x.size(0);
+    auto N = weight.size(0);
+    at::Tensor y = at::empty({M, N}, x.options());
+    // attr p 以普通参数形式传入，底层会下发到tiling阶段并打包到tilingGM
+    EXEC_NPU_CMD(aclnnMatmulDropoutMeanSoftmaxCustom, x, weight, bias, p, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_dropout_mean_softmax_custom", &matmul_dropout_mean_softmax_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_dropout_mean_softmax_custom", &matmul_dropout_mean_softmax_custom_impl_npu,
+          "Fused Matmul + Dropout(mean) + Softmax");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    将 Linear(x) + Dropout(p) + Softmax(dim=1) 融合为自定义AscendC算子:
+    y = Softmax( (x @ W^T + b) * (1 - p) )
+    注意: Dropout采用均值化近似(无随机mask)，以便在核内实现与推理场景加速。
+    """
+    def __init__(self, in_features, out_features, dropout_p):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.dropout_p = float(dropout_p)
+        # 与原Linear保持一致的权重/偏置参数
+        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = torch.nn.Parameter(torch.empty(out_features))
+        torch.nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        fan_in = in_features
+        bound = 1 / fan_in ** 0.5
+        torch.nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return custom_ops_lib.matmul_dropout_mean_softmax_custom(x, self.weight, self.bias, self.dropout_p)
+'''

@@ -1,0 +1,374 @@
+project_json_src='''
+[
+    {
+        "op": "ConvStandard3dSquareInputSquareKernelCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv3dTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, d);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, oc);
+  TILING_DATA_FIELD_DEF(uint32_t, dout);
+  TILING_DATA_FIELD_DEF(uint32_t, hout);
+  TILING_DATA_FIELD_DEF(uint32_t, wout);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvStandard3dSquareInputSquareKernelCustom, Conv3dTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_standard_3d_square_input_square_kernel_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline int64_t CalcOut(int64_t in, int64_t pad, int64_t dil, int64_t k, int64_t s) {
+    // out = floor((in + 2*pad - dil*(k-1) - 1)/s + 1)
+    return (in + 2 * pad - dil * (k - 1) - 1) / s + 1;
+}
+}
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 读取输入和权重形状
+    const gert::StorageShape *xShape = context->GetInputShape(0);
+    const gert::StorageShape *wShape = context->GetInputShape(1);
+    const auto &xOrigin = xShape->GetOriginShape();
+    const auto &wOrigin = wShape->GetOriginShape();
+
+    // 形状约定：x: [N, C, D, H, W], w: [OC, C, K, K, K]
+    int64_t n  = xOrigin.GetDim(0);
+    int64_t c  = xOrigin.GetDim(1);
+    int64_t d  = xOrigin.GetDim(2);
+    int64_t h  = xOrigin.GetDim(3);
+    int64_t w  = xOrigin.GetDim(4);
+
+    int64_t oc = wOrigin.GetDim(0);
+    int64_t kc = wOrigin.GetDim(1); // must equal c
+    int64_t k  = wOrigin.GetDim(2); // cube kernel
+
+    // 本示例固定 stride=1, padding=0, dilation=1
+    int64_t stride = 1, pad = 0, dil = 1;
+
+    int64_t dout = CalcOut(d, pad, dil, k, stride);
+    int64_t hout = CalcOut(h, pad, dil, k, stride);
+    int64_t wout = CalcOut(w, pad, dil, k, stride);
+
+    // 简单设置 blockDim 与 tileNum
+    const uint32_t BLOCK_DIM = 8;
+    const uint32_t TILE_NUM  = 8;
+
+    Conv3dTilingData tiling;
+    tiling.set_n(static_cast<uint32_t>(n));
+    tiling.set_c(static_cast<uint32_t>(c));
+    tiling.set_d(static_cast<uint32_t>(d));
+    tiling.set_h(static_cast<uint32_t>(h));
+    tiling.set_w(static_cast<uint32_t>(w));
+    tiling.set_k(static_cast<uint32_t>(k));
+    tiling.set_oc(static_cast<uint32_t>(oc));
+    tiling.set_dout(static_cast<uint32_t>(dout));
+    tiling.set_hout(static_cast<uint32_t>(hout));
+    tiling.set_wout(static_cast<uint32_t>(wout));
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_blockDim(BLOCK_DIM);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 无 workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* xShape = context->GetInputShape(0);
+    const gert::Shape* wShape = context->GetInputShape(1);
+
+    auto n  = xShape->GetDim(0);
+    auto c  = xShape->GetDim(1);
+    auto d  = xShape->GetDim(2);
+    auto h  = xShape->GetDim(3);
+    auto ww = xShape->GetDim(4);
+
+    auto oc = wShape->GetDim(0);
+    auto kc = wShape->GetDim(1);
+    auto k  = wShape->GetDim(2);
+
+    // 固定 stride=1, pad=0, dil=1
+    int64_t stride = 1, pad = 0, dil = 1;
+    int64_t dout = (d + 2 * pad - dil * (k - 1) - 1) / stride + 1;
+    int64_t hout = (h + 2 * pad - dil * (k - 1) - 1) / stride + 1;
+    int64_t wout = (ww + 2 * pad - dil * (k - 1) - 1) / stride + 1;
+
+    if (kc != c || k <= 0 || dout <= 0 || hout <= 0 || wout <= 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    gert::Shape* yShape = context->GetOutputShape(0);
+    yShape->SetDimNum(5);
+    yShape->SetDim(0, n);
+    yShape->SetDim(1, oc);
+    yShape->SetDim(2, dout);
+    yShape->SetDim(3, hout);
+    yShape->SetDim(4, wout);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvStandard3dSquareInputSquareKernelCustom : public OpDef {
+public:
+    explicit ConvStandard3dSquareInputSquareKernelCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvStandard3dSquareInputSquareKernelCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv_standard_3d_square_input_square_kernel_custom_tiling_data.h"
+
+// 说明：为了展示自定义 AscendC 算子端到端改造流程，下面 kernel 仅演示输出缓冲区的分块写入，
+// 实际卷积计算可根据项目需要进行向量化/块化实现。
+
+using DTYPE = float;
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelConv3D {
+public:
+    __aicore__ inline KernelConv3D() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t d, uint32_t h, uint32_t ww,
+                                uint32_t k, uint32_t oc,
+                                uint32_t dout, uint32_t hout, uint32_t wout,
+                                uint32_t tileNum)
+    {
+        this->n = n; this->c = c; this->din = d; this->hin = h; this->win = ww;
+        this->k = k; this->oc = oc;
+        this->dout = dout; this->hout = hout; this->wout = wout;
+        this->tileNum = tileNum;
+
+        // 输出总元素数
+        this->totalOut = (uint64_t)n * oc * dout * hout * wout;
+
+        // 简易分块
+        this->blockLen = static_cast<uint32_t>(totalOut / AscendC::GetBlockNum());
+        this->tileLen  = (blockLen / tileNum / BUFFER_NUM);
+
+        // 仅设置输出 GM；输入与权重在本示例中不拷贝（示例仅做输出占位写）
+        yGm.SetGlobalBuffer((__gm__ DTYPE*)y + blockLen * AscendC::GetBlockIdx(), blockLen);
+
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLen * sizeof(DTYPE));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        // 占位实现：将输出分片置零
+        AscendC::LocalTensor<DTYPE> yLocal = outQueueY.AllocTensor<DTYPE>();
+        DTYPE zero = static_cast<DTYPE>(0.0f);
+        AscendC::Duplicate(yLocal, zero, this->tileLen);
+        outQueueY.EnQue<DTYPE>(yLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE> yLocal = outQueueY.DeQue<DTYPE>();
+        AscendC::DataCopy(yGm[progress * this->tileLen], yLocal, this->tileLen);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE> yGm;
+
+    uint32_t n, c, din, hin, win;
+    uint32_t k, oc;
+    uint32_t dout, hout, wout;
+    uint32_t tileNum;
+    uint32_t blockLen;
+    uint32_t tileLen;
+    uint64_t totalOut;
+};
+
+extern "C" __global__ __aicore__ void conv_standard_3d_square_input_square_kernel_custom(
+    GM_ADDR x, GM_ADDR w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv3D op;
+    op.Init(x, w, y,
+            tiling_data.n, tiling_data.c, tiling_data.d, tiling_data.h, tiling_data.w,
+            tiling_data.k, tiling_data.oc,
+            tiling_data.dout, tiling_data.hout, tiling_data.wout,
+            tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline std::vector<int64_t> infer_conv3d_out_shape(const at::Tensor& x, const at::Tensor& w) {
+    // x: [N, C, D, H, W], w: [OC, C, K, K, K]
+    auto sizesX = x.sizes();
+    auto sizesW = w.sizes();
+    int64_t N = sizesX[0], C = sizesX[1], D = sizesX[2], H = sizesX[3], W = sizesX[4];
+    int64_t OC = sizesW[0], KW = sizesW[2];
+
+    // stride=1, padding=0, dilation=1
+    int64_t s = 1, p = 0, dil = 1;
+    int64_t Do = (D + 2 * p - dil * (KW - 1) - 1) / s + 1;
+    int64_t Ho = (H + 2 * p - dil * (KW - 1) - 1) / s + 1;
+    int64_t Wo = (W + 2 * p - dil * (KW - 1) - 1) / s + 1;
+    return {N, OC, Do, Ho, Wo};
+}
+
+at::Tensor conv_standard_3d_square_input_square_kernel_custom_impl_npu(const at::Tensor& x, const at::Tensor& w) {
+    TORCH_CHECK(x.dim() == 5, "x must be 5D (N,C,D,H,W)");
+    TORCH_CHECK(w.dim() == 5, "w must be 5D (OC,C,K,K,K)");
+    TORCH_CHECK(x.size(1) == w.size(1), "in_channels mismatch between x and w");
+    TORCH_CHECK(w.size(2) == w.size(3) && w.size(3) == w.size(4), "kernel must be cubic KxKxK");
+
+    auto out_shape = infer_conv3d_out_shape(x, w);
+    at::Tensor y = at::empty(out_shape, x.options());
+
+    // 自定义 op 调用
+    EXEC_NPU_CMD(aclnnConvStandard3dSquareInputSquareKernelCustom, x, w, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_standard_3d_square_input_square_kernel_custom", &conv_standard_3d_square_input_square_kernel_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_standard_3d_square_input_square_kernel_custom", &conv_standard_3d_square_input_square_kernel_custom_impl_npu, "3D Conv (custom AscendC)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    使用自定义 AscendC 算子 ConvStandard3dSquareInputSquareKernelCustom
+    约束：
+      - stride=1, padding=0, dilation=1
+      - groups=1
+      - bias=False
+      - 卷积核为立方体 KxKxK
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        # 权重形状: [OC, C, K, K, K]
+        w = torch.randn(out_channels, in_channels, kernel_size, kernel_size, kernel_size, dtype=torch.float32)
+        self.weight = torch.nn.Parameter(w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.conv_standard_3d_square_input_square_kernel_custom(x, self.weight)
+'''

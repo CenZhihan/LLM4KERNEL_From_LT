@@ -1,0 +1,291 @@
+project_json_src='''
+[
+    {
+        "op": "Conv2dMinTanhTanhCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv2dMinTanhTanhCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, nVal);
+  TILING_DATA_FIELD_DEF(uint32_t, cVal);
+  TILING_DATA_FIELD_DEF(uint32_t, hwVal);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv2dMinTanhTanhCustom, Conv2dMinTanhTanhCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv2d_min_tanh_tanh_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (a + b - 1) / b;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 1;     // 为保证按样本边界处理，使用单核演示
+const uint32_t TILE_NUM = 8;      // 可根据UB容量与性能调优
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv2dMinTanhTanhCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    // 期望输入为[N, C, H, W]
+    uint32_t n = static_cast<uint32_t>(in_shape->GetDim(0));
+    uint32_t c = static_cast<uint32_t>(in_shape->GetDim(1));
+    uint32_t h = static_cast<uint32_t>(in_shape->GetDim(2));
+    uint32_t w = static_cast<uint32_t>(in_shape->GetDim(3));
+    uint32_t hw = h * w;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_nVal(n);
+    tiling.set_cVal(c);
+    tiling.set_hwVal(hw);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    // 输入为 [N, C, H, W]，输出为 [N, 1, H, W]
+    int64_t n = in_shape->GetDim(0);
+    int64_t h = in_shape->GetDim(2);
+    int64_t w = in_shape->GetDim(3);
+
+    std::vector<int64_t> out_dims = {n, 1, h, w};
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    out_shape->SetDimNum(4);
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        out_shape->SetDim(i, out_dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv2dMinTanhTanhCustom : public OpDef {
+public:
+    explicit Conv2dMinTanhTanhCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv2dMinTanhTanhCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv2d_min_tanh_tanh_custom_tiling_data.h"
+
+// 说明：实现对输入[N, C, H, W]在通道维度(C)做逐元素最小值归约，随后两次Tanh。
+// 计算流程：按样本N逐个处理；对每个样本，将HW平面切成tile；每个tile上遍历所有通道，使用元素级Min累积最小值；最后对最小值执行两次Tanh并写回。
+// 使用到的API依据参考文档：
+// - DataCopy：数据搬移
+// - Min（两操作数元素级最小）：表1-2 Two-Operand Instructions
+// - Tanh（高阶数学库）：表1-10 Math library APIs
+// - TPipe/TQue/Data structures：用于本地缓冲与队列管理
+// - GetBlockNum/GetBlockIdx：系统变量访问API
+
+constexpr int32_t BUFFER_NUM = 2; // 简单双缓冲示例
+
+class KernelConv2dMinTanhTanh {
+public:
+    __aicore__ inline KernelConv2dMinTanhTanh() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR z,
+                                uint32_t nVal, uint32_t cVal, uint32_t hwVal, uint32_t tileNum)
+    {
+        this->N = nVal;
+        this->C = cVal;
+        this->HW = hwVal;
+        this->tileNum = tileNum;
+
+        // 每个样本的HW平面按照 tileNum*BUFFER_NUM 等份上限切分
+        uint32_t loops = this->tileNum * BUFFER_NUM;
+        this->tileLen = (this->HW + loops - 1) / loops;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z*)z);
+
+        // 分配本地缓冲
+        pipe.InitBuffer(workQueue, BUFFER_NUM, this->tileLen * sizeof(DTYPE_X));   // 累积min的工作缓冲
+        pipe.InitBuffer(tmpQueue, 1, this->tileLen * sizeof(DTYPE_X));             // 临时通道切片
+        pipe.InitBuffer(outQueue, 1, this->tileLen * sizeof(DTYPE_Z));             // 输出tile缓冲
+    }
+
+    __aicore__ inline void Process()
+    {
+        uint32_t loops = this->tileNum * BUFFER_NUM;
+        for (uint32_t n = 0; n < this->N; ++n) {
+            for (uint32_t i = 0; i < loops; ++i) {
+                uint32_t basePos = i * this->tileLen;
+                if (basePos >= this->HW) {
+                    break;
+                }
+                uint32_t curLen = this->HW - basePos;
+                if (curLen > this->tileLen) curLen = this->tileLen;
+
+                // 读取第0个通道作为初始min
+                AscendC::LocalTensor<DTYPE_X> acc = workQueue.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(acc, xGm[(n * this->C + 0) * this->HW + basePos], curLen);
+
+                // 遍历其余通道，逐元素最小
+                for (uint32_t c = 1; c < this->C; ++c) {
+                    AscendC::LocalTensor<DTYPE_X> tmp = tmpQueue.AllocTensor<DTYPE_X>();
+                    AscendC::DataCopy(tmp, xGm[(n * this->C + c) * this->HW + basePos], curLen);
+
+                    AscendC::LocalTensor<DTYPE_X> accOut = workQueue.AllocTensor<DTYPE_X>();
+                    AscendC::Min(accOut, acc, tmp, curLen);
+
+                    workQueue.FreeTensor(acc);
+                    tmpQueue.FreeTensor(tmp);
+                    acc = accOut;
+                }
+
+                // 两次Tanh
+                AscendC::LocalTensor<DTYPE_Z> out = outQueue.AllocTensor<DTYPE_Z>();
+                AscendC::Tanh(out, acc, curLen);
+                AscendC::Tanh(out, out, curLen);
+
+                // 写回输出[N, 1, H, W]
+                AscendC::DataCopy(zGm[(n * 1 + 0) * this->HW + basePos], out, curLen);
+
+                outQueue.FreeTensor(out);
+                workQueue.FreeTensor(acc);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> workQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> tmpQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+
+    uint32_t N;
+    uint32_t C;
+    uint32_t HW;
+    uint32_t tileNum;
+    uint32_t tileLen;
+};
+
+extern "C" __global__ __aicore__ void conv2d_min_tanh_tanh_custom(GM_ADDR x, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv2dMinTanhTanh op;
+    op.Init(x, z, tiling_data.nVal, tiling_data.cVal, tiling_data.hwVal, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv2d_min_tanh_tanh_custom_impl_npu(const at::Tensor& self) {
+    // 输入为[N, C, H, W]，输出为[N, 1, H, W]
+    auto sizes = self.sizes();
+    at::Tensor result = at::empty({sizes[0], 1, sizes[2], sizes[3]}, self.options());
+    EXEC_NPU_CMD(aclnnConv2dMinTanhTanhCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv2d_min_tanh_tanh_custom", &conv2d_min_tanh_tanh_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv2d_min_tanh_tanh_custom", &conv2d_min_tanh_tanh_custom_impl_npu, "min over C + tanh + tanh");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    使用自定义AscendC算子，将通道最小值与两次Tanh融合加速（Conv2d保持原生实现）。
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)                                 # [N, C, H, W]
+        x = custom_ops_lib.conv2d_min_tanh_tanh_custom(x)  # [N, 1, H, W]
+        return x
+'''

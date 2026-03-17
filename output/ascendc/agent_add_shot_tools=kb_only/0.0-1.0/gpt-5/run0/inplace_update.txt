@@ -1,0 +1,358 @@
+project_json_src='''
+[
+    {
+        "op": "InplaceUpdateCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "idx",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            },
+            {
+                "name": "value",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(InplaceUpdateCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);   // x.numel()
+  TILING_DATA_FIELD_DEF(uint32_t, cols);          // x.shape[1]
+  TILING_DATA_FIELD_DEF(uint32_t, idxLength);     // idx.numel()
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);       // generic tiling factor
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(InplaceUpdateCustom, InplaceUpdateCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "inplace_update_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    InplaceUpdateCustomTilingData tiling;
+    // x: input 0
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    // cols from dim1 of x
+    uint32_t cols = 1;
+    if (context->GetInputShape(0)->GetOriginShape().GetDimNum() >= 2) {
+        cols = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetDim(1));
+    } else {
+        cols = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+    }
+    // idx length from input 1
+    uint32_t idxLength = context->GetInputShape(1)->GetOriginShape().GetShapeSize();
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_cols(cols);
+    tiling.set_idxLength(idxLength);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // y dtype follows x
+    const auto input0Type = context->GetInputDataType(0);
+    context->SetOutputDataType(0, input0Type);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class InplaceUpdateCustom : public OpDef {
+public:
+    explicit InplaceUpdateCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("idx")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("value")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(InplaceUpdateCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "inplace_update_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2; // pipeline buffers for copy stage
+constexpr int32_t IDX_BUFFER_NUM = 1; // buffers for idx tiles
+
+// Helper to get scalar from LocalTensor (index buffer)
+template<typename T>
+__aicore__ inline T LocalGet(const AscendC::LocalTensor<T>& t, int32_t i) {
+    // Assume SDK provides element access; fall back to pointer-style access if available
+    return t.GetValue(i);
+}
+
+class KernelInplaceUpdate {
+public:
+    __aicore__ inline KernelInplaceUpdate() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR idx, GM_ADDR value, GM_ADDR y,
+                                uint32_t totalLength, uint32_t cols, uint32_t idxLength, uint32_t tileNum)
+    {
+        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
+        this->cols = cols;
+        this->tileNum = tileNum;
+
+        // Partition data across blocks
+        this->blockLength = totalLength / AscendC::GetBlockNum();          // elements of x/y this core handles
+        this->blockIdxLen = idxLength / AscendC::GetBlockNum();            // number of rows (indices) this core handles
+
+        // Copy X and Y buffers setup (block range)
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        // IDX and VALUE buffers setup (block range)
+        idxGm.SetGlobalBuffer((__gm__ int32_t*)idx + this->blockIdxLen * AscendC::GetBlockIdx(), this->blockIdxLen);
+        // value is [idxLength, cols]
+        valueGm.SetGlobalBuffer((__gm__ DTYPE_Y*)value + (uint64_t)this->blockIdxLen * this->cols * AscendC::GetBlockIdx(),
+                                (uint64_t)this->blockIdxLen * this->cols);
+
+        // Tile length for copying x->y
+        ASSERT(tileNum != 0 && "tile num can not be zero!");
+        this->tileLengthCopy = this->blockLength / tileNum / BUFFER_NUM;
+        if (this->tileLengthCopy == 0) { this->tileLengthCopy = this->blockLength; }
+
+        // Tile size for idx processing (number of rows per tile)
+        this->idxTile = this->blockIdxLen / tileNum;
+        if (this->idxTile == 0) { this->idxTile = (this->blockIdxLen == 0) ? 0 : this->blockIdxLen; }
+
+        // Queues for copy stage
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLengthCopy * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLengthCopy * sizeof(DTYPE_Z));
+
+        // Queue for idx tiles
+        if (this->idxTile > 0) {
+            pipe.InitBuffer(inQueueIdx, IDX_BUFFER_NUM, this->idxTile * sizeof(int32_t));
+        }
+        // Queue for one row of value
+        pipe.InitBuffer(inQueueValRow, 1, this->cols * sizeof(DTYPE_Y));
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyXtoY();
+        UpdateRows();
+    }
+
+private:
+    __aicore__ inline void CopyXtoY()
+    {
+        if (this->blockLength == 0) return;
+        int32_t loopCount = (int32_t)this->tileNum * BUFFER_NUM;
+        uint32_t proceeded = 0;
+        for (int32_t i = 0; i < loopCount && proceeded < this->blockLength; i++) {
+            uint32_t curr = AscendC::min((uint32_t)this->tileLengthCopy, this->blockLength - proceeded);
+            AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+            AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
+            AscendC::DataCopy(xLocal, xGm[proceeded], curr);
+            inQueueX.EnQue(xLocal);
+
+            AscendC::LocalTensor<DTYPE_X> xLocalC = inQueueX.DeQue<DTYPE_X>();
+            AscendC::DataCopy(yLocal, xLocalC, curr);
+            outQueueY.EnQue<DTYPE_Z>(yLocal);
+            inQueueX.FreeTensor(xLocalC);
+
+            AscendC::LocalTensor<DTYPE_Z> yLocalC = outQueueY.DeQue<DTYPE_Z>();
+            AscendC::DataCopy(yGm[proceeded], yLocalC, curr);
+            outQueueY.FreeTensor(yLocalC);
+
+            proceeded += curr;
+        }
+    }
+
+    __aicore__ inline void UpdateRows()
+    {
+        if (this->blockIdxLen == 0) return;
+
+        uint32_t processedRows = 0;
+        while (processedRows < this->blockIdxLen) {
+            uint32_t currTileRows = AscendC::min(this->idxTile, this->blockIdxLen - processedRows);
+
+            // Load a tile of indices
+            AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.AllocTensor<int32_t>();
+            AscendC::DataCopy(idxLocal, idxGm[processedRows], currTileRows);
+            inQueueIdx.EnQue(idxLocal);
+
+            AscendC::LocalTensor<int32_t> idxTileLocal = inQueueIdx.DeQue<int32_t>();
+
+            // For each row in the tile: copy value row then scatter-overwrite to y
+            for (uint32_t r = 0; r < currTileRows; ++r) {
+                // Read destination row index
+                int32_t rowIdx = LocalGet<int32_t>(idxTileLocal, (int32_t)r);
+                uint64_t yOffset = (uint64_t)rowIdx * this->cols;
+
+                // Load value row (from value tile) and write to y at yOffset
+                AscendC::LocalTensor<DTYPE_Y> valRowLocal = inQueueValRow.AllocTensor<DTYPE_Y>();
+                AscendC::DataCopy(valRowLocal, valueGm[((uint64_t)processedRows + r) * this->cols], this->cols);
+                AscendC::DataCopy(yGm[yOffset], valRowLocal, this->cols);
+                inQueueValRow.FreeTensor(valRowLocal);
+            }
+
+            inQueueIdx.FreeTensor(idxTileLocal);
+            processedRows += currTileRows;
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+
+    // Queues for copy x -> y
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    // Queues for idx and value-row
+    AscendC::TQue<AscendC::QuePosition::VECIN, IDX_BUFFER_NUM> inQueueIdx;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueValRow;
+
+    // GM tensors
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<int32_t> idxGm;
+    AscendC::GlobalTensor<DTYPE_Y> valueGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    // tiling/runtime params
+    uint32_t blockLength;    // elements in x/y for this block
+    uint32_t tileNum;
+    uint32_t tileLengthCopy; // copy tile length (elements)
+    uint32_t cols;           // number of columns per row
+    uint32_t blockIdxLen;    // number of indices for this block
+    uint32_t idxTile;        // rows per idx tile
+};
+
+extern "C" __global__ __aicore__ void inplace_update_custom(GM_ADDR x, GM_ADDR idx, GM_ADDR value,
+                                                            GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelInplaceUpdate op;
+    op.Init(x, idx, value, y, tiling_data.totalLength, tiling_data.cols, tiling_data.idxLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor inplace_update_custom_impl_npu(const at::Tensor& x, const at::Tensor& idx, const at::Tensor& value) {
+    // Output buffer
+    at::Tensor y = at::empty_like(x);
+    // Ensure idx is int32
+    at::Tensor idx32 = idx.scalar_type() == at::kInt ? idx : idx.to(at::kInt);
+    EXEC_NPU_CMD(aclnnInplaceUpdateCustom, x, idx32, value, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("inplace_update_custom", &inplace_update_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("inplace_update_custom", &inplace_update_custom_impl_npu, "inplace row update: x[idx] = value");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, idx, value):
+        # Cast idx to int32 for kernel
+        if idx.dtype != torch.int32:
+            idx = idx.to(torch.int32)
+        return custom_ops_lib.inplace_update_custom(x, idx, value)
+'''

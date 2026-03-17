@@ -1,0 +1,288 @@
+project_json_src='''
+[
+    {
+        "op": "HuberLossCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "pred",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "target",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "loss",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(HuberLossCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(HuberLossCustom, HuberLossCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "huber_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    HuberLossCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape; // 输出与输入同形状（逐元素损失）
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class HuberLossCustom : public OpDef {
+public:
+    explicit HuberLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("pred")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("target")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("loss")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(HuberLossCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "huber_loss_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+class KernelHuberLoss {
+public:
+    __aicore__ inline KernelHuberLoss() {}
+    __aicore__ inline void Init(GM_ADDR pred, GM_ADDR target, GM_ADDR loss, uint32_t totalLength, uint32_t tileNum)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        predGm.SetGlobalBuffer((__gm__ float *)pred + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        targetGm.SetGlobalBuffer((__gm__ float *)target + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        lossGm.SetGlobalBuffer((__gm__ float *)loss + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueuePred, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueTarget, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueLoss, BUFFER_NUM, this->tileLength * sizeof(float));
+
+        // two temporary local buffers for intermediate results
+        pipe.InitBuffer(tmpQueueA, BUFFER_NUM, this->tileLength * sizeof(uint8_t)); // used as float buffer
+        pipe.InitBuffer(tmpQueueB, BUFFER_NUM, this->tileLength * sizeof(uint8_t)); // used as float buffer
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<float> predLocal = inQueuePred.AllocTensor<float>();
+        AscendC::LocalTensor<float> targetLocal = inQueueTarget.AllocTensor<float>();
+        AscendC::DataCopy(predLocal, predGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(targetLocal, targetGm[progress * this->tileLength], this->tileLength);
+        inQueuePred.EnQue(predLocal);
+        inQueueTarget.EnQue(targetLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t progress)
+    {
+        AscendC::LocalTensor<float> predLocal = inQueuePred.DeQue<float>();
+        AscendC::LocalTensor<float> targetLocal = inQueueTarget.DeQue<float>();
+        AscendC::LocalTensor<float> lossLocal = outQueueLoss.AllocTensor<float>();
+
+        AscendC::LocalTensor<uint8_t> tmpALocalU8 = tmpQueueA.AllocTensor<uint8_t>();
+        AscendC::LocalTensor<uint8_t> tmpBLocalU8 = tmpQueueB.AllocTensor<uint8_t>();
+        AscendC::LocalTensor<float> tmpALocal = tmpALocalU8.ReinterpretCast<float>();
+        AscendC::LocalTensor<float> tmpBLocal = tmpBLocalU8.ReinterpretCast<float>();
+
+        // diff = pred - target => store in lossLocal
+        AscendC::Sub(lossLocal, predLocal, targetLocal, this->tileLength);
+
+        // absd = Abs(diff) => in place in lossLocal
+        AscendC::Abs(lossLocal, lossLocal, this->tileLength);
+
+        // tmpBLocal = 1.0 (broadcast)
+        float one = 1.0f;
+        AscendC::Duplicate(tmpBLocal, one, this->tileLength);
+
+        // tmpALocal = min(absd, 1.0) => t
+        AscendC::Minimum(tmpALocal, lossLocal, tmpBLocal, this->tileLength);
+
+        // term2: lossLocal = absd - t
+        AscendC::Sub(lossLocal, lossLocal, tmpALocal, this->tileLength);
+
+        // term1: tmpBLocal = 0.5 * t * t
+        AscendC::Mul(tmpBLocal, tmpALocal, tmpALocal, this->tileLength);
+        AscendC::Muls(tmpBLocal, tmpBLocal, 0.5f, this->tileLength);
+
+        // lossLocal = term1 + term2
+        AscendC::Add(lossLocal, lossLocal, tmpBLocal, this->tileLength);
+
+        outQueueLoss.EnQue<float>(lossLocal);
+
+        tmpQueueA.FreeTensor(tmpALocalU8);
+        tmpQueueB.FreeTensor(tmpBLocalU8);
+        inQueuePred.FreeTensor(predLocal);
+        inQueueTarget.FreeTensor(targetLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<float> lossLocal = outQueueLoss.DeQue<float>();
+        AscendC::DataCopy(lossGm[progress * this->tileLength], lossLocal, this->tileLength);
+        outQueueLoss.FreeTensor(lossLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueuePred, inQueueTarget;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueueA, tmpQueueB;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueLoss;
+
+    AscendC::GlobalTensor<float> predGm;
+    AscendC::GlobalTensor<float> targetGm;
+    AscendC::GlobalTensor<float> lossGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void huber_loss_custom(GM_ADDR pred, GM_ADDR target, GM_ADDR loss, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelHuberLoss op;
+    op.Init(pred, target, loss, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor huber_loss_custom_impl_npu(const at::Tensor& pred, const at::Tensor& target) {
+    at::Tensor result = at::empty_like(pred);
+    EXEC_NPU_CMD(aclnnHuberLossCustom, pred, target, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("huber_loss_custom", &huber_loss_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("huber_loss_custom", &huber_loss_custom_impl_npu, "Smooth L1 (Huber) loss (elementwise)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, predictions, targets):
+        # 自定义算子返回逐元素Huber损失，这里与原始语义一致取mean
+        return custom_ops_lib.huber_loss_custom(predictions, targets).mean()
+'''
