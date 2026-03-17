@@ -26,8 +26,7 @@ project_json_src='''
                     "float"
                 ]
             }
-        ],
-        "attr": []
+        ]
     }
 ]
 '''
@@ -43,7 +42,7 @@ TILING_DATA_FIELD_DEF(uint32_t, tileLength);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(SoftsignCustom, SoftsignCustomTilingData)
-} // namespace optiling
+}
 """
 
 host_operator_src="""
@@ -114,7 +113,7 @@ public:
     }
 };
 OP_ADD(SoftsignCustom);
-} // namespace ops
+}
 """
 
 kernel_src="""
@@ -122,7 +121,7 @@ kernel_src="""
 #define __NPU_TILING__
 #include "softsign_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
 class KernelSoftsign {
 public:
@@ -148,8 +147,8 @@ public:
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float)); // abs(x)
-        pipe.InitBuffer(tmpBuffer2, this->tileLength * sizeof(float)); // 1 + abs(x)
+        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float)); // abs(x) / denom
+        pipe.InitBuffer(tmpBuffer2, this->tileLength * sizeof(float)); // recip
     }
 
     __aicore__ inline void Process()
@@ -179,12 +178,14 @@ private:
     {
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-        AscendC::LocalTensor<float> tmpAbs = tmpBuffer1.Get<float>();
-        AscendC::LocalTensor<float> tmpDen = tmpBuffer2.Get<float>();
+        AscendC::LocalTensor<float> tmp1 = tmpBuffer1.Get<float>();
+        AscendC::LocalTensor<float> tmp2 = tmpBuffer2.Get<float>();
 
-        AscendC::Abs(tmpAbs, xLocal, length);                  // |x|
-        AscendC::Adds(tmpDen, tmpAbs, 1.0f, length);           // 1 + |x|
-        AscendC::Div(yLocal, xLocal, tmpDen, length);          // x / (1 + |x|)
+        // Softsign: y = x / (1 + |x|) = x * (1 / (1 + |x|))
+        AscendC::Abs(tmp1, xLocal, length);                 // tmp1 = |x|
+        AscendC::Adds(tmp1, tmp1, 1.0f, length);            // tmp1 = 1 + |x|
+        AscendC::Reciprocal(tmp2, tmp1, length);            // tmp2 = 1 / (1 + |x|)
+        AscendC::Mul(yLocal, xLocal, tmp2, length);         // y = x * tmp2
 
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
@@ -209,8 +210,7 @@ private:
     uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void softsign_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void softsign_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelSoftsign op;
     op.Init(x, y, tiling_data.blockLength, tiling_data.lastBlockLength, tiling_data.tileLength);

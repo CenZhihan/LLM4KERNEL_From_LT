@@ -74,6 +74,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
+
     return ge::GRAPH_SUCCESS;
 }
 } // namespace optiling
@@ -123,13 +124,12 @@ kernel_src="""
 #define __NPU_TILING__
 #include "relu_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
 class KernelRelu {
 public:
     __aicore__ inline KernelRelu() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t blockLength, uint32_t lastBlockLength, uint32_t tileLength)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t blockLength, uint32_t lastBlockLength, uint32_t tileLength)
     {
         this->tileLength = tileLength;
 
@@ -144,18 +144,16 @@ public:
         this->tailLength = this->blockLength % this->tileLength;
 
         uint32_t offset = blockLength * AscendC::GetBlockIdx();
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x) + offset, this->blockLength);
-        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(y) + offset, this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ float *)x + offset, this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y + offset, this->blockLength);
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
     }
-
     __aicore__ inline void Process()
     {
         if (this->blockLength == 0) return;
-
-        for (int32_t i = 0; i < static_cast<int32_t>(this->tileNum); ++i) {
+        for (int32_t i = 0; i < this->tileNum; i++) {
             CopyIn(i, this->tileLength);
             Compute(i, this->tileLength);
             CopyOut(i, this->tileLength);
@@ -174,18 +172,16 @@ private:
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], length);
         inQueueX.EnQue(xLocal);
     }
-
     __aicore__ inline void Compute(int32_t /*progress*/, uint32_t length)
     {
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
 
-        AscendC::Relu(yLocal, xLocal, static_cast<int32_t>(length));
+        AscendC::Maxs(yLocal, xLocal, 0.0f, length);
 
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
     }
-
     __aicore__ inline void CopyOut(int32_t progress, uint32_t length)
     {
         AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
@@ -198,14 +194,13 @@ private:
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::GlobalTensor<float> xGm, yGm;
-    uint32_t blockLength = 0;
-    uint32_t tileNum = 0;
-    uint32_t tailLength = 0;
-    uint32_t tileLength = 0;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tailLength;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelRelu op;
     op.Init(x, y, tiling_data.blockLength, tiling_data.lastBlockLength, tiling_data.tileLength);

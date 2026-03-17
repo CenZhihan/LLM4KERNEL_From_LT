@@ -70,7 +70,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     const gert::RuntimeAttrs *attrs = context->GetAttrs();
     const float *beta = attrs->GetAttrPointer<float>(0);
 
-    uint32_t blockLength = (totalLength / BLOCK_DIM);
+    uint32_t blockLength = totalLength / BLOCK_DIM;
     blockLength = (blockLength / ALIGN_NUM) * ALIGN_NUM;
     uint32_t lastBlockLength = totalLength - blockLength * (BLOCK_DIM - 1);
 
@@ -82,8 +82,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+    currentWorkspace[0] = 0; // Swish高阶API无需额外工作空间
     return ge::GRAPH_SUCCESS;
 }
 } // namespace optiling
@@ -119,7 +120,7 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Attr("beta").AttrType(OPTIONAL).Float(1.0);
+        this->Attr("beta").AttrType(OPTIONAL).Float(1.0f);
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
@@ -134,12 +135,14 @@ kernel_src="""
 #define __NPU_TILING__
 #include "swish_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t BUFFER_NUM = 2; // VECIN/VECOUT队列的张量数量
 
 class KernelSwish {
 public:
     __aicore__ inline KernelSwish() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t blockLength, uint32_t lastBlockLength, uint32_t tileLength, float beta)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t blockLength, uint32_t lastBlockLength,
+                                uint32_t tileLength, float beta)
     {
         this->beta = static_cast<float>(beta);
         this->tileLength = tileLength;
@@ -149,6 +152,7 @@ public:
         } else {
             this->blockLength = blockLength;
         }
+
         if (this->blockLength == 0) return;
 
         this->tileNum = this->blockLength / this->tileLength;
@@ -165,14 +169,15 @@ public:
     __aicore__ inline void Process()
     {
         if (this->blockLength == 0) return;
+
         for (int32_t i = 0; i < this->tileNum; i++) {
             CopyIn(i, this->tileLength);
-            Compute(this->tileLength);
+            Compute(i, this->tileLength);
             CopyOut(i, this->tileLength);
         }
         if (this->tailLength > 0) {
             CopyIn(this->tileNum, this->tailLength);
-            Compute(this->tailLength);
+            Compute(this->tileNum, this->tailLength);
             CopyOut(this->tileNum, this->tailLength);
         }
     }
@@ -185,11 +190,12 @@ private:
         inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(uint32_t length)
+    __aicore__ inline void Compute(int32_t /*progress*/, uint32_t length)
     {
-        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
-        AscendC::Swish(yLocal, xLocal, length, this->beta);
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        // 使用高阶API Swish(dst, src, length, beta)
+        Swish(yLocal, xLocal, length, this->beta);
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
     }
@@ -206,17 +212,19 @@ private:
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::GlobalTensor<float> xGm, yGm;
-    uint32_t blockLength;
-    uint32_t tileNum;
-    uint32_t tailLength;
-    uint32_t tileLength;
-    float beta;
+    uint32_t blockLength = 0;
+    uint32_t tileNum = 0;
+    uint32_t tailLength = 0;
+    uint32_t tileLength = 0;
+    float beta = 1.0f;
 };
 
 extern "C" __global__ __aicore__ void swish_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelSwish op;
-    op.Init(x, y, tiling_data.blockLength, tiling_data.lastBlockLength, tiling_data.tileLength, tiling_data.beta);
+    op.Init(x, y,
+            tiling_data.blockLength, tiling_data.lastBlockLength,
+            tiling_data.tileLength, tiling_data.beta);
     op.Process();
 }
 """
@@ -248,6 +256,9 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
+    """
+    Optimized model using custom AscendC Swish kernel.
+    """
     def __init__(self, beta: float = 1.0):
         super(ModelNew, self).__init__()
         self.beta = beta

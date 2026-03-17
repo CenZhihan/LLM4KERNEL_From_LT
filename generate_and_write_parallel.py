@@ -62,11 +62,11 @@ def _generate_one_agent(
         )
         with open(out_path, "w") as f:
             f.write(result.raw_answer)
-        tool_usage = getattr(result, "tool_usage", None)
-        if tool_usage:
-            tools_path = os.path.join(out_dir, f"{op}.tools.json")
-            with open(tools_path, "w", encoding="utf-8") as f:
-                json.dump(tool_usage, f, indent=2, ensure_ascii=False)
+        report = getattr(result, "report", None)
+        if report:
+            report_path = os.path.join(out_dir, f"{op}_report.json")
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
         print(f"[INFO][Agent] Done op {op}")
         return op, None
     except Exception as e:

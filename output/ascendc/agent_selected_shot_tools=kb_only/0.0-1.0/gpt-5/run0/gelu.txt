@@ -49,7 +49,6 @@ REGISTER_TILING_DATA_CLASS(GeluCustom, GeluCustomTilingData)
 host_operator_src="""
 #include "gelu_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 48;
@@ -59,12 +58,10 @@ const uint32_t MAX_TILE_LENGTH = 8192;
 static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
     GeluCustomTilingData tiling;
-
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
 
-    // Split data across blocks
-    uint32_t blockLength = (totalLength / BLOCK_DIM);
-    blockLength = (blockLength / ALIGN_NUM) * ALIGN_NUM; // align to 8 elements for efficient datamove
+    uint32_t blockLength = totalLength / BLOCK_DIM;
+    blockLength = (blockLength / ALIGN_NUM) * ALIGN_NUM;
     uint32_t lastBlockLength = totalLength - blockLength * (BLOCK_DIM - 1);
 
     context->SetBlockDim(BLOCK_DIM);
@@ -76,8 +73,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0; // no extra workspace needed when using AscendC::Gelu without shared buffer
-
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 } // namespace optiling
@@ -90,7 +86,6 @@ static ge::graphStatus InferShape(gert::InferShapeContext *context)
     *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const ge::DataType x_dtype = context->GetInputDataType(0);
@@ -114,7 +109,6 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
@@ -129,7 +123,7 @@ kernel_src="""
 #define __NPU_TILING__
 #include "gelu_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+constexpr int32_t BUFFER_NUM = 2;
 
 class KernelGelu {
 public:
@@ -144,6 +138,7 @@ public:
         } else {
             this->blockLength = blockLength;
         }
+
         if (this->blockLength == 0) return;
 
         this->tileNum = this->blockLength / this->tileLength;
@@ -160,40 +155,38 @@ public:
     __aicore__ inline void Process()
     {
         if (this->blockLength == 0) return;
-
-        for (int32_t i = 0; i < this->tileNum; i++) {
+        for (uint32_t i = 0; i < this->tileNum; i++) {
             CopyIn(i, this->tileLength);
-            Compute(i, this->tileLength);
+            Compute(this->tileLength);
             CopyOut(i, this->tileLength);
         }
         if (this->tailLength > 0) {
             CopyIn(this->tileNum, this->tailLength);
-            Compute(this->tileNum, this->tailLength);
+            Compute(this->tailLength);
             CopyOut(this->tileNum, this->tailLength);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress, uint32_t length)
+    __aicore__ inline void CopyIn(uint32_t progress, uint32_t length)
     {
         AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], length);
         inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/, uint32_t length)
+    __aicore__ inline void Compute(uint32_t length)
     {
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
 
-        // Use AscendC GELU high-level API
         AscendC::Gelu(yLocal, xLocal, length);
 
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
     }
 
-    __aicore__ inline void CopyOut(int32_t progress, uint32_t length)
+    __aicore__ inline void CopyOut(uint32_t progress, uint32_t length)
     {
         AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
         AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, length);

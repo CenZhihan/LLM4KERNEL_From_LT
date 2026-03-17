@@ -129,8 +129,11 @@ public:
     __aicore__ inline KernelHardsigmoid() {}
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t blockLength, uint32_t lastBlockLength, uint32_t tileLength)
     {
+        this->alpha = 1.0f / 6.0f; // slope
+        this->beta = 0.5f;         // bias
         this->tileLength = tileLength;
 
+        // Determine the length for this block
         if (AscendC::GetBlockIdx() == AscendC::GetBlockNum() - 1) {
             this->blockLength = lastBlockLength;
         } else {
@@ -148,9 +151,8 @@ public:
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float)); // for linear transform
     }
-
     __aicore__ inline void Process()
     {
         if (this->blockLength == 0) return;
@@ -173,28 +175,24 @@ private:
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], length);
         inQueueX.EnQue(xLocal);
     }
-
-    __aicore__ inline void Compute(int32_t progress, uint32_t length)
+    __aicore__ inline void Compute(int32_t /*progress*/, uint32_t length)
     {
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-        AscendC::LocalTensor<float> tmp1 = tmpBuffer1.Get<float>();
+        AscendC::LocalTensor<float> t1 = tmpBuffer1.Get<float>();
 
-        // y = clamp(x * (1/6) + 0.5, 0, 1)
-        const float alpha = 1.0f / 6.0f;
-        const float beta = 0.5f;
-        const float zero = 0.0f;
-        const float one = 1.0f;
-
-        AscendC::Muls(tmp1, xLocal, alpha, length);     // tmp1 = x * alpha
-        AscendC::Adds(tmp1, tmp1, beta, length);        // tmp1 = tmp1 + beta
-        AscendC::Maxs(yLocal, tmp1, zero, length);      // yLocal = max(tmp1, 0)
-        AscendC::Mins(yLocal, yLocal, one, length);     // yLocal = min(yLocal, 1)
+        // t1 = alpha * x
+        AscendC::Muls(t1, xLocal, this->alpha, length);
+        // t1 = t1 + beta
+        AscendC::Adds(t1, t1, this->beta, length);
+        // t1 = min(t1, 1.0)
+        AscendC::Mins(t1, t1, 1.0f, length);
+        // y = max(t1, 0.0)
+        AscendC::Maxs(yLocal, t1, 0.0f, length);
 
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
     }
-
     __aicore__ inline void CopyOut(int32_t progress, uint32_t length)
     {
         AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
@@ -212,6 +210,8 @@ private:
     uint32_t tileNum;
     uint32_t tailLength;
     uint32_t tileLength;
+    float alpha;
+    float beta;
 };
 
 extern "C" __global__ __aicore__ void hardsigmoid_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {

@@ -21,6 +21,7 @@ class AgentResult:
     raw_answer: str
     reasoning: Optional[str] = None
     tool_usage: Optional[List[Dict[str, Any]]] = None
+    report: Optional[Dict[str, Any]] = None
 
 
 def _build_prompt(language: str, strategy_name: str, op: str) -> str:
@@ -37,11 +38,12 @@ def generate_kernel_with_agent(
     tool_mode: AgentToolMode,
 ) -> AgentResult:
     prompt = _build_prompt(task.language, task.strategy_name, task.op)
-    # 启用知识库时，在任务描述前鼓励先查知识库再作答，避免模型过于自信直接回答
+    # 启用知识库时，在任务描述前提示可以利用 AscendC API 文档，降低编造 API 的概率
     if tool_mode in (AgentToolMode.KB_ONLY, AgentToolMode.KB_AND_WEB):
         prompt = (
-            "【说明】请先使用知识库检索与本题相关的文档、API 说明或示例，再基于检索结果作答；"
-            "不要仅凭已有知识直接写代码。\n\n"
+            "[Note] You have access to a knowledge base that contains Huawei Ascend C API documentation. "
+            "This documentation is highly reliable; following it when writing kernels can greatly reduce the chance of inventing non-existent APIs. "
+            "You are strongly encouraged to consult the knowledge base before answering, but it is not strictly required.\n\n"
             + prompt
         )
 
@@ -60,7 +62,26 @@ def generate_kernel_with_agent(
         last = messages[-1]
         raw_answer = getattr(last, "content", "") or ""
 
-    tool_calls = final_state.get("tool_calls_log", [])
-    tool_usage = tool_calls if tool_calls else None
-    return AgentResult(op=task.op, raw_answer=raw_answer, tool_usage=tool_usage)
+    reasoning = (final_state.get("reasoning_content") or "").strip() or None
+    tool_calls = final_state.get("tool_calls_log", []) or []
+    report = {
+        "reasoning_content": reasoning,
+        "answer": raw_answer,
+        "tool_calls": [
+            {
+                "round": t.get("round"),
+                "tool": t.get("tool", ""),
+                "query": t.get("query", ""),
+                "response": t.get("response", ""),
+            }
+            for t in tool_calls
+        ],
+    }
+    return AgentResult(
+        op=task.op,
+        raw_answer=raw_answer,
+        reasoning=reasoning,
+        tool_usage=tool_calls if tool_calls else None,
+        report=report,
+    )
 

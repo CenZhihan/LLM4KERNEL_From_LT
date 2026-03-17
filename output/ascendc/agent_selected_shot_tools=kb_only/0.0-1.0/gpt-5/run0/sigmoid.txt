@@ -49,7 +49,6 @@ REGISTER_TILING_DATA_CLASS(SigmoidCustom, SigmoidCustomTilingData)
 host_operator_src="""
 #include "sigmoid_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 48;
@@ -61,24 +60,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     SigmoidCustomTilingData tiling;
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
 
-    uint32_t blockLength = 0;
-    if (BLOCK_DIM > 1) {
-        blockLength = totalLength / BLOCK_DIM;
-        blockLength = (blockLength / ALIGN_NUM) * ALIGN_NUM; // align to 8 elements
-    }
-    uint32_t lastBlockLength = 0;
-    if (BLOCK_DIM > 1) {
-        uint64_t usedByFirstBlocks = static_cast<uint64_t>(blockLength) * (BLOCK_DIM - 1);
-        if (usedByFirstBlocks >= totalLength) {
-            // Extremely small tensors, fall back to last block handling
-            blockLength = 0;
-            lastBlockLength = totalLength;
-        } else {
-            lastBlockLength = totalLength - static_cast<uint32_t>(usedByFirstBlocks);
-        }
-    } else {
-        lastBlockLength = totalLength;
-    }
+    uint32_t blockLength = totalLength / BLOCK_DIM;
+    blockLength = (blockLength / ALIGN_NUM) * ALIGN_NUM;
+    uint32_t lastBlockLength = totalLength - blockLength * (BLOCK_DIM - 1);
 
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_blockLength(blockLength);
@@ -96,15 +80,15 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext *context)
 {
-    const gert::Shape *x1_shape = context->GetInputShape(0);
+    const gert::Shape *x_shape = context->GetInputShape(0);
     gert::Shape *y_shape = context->GetOutputShape(0);
-    *y_shape = *x1_shape;
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const ge::DataType x1_dtype = context->GetInputDataType(0);
-    context->SetOutputDataType(0, x1_dtype);
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
     return GRAPH_SUCCESS;
 }
 } // namespace ge
@@ -138,13 +122,12 @@ kernel_src="""
 #define __NPU_TILING__
 #include "sigmoid_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+constexpr int32_t BUFFER_NUM = 2;
 
 class KernelSigmoid {
 public:
     __aicore__ inline KernelSigmoid() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t blockLength, uint32_t lastBlockLength, uint32_t tileLength)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t blockLength, uint32_t lastBlockLength, uint32_t tileLength)
     {
         this->tileLength = tileLength;
 
@@ -153,26 +136,28 @@ public:
         } else {
             this->blockLength = blockLength;
         }
-
-        if (this->blockLength == 0) return;
+        if (this->blockLength == 0) {
+            return;
+        }
 
         this->tileNum = this->blockLength / this->tileLength;
         this->tailLength = this->blockLength % this->tileLength;
 
         uint32_t offset = blockLength * AscendC::GetBlockIdx();
-        xGm.SetGlobalBuffer((__gm__ float *)x + offset, this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ float *)y + offset, this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ float*)x + offset, this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float*)y + offset, this->blockLength);
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float)); // for -x and e^{-x}
-        pipe.InitBuffer(tmpBuffer2, this->tileLength * sizeof(float)); // for 1 + e^{-x}
+        pipe.InitBuffer(tmpBuf1, this->tileLength * sizeof(float));  // for -x and exp(-x)
+        pipe.InitBuffer(tmpBuf2, this->tileLength * sizeof(float));  // for 1 + exp(-x)
     }
 
     __aicore__ inline void Process()
     {
         if (this->blockLength == 0) return;
-        for (int32_t i = 0; i < this->tileNum; i++) {
+
+        for (int32_t i = 0; i < this->tileNum; ++i) {
             CopyIn(i, this->tileLength);
             Compute(i, this->tileLength);
             CopyOut(i, this->tileLength);
@@ -192,21 +177,21 @@ private:
         inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/, uint32_t length)
+    __aicore__ inline void Compute(int32_t progress, uint32_t length)
     {
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-        AscendC::LocalTensor<float> tmp1 = tmpBuffer1.Get<float>();
-        AscendC::LocalTensor<float> tmp2 = tmpBuffer2.Get<float>();
+        AscendC::LocalTensor<float> t1 = tmpBuf1.Get<float>();
+        AscendC::LocalTensor<float> t2 = tmpBuf2.Get<float>();
 
-        // tmp1 = -x
-        AscendC::Muls(tmp1, xLocal, -1.0f, length);
-        // tmp1 = exp(-x)
-        AscendC::Exp(tmp1, tmp1, length);
-        // tmp2 = tmp1 + 1.0 => 1 + e^{-x}
-        AscendC::Adds(tmp2, tmp1, 1.0f, length);
-        // y = 1 / (1 + e^{-x})
-        AscendC::Reciprocal(yLocal, tmp2, length);
+        // t1 = -x
+        AscendC::Muls(t1, xLocal, -1.0f, length);
+        // t1 = exp(-x)  (use high-level Exp, polynomial degree 15, not reusing source)
+        AscendC::Exp<float, 15, false>(t1, t1, length);
+        // t2 = 1 + exp(-x)
+        AscendC::Adds(t2, t1, 1.0f, length);
+        // y = 1 / (1 + exp(-x)) = Reciprocal(t2)
+        AscendC::Reciprocal(yLocal, t2, length);
 
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
@@ -221,7 +206,7 @@ private:
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuf1, tmpBuf2;
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::GlobalTensor<float> xGm, yGm;
@@ -231,7 +216,8 @@ private:
     uint32_t tileLength = 0;
 };
 
-extern "C" __global__ __aicore__ void sigmoid_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+extern "C" __global__ __aicore__ void sigmoid_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
     GET_TILING_DATA(tiling_data, tiling);
     KernelSigmoid op;
     op.Init(x, y, tiling_data.blockLength, tiling_data.lastBlockLength, tiling_data.tileLength);

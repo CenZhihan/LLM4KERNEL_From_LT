@@ -1,11 +1,11 @@
-from typing import Any, Dict, List, Annotated
+from typing import Any, Dict, List, Annotated, Tuple
 
 from typing_extensions import NotRequired
 
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph
 from langgraph.graph import MessagesState
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
+from openai import OpenAI
 
 from .agent_config import AgentToolMode, get_llm_config_from_env
 
@@ -45,25 +45,67 @@ class AgentKernelState(MessagesState):
     query_round_count: NotRequired[int]
     next_action: NotRequired[str]
     current_query: NotRequired[str]
+    reasoning_content: NotRequired[str]
 
 
-def _build_llm():
-    cfg = get_llm_config_from_env()
-    return ChatOpenAI(
-        model=cfg["model"],
-        api_key=cfg["api_key"],
-        base_url=cfg["base_url"],
+def _openai_completion(
+    client: OpenAI,
+    model: str,
+    messages: List[Dict[str, str]],
+    stream: bool = False,
+) -> Tuple[str, str]:
+    """Returns (content_str, reasoning_str). reasoning_str may be empty."""
+    if not stream:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=False,
+        )
+        msg = resp.choices[0].message
+        content = (msg.content or "").strip()
+        reasoning = (
+            getattr(msg, "reasoning_content", None)
+            or (getattr(msg, "model_extra", None) or {}).get("reasoning_content")
+            or ""
+        )
+        if reasoning and not isinstance(reasoning, str):
+            reasoning = ""
+        return content, (reasoning if isinstance(reasoning, str) else "")
+    # stream=True
+    stream_resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        stream=True,
     )
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    for chunk in stream_resp:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if getattr(delta, "content", None):
+            content_parts.append(delta.content)
+        r = (
+            getattr(delta, "reasoning_content", None)
+            or (getattr(delta, "model_extra", None) or {}).get("reasoning_content")
+        )
+        if r:
+            reasoning_parts.append(r)
+    return "".join(content_parts).strip(), "".join(reasoning_parts)
 
 
-def _ensure_english_for_kb(llm, user_question: str) -> str:
+def _ensure_english_for_kb(
+    client: OpenAI, model: str, user_question: str
+) -> str:
     prompt = (
         "将下面用户问题转成一句英文查询（用于知识库检索），"
         "只输出这句英文，不要解释、不要引号。\n\n"
         f"{user_question}"
     )
-    resp = llm.invoke([{"role": "user", "content": prompt}])
-    out = (resp.content or "").strip().strip('"\'')
+    content, _ = _openai_completion(
+        client, model, [{"role": "user", "content": prompt}], stream=False
+    )
+    out = content.strip().strip('"\'')
     return out or user_question
 
 
@@ -88,7 +130,12 @@ def _run_web_search(query: str, max_results: int = 5) -> List[str]:
 
 
 def build_agent_app(tool_mode: AgentToolMode):
-    llm = _build_llm()
+    cfg = get_llm_config_from_env()
+    client = OpenAI(
+        api_key=cfg["api_key"],
+        base_url=cfg["base_url"],
+    )
+    model = cfg["model"]
 
     enable_kb = tool_mode in (AgentToolMode.KB_ONLY, AgentToolMode.KB_AND_WEB)
     enable_web = tool_mode in (AgentToolMode.WEB_ONLY, AgentToolMode.KB_AND_WEB)
@@ -148,8 +195,9 @@ def build_agent_app(tool_mode: AgentToolMode):
             prompt += f"已达最大查询轮数（{MAX_QUERY_ROUNDS}），本回合只能选 ANSWER。\n"
         prompt += "请按上述格式输出（第一行 KB/WEB/ANSWER，若选 KB 或 WEB 则第二行写一句完整查询）："
 
-        resp = llm.invoke([{"role": "user", "content": prompt}])
-        raw = (resp.content or "").strip()
+        raw, _ = _openai_completion(
+            client, model, [{"role": "user", "content": prompt}], stream=False
+        )
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         first = (lines[0].upper() if lines else "") or "ANSWER"
         query_line = lines[1] if len(lines) > 1 else ""
@@ -188,10 +236,11 @@ def build_agent_app(tool_mode: AgentToolMode):
         if not query or len(query) < 3:
             query = (user_question or "").strip()
         if query and not query.replace(" ", "").isascii():
-            query = _ensure_english_for_kb(llm, query)
+            query = _ensure_english_for_kb(client, model, query)
         chunks = query_knowledge(query, top_k=3)
         round_num = state.get("query_round_count", 0) + 1
-        log_entry = {"round": round_num, "tool": "KB", "query": query}
+        response = "\n".join(chunks) if chunks else ""
+        log_entry = {"round": round_num, "tool": "KB", "query": query, "response": response}
         return {
             "kb_results": chunks,
             "query_round_count": round_num,
@@ -213,14 +262,17 @@ def build_agent_app(tool_mode: AgentToolMode):
                 f"用户需求：\n{user_need}\n\n目前已搜到的信息：\n{existing_text}\n\n"
                 "请再提出一个与上述不同的、能补充获取更多相关信息的搜索问题（一句话，只输出这句话，不要解释）。"
             )
-        resp = llm.invoke([{"role": "user", "content": prompt}])
-        query = (resp.content or "").strip().strip('"\'')
+        content, _ = _openai_completion(
+            client, model, [{"role": "user", "content": prompt}], stream=False
+        )
+        query = content.strip().strip('"\'')
         query = query or user_need
         results = _run_web_search(query)
         if not results:
             results = ["(未找到相关结果)"]
         round_num = state.get("query_round_count", 0) + 1
-        log_entry = {"round": round_num, "tool": "WEB", "query": query}
+        response = "\n".join(results) if results else ""
+        log_entry = {"round": round_num, "tool": "WEB", "query": query, "response": response}
         return {
             "search_results": results,
             "query_round_count": round_num,
@@ -256,8 +308,13 @@ def build_agent_app(tool_mode: AgentToolMode):
                 f"用户问题：{user_question}"
             )
 
-        resp = llm.invoke([{"role": "system", "content": system_prompt}])
-        return {"messages": [resp]}
+        content_str, reasoning_str = _openai_completion(
+            client, model, [{"role": "system", "content": system_prompt}], stream=True
+        )
+        return {
+            "messages": [AIMessage(content=content_str)],
+            "reasoning_content": reasoning_str or "",
+        }
 
     def entry_node(state: AgentKernelState) -> dict:
         return {}
