@@ -3,10 +3,10 @@
 # 查询轮数上限（KB + Web 总轮数）
 MAX_QUERY_ROUNDS = 3
 # 是否允许使用知识库查询 / 网页搜索（两者可独立开关）
-ENABLE_KB_QUERY = True
-ENABLE_WEB_SEARCH = False
+ENABLE_KB_QUERY = False
+ENABLE_WEB_SEARCH = True
 
-from typing import TypedDict, List, Annotated
+from typing import TypedDict, List, Annotated, Optional, Dict, Tuple
 
 try:
     from typing import NotRequired
@@ -18,6 +18,18 @@ from langgraph.graph import MessagesState
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 import os
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    import trafilatura
+except ImportError:
+    trafilatura = None
 
 try:
     from ddgs import DDGS
@@ -185,33 +197,198 @@ def _generate_search_query(state: AgentState) -> str:
     return query or user_need
 
 
-def _run_web_search(query: str, max_results: int = 5) -> List[str]:
-    """使用 ddgs（或 duckduckgo_search）执行真实网页搜索，返回摘要列表。"""
+def _run_web_search(query: str, max_results: int = 8) -> List[dict]:
+    """使用 ddgs（或 duckduckgo_search）执行网页搜索，返回结构化结果：title/snippet/url。"""
     if DDGS is None:
-        return [f"[请安装搜索包: pip install ddgs] 查询: {query}"]
+        return [{"title": "", "snippet": f"[请安装搜索包: pip install ddgs] 查询: {query}", "url": ""}]
     try:
         with DDGS() as ddgs:
             raw = ddgs.text(query, max_results=max_results)
             results = list(raw) if raw else []
-        out = []
+        out: List[dict] = []
         for r in results:
             if not isinstance(r, dict):
                 continue
-            title = r.get("title") or r.get("name") or ""
-            body = r.get("body") or r.get("snippet") or r.get("description") or ""
-            if title or body:
-                out.append(f"【{title}】 {body}".strip())
-        return out if out else [f"[未返回结果，请稍后重试] 查询: {query}"]
+            title = (r.get("title") or r.get("name") or "").strip()
+            snippet = (
+                r.get("body")
+                or r.get("snippet")
+                or r.get("description")
+                or ""
+            ).strip()
+            url = (r.get("href") or r.get("url") or "").strip()
+            if not (title or snippet or url):
+                continue
+            out.append({"title": title, "snippet": snippet, "url": url})
+        return out if out else [{"title": "", "snippet": f"[未返回结果，请稍后重试] 查询: {query}", "url": ""}]
     except Exception as e:
-        return [f"[搜索异常: {e}] 查询: {query}"]
+        return [{"title": "", "snippet": f"[搜索异常: {e}] 查询: {query}", "url": ""}]
+
+
+def _is_bad_url(url: str) -> bool:
+    if not url:
+        return True
+    u = url.strip().lower()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return True
+    # 常见“搜索页/聚合页”过滤
+    bad_patterns = (
+        "bing.com/search",
+        "duckduckgo.com/?q=",
+        "/search?",
+        "/search/",
+        "google.com/search",
+    )
+    return any(p in u for p in bad_patterns)
+
+
+def _fetch_html(url: str, timeout_s: float = 8.0) -> Optional[str]:
+    if requests is None:
+        return None
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout_s,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
+        )
+        if resp.status_code >= 400:
+            return None
+        resp.encoding = resp.encoding or "utf-8"
+        return resp.text
+    except Exception:
+        return None
+
+
+def _extract_main_text_from_html(html: str) -> Optional[str]:
+    if not html:
+        return None
+    if trafilatura is None:
+        return None
+    try:
+        text = trafilatura.extract(html, include_comments=False, include_tables=False)
+        if not text:
+            return None
+        cleaned = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return cleaned or None
+    except Exception:
+        return None
+
+
+def _fetch_and_extract(url: str, timeout_s: float = 8.0, max_chars: int = 4000) -> Optional[str]:
+    html = _fetch_html(url, timeout_s=timeout_s)
+    if not html:
+        return None
+    text = _extract_main_text_from_html(html)
+    if not text:
+        return None
+    return text[:max_chars]
+
+
+def _score_relevance(query: str, title: str, snippet: str, text: Optional[str]) -> int:
+    # 极简相关性评分：query 分词后在 (title/snippet/text) 中命中越多分越高
+    q = (query or "").lower()
+    terms = [t for t in re.split(r"[\s,，。;；:：/|]+", q) if len(t) >= 2]
+    hay = "\n".join([title or "", snippet or "", text or ""]).lower()
+    score = 0
+    for t in terms:
+        if t in hay:
+            score += 1
+    # 对“疑似搜索页”再降权
+    if "search" in (title or "").lower():
+        score -= 2
+    return score
+
+
+def _format_evidence_block(title: str, url: str, extracted: Optional[str], snippet: str) -> str:
+    ttl = title.strip() if title else "(无标题)"
+    u = url.strip() if url else ""
+    if extracted:
+        return f"【{ttl}】\nURL: {u}\n正文摘录:\n{extracted}".strip()
+    # 回退到 snippet（标注来源）
+    sn = snippet.strip() if snippet else ""
+    return f"【{ttl}】\nURL: {u}\n（仅搜索摘要，未抓取正文）\n{sn}".strip()
 
 
 def search_node(state: AgentState) -> dict:
     """使用 current_query 或生成搜索句，执行网页搜索并叠加结果，query_round_count+1。"""
     query = state.get("current_query") or _generate_search_query(state)
-    results = _run_web_search(query)
-    if not results:
-        results = ["(未找到相关结果)"]
+    raw_results = _run_web_search(query, max_results=8)
+
+    # 过滤并截取前 5 个 URL 进行抓取
+    candidates: List[dict] = []
+    for r in raw_results:
+        url = (r.get("url") or "").strip()
+        if url and _is_bad_url(url):
+            continue
+        candidates.append(r)
+    candidates = candidates[:5]
+
+    # 并发抓取 + 正文抽取（若依赖缺失则全部回退到 snippet）
+    fetched_text: Dict[str, Optional[str]] = {}
+    if requests is not None and trafilatura is not None:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futs = {}
+            for r in candidates:
+                url = (r.get("url") or "").strip()
+                if not url:
+                    continue
+                futs[ex.submit(_fetch_and_extract, url, 8.0, 4000)] = url
+            for fut in as_completed(futs):
+                url = futs[fut]
+                try:
+                    fetched_text[url] = fut.result()
+                except Exception:
+                    fetched_text[url] = None
+
+    scored_blocks: List[Tuple[int, str]] = []
+    debug_items: List[Dict[str, object]] = []
+    for r in candidates:
+        title = r.get("title") or ""
+        snippet = r.get("snippet") or ""
+        url = (r.get("url") or "").strip()
+        extracted = fetched_text.get(url) if url else None
+        score = _score_relevance(query, title, snippet, extracted)
+        block = _format_evidence_block(title, url, extracted, snippet)
+        scored_blocks.append((score, block))
+        debug_items.append(
+            {
+                "score": score,
+                "title": title,
+                "url": url,
+                "extracted": extracted,
+                "snippet": snippet,
+            }
+        )
+
+    scored_blocks.sort(key=lambda x: x[0], reverse=True)
+    results = [b for _, b in scored_blocks] if scored_blocks else ["(未找到相关结果)"]
+
+    # 调试输出：每条给出标题 + 前 300 字（优先正文摘录，失败则用搜索摘要）
+    try:
+        debug_items.sort(key=lambda x: x.get("score", 0), reverse=True)
+        print("\n----- WEB抓取预览（标题 + 前300字）-----")
+        for i, it in enumerate(debug_items[:5]):
+            ttl = (it.get("title") or "").strip() or "(无标题)"
+            url = (it.get("url") or "").strip()
+            text = (it.get("extracted") or "").strip()
+            if not text:
+                text = (it.get("snippet") or "").strip()
+                src = "摘要"
+            else:
+                src = "正文"
+            preview = text[:300].replace("\n", " ").strip()
+            print(f"[{i}] score={it.get('score', 0)} src={src} | {ttl}")
+            if url:
+                print(f"    URL: {url}")
+            if preview:
+                print(f"    {preview}")
+        print("--------------------------------------\n")
+    except Exception:
+        pass
     round_num = state.get("query_round_count", 0) + 1
     print(f"[Round {round_num}] 工具=网页搜索(WEB), 查询=\"{query}\"")
     return {
@@ -355,8 +532,9 @@ if __name__ == "__main__":
 
     # 使用更容易触发搜索的问题（实时/事实类）；若用「我是谁」等身份问题，模型常判为不需搜索
     initial_state = {
-        "messages": [HumanMessage(content="Ascend C的softmax怎么写？")]
+        #"messages": [HumanMessage(content="Ascend C的softmax怎么写？")]
         #"messages": [HumanMessage(content="今天适不适合去北京旅游？")]
+        "messages": [HumanMessage(content="具体谈谈什么是openclaw，有什么风险")]
     }
     try:
         final_state = app.invoke(initial_state)
