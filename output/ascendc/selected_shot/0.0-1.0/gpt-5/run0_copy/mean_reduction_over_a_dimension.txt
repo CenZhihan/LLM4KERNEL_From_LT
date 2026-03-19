@@ -1,0 +1,301 @@
+project_json_src='''
+[
+    {
+        "op": "MeanReductionOverADimensionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(TilingData)
+TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+TILING_DATA_FIELD_DEF(uint32_t, outElems);
+TILING_DATA_FIELD_DEF(uint32_t, reduceLen);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MeanReductionOverADimensionCustom, TilingData)
+} // namespace optiling
+
+"""
+
+host_operator_src="""
+#include "mean_reduction_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+constexpr uint32_t BLOCK_DIM = 1;
+constexpr uint32_t ONE_REPEAT_LEN = 256;
+constexpr uint32_t ONE_BLOCK_LEN = 32;
+constexpr uint32_t FLOAT_THRESHOLD0 = ONE_REPEAT_LEN / sizeof(float);
+constexpr uint32_t FLOAT_THRESHOLD1 = (ONE_REPEAT_LEN / sizeof(float)) * (ONE_BLOCK_LEN / sizeof(float));
+constexpr uint32_t FLOAT_THRESHOLD2 = (ONE_REPEAT_LEN / sizeof(float)) * (ONE_REPEAT_LEN / sizeof(float));
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    TilingData tiling;
+    auto originShape = context->GetInputShape(0)->GetOriginShape();
+    uint32_t dimNum = originShape.GetDimNum();
+    uint32_t reduceLen = (dimNum > 0) ? static_cast<uint32_t>(originShape.GetDim(dimNum - 1)) : 1;
+    uint32_t totalLength = static_cast<uint32_t>(originShape.GetShapeSize());
+    uint32_t outElems = (reduceLen == 0) ? 0 : (totalLength / reduceLen);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_outElems(outElems);
+    tiling.set_reduceLen(reduceLen);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    uint32_t dimNum = x_shape->GetDimNum();
+    std::vector<int64_t> outDims;
+    outDims.reserve(dimNum > 0 ? dimNum - 1 : 1);
+    for (uint32_t i = 0; i + 1 < dimNum; ++i) {
+        outDims.push_back(x_shape->GetDim(i));
+    }
+    if (dimNum == 0) { // scalar -> scalar mean
+        outDims.push_back(1);
+    } else if (outDims.size() == 0) {
+        // If input is 1D, output is 1D with length equal to number of rows (which is 1)
+        outDims.push_back(1);
+    }
+    gert::Shape y(outDims);
+    *context->GetOutputShape(0) = y;
+    return GRAPH_SUCCESS;
+}
+
+static graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class MeanReductionOverADimensionCustom : public OpDef {
+public:
+    explicit MeanReductionOverADimensionCustom(const char *name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore()
+            .SetTiling(optiling::TilingFunc)
+            .AddConfig("ascend910b");
+    }
+};
+OP_ADD(MeanReductionOverADimensionCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "mean_reduction_over_a_dimension_custom_tiling_data.h"
+
+class KernelMeanReduceLastDim {
+    static constexpr uint32_t DEFAULT_BLK_STRIDE = 1;
+    static constexpr uint32_t DEFAULT_REP_STRIDE = 8;
+    static constexpr uint32_t REP_LEN = 256;
+    static constexpr uint32_t BLK_LEN = 32;
+public:
+    __aicore__ inline KernelMeanReduceLastDim() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR z, uint32_t totalLength, uint32_t outElems, uint32_t reduceLen)
+    {
+        this->totalLength = totalLength;
+        this->outElems = outElems;
+        this->reduceLen = reduceLen;
+
+        xGm.SetGlobalBuffer((__gm__ float *)x, totalLength);
+        zGm.SetGlobalBuffer((__gm__ float *)z, outElems);
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t row = 0; row < outElems; ++row) {
+            ReduceOneRow(row);
+        }
+    }
+
+private:
+    __aicore__ inline void ReduceOneRow(uint32_t rowIdx)
+    {
+        // Local buffers
+        pipe.InitBuffer(bufRow, reduceLen * sizeof(float));
+        pipe.InitBuffer(bufTmp, reduceLen * sizeof(float));
+
+        AscendC::LocalTensor<float> rowLocal = bufRow.Get<float>();
+        AscendC::LocalTensor<float> tmpLocal = bufTmp.Get<float>();
+        AscendC::LocalTensor<float> outLocal = outQueue.AllocTensor<float>();
+
+        // Copy one contiguous row (last-dimension vector)
+        AscendC::DataCopy(rowLocal, xGm[rowIdx * reduceLen], reduceLen);
+
+        // Choose strategy based on length
+        const uint32_t FLOAT_THRESHOLD0 = REP_LEN / sizeof(float);                           // 64
+        const uint32_t FLOAT_THRESHOLD1 = (REP_LEN / sizeof(float)) * (BLK_LEN / sizeof(float)); // 512
+        const uint32_t FLOAT_THRESHOLD2 = (REP_LEN / sizeof(float)) * (REP_LEN / sizeof(float)); // 4096
+
+        if (reduceLen <= FLOAT_THRESHOLD0) {
+            // Simple WholeReduceSum for small rows
+            constexpr int64_t maskLen = REP_LEN / sizeof(float);
+            AscendC::WholeReduceSum<float>(outLocal, rowLocal, maskLen, 1,
+                DEFAULT_BLK_STRIDE, DEFAULT_BLK_STRIDE, DEFAULT_REP_STRIDE);
+        } else if (reduceLen <= FLOAT_THRESHOLD1) {
+            // One BlockReduce + one WholeReduce
+            constexpr uint32_t c0Count = BLK_LEN / sizeof(float);
+            const uint32_t blockNum0 = (reduceLen + c0Count - 1) / c0Count;
+
+            AscendC::SetMaskCount();
+            AscendC::SetVectorMask<float>(0, reduceLen);
+            AscendC::BlockReduceSum<float, false>(tmpLocal, rowLocal, AscendC::MASK_PLACEHOLDER, 1,
+                DEFAULT_BLK_STRIDE, DEFAULT_BLK_STRIDE, DEFAULT_REP_STRIDE);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::SetVectorMask<float>(0, blockNum0);
+            AscendC::WholeReduceSum<float, false>(outLocal, tmpLocal, AscendC::MASK_PLACEHOLDER, 1,
+                DEFAULT_BLK_STRIDE, DEFAULT_BLK_STRIDE, DEFAULT_REP_STRIDE);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::SetMaskNorm();
+        } else {
+            // Two WholeReduce: first between repeats, then across repeats
+            const uint32_t repeatNum = (reduceLen * sizeof(float) + REP_LEN - 1) / REP_LEN;
+
+            AscendC::SetMaskCount();
+            AscendC::SetVectorMask<float>(0, reduceLen);
+            AscendC::WholeReduceSum<float, false>(tmpLocal, rowLocal, AscendC::MASK_PLACEHOLDER, 1,
+                DEFAULT_BLK_STRIDE, DEFAULT_BLK_STRIDE, DEFAULT_REP_STRIDE);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::SetVectorMask<float>(0, repeatNum);
+            AscendC::WholeReduceSum<float, false>(outLocal, tmpLocal, AscendC::MASK_PLACEHOLDER, 1,
+                DEFAULT_BLK_STRIDE, DEFAULT_BLK_STRIDE, DEFAULT_REP_STRIDE);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::SetMaskNorm();
+        }
+
+        // Divide by reduceLen to get mean
+        const float invK = 1.0f / static_cast<float>(reduceLen);
+        AscendC::SetVectorMask<float>(0, 1);
+        AscendC::Muls<float>(outLocal, outLocal, invK, 1, DEFAULT_BLK_STRIDE, DEFAULT_REP_STRIDE);
+        AscendC::SetMaskNorm();
+
+        // Write out one element
+        outQueue.EnQue<float>(outLocal);
+        AscendC::LocalTensor<float> outLocalDeq = outQueue.DeQue<float>();
+        AscendC::DataCopy(zGm[rowIdx], outLocalDeq, 1);
+        outQueue.FreeTensor(outLocalDeq);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufRow;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufTmp;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueue;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> zGm;
+
+    uint32_t totalLength;
+    uint32_t outElems;
+    uint32_t reduceLen;
+};
+
+extern "C" __global__ __aicore__ void mean_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMeanReduceLastDim op;
+    op.Init(x, z, tiling_data.totalLength, tiling_data.outElems, tiling_data.reduceLen);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor mean_reduce_lastdim_impl_npu(const at::Tensor& x) {
+    // Reduce over last dimension; output is flattened to 1D of length = numel / lastdim
+    TORCH_CHECK(x.dim() >= 1, "Input must have at least 1 dimension");
+    auto outElems = x.numel() / x.size(-1);
+    at::Tensor result = at::empty({static_cast<long>(outElems)}, x.options());
+    EXEC_NPU_CMD(aclnnMeanReductionOverADimensionCustom, x, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("mean_reduction_over_a_dimension_custom", &mean_reduce_lastdim_impl_npu);
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mean_reduction_over_a_dimension_custom", &mean_reduce_lastdim_impl_npu, "mean reduction over last dim");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model: performs mean reduction over a specified dimension using a custom AscendC kernel.
+    The custom kernel reduces over the last dimension, so we move the target dimension to the last.
+    """
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Move the target dimension to the last for kernel compatibility
+        x_perm = x.movedim(self.dim, -1)
+        # Custom kernel returns a flat tensor of length prod(x_perm.shape[:-1])
+        z_flat = custom_ops_lib.mean_reduction_over_a_dimension_custom(x_perm)
+        # Reshape back to the original rank with the reduced dimension removed
+        out_shape = x_perm.shape[:-1]
+        return z_flat.view(*out_shape)
+'''

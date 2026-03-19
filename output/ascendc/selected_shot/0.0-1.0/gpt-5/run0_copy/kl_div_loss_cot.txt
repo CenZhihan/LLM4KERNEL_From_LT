@@ -1,0 +1,42 @@
+**Clarifying batch size calculation**
+
+To divide by the batch size, I need the first dimension. I can obtain dimensions using the vector method, like `GetInputShape(0)->GetStorageShape().GetDim(0)`. There's also a Base API that utilizes tiling functions where I can use `context->GetInputShape(0)->GetStorageShape().GetDimensionCount()` and `GetDimension(i)`. I'm realizing that for KLD batch mean, I just need to divide by the batch size. If that's tricky, I can compute the sum and simply divide by the batch size passed from the host. So, I'll update the necessary structs accordingly!
+
+**Clarifying API and batch size**
+
+It seems that the example didn't use the dimensions. This API might differ slightly, but I want to stick with the typical pattern, like using `GetDim(0)` or `GetDimensions()[0]`. I need to maintain consistency with the macros I’ve used. The earlier code included a header, which points to a C++ API for Gert. For dimensions, I might consider a function to get the origin shape, although it’s not validated. 
+
+For calculating the kernel, I’ll use a tiling approach like MSE. I’ll read pairs of arrays for each tile and ensure to manage potential log(0) issues with predictions. Adding epsilon might be necessary for safety.
+
+**Implementing KLD calculations**
+
+The PyTorch `kl_div` expects the input to be log-probabilities, so when computing `log(predict)`, I need to avoid the issue of `log(0)`. To do that, I’ll clamp `predict` to a minimum of `1e-12`. When implementing with AscendC ops, I need to confirm if it supports natural logarithm operations. The function name in AscendC is `Ln`, not `Log`, which I’ll use instead.
+
+For calculations, I’ll rely on operations like `Sub`, `Mul`, `ReduceSum`, and `Div`, along with clamping using `AscendC::Maxs`. Lastly, I should be cautious about computing `log(target)` because if `target` is zero, it leads to `-inf`, so stability is essential.
+
+**Restructuring KL divergence expression**
+
+In PyTorch, the formula is `target * (log(target) - input)`, and it treats `0 * log(0)` as `0`. The implementation avoids issues by overlooking gradients for that area. However, computing `Ln` on zero results in `-inf`, which can then lead to `NaN` when multiplied by zero. To prevent this, I can clamp the target to a small epsilon, but that risks incorrectly adding mass to zero entries.
+
+Instead, I’ll reshape the expression to be `target * log(max(target, eps)) - target * log(predict)`. For when `t = 0`, `0 * log(eps)` equals `0`, which is safe since we’re using finite values. I'll also ensure the prediction is similarly clamped using epsilon.
+
+**Implementing KLD loss algorithm**
+
+The algorithm per element will compute `p = max(predict[i], eps)`, and I'll also set `t = target[i]`. The calculation for the loss will be `l = t * (log(max(t, eps)) - log(p))`, and I'll accumulate these before dividing by `batchSize`. I'll implement this using float types.
+
+The kernel will have a structure similar to MSE, with batch size passed for tiling. I will need to define `KlDivLossCustom` as an operation with specific inputs and outputs, and I’ll integrate a method for copying data efficiently while maintaining accurate dimensions. Adapting last tile handling will simplify the code while ensuring correctness. 
+
+For the operations, I'll use AscendC functions to compute logarithms effectively and manage the necessary data clamps. Thus, I'll ensure that the implementation is streamlined for performance and minimizes complexity.
+
+**Optimizing buffer management for KLD loss**
+
+To temporarily reuse buffers, I can store `logpLocal` in `pLocal` by overwriting it. For `tLocal`, I might need to keep the original value for multiplication. This means allocating a separate temporary buffer, `tmpLocal`, but since that's not available, I'll work with `xLocal` instead. 
+
+I'll define the necessary terms and buffer allocations, ensuring that `t` remains unchanged during operations while clamping `p` for safety. The calculations will proceed through carefully managed buffer copies to avoid data loss and maintain original values, and I’ll set up memory management for scales and operations effectively within the kernel. The final integration will also require adjustments in the Python binding for seamless functionality with the model class, and I'll ensure that the inputs remain compatible without excessive outputs.
+
+**Finalizing KLD loss implementation**
+
+The earlier example focused on using a custom operator for the model's forward function, so I need to ensure I produce exactly six strings. I'll start by confirming the kernel function name for `kl_div_loss_custom` and add the necessary macros for tiling data. It’s important to reference the correct header file. 
+
+For the logarithm operations, I’ll go with `AscendC::Ln` because the documentation favors it. I plan to mirror the usage of the `ReduceSum` and other operations as exemplified. Finally, I'll set up my buffers correctly, handle the current length, and ensure data types remain consistent as floats while preparing to draft the code snippets.
+
