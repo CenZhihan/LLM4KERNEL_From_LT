@@ -18,6 +18,17 @@ def eval_single_op(op, out_dir, language):
     """
     result = {'compiled': False, 'correctness': None, 'performance': None}
     op_path = os.path.join(out_dir, f'{op}.txt')
+    # external165 数据集中存在少量命名差异：hard_sigmoid/hard_tanh vs hardsigmoid/hardtanh
+    if not os.path.exists(op_path):
+        alias_map = {
+            'hardsigmoid': 'hard_sigmoid',
+            'hardtanh': 'hard_tanh',
+        }
+        alias = alias_map.get(op)
+        if alias:
+            alias_path = os.path.join(out_dir, f'{alias}.txt')
+            if os.path.exists(alias_path):
+                op_path = alias_path
     if not os.path.exists(op_path):
         print(f"[FAIL] op {op}: missing {op_path}")
         result['correctness_info'] = 'Missing generated file'

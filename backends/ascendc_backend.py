@@ -17,15 +17,20 @@ class AscendBackend(Backend):
         self.current_op = None  # 当前评测的 op，用于用完后删除工程目录
 
     def get_device(self):
-        return torch.device('npu:6')
+        device_id = int(os.environ.get("NPU_DEVICE", "0"))
+        return torch.device(f'npu:{device_id}')
 
     def get_hardware_name(self):
         return ascendc_device  # torch_npu.npu.get_device_name(device) causes crash
 
     def compile(self, generated_code, op):
-        self.current_op = op
+        compile_op = {
+            'hardsigmoid': 'hard_sigmoid',
+            'hardtanh': 'hard_tanh',
+        }.get(op, op)
+        self.current_op = compile_op
         try:
-            ascend_compile(generated_code, op, self.context)
+            ascend_compile(generated_code, compile_op, self.context)
             return True, None
         except Exception as e:
             os.chdir(project_root_path)
