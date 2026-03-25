@@ -1,8 +1,11 @@
 import os
 
 # path
-project_root_path = os.getcwd()
-ref_impl_base_path = f'{project_root_path}/reference'
+# 获取 MultiKernelBench 所在目录
+_multikernelbench_dir = os.path.dirname(os.path.abspath(__file__))
+# 根目录 (LLM4KERNEL_From_LT)
+project_root_path = os.path.dirname(os.path.dirname(os.path.dirname(_multikernelbench_dir)))
+ref_impl_base_path = f'{_multikernelbench_dir}/reference'
 # Virtual include path placeholder for Catlass backend.
 catlass_include_path = "/virtual/path/to/catlass/include"
 

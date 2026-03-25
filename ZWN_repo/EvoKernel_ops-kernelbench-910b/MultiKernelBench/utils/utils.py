@@ -1,12 +1,18 @@
 import os
 import config
 import re
-from openai import OpenAI
 from dataset import dataset
-import torch
+
+def _load_api_config():
+    """从 api_config.py 加载配置"""
+    try:
+        import api_config as ac
+        return ac.XI_AI_API_KEY, ac.XI_AI_BASE_URL
+    except ImportError:
+        return None, None
 
 def get_client(model):
-    #client 
+    from openai import OpenAI  # 延迟导入，避免模块加载时的依赖问题
     if model.startswith('deepseek'):
         DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY")
         client = OpenAI(
@@ -22,7 +28,19 @@ def get_client(model):
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
             timeout=10000000,
             max_retries=3,
-        ) 
+        )
+    elif model.startswith('gpt'):
+        # 优先从 api_config.py 读取，否则从环境变量读取
+        api_key, base_url = _load_api_config()
+        if api_key is None:
+            api_key = os.environ.get("XI_AI_API_KEY")
+            base_url = os.environ.get("XI_AI_BASE_URL", "https://api-2.xi-ai.cn/v1")
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=10000000,
+            max_retries=3,
+        )
     else:
         api_key = os.environ.get("OPEN_ROUNTER_KEY")
         client = OpenAI(

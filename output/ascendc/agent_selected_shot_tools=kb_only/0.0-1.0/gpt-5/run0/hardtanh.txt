@@ -74,16 +74,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
     HardtanhCustomTilingData tiling;
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+
     const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const float *minVal = attrs->GetAttrPointer<float>(0);
+    const float *maxVal = attrs->GetAttrPointer<float>(1);
 
-    float defaultMin = -1.0f;
-    float defaultMax =  1.0f;
-    const float *minValPtr = attrs ? attrs->GetAttrPointer<float>(0) : nullptr;
-    const float *maxValPtr = attrs ? attrs->GetAttrPointer<float>(1) : nullptr;
-    float minVal = minValPtr ? *minValPtr : defaultMin;
-    float maxVal = maxValPtr ? *maxValPtr : defaultMax;
-
-    uint32_t blockLength = (totalLength / BLOCK_DIM);
+    uint32_t blockLength = totalLength / BLOCK_DIM;
     blockLength = (blockLength / ALIGN_NUM) * ALIGN_NUM;
     uint32_t lastBlockLength = totalLength - blockLength * (BLOCK_DIM - 1);
 
@@ -91,11 +87,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     tiling.set_blockLength(blockLength);
     tiling.set_lastBlockLength(lastBlockLength);
     tiling.set_tileLength(MAX_TILE_LENGTH);
-    tiling.set_minVal(minVal);
-    tiling.set_maxVal(maxVal);
+    tiling.set_minVal(*minVal);
+    tiling.set_maxVal(*maxVal);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -133,8 +130,8 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Attr("min_val").AttrType(OPTIONAL).Float(-1.0f);
-        this->Attr("max_val").AttrType(OPTIONAL).Float(1.0f);
+        this->Attr("min_val").AttrType(OPTIONAL).Float(-1.0);
+        this->Attr("max_val").AttrType(OPTIONAL).Float(1.0);
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
@@ -156,10 +153,11 @@ public:
     __aicore__ inline KernelHardtanh() {}
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
                                 uint32_t blockLength, uint32_t lastBlockLength,
-                                uint32_t tileLength, float minVal, float maxVal)
+                                uint32_t tileLength,
+                                float minVal, float maxVal)
     {
-        this->minVal = minVal;
-        this->maxVal = maxVal;
+        this->minVal = static_cast<float>(minVal);
+        this->maxVal = static_cast<float>(maxVal);
         this->tileLength = tileLength;
 
         if (AscendC::GetBlockIdx() == AscendC::GetBlockNum() - 1) {
@@ -167,7 +165,6 @@ public:
         } else {
             this->blockLength = blockLength;
         }
-
         if (this->blockLength == 0) return;
 
         this->tileNum = this->blockLength / this->tileLength;
@@ -181,6 +178,7 @@ public:
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(tmpBuffer, this->tileLength * sizeof(float));
     }
+
     __aicore__ inline void Process()
     {
         if (this->blockLength == 0) return;
@@ -203,7 +201,8 @@ private:
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], length);
         inQueueX.EnQue(xLocal);
     }
-    __aicore__ inline void Compute(int32_t progress, uint32_t length)
+
+    __aicore__ inline void Compute(int32_t, uint32_t length)
     {
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
@@ -216,6 +215,7 @@ private:
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
     }
+
     __aicore__ inline void CopyOut(int32_t progress, uint32_t length)
     {
         AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
@@ -229,6 +229,7 @@ private:
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::GlobalTensor<float> xGm, yGm;
+
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tailLength;
@@ -241,8 +242,11 @@ extern "C" __global__ __aicore__ void hardtanh_custom(GM_ADDR x, GM_ADDR y, GM_A
     GET_TILING_DATA(tiling_data, tiling);
     KernelHardtanh op;
     op.Init(x, y,
-            tiling_data.blockLength, tiling_data.lastBlockLength,
-            tiling_data.tileLength, tiling_data.minVal, tiling_data.maxVal);
+            tiling_data.blockLength,
+            tiling_data.lastBlockLength,
+            tiling_data.tileLength,
+            tiling_data.minVal,
+            tiling_data.maxVal);
     op.Process();
 }
 """
@@ -274,9 +278,11 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, min_val: float = -1.0, max_val: float = 1.0):
         super(ModelNew, self).__init__()
-
+        self.min_val = min_val
+        self.max_val = max_val
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return custom_ops_lib.hardtanh_custom(x, -1.0, 1.0)
+        return custom_ops_lib.hardtanh_custom(x, self.min_val, self.max_val)
 '''

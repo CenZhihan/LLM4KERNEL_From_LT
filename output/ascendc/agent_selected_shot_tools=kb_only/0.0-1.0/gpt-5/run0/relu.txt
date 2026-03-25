@@ -60,21 +60,27 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     ReluCustomTilingData tiling;
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
 
-    uint32_t blockLength = (totalLength / BLOCK_DIM);
+    uint32_t blockDim = BLOCK_DIM;
+    if (totalLength < blockDim) {
+        blockDim = (totalLength == 0) ? 1 : totalLength;
+    }
+    uint32_t blockLength = totalLength / blockDim;
     blockLength = (blockLength / ALIGN_NUM) * ALIGN_NUM;
-    uint32_t lastBlockLength = totalLength - blockLength * (BLOCK_DIM - 1);
+    if (blockLength == 0 && totalLength > 0) {
+        blockLength = ALIGN_NUM;
+        blockDim = (totalLength + blockLength - 1) / blockLength;
+    }
+    uint32_t lastBlockLength = totalLength - blockLength * (blockDim - 1);
 
-    context->SetBlockDim(BLOCK_DIM);
+    context->SetBlockDim(blockDim);
     tiling.set_blockLength(blockLength);
     tiling.set_lastBlockLength(lastBlockLength);
     tiling.set_tileLength(MAX_TILE_LENGTH);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-
     return ge::GRAPH_SUCCESS;
 }
 } // namespace optiling
@@ -129,38 +135,42 @@ constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 class KernelRelu {
 public:
     __aicore__ inline KernelRelu() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t blockLength, uint32_t lastBlockLength, uint32_t tileLength)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t blockLengthIn, uint32_t lastBlockLengthIn, uint32_t tileLengthIn)
     {
-        this->tileLength = tileLength;
+        this->tileLength = tileLengthIn;
 
-        if (AscendC::GetBlockIdx() == AscendC::GetBlockNum() - 1) {
-            this->blockLength = lastBlockLength;
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+
+        if (blockIdx == blockNum - 1) {
+            this->blockLength = lastBlockLengthIn;
         } else {
-            this->blockLength = blockLength;
+            this->blockLength = blockLengthIn;
         }
         if (this->blockLength == 0) return;
 
         this->tileNum = this->blockLength / this->tileLength;
         this->tailLength = this->blockLength % this->tileLength;
 
-        uint32_t offset = blockLength * AscendC::GetBlockIdx();
-        xGm.SetGlobalBuffer((__gm__ float *)x + offset, this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ float *)y + offset, this->blockLength);
+        uint32_t offset = blockLengthIn * blockIdx;
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x) + offset, this->blockLength);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(y) + offset, this->blockLength);
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
     }
+
     __aicore__ inline void Process()
     {
         if (this->blockLength == 0) return;
         for (int32_t i = 0; i < this->tileNum; i++) {
             CopyIn(i, this->tileLength);
-            Compute(i, this->tileLength);
+            Compute(this->tileLength);
             CopyOut(i, this->tileLength);
         }
         if (this->tailLength > 0) {
             CopyIn(this->tileNum, this->tailLength);
-            Compute(this->tileNum, this->tailLength);
+            Compute(this->tailLength);
             CopyOut(this->tileNum, this->tailLength);
         }
     }
@@ -172,16 +182,17 @@ private:
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], length);
         inQueueX.EnQue(xLocal);
     }
-    __aicore__ inline void Compute(int32_t /*progress*/, uint32_t length)
+
+    __aicore__ inline void Compute(uint32_t length)
     {
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-
-        AscendC::Maxs(yLocal, xLocal, 0.0f, length);
-
+        float zero = 0.0f;
+        AscendC::Maxs(yLocal, xLocal, zero, length);
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
     }
+
     __aicore__ inline void CopyOut(int32_t progress, uint32_t length)
     {
         AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
@@ -194,10 +205,10 @@ private:
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::GlobalTensor<float> xGm, yGm;
-    uint32_t blockLength;
-    uint32_t tileNum;
-    uint32_t tailLength;
-    uint32_t tileLength;
+    uint32_t blockLength = 0;
+    uint32_t tileNum = 0;
+    uint32_t tailLength = 0;
+    uint32_t tileLength = 0;
 };
 
 extern "C" __global__ __aicore__ void relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {

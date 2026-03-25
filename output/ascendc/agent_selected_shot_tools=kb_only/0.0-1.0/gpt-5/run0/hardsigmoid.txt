@@ -26,8 +26,7 @@ project_json_src='''
                     "float"
                 ]
             }
-        ],
-        "attr": []
+        ]
     }
 ]
 '''
@@ -71,6 +70,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -129,11 +129,8 @@ public:
     __aicore__ inline KernelHardsigmoid() {}
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t blockLength, uint32_t lastBlockLength, uint32_t tileLength)
     {
-        this->alpha = 1.0f / 6.0f; // slope
-        this->beta = 0.5f;         // bias
         this->tileLength = tileLength;
 
-        // Determine the length for this block
         if (AscendC::GetBlockIdx() == AscendC::GetBlockNum() - 1) {
             this->blockLength = lastBlockLength;
         } else {
@@ -151,19 +148,20 @@ public:
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float)); // for linear transform
     }
+
     __aicore__ inline void Process()
     {
         if (this->blockLength == 0) return;
+
         for (int32_t i = 0; i < this->tileNum; i++) {
             CopyIn(i, this->tileLength);
-            Compute(i, this->tileLength);
+            Compute(this->tileLength);
             CopyOut(i, this->tileLength);
         }
         if (this->tailLength > 0) {
             CopyIn(this->tileNum, this->tailLength);
-            Compute(this->tileNum, this->tailLength);
+            Compute(this->tailLength);
             CopyOut(this->tileNum, this->tailLength);
         }
     }
@@ -175,24 +173,26 @@ private:
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], length);
         inQueueX.EnQue(xLocal);
     }
-    __aicore__ inline void Compute(int32_t /*progress*/, uint32_t length)
+
+    __aicore__ inline void Compute(uint32_t length)
     {
+        const float kShift = 3.0f;
+        const float kInv6 = 1.0f / 6.0f;
+
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-        AscendC::LocalTensor<float> t1 = tmpBuffer1.Get<float>();
 
-        // t1 = alpha * x
-        AscendC::Muls(t1, xLocal, this->alpha, length);
-        // t1 = t1 + beta
-        AscendC::Adds(t1, t1, this->beta, length);
-        // t1 = min(t1, 1.0)
-        AscendC::Mins(t1, t1, 1.0f, length);
-        // y = max(t1, 0.0)
-        AscendC::Maxs(yLocal, t1, 0.0f, length);
+        // y = (x + 3) / 6
+        AscendC::Adds(yLocal, xLocal, kShift, length);
+        AscendC::Muls(yLocal, yLocal, kInv6, length);
+        // y = clip(y, 0, 1)
+        AscendC::Maxs(yLocal, yLocal, 0.0f, length);
+        AscendC::Mins(yLocal, yLocal, 1.0f, length);
 
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
     }
+
     __aicore__ inline void CopyOut(int32_t progress, uint32_t length)
     {
         AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
@@ -202,7 +202,6 @@ private:
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1;
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::GlobalTensor<float> xGm, yGm;
@@ -210,8 +209,6 @@ private:
     uint32_t tileNum;
     uint32_t tailLength;
     uint32_t tileLength;
-    float alpha;
-    float beta;
 };
 
 extern "C" __global__ __aicore__ void hardsigmoid_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {

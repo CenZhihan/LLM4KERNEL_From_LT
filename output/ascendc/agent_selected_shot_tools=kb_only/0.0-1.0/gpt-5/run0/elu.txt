@@ -134,7 +134,7 @@ kernel_src="""
 #define __NPU_TILING__
 #include "elu_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor个数
 
 class KernelElu {
 public:
@@ -161,8 +161,8 @@ public:
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpBuffer2, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpNegBuf, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpExpBuf, this->tileLength * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -188,31 +188,26 @@ private:
         inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/, uint32_t length)
+    __aicore__ inline void Compute(int32_t progress, uint32_t length)
     {
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-        AscendC::LocalTensor<float> tmp1 = tmpBuffer1.Get<float>(); // store positive part
-        AscendC::LocalTensor<float> tmp2 = tmpBuffer2.Get<float>(); // store negative path intermediates
+        AscendC::LocalTensor<float> tmpNeg = tmpNegBuf.Get<float>();
+        AscendC::LocalTensor<float> tmpExp = tmpExpBuf.Get<float>();
 
-        // tmp1 = max(x, 0)
-        float zero = 0.0f;
-        AscendC::Maxs(tmp1, xLocal, zero, length);
-
-        // tmp2 = min(x, 0)
-        AscendC::Mins(tmp2, xLocal, zero, length);
-
-        // tmp2 = exp(tmp2)
-        AscendC::Exp(tmp2, tmp2, length);
-
-        // tmp2 = tmp2 - 1
-        AscendC::Adds(tmp2, tmp2, -1.0f, length);
-
-        // tmp2 = alpha * tmp2
-        AscendC::Muls(tmp2, tmp2, this->alpha, length);
-
-        // y = tmp1 + tmp2
-        AscendC::Add(yLocal, tmp1, tmp2, length);
+        // ELU(x) = max(0, x) + alpha * (exp(min(0, x)) - 1)
+        // 1) tmpNeg = min(0, x)
+        AscendC::Mins(tmpNeg, xLocal, 0.0f, length);
+        // 2) tmpExp = exp(tmpNeg)
+        AscendC::Exp(tmpExp, tmpNeg, length);
+        // 3) tmpExp = tmpExp - 1
+        AscendC::Adds(tmpExp, tmpExp, -1.0f, length);
+        // 4) tmpExp = alpha * tmpExp
+        AscendC::Muls(tmpExp, tmpExp, this->alpha, length);
+        // 5) yLocal = max(0, x)
+        AscendC::Maxs(yLocal, xLocal, 0.0f, length);
+        // 6) yLocal += tmpExp
+        AscendC::Add(yLocal, yLocal, tmpExp, length);
 
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
@@ -227,11 +222,10 @@ private:
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpNegBuf, tmpExpBuf;
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::GlobalTensor<float> xGm, yGm;
-
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tailLength;
