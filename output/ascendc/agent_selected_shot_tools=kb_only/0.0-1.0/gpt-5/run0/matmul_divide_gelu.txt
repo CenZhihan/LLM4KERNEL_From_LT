@@ -1,0 +1,343 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulDivideGeluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "weight",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "bias",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulDivideGeluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, reserved0);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulDivideGeluCustom, MatmulDivideGeluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "matmul_divide_gelu_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "register/tilingdata_base.h"
+#include "graph/utils/type_utils.h"
+
+// Matmul tiling headers (interface provided by AscendC Matmul tiling APIs)
+#include <cstring>
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // Get input shapes:
+    // x: [M, K], weight: [N, K] (PyTorch nn.Linear weight is [N, K], we will transpose B inside kernel)
+    auto xShape = context->GetInputShape(0)->GetOriginShape();
+    auto wShape = context->GetInputShape(1)->GetOriginShape();
+
+    if (xShape.GetDimNum() != 2 || wShape.GetDimNum() != 2) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint64_t M = static_cast<uint64_t>(xShape.GetDim(0));
+    uint64_t K = static_cast<uint64_t>(xShape.GetDim(1));
+    uint64_t N = static_cast<uint64_t>(wShape.GetDim(0)); // weight: [N, K]
+
+    // Build tiling using MultiCoreMatmulTiling
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
+    tiling.SetDim(1);
+    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetShape(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
+    tiling.SetSingleShape(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
+    tiling.SetOrgShape(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
+    tiling.SetBias(true);
+    tiling.SetBufferSpace(-1, -1, -1);
+
+    optiling::TCubeTiling tileData;
+    int ret = tiling.GetTiling(tileData);
+    if (ret == -1) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // blockDim
+    context->SetBlockDim(tiling.GetCoreNum());
+
+    // Save TCubeTiling as raw tiling data
+    auto raw = context->GetRawTilingData();
+    const size_t needSize = sizeof(optiling::TCubeTiling);
+    if (raw->GetCapacity() < needSize) {
+        return ge::GRAPH_FAILED;
+    }
+    std::memcpy(raw->GetData(), &tileData, sizeof(optiling::TCubeTiling));
+    raw->SetDataSize(sizeof(optiling::TCubeTiling));
+
+    // No workspace needed for this fused op (matmul lib may manage system workspace internally)
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);      // [M, K]
+    const gert::Shape* w_shape = context->GetInputShape(1);      // [N, K]
+    if (x_shape->GetDimNum() != 2 || w_shape->GetDimNum() != 2) {
+        return GRAPH_FAILED;
+    }
+    int64_t M = x_shape->GetDim(0);
+    int64_t N = w_shape->GetDim(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, M);
+    y_shape->SetDim(1, N);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MatmulDivideGeluCustom : public OpDef {
+public:
+    explicit MatmulDivideGeluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulDivideGeluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+using A_T = float;
+using B_T = float;
+using C_T = float;
+using BiasT = float;
+
+constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t VEC_TILE_SIZE = 4096; // UB tile size for post-GELU pass
+
+extern "C" __global__ __aicore__ void matmul_divide_gelu_custom(GM_ADDR xGM, GM_ADDR wGM, GM_ADDR biasGM, GM_ADDR yGM, GM_ADDR tilingGM, GM_ADDR workspaceGM)
+{
+    // Define Matmul types: A:[M,K], B:[N,K] with transposeB=true to treat as [K,N], C:[M,N]
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL> bType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, BiasT> biasType;
+
+    // Load TCubeTiling from GM
+    optiling::TCubeTiling tiling;
+    auto tempTilingGM = (__gm__ uint32_t*)tilingGM;
+    auto tempTiling = (uint32_t*)&tiling;
+    for (int i = 0; i < static_cast<int>(sizeof(optiling::TCubeTiling) / sizeof(uint32_t)); ++i, ++tempTilingGM, ++tempTiling) {
+        *tempTiling = *tempTilingGM;
+    }
+
+    // Initialize GM tensors with single-core region sizes
+    AscendC::GlobalTensor<A_T> aGlobal;
+    AscendC::GlobalTensor<B_T> bGlobal;
+    AscendC::GlobalTensor<C_T> cGlobal;
+    AscendC::GlobalTensor<BiasT> biasGlobal;
+
+    int32_t sizeABytes = tiling.ALayoutInfoB * tiling.singleCoreM * tiling.singleCoreK * sizeof(A_T);
+    int32_t sizeBBytes = tiling.BLayoutInfoB * tiling.singleCoreK * tiling.singleCoreN * sizeof(B_T);
+    int32_t sizeCBytes = tiling.CLayoutInfoB * tiling.singleCoreM * tiling.singleCoreN * sizeof(C_T);
+    int32_t sizeBiasBytes = tiling.CLayoutInfoB * tiling.singleCoreN * sizeof(BiasT);
+
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(xGM), sizeABytes/sizeof(A_T));
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(wGM), sizeBBytes/sizeof(B_T));
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(yGM), sizeCBytes/sizeof(C_T));
+    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(biasGM), sizeBiasBytes/sizeof(BiasT));
+
+    int offset_a = 0, offset_b = 0, offset_c = 0, offset_bias = 0;
+    AscendC::GlobalTensor<A_T> gm_a;
+    gm_a.SetGlobalBuffer(const_cast<__gm__ A_T*>(aGlobal[offset_a].GetPhyAddr()),
+                         tiling.singleCoreM * tiling.singleCoreK);
+    AscendC::GlobalTensor<B_T> gm_b;
+    gm_b.SetGlobalBuffer(const_cast<__gm__ B_T*>(bGlobal[offset_b].GetPhyAddr()),
+                         tiling.singleCoreK * tiling.singleCoreN);
+    AscendC::GlobalTensor<C_T> gm_c;
+    gm_c.SetGlobalBuffer(const_cast<__gm__ C_T*>(cGlobal[offset_c].GetPhyAddr()),
+                         tiling.singleCoreM * tiling.singleCoreN);
+    AscendC::GlobalTensor<BiasT> gm_bias;
+    gm_bias.SetGlobalBuffer(const_cast<__gm__ BiasT*>(biasGlobal[offset_bias].GetPhyAddr()),
+                            tiling.singleCoreN);
+
+    // Create Matmul instance and run
+    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm1;
+
+    AscendC::TPipe pipe;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm1);
+    mm1.Init(&tiling);
+    mm1.SetTensorA(gm_a, false);
+    mm1.SetTensorB(gm_b, true);
+    mm1.SetWorkspace(workspaceGM, 0);
+    mm1.SetBias(gm_bias);
+
+    // No multi-batch: batchA=1, batchB=1
+    mm1.IterateBatch(gm_c, 1, 1, false);
+
+    // Post-processing: apply GELU to C in GM and write back in place
+    // Stream tiles from GM -> UB, FasterGelu -> GM
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+    pipe.InitBuffer(inQueue, BUFFER_NUM, VEC_TILE_SIZE * sizeof(C_T));
+    pipe.InitBuffer(outQueue, BUFFER_NUM, VEC_TILE_SIZE * sizeof(C_T));
+
+    const int32_t totalElems = tiling.singleCoreM * tiling.singleCoreN;
+    int32_t offset = 0;
+    while (offset < totalElems) {
+        // CopyIn
+        AscendC::LocalTensor<C_T> srcLocal = inQueue.AllocTensor<C_T>();
+        int32_t curLen = AscendC::min(VEC_TILE_SIZE, totalElems - offset);
+        AscendC::DataCopy(srcLocal, gm_c[offset], curLen);
+        inQueue.EnQue(srcLocal);
+
+        // Compute
+        AscendC::LocalTensor<C_T> srcL = inQueue.DeQue<C_T>();
+        AscendC::LocalTensor<C_T> dstL = outQueue.AllocTensor<C_T>();
+        AscendC::FasterGelu(dstL, srcL, curLen);
+        outQueue.EnQue<C_T>(dstL);
+        inQueue.FreeTensor(srcL);
+
+        // CopyOut
+        AscendC::LocalTensor<C_T> outL = outQueue.DeQue<C_T>();
+        AscendC::DataCopy(gm_c[offset], outL, curLen);
+        outQueue.FreeTensor(outL);
+
+        offset += curLen;
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_divide_gelu_custom_impl_npu(const at::Tensor& x, const at::Tensor& weight, const at::Tensor& bias) {
+    // y = GELU(x @ weight^T + bias), where weight/bias can be pre-scaled by caller
+    at::Tensor y = at::empty({x.size(0), weight.size(0)}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulDivideGeluCustom, x, weight, bias, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_divide_gelu_custom", &matmul_divide_gelu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_divide_gelu_custom", &matmul_divide_gelu_custom_impl_npu, "fused matmul/div/gelu");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model using custom AscendC kernel:
+    y = GELU((x @ W^T + b) / divisor) is implemented by pre-scaling W and b on host,
+    then calling a fused Matmul + Bias + GELU kernel.
+    """
+    def __init__(self, input_size, output_size, divisor):
+        super().__init__()
+        self.linear = torch.nn.Linear(input_size, output_size)
+        self.divisor = float(divisor)
+
+    def forward(self, x):
+        # Pre-scale weights and bias on host side to fuse division into Matmul + Bias:
+        # (x @ W^T + b) / d = x @ (W/d)^T + (b/d)
+        w_scaled = self.linear.weight / self.divisor
+        b_scaled = self.linear.bias / self.divisor
+        return custom_ops_lib.matmul_divide_gelu_custom(x, w_scaled, b_scaled)
+'''

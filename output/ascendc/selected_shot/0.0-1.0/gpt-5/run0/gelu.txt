@@ -113,13 +113,10 @@ public:
 
 OP_ADD(GeluCustom);
 }
-
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "gelu_custom_tiling_data.h"
 
 constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
@@ -140,6 +137,7 @@ public:
         pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float));
         pipe.InitBuffer(tmpBuffer2, this->tileLength * sizeof(float));
         pipe.InitBuffer(tmpBuffer3, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpBuffer4, this->tileLength * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -160,33 +158,34 @@ private:
         inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(int32_t progress)
+    __aicore__ inline void Compute(int32_t)
     {
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-        AscendC::LocalTensor<float> t1 = tmpBuffer1.Get<float>();
-        AscendC::LocalTensor<float> t2 = tmpBuffer2.Get<float>();
-        AscendC::LocalTensor<float> t3 = tmpBuffer3.Get<float>();
 
-        // GELU approximation: 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
-        // t1 = x^2
+        AscendC::LocalTensor<float> t1 = tmpBuffer1.Get<float>(); // x^2
+        AscendC::LocalTensor<float> t2 = tmpBuffer2.Get<float>(); // x^3 then 0.044715*x^3
+        AscendC::LocalTensor<float> t3 = tmpBuffer3.Get<float>(); // inner accumulators
+        AscendC::LocalTensor<float> t4 = tmpBuffer4.Get<float>(); // 0.5*x
+
+        // t1 = x * x
         AscendC::Mul(t1, xLocal, xLocal, this->tileLength);
-        // t2 = x^3
-        AscendC::Mul(t2, t1, xLocal, this->tileLength);
-        // t2 = 0.044715 * x^3
+        // t2 = x * t1 = x^3
+        AscendC::Mul(t2, xLocal, t1, this->tileLength);
+        // t2 = 0.044715f * t2
         AscendC::Muls(t2, t2, 0.044715f, this->tileLength);
-        // t3 = x + 0.044715 * x^3
+        // t3 = x + t2
         AscendC::Add(t3, xLocal, t2, this->tileLength);
-        // t3 = sqrt(2/pi) * t3
-        AscendC::Muls(t3, t3, 0.7978845608028654f, this->tileLength); // sqrt(2/pi)
+        // t3 = sqrt(2/pi) * t3, where sqrt(2/pi) ≈ 0.7978845834732056
+        AscendC::Muls(t3, t3, 0.7978845834732056f, this->tileLength);
         // t3 = tanh(t3)
         AscendC::Tanh(t3, t3, this->tileLength);
-        // t3 = 1 + t3
+        // t3 = t3 + 1.0
         AscendC::Adds(t3, t3, 1.0f, this->tileLength);
-        // t3 = 0.5 * t3
-        AscendC::Muls(t3, t3, 0.5f, this->tileLength);
-        // y = x * t3
-        AscendC::Mul(yLocal, xLocal, t3, this->tileLength);
+        // t4 = 0.5 * x
+        AscendC::Muls(t4, xLocal, 0.5f, this->tileLength);
+        // y = t4 * t3
+        AscendC::Mul(yLocal, t4, t3, this->tileLength);
 
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
@@ -201,7 +200,7 @@ private:
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2, tmpBuffer3;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2, tmpBuffer3, tmpBuffer4;
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::GlobalTensor<float> xGm, yGm;
@@ -231,11 +230,11 @@ at::Tensor gelu_impl_npu(const at::Tensor& self) {
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("gelu_custom", &gelu_impl_npu);
+    m.impl(\"gelu_custom\", &gelu_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("gelu_custom", &gelu_impl_npu, "GELU activation");
+    m.def(\"gelu_custom\", &gelu_impl_npu, \"GELU activation\");
 }
 """
 
@@ -245,12 +244,9 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    Optimized model that performs a GELU activation using a custom AscendC kernel.
-    """
     def __init__(self):
         super(ModelNew, self).__init__()
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return custom_ops_lib.gelu_custom(x)
 '''

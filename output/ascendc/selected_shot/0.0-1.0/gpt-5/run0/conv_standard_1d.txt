@@ -1,0 +1,288 @@
+project_json_src='''
+[
+    {
+        "op": "ConvStandard1dCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvStandard1dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, Cin);
+  TILING_DATA_FIELD_DEF(uint32_t, Lin);
+  TILING_DATA_FIELD_DEF(uint32_t, Cout);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, Lout);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvStandard1dCustom, ConvStandard1dCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_standard_1d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvStandard1dCustomTilingData tiling;
+
+    auto inShape = context->GetInputShape(0)->GetOriginShape();
+    auto wShape  = context->GetInputShape(1)->GetOriginShape();
+
+    uint32_t N    = static_cast<uint32_t>(inShape.GetDim(0));
+    uint32_t Cin  = static_cast<uint32_t>(inShape.GetDim(1));
+    uint32_t Lin  = static_cast<uint32_t>(inShape.GetDim(2));
+    uint32_t Cout = static_cast<uint32_t>(wShape.GetDim(0));
+    uint32_t K    = static_cast<uint32_t>(wShape.GetDim(2));
+
+    // Defaults: stride=1, padding=0, dilation=1, groups=1
+    uint32_t stride   = 1;
+    uint32_t padding  = 0;
+    uint32_t dilation = 1;
+
+    uint32_t Lout = (Lin + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_N(N);
+    tiling.set_Cin(Cin);
+    tiling.set_Lin(Lin);
+    tiling.set_Cout(Cout);
+    tiling.set_K(K);
+    tiling.set_Lout(Lout);
+    tiling.set_tileNum(1);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    if (x_shape->GetDimNum() != 3 || w_shape->GetDimNum() != 3) {
+        return ge::GRAPH_FAILED;
+    }
+    int64_t N    = x_shape->GetDim(0);
+    int64_t Cin  = x_shape->GetDim(1);
+    int64_t Lin  = x_shape->GetDim(2);
+    int64_t Cout = w_shape->GetDim(0);
+    int64_t K    = w_shape->GetDim(2);
+
+    // Defaults: stride=1, padding=0, dilation=1
+    int64_t Lout = (Lin - K) + 1;
+
+    if (Lout < 0) return ge::GRAPH_FAILED;
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(3);
+    y_shape->SetDim(0, N);
+    y_shape->SetDim(1, Cout);
+    y_shape->SetDim(2, Lout);
+
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvStandard1dCustom : public OpDef {
+public:
+    explicit ConvStandard1dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvStandard1dCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+extern "C" __global__ __aicore__ void conv_standard_1d_custom(GM_ADDR x, GM_ADDR w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+
+    const int N    = static_cast<int>(tiling_data.N);
+    const int Cin  = static_cast<int>(tiling_data.Cin);
+    const int Lin  = static_cast<int>(tiling_data.Lin);
+    const int Cout = static_cast<int>(tiling_data.Cout);
+    const int K    = static_cast<int>(tiling_data.K);
+    const int Lout = static_cast<int>(tiling_data.Lout);
+
+    // Defaults: stride=1, padding=0, dilation=1 (standard convolution without bias/groups)
+    const int stride = 1;
+    const int padding = 0;
+    const int dilation = 1;
+
+    __gm__ float* xGm = reinterpret_cast<__gm__ float*>(x);
+    __gm__ float* wGm = reinterpret_cast<__gm__ float*>(w);
+    __gm__ float* yGm = reinterpret_cast<__gm__ float*>(y);
+
+    int blocks = AscendC::GetBlockNum();
+    int bid = AscendC::GetBlockIdx();
+
+    int coPerBlock = (Cout + blocks - 1) / blocks;
+    int coStart = bid * coPerBlock;
+    int coEnd = coStart + coPerBlock;
+    if (coEnd > Cout) coEnd = Cout;
+
+    // Index helpers
+    auto x_index = [Cin, Lin](__gm__ float* base, int n, int c, int t) -> float {
+        return base[n * Cin * Lin + c * Lin + t];
+    };
+    auto w_index = [Cin, K](__gm__ float* base, int co, int ci, int k) -> float {
+        return base[co * Cin * K + ci * K + k];
+    };
+    auto y_write = [Cout, Lout](__gm__ float* base, int n, int co, int l, float v) {
+        base[n * Cout * Lout + co * Lout + l] = v;
+    };
+
+    for (int n = 0; n < N; ++n) {
+        for (int co = coStart; co < coEnd; ++co) {
+            for (int l = 0; l < Lout; ++l) {
+                float acc = 0.0f;
+                #pragma unroll(1)
+                for (int ci = 0; ci < Cin; ++ci) {
+                    #pragma unroll(1)
+                    for (int k = 0; k < K; ++k) {
+                        int t_in = l * stride - padding + k * dilation;
+                        // Since padding=0 and dilation=1, t_in = l + k
+                        float xv = xGm[n * Cin * Lin + ci * Lin + t_in];
+                        float wv = wGm[co * Cin * K + ci * K + k];
+                        acc += xv * wv;
+                    }
+                }
+                y_write(yGm, n, co, l, acc);
+            }
+        }
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_standard_1d_custom_impl_npu(const at::Tensor& x, const at::Tensor& w) {
+    auto N = x.size(0);
+    auto Cin = x.size(1);
+    auto Lin = x.size(2);
+    auto Cout = w.size(0);
+    auto K = w.size(2);
+    // Defaults: stride=1, padding=0, dilation=1
+    auto Lout = Lin - K + 1;
+    at::Tensor y = at::empty({N, Cout, Lout}, x.options());
+    EXEC_NPU_CMD(aclnnConvStandard1dCustom, x, w, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_standard_1d_custom", &conv_standard_1d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_standard_1d_custom", &conv_standard_1d_custom_impl_npu, "Standard 1D convolution custom op");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized 1D convolution using a custom AscendC kernel.
+    Supports stride=1, padding=0, dilation=1, groups=1, bias=False.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int):
+        super().__init__()
+        # Initialize weight similar to nn.Conv1d (no bias)
+        weight = torch.empty(out_channels, in_channels, kernel_size)
+        torch.nn.init.kaiming_uniform_(weight, a=5**0.5)
+        self.weight = torch.nn.Parameter(weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.conv_standard_1d_custom(x, self.weight)
+'''

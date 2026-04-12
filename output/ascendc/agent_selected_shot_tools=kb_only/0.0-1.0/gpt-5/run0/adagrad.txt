@@ -1,0 +1,313 @@
+project_json_src='''
+[
+    {
+        "op": "AdagradCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "param",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "grad",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "accum",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(AdagradCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(float, lr);
+  TILING_DATA_FIELD_DEF(float, eps);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(AdagradCustom, AdagradCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "adagrad_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+// 默认学习率与epsilon（与Python侧默认保持一致）
+const float DEFAULT_LR = 1e-2f;
+const float DEFAULT_EPS = 1e-10f;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    AdagradCustomTilingData tiling;
+
+    // 输入0为param，输出与其同shape
+    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_lr(DEFAULT_LR);
+    tiling.set_eps(DEFAULT_EPS);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class AdagradCustom : public OpDef {
+public:
+    explicit AdagradCustom(const char* name) : OpDef(name)
+    {
+        this->Input("param")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("grad")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("accum")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("out")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(AdagradCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE_PARAM = float;
+using DTYPE_GRAD  = float;
+using DTYPE_ACCUM = float;
+using DTYPE_OUT   = float;
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+class KernelAdagrad {
+public:
+    __aicore__ inline KernelAdagrad() {}
+    __aicore__ inline void Init(GM_ADDR param, GM_ADDR grad, GM_ADDR accum, GM_ADDR out,
+                                uint32_t totalLength, uint32_t tileNum, float lr, float eps)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->lr = lr;
+        this->eps = eps;
+
+        paramGm.SetGlobalBuffer((__gm__ DTYPE_PARAM *)param + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        gradGm.SetGlobalBuffer((__gm__ DTYPE_GRAD  *)grad  + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        accumGm.SetGlobalBuffer((__gm__ DTYPE_ACCUM *)accum + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        outGm.SetGlobalBuffer((__gm__ DTYPE_OUT   *)out   + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueParam, BUFFER_NUM, this->tileLength * sizeof(DTYPE_PARAM));
+        pipe.InitBuffer(inQueueGrad,  BUFFER_NUM, this->tileLength * sizeof(DTYPE_GRAD));
+        pipe.InitBuffer(inQueueAccum, BUFFER_NUM, this->tileLength * sizeof(DTYPE_ACCUM));
+        pipe.InitBuffer(outQueueOut,  BUFFER_NUM, this->tileLength * sizeof(DTYPE_OUT));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_PARAM> paramLocal = inQueueParam.AllocTensor<DTYPE_PARAM>();
+        AscendC::LocalTensor<DTYPE_GRAD>  gradLocal  = inQueueGrad.AllocTensor<DTYPE_GRAD>();
+        AscendC::LocalTensor<DTYPE_ACCUM> accumLocal = inQueueAccum.AllocTensor<DTYPE_ACCUM>();
+
+        AscendC::DataCopy(paramLocal, paramGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(gradLocal,  gradGm[progress * this->tileLength],  this->tileLength);
+        AscendC::DataCopy(accumLocal, accumGm[progress * this->tileLength], this->tileLength);
+
+        inQueueParam.EnQue(paramLocal);
+        inQueueGrad.EnQue(gradLocal);
+        inQueueAccum.EnQue(accumLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE_PARAM> paramLocal = inQueueParam.DeQue<DTYPE_PARAM>();
+        AscendC::LocalTensor<DTYPE_GRAD>  gradLocal  = inQueueGrad.DeQue<DTYPE_GRAD>();
+        AscendC::LocalTensor<DTYPE_ACCUM> accumLocal = inQueueAccum.DeQue<DTYPE_ACCUM>();
+        AscendC::LocalTensor<DTYPE_OUT>   outLocal   = outQueueOut.AllocTensor<DTYPE_OUT>();
+
+        // outLocal = grad * grad
+        AscendC::Mul(outLocal, gradLocal, gradLocal, this->tileLength);
+        // outLocal = accum + (grad * grad)
+        AscendC::Add(outLocal, outLocal, accumLocal, this->tileLength);
+        // outLocal = sqrt(outLocal)
+        AscendC::Sqrt(outLocal, outLocal, this->tileLength);
+        // outLocal = outLocal + eps
+        AscendC::Adds(outLocal, outLocal, (DTYPE_OUT)this->eps, this->tileLength);
+        // outLocal = grad / outLocal
+        AscendC::Div(outLocal, gradLocal, outLocal, this->tileLength);
+        // outLocal = lr * outLocal
+        AscendC::Muls(outLocal, outLocal, (DTYPE_OUT)this->lr, this->tileLength);
+        // outLocal = param - outLocal
+        AscendC::Sub(outLocal, paramLocal, outLocal, this->tileLength);
+
+        outQueueOut.EnQue<DTYPE_OUT>(outLocal);
+        inQueueParam.FreeTensor(paramLocal);
+        inQueueGrad.FreeTensor(gradLocal);
+        inQueueAccum.FreeTensor(accumLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_OUT> outLocal = outQueueOut.DeQue<DTYPE_OUT>();
+        AscendC::DataCopy(outGm[progress * this->tileLength], outLocal, this->tileLength);
+        outQueueOut.FreeTensor(outLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueParam, inQueueGrad, inQueueAccum;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueOut;
+
+    AscendC::GlobalTensor<DTYPE_PARAM> paramGm;
+    AscendC::GlobalTensor<DTYPE_GRAD>  gradGm;
+    AscendC::GlobalTensor<DTYPE_ACCUM> accumGm;
+    AscendC::GlobalTensor<DTYPE_OUT>   outGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+    float lr;
+    float eps;
+};
+
+extern "C" __global__ __aicore__ void adagrad_custom(GM_ADDR param, GM_ADDR grad, GM_ADDR accum, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelAdagrad op;
+    op.Init(param, grad, accum, out, tiling_data.totalLength, tiling_data.tileNum, tiling_data.lr, tiling_data.eps);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor adagrad_custom_impl_npu(const at::Tensor& param, const at::Tensor& grad, const at::Tensor& accum) {
+    at::Tensor result = at::empty_like(param);
+    // lr与eps在Host侧Tiling中设定为默认值
+    EXEC_NPU_CMD(aclnnAdagradCustom, param, grad, accum, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("adagrad_custom", &adagrad_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("adagrad_custom", &adagrad_custom_impl_npu, "Adagrad update: param - lr * grad / (sqrt(accum + grad^2) + eps)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, lr=1e-2, eps=1e-10):
+        super().__init__()
+        self.lr = lr
+        self.eps = eps
+
+    def forward(self, param, grad, accum):
+        # lr与eps在自定义算子Host侧采用默认值(1e-2, 1e-10)
+        return custom_ops_lib.adagrad_custom(param, grad, accum)
+'''

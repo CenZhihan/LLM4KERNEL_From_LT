@@ -40,7 +40,6 @@ BEGIN_TILING_DATA_DEF(Conv2dGeluGlobalAvgPoolCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, c);
   TILING_DATA_FIELD_DEF(uint32_t, h);
   TILING_DATA_FIELD_DEF(uint32_t, w);
-  TILING_DATA_FIELD_DEF(uint32_t, hw);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(Conv2dGeluGlobalAvgPoolCustom, Conv2dGeluGlobalAvgPoolCustomTilingData)
@@ -52,27 +51,25 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-
+const uint32_t BLOCK_DIM = 1;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    if (x_shape->GetOriginShape().GetDimNum() != 4) {
-        return ge::GRAPH_FAILED;
-    }
-    uint32_t n = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
-    uint32_t c = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
-    uint32_t h = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(2));
-    uint32_t w = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(3));
-
     Conv2dGeluGlobalAvgPoolCustomTilingData tiling;
+    const gert::StorageShape* x_shape = &(context->GetInputShape(0)->GetStorageShape());
+    uint32_t dims = x_shape->GetDimNum();
+    if (dims != 4) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    uint32_t n = x_shape->GetDim(0);
+    uint32_t c = x_shape->GetDim(1);
+    uint32_t h = x_shape->GetDim(2);
+    uint32_t w = x_shape->GetDim(3);
+
+    context->SetBlockDim(BLOCK_DIM);
     tiling.set_n(n);
     tiling.set_c(c);
     tiling.set_h(h);
     tiling.set_w(w);
-    tiling.set_hw(h * w);
-
-    context->SetBlockDim(BLOCK_DIM);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
@@ -86,18 +83,18 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
-    if (x_shape->GetOriginShape().GetDimNum() != 4) {
-        return GRAPH_FAILED;
+    if (x_shape->GetDimNum() != 4) {
+        return GRAPH_PARAM_INVALID;
     }
+    uint64_t n = x_shape->GetDim(0);
+    uint64_t c = x_shape->GetDim(1);
     gert::Shape* y_shape = context->GetOutputShape(0);
-    gert::Shape out;
-    out.SetDimNum(2);
-    out.SetDim(0, x_shape->GetOriginShape().GetDim(0));
-    out.SetDim(1, x_shape->GetOriginShape().GetDim(1));
-    *y_shape = out;
+    // Output after global avg pool + squeeze: [N, C]
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, n);
+    y_shape->SetDim(1, c);
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -116,6 +113,7 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -123,7 +121,9 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -134,113 +134,98 @@ OP_ADD(Conv2dGeluGlobalAvgPoolCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv2d_gelu_global_avg_pool_custom_tiling_data.h"
 
-// 本算子对输入特征图先执行GELU，再做全局平均池化(对H*W求均值)，输出形状[N, C]。
-// 参考文档：Gelu 高级API (Ascend C API Reference 5.3.3.1)
-// 参考文档：ReduceSum/Scalar/Muls 基础API (Ascend C API Reference Table 1-2)
+using dataType = float;
 
-#ifndef DTYPE_X
-#define DTYPE_X float
-#endif
-#ifndef DTYPE_Y
-#define DTYPE_Y float
-#endif
-
-constexpr int32_t BUFFER_NUM = 1;
-
-class KernelGeluGap {
+class KernelConv2dGeluGlobalAvgPool {
 public:
-    __aicore__ inline KernelGeluGap() {}
-
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t n, uint32_t c, uint32_t h, uint32_t w, uint32_t hw)
+    __aicore__ inline KernelConv2dGeluGlobalAvgPool() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t n, uint32_t c, uint32_t h, uint32_t w)
     {
         this->n = n;
         this->c = c;
         this->h = h;
         this->w = w;
-        this->hw = hw;
-        this->groups = n * c;
+        this->hw = h * w;
+        this->totalLen = n * c * h * w;
+        this->outLen = n * c;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, (uint64_t)n * c * h * w);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y, (uint64_t)n * c);
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(x), totalLen);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(y), outLen);
 
-        // 每次处理一个(N,C)组的H*W平面
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->hw * sizeof(DTYPE_X));
-        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->hw * sizeof(DTYPE_X)); // 存放GELU后的中间结果
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, sizeof(DTYPE_Y));           // 存放均值标量
+        // Buffers
+        pipe.InitBuffer(inQueueX, 1, totalLen * sizeof(dataType));
+        pipe.InitBuffer(tmpQueueGelu, 1, totalLen * sizeof(dataType));
+        // output mean buffer (no extra padding copy out)
+        pipe.InitBuffer(outQueueY, 1, outLen * sizeof(dataType));
     }
 
     __aicore__ inline void Process()
     {
-        for (uint32_t g = 0; g < groups; ++g) {
-            CopyIn(g);
-            Compute(g);
-            CopyOut(g);
-        }
+        CopyIn();
+        Compute();
+        CopyOut();
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t groupIdx)
+    __aicore__ inline void CopyIn()
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        uint64_t offset = (uint64_t)groupIdx * hw;
-        AscendC::DataCopy(xLocal, xGm[offset], hw);
+        AscendC::LocalTensor<dataType> xLocal = inQueueX.AllocTensor<dataType>();
+        AscendC::DataCopy(xLocal, xGm, totalLen);
         inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(uint32_t /*groupIdx*/)
+    __aicore__ inline void Compute()
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_X> geluLocal = tmpQueue.AllocTensor<DTYPE_X>();
-        // GELU
-        AscendC::Gelu(geluLocal, xLocal, hw);
+        AscendC::LocalTensor<dataType> xLocal = inQueueX.DeQue<dataType>();
+        AscendC::LocalTensor<dataType> geluLocal = tmpQueueGelu.AllocTensor<dataType>();
+        // Apply GELU element-wise
+        AscendC::Gelu(geluLocal, xLocal, totalLen);
 
-        // 对H*W做ReduceSum得到一个标量，再除以(hw)得到均值
-        AscendC::LocalTensor<DTYPE_Y> meanLocal = outQueueY.AllocTensor<DTYPE_Y>();
-        // 将输出标量缓冲区清零以便累加（可选）
-        // 这里直接调用ReduceSum，输出到单元素Tensor
-        AscendC::ReduceSum(meanLocal, geluLocal, hw);
-        DTYPE_Y inv = static_cast<DTYPE_Y>(1.0f) / static_cast<DTYPE_Y>(hw);
-        AscendC::Muls(meanLocal, meanLocal, inv); // mean = sum / (H*W)
+        // Global Average Pool over H*W for each (N, C)
+        // Treat geluLocal as [N*C, H*W], reduce mean across the last dimension.
+        AscendC::LocalTensor<dataType> meanLocal = outQueueY.AllocTensor<dataType>();
+        AscendC::MeanParams meanParams;
+        meanParams.outter = outLen;   // N * C
+        meanParams.inner  = hw;       // H * W
+        meanParams.n      = hw;       // reduce over H*W
+        AscendC::Mean<dataType, dataType>(meanLocal, geluLocal, meanParams);
 
-        outQueueY.EnQue(meanLocal);
-        tmpQueue.FreeTensor(geluLocal);
+        outQueueY.EnQue<dataType>(meanLocal);
         inQueueX.FreeTensor(xLocal);
+        tmpQueueGelu.FreeTensor(geluLocal);
     }
 
-    __aicore__ inline void CopyOut(uint32_t groupIdx)
+    __aicore__ inline void CopyOut()
     {
-        AscendC::LocalTensor<DTYPE_Y> meanLocal = outQueueY.DeQue<DTYPE_Y>();
-        uint64_t yoff = (uint64_t)groupIdx;
-        AscendC::DataCopy(yGm[yoff], meanLocal, 1);
+        AscendC::LocalTensor<dataType> meanLocal = outQueueY.DeQue<dataType>();
+        AscendC::DataCopy(yGm, meanLocal, outLen);
         outQueueY.FreeTensor(meanLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> tmpQueue;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpQueueGelu;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY;
 
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<dataType> xGm;
+    AscendC::GlobalTensor<dataType> yGm;
 
     uint32_t n;
     uint32_t c;
     uint32_t h;
     uint32_t w;
     uint32_t hw;
-    uint32_t groups;
+    uint32_t totalLen;
+    uint32_t outLen;
 };
 
 extern "C" __global__ __aicore__ void conv2d_gelu_global_avg_pool_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
-    GET_TILING_DATA(tilingData, tiling);
-    KernelGeluGap op;
-    op.Init(x, y, tilingData.n, tilingData.c, tilingData.h, tilingData.w, tilingData.hw);
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv2dGeluGlobalAvgPool op;
+    op.Init(x, y, tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w);
     op.Process();
 }
 """
@@ -252,10 +237,10 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor conv2d_gelu_global_avg_pool_custom_impl_npu(const at::Tensor& x) {
-    // x: [N, C, H, W], return [N, C]
-    auto N = x.size(0);
-    auto C = x.size(1);
-    at::Tensor result = at::empty({N, C}, x.options());
+    // x: [N, C, H, W] after convolution
+    auto sizes = x.sizes();
+    TORCH_CHECK(sizes.size() == 4, \\"Input must be 4D [N,C,H,W]\\");
+    at::Tensor result = at::empty({sizes[0], sizes[1]}, x.options());
     EXEC_NPU_CMD(aclnnConv2dGeluGlobalAvgPoolCustom, x, result);
     return result;
 }
@@ -265,7 +250,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv2d_gelu_global_avg_pool_custom", &conv2d_gelu_global_avg_pool_custom_impl_npu, "GELU + GlobalAvgPool over spatial dims");
+    m.def("conv2d_gelu_global_avg_pool_custom", &conv2d_gelu_global_avg_pool_custom_impl_npu, "Conv2d->GELU->GAP (fused post-conv)");
 }
 """
 
@@ -276,15 +261,16 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Conv2d -> GELU -> GlobalAvgPool(2D) fused with custom AscendC kernel (activation+pool).
+    Optimized model: keep PyTorch conv, fuse GELU + GlobalAvgPool into a custom AscendC kernel.
     """
     def __init__(self, in_channels, out_channels, kernel_size):
         super(ModelNew, self).__init__()
         self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size)
 
     def forward(self, x):
-        # 保留Conv2d由框架执行，后续GELU+GAP使用自定义算子
+        # PyTorch conv
         x = self.conv(x)
-        y = custom_ops_lib.conv2d_gelu_global_avg_pool_custom(x)
-        return y
+        # Fused GELU + GlobalAvgPool (H, W -> 1,1) + squeeze to [N, C]
+        x = custom_ops_lib.conv2d_gelu_global_avg_pool_custom(x)
+        return x
 '''

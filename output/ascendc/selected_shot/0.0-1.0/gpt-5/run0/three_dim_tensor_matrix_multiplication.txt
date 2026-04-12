@@ -64,7 +64,8 @@ using namespace matmul_tiling;
 
 namespace optiling {
 /**
-  * @brief  Generate matmul tiling for 3D tensor-matrix multiplication by flattening batch.
+  * @brief  Generate matmul tiling for 3D tensor (N,M,K) times 2D matrix (K,L) -> (N,M,L).
+  *         We fuse N and M into a single M_total = N*M for tiling.
   * @param  context: Tiling kernel context.
   * @retval Status of GetTiling (GRAPH_SUCCESS or GRAPH_FAILED).
   */
@@ -74,13 +75,13 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     auto shape_A = context->GetInputTensor(0)->GetOriginShape();
     auto shape_B = context->GetInputTensor(1)->GetOriginShape();
 
-    // A: (N, M, K), B: (K, L) => treat as (N*M, K) x (K, L)
     int32_t N = shape_A.GetDim(0);
     int32_t M = shape_A.GetDim(1);
     int32_t K = shape_A.GetDim(2);
     int32_t L = shape_B.GetDim(1);
 
-    int32_t Mt = N * M;
+    int32_t M_total = N * M;
+
     int32_t baseM = 128;
     int32_t baseN = 128;
 
@@ -89,9 +90,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     cubeTiling.SetAType(TPosition::GM, CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
     cubeTiling.SetBType(TPosition::GM, CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
     cubeTiling.SetCType(TPosition::GM, CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    cubeTiling.SetShape(Mt, L, K);
-    cubeTiling.SetOrgShape(Mt, L, K);
+    cubeTiling.SetShape(M_total, L, K);
+    cubeTiling.SetOrgShape(M_total, L, K);
     cubeTiling.SetFixSplit(baseM, baseN, -1);
+    cubeTiling.SetBias(false);
     cubeTiling.SetBufferSpace(-1, -1, -1);
 
     ThreeDimTensorMatrixMultiplicationCustomTilingData tiling;
@@ -158,11 +160,10 @@ __aicore__ inline uint32_t Ceiling(uint32_t a, uint32_t b)
     return (a + b - 1) / b;
 }
 
-template <typename aType, typename bType, typename cType>
-class MatmulKernel {
+template <typename aType, typename bType, typename cType> class MatmulKernel {
 public:
     __aicore__ inline MatmulKernel(){};
-    __aicore__ inline void Init(GM_ADDR a, GM_ADDR b, GM_ADDR c, GM_ADDR workspace, const TCubeTiling &tiling);
+    __aicore__ inline void Init(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, const TCubeTiling &tiling);
     template <bool setTmpSpace = false> __aicore__ inline void Process(AscendC::TPipe *pipe);
 
     __aicore__ inline void CalcOffset(int32_t blockIdx, const TCubeTiling &tiling, int32_t &offsetA, int32_t &offsetB,
@@ -180,13 +181,13 @@ public:
 };
 
 template <typename aType, typename bType, typename cType>
-__aicore__ inline void MatmulKernel<aType, bType, cType>::Init(GM_ADDR a, GM_ADDR b, GM_ADDR c, GM_ADDR workspace,
+__aicore__ inline void MatmulKernel<aType, bType, cType>::Init(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace,
                                                                const TCubeTiling &tiling)
 {
     this->tiling = tiling;
-    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ aType *>(a), tiling.M * tiling.Ka);
-    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ bType *>(b), tiling.Kb * tiling.N);
-    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ cType *>(c), tiling.M * tiling.N);
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ aType *>(A), tiling.M * tiling.Ka);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ bType *>(B), tiling.Kb * tiling.N);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ cType *>(C), tiling.M * tiling.N);
 
     int32_t offsetA = 0;
     int32_t offsetB = 0;
@@ -233,8 +234,8 @@ MatmulKernel<aType, bType, cType>::CalcOffset(int32_t blockIdx, const TCubeTilin
     offsetC = mCoreIndx * tiling.N * tiling.singleCoreM + nCoreIndx * tiling.singleCoreN;
 }
 
-extern "C" __global__ __aicore__ void three_dim_tensor_matrix_multiplication_custom(
-    GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void three_dim_tensor_matrix_multiplication_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C,
+                                                                                    GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tilingData, tiling);
     MatmulKernel<float, float, float> matmulKernel;
@@ -256,12 +257,13 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor three_dim_tensor_matrix_multiplication_impl_npu(const at::Tensor& A, const at::Tensor& B) {
-    // A: (N, M, K), B: (K, L) -> C: (N, M, L)
-    TORCH_CHECK(A.dim() == 3, \"A must be 3D\");
-    TORCH_CHECK(B.dim() == 2, \"B must be 2D\");
+    // Expect A: (N, M, K), B: (K, L)
     auto A_sizes = A.sizes();
     auto B_sizes = B.sizes();
-    TORCH_CHECK(A_sizes[2] == B_sizes[0], \"K dimension mismatch\");
+
+    TORCH_CHECK(A.dim() == 3, \"A must be 3D\");
+    TORCH_CHECK(B.dim() == 2, \"B must be 2D\");
+    TORCH_CHECK(A_sizes[2] == B_sizes[0], \"Inner dimensions must match\");
 
     std::vector<int64_t> output_shape = {A_sizes[0], A_sizes[1], B_sizes[1]};
     at::Tensor result = at::empty(output_shape, A.options());
@@ -270,11 +272,11 @@ at::Tensor three_dim_tensor_matrix_multiplication_impl_npu(const at::Tensor& A, 
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl(\"three_dim_tensor_matrix_multiplication_custom\", &three_dim_tensor_matrix_multiplication_impl_npu);
+    m.impl("three_dim_tensor_matrix_multiplication_custom", &three_dim_tensor_matrix_multiplication_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def(\"three_dim_tensor_matrix_multiplication_custom\", &three_dim_tensor_matrix_multiplication_impl_npu, \"3D tensor-matrix multiplication\");
+    m.def("three_dim_tensor_matrix_multiplication_custom", &three_dim_tensor_matrix_multiplication_impl_npu, "3D tensor-matrix matmul");
 }
 """
 

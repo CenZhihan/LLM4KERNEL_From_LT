@@ -30,66 +30,46 @@ project_json_src='''
     }
 ]
 '''
-
 host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(Conv3dGroupNormMeanCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, batch);
-  TILING_DATA_FIELD_DEF(uint32_t, c);
-  TILING_DATA_FIELD_DEF(uint32_t, d);
-  TILING_DATA_FIELD_DEF(uint32_t, h);
-  TILING_DATA_FIELD_DEF(uint32_t, w);
-  TILING_DATA_FIELD_DEF(uint32_t, rLength);
-  TILING_DATA_FIELD_DEF(uint32_t, rLengthWithPadding);
+  TILING_DATA_FIELD_DEF(uint32_t, innerLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(Conv3dGroupNormMeanCustom, Conv3dGroupNormMeanCustomTilingData)
 }
 """
-
 host_operator_src="""
 #include "conv3d_group_norm_mean_custom_tiling.h"
 #include "register/op_def_registry.h"
 
-namespace {
-inline uint32_t AlignTo(const uint32_t x, const uint32_t align) {
-    return (x + align - 1) / align * align;
-}
-}
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     Conv3dGroupNormMeanCustomTilingData tiling;
 
-    const gert::Shape* x_shape = context->GetInputShape(0); // [B, C, D, H, W]
-    uint32_t dims = x_shape->GetOriginShape().GetDimNum();
-    if (dims != 5) {
-        return ge::GRAPH_FAILED;
-    }
-    uint32_t b = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
-    uint32_t c = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
-    uint32_t d = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(2));
-    uint32_t h = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(3));
-    uint32_t w = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(4));
-
-    uint32_t rLength = c * d * h * w;
-    // 32-byte alignment on the inner axis, float element size = 4 => align to 8 elements
-    uint32_t rLengthWithPadding = AlignTo(rLength, 8);
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    // 期望输入形状为 [B, C, D, H, W]
+    uint32_t batch = origin.GetDim(0);
+    uint32_t c = origin.GetDim(1);
+    uint32_t d = origin.GetDim(2);
+    uint32_t h = origin.GetDim(3);
+    uint32_t w = origin.GetDim(4);
+    uint32_t innerLength = c * d * h * w;
 
     context->SetBlockDim(BLOCK_DIM);
-
-    tiling.set_batch(b);
-    tiling.set_c(c);
-    tiling.set_d(d);
-    tiling.set_h(h);
-    tiling.set_w(w);
-    tiling.set_rLength(rLength);
-    tiling.set_rLengthWithPadding(rLengthWithPadding);
+    tiling.set_batch(batch);
+    tiling.set_innerLength(innerLength);
+    tiling.set_tileNum(TILE_NUM);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
@@ -104,13 +84,13 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* x_shape = context->GetInputShape(0); // [B, C, D, H, W]
-    gert::Shape* y_shape = context->GetOutputShape(0);      // [B]
-    std::vector<int64_t> y_dims = { x_shape->GetOriginShape().GetDim(0) };
-    y_shape->SetDimNum(y_dims.size());
-    for (size_t i = 0; i < y_dims.size(); ++i) {
-        y_shape->SetDim(i, y_dims[i]);
-    }
+    // 输出形状为 [B]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    auto origin = x_shape->GetOriginShape();
+    int64_t b = origin.GetDim(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    // 若无便捷设置接口，则沿用示例方式拷贝形状（实际运行时框架会据算子输出覆写）
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
@@ -132,7 +112,6 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -141,7 +120,8 @@ public:
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -149,157 +129,142 @@ public:
 OP_ADD(Conv3dGroupNormMeanCustom);
 }
 """
-
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv3d_group_norm_mean_custom_tiling_data.h"
 
-// 本内核：对输入 x (B, C, D, H, W) 的每个 batch 进行求和（随后在 Python 绑定中除以 C*D*H*W 得到均值）
-// 参考：
-// - 归约算子 PairReduceSum（用于两两求和）：CANN Ascend C API Reference 4.1.8.10 PairReduceSum
-// - 队列/拷贝/向量加法用法参考示例代码
+// 本自定义核实现对输入张量 x（期望为 GN 之后的 (B, C, D, H, W)）
+// 沿 [C, D, H, W] 求均值，输出 y 形状为 (B,)。
+// 为简化演示与通用性，采用逐 batch 的分块 ReduceSum，然后乘以 1/innerLength 得到均值。
 
-constexpr int32_t BUFFER_NUM = 1;  // 单批处理
+constexpr int32_t BUFFER_NUM = 2;
 
-class KernelConv3dGroupNormMean {
+class KernelMeanReduce {
 public:
-    __aicore__ inline KernelConv3dGroupNormMean() {}
+    __aicore__ inline KernelMeanReduce() {}
+
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t batch, uint32_t c, uint32_t d, uint32_t h, uint32_t w,
-                                uint32_t rLen, uint32_t rLenPad)
+                                uint32_t batch, uint32_t innerLength, uint32_t tileNum)
     {
         this->batch = batch;
-        this->c = c;
-        this->d = d;
-        this->h = h;
-        this->w = w;
-        this->rLength = rLen;
-        this->rLengthWithPadding = rLenPad;
+        this->innerLength = innerLength;
+        this->tileNum = tileNum;
 
-        // 将输入视为 [B, R] 的扁平化布局（按 batch 连续）
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_X *>(x), static_cast<uint64_t>(batch) * rLen);
-        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_Y *>(y), batch);
+        // 每个 block 负责的样本数
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t idx = AscendC::GetBlockIdx();
+        this->batchPerBlock = (batch + blocks - 1) / blocks;
+        this->batchStart = idx * this->batchPerBlock;
+        this->batchEnd = this->batchStart + this->batchPerBlock;
+        if (this->batchEnd > batch) this->batchEnd = batch;
+        this->procBatch = (this->batchEnd > this->batchStart) ? (this->batchEnd - this->batchStart) : 0;
 
-        // 为每个 batch 的 R 元素申请本地缓冲
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->rLengthWithPadding * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, sizeof(DTYPE_Y) * batch);
+        // 设定 GM 基址和范围
+        xGm.SetGlobalBuffer((__gm__ float*)x + (uint64_t)this->batchStart * innerLength,
+                            (uint64_t)this->procBatch * innerLength);
+        yGm.SetGlobalBuffer((__gm__ float*)y + this->batchStart, this->procBatch);
+
+        // 分块长度（假定可整除）
+        this->loopCount = this->tileNum * BUFFER_NUM;
+        this->tileLength = (this->loopCount > 0) ? (this->innerLength / this->loopCount) : this->innerLength;
+        if (this->tileLength == 0) this->tileLength = this->innerLength;
+
+        // 初始化缓冲
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        // workLocal 可按 Method 2 任意大小传入，这里给定 tileLength 大小
+        pipe.InitBuffer(tmpWorkQue, BUFFER_NUM, this->tileLength * sizeof(float));
+        // 输出与临时标量缓冲（大小 1）
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, 1 * sizeof(float));
+        pipe.InitBuffer(tmpScalarQue, BUFFER_NUM, 1 * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        for (uint32_t b = AscendC::GetBlockIdx(); b < batch; b += AscendC::GetBlockNum()) {
-            CopyIn(b);
-            Compute(b);
-            CopyOut(b);
+        if (this->procBatch == 0) { return; }
+
+        for (uint32_t b = 0; b < this->procBatch; ++b) {
+            // 累加器 accLocal
+            AscendC::LocalTensor<float> accLocal = outQueueY.AllocTensor<float>();
+            float zero = 0.0f;
+            AscendC::Duplicate(accLocal, zero, 1);
+
+            for (uint32_t i = 0; i < this->loopCount; ++i) {
+                // 读入一块
+                AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+                uint64_t gmOffset = (uint64_t)b * this->innerLength + (uint64_t)i * this->tileLength;
+                AscendC::DataCopy(xLocal, xGm[gmOffset], this->tileLength);
+                inQueueX.EnQue(xLocal);
+
+                // ReduceSum -> 得到该块和
+                AscendC::LocalTensor<float> xTile = inQueueX.DeQue<float>();
+                AscendC::LocalTensor<float> workLocal = tmpWorkQue.AllocTensor<float>();
+                AscendC::LocalTensor<float> sumLocal = tmpScalarQue.AllocTensor<float>();
+                AscendC::ReduceSum(sumLocal, xTile, workLocal, this->tileLength);
+
+                // acc += sumLocal
+                AscendC::Add(accLocal, accLocal, sumLocal, 1);
+
+                // 释放
+                tmpScalarQue.FreeTensor(sumLocal);
+                tmpWorkQue.FreeTensor(workLocal);
+                inQueueX.FreeTensor(xTile);
+            }
+
+            // 均值：accLocal *= (1.0 / innerLength)
+            AscendC::LocalTensor<float> scaleLocal = tmpScalarQue.AllocTensor<float>();
+            float scale = 1.0f / static_cast<float>(this->innerLength);
+            AscendC::Duplicate(scaleLocal, scale, 1);
+            AscendC::Mul(accLocal, accLocal, scaleLocal, 1);
+            tmpScalarQue.FreeTensor(scaleLocal);
+
+            // 写回
+            outQueueY.EnQue<float>(accLocal);
+            AscendC::LocalTensor<float> outLocal = outQueueY.DeQue<float>();
+            AscendC::DataCopy(yGm[b], outLocal, 1);
+            outQueueY.FreeTensor(outLocal);
         }
-    }
-
-private:
-    __aicore__ inline void CopyIn(uint32_t bIdx)
-    {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        // 将该 batch 的 R 个元素复制到本地缓冲
-        AscendC::DataCopy(xLocal, xGm[bIdx * rLength], rLength);
-        // 对 padding 部分填 0，避免参与计算
-        if (rLengthWithPadding > rLength) {
-            AscendC::LocalTensor<DTYPE_X> padLocal = xLocal[rLength];
-            DTYPE_X zero = static_cast<DTYPE_X>(0);
-            AscendC::Duplicate(padLocal, zero, rLengthWithPadding - rLength);
-        }
-        inQueueX.EnQue(xLocal);
-    }
-
-    __aicore__ inline void Compute(uint32_t /*bIdx*/)
-    {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-
-        // 通过迭代“前半段 += 后半段”的方式进行树形归约求和
-        int32_t len = static_cast<int32_t>(rLengthWithPadding);
-        while (len > 1) {
-            int32_t half = len >> 1;
-            // 将前 half 个元素与后 half 个元素逐元素相加，结果存回前 half
-            AscendC::LocalTensor<DTYPE_X> left  = xLocal;          // 从 0 开始
-            AscendC::LocalTensor<DTYPE_X> right = xLocal[half];    // 从 half 偏移开始
-            AscendC::Add(left, left, right, half);
-            len = half;
-        }
-
-        // xLocal[0] 现为该 batch 的和，暂存到 y 缓冲（在 CopyOut 中写回）
-        // 为了与队列模型匹配，分配一个 yLocal 元素并复制
-        if (!outCached) {
-            yLocalCache = outQueueY.AllocTensor<DTYPE_Y>();
-            // 预填充为 0
-            AscendC::Duplicate(yLocalCache, static_cast<DTYPE_Y>(0), batch);
-            outCached = true;
-        }
-        // 将 sum 写入缓存位置（此处直接写入偏移 b 的位置）
-        // 注意：由于不支持随机写 GM，这里在 CopyOut 中按 b 索引写回 GM
-        // 暂把值存放在 class 成员 tempSum，随 b 一起输出
-        tempSum = static_cast<DTYPE_Y>(xLocal.GetValue(0));
-        inQueueX.FreeTensor(xLocal);
-    }
-
-    __aicore__ inline void CopyOut(uint32_t bIdx)
-    {
-        // 直接将该 batch 的 sum 写回 GM（每次一个标量）
-        // 为简化，单独申请标量局部缓冲进行回写
-        DTYPE_Y sumVal = tempSum;
-        AscendC::DataCopy(yGm[bIdx], &sumVal, 1);
-        // 若是最后一个 batch，可释放 yLocalCache（非必须）
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpWorkQue;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> tmpScalarQue;
 
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
 
-    uint32_t batch;
-    uint32_t c, d, h, w;
-    uint32_t rLength;
-    uint32_t rLengthWithPadding;
+    uint32_t batch = 0;
+    uint32_t innerLength = 0;
+    uint32_t tileNum = 1;
+    uint32_t loopCount = 1;
+    uint32_t tileLength = 1;
 
-    // 简化用的缓存变量
-    bool outCached = false;
-    AscendC::LocalTensor<DTYPE_Y> yLocalCache;
-    DTYPE_Y tempSum;
+    uint32_t batchPerBlock = 0;
+    uint32_t batchStart = 0;
+    uint32_t batchEnd = 0;
+    uint32_t procBatch = 0;
 };
 
 extern "C" __global__ __aicore__ void conv3d_group_norm_mean_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelConv3dGroupNormMean op;
-    op.Init(x, y,
-            tiling_data.batch(), tiling_data.c(), tiling_data.d(), tiling_data.h(), tiling_data.w(),
-            tiling_data.rLength(), tiling_data.rLengthWithPadding());
+    KernelMeanReduce op;
+    op.Init(x, y, tiling_data.batch, tiling_data.innerLength, tiling_data.tileNum);
     op.Process();
 }
 """
-
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-// 内核输出每个 batch 的和，绑定中再除以 C*D*H*W 得到均值
 at::Tensor conv3d_group_norm_mean_custom_impl_npu(const at::Tensor& x) {
-    TORCH_CHECK(x.dim() == 5, \"x must be 5D: [B, C, D, H, W]\");
-    auto B = x.size(0);
-    auto C = x.size(1);
-    auto D = x.size(2);
-    auto H = x.size(3);
-    auto W = x.size(4);
-
-    at::Tensor y_sum = at::empty({B}, x.options());
-    EXEC_NPU_CMD(aclnnConv3dGroupNormMeanCustom, x, y_sum);
-
-    // 转为均值
-    const double denom = static_cast<double>(C) * static_cast<double>(D) * static_cast<double>(H) * static_cast<double>(W);
-    at::Tensor y_mean = y_sum / denom;
-    return y_mean;
+    // 输出形状为 (B,)
+    auto out_sizes = std::vector<int64_t>{x.size(0)};
+    at::Tensor result = at::empty(out_sizes, x.options());
+    EXEC_NPU_CMD(aclnnConv3dGroupNormMeanCustom, x, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -307,10 +272,9 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv3d_group_norm_mean_custom", &conv3d_group_norm_mean_custom_impl_npu, "Mean over [C,D,H,W] after GroupNorm");
+    m.def("conv3d_group_norm_mean_custom", &conv3d_group_norm_mean_custom_impl_npu, "Mean over C,D,H,W after GN");
 }
 """
-
 model_src='''
 import torch
 import torch_npu
@@ -318,17 +282,17 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    优化版：保留 PyTorch 的 Conv3d 与 GroupNorm，实现最终的按 [C,D,H,W] 维度均值计算为自定义 AscendC 内核
+    Conv3d -> GroupNorm -> Mean(C,D,H,W) fused为自定义AscendC均值核（仅替换最终Mean阶段）
     """
     def __init__(self, in_channels, out_channels, kernel_size, num_groups):
-        super(ModelNew, self).__init__()
+        super().__init__()
         self.conv = torch.nn.Conv3d(in_channels, out_channels, kernel_size)
         self.group_norm = torch.nn.GroupNorm(num_groups, out_channels)
 
     def forward(self, x):
         x = self.conv(x)
         x = self.group_norm(x)
-        # 使用自定义 AscendC 内核在 NPU 上计算每个 batch 的均值
+        # 使用自定义核计算 (C,D,H,W) 维度上的均值，输出形状为 (B,)
         y = custom_ops_lib.conv3d_group_norm_mean_custom(x)
         return y
 '''

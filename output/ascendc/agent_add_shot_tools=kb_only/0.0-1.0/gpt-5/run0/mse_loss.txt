@@ -46,10 +46,8 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(MseLossCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, size);
-  TILING_DATA_FIELD_DEF(uint32_t, outter);
-  TILING_DATA_FIELD_DEF(uint32_t, inner);
-  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(MseLossCustom, MseLossCustomTilingData)
@@ -59,40 +57,20 @@ REGISTER_TILING_DATA_CLASS(MseLossCustom, MseLossCustomTilingData)
 host_operator_src="""
 #include "mse_loss_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 1;
+const uint32_t TILE_NUM = 8;
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     MseLossCustomTilingData tiling;
-
-    // 将整个输入当作一维向量进行处理：outter=1, n=总元素数
-    uint32_t outter = 1;
-    uint32_t n = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
-
-    // dtype 大小
-    auto dt = context->GetInputTensor(0)->GetDataType();
-    uint32_t dtypesize = (dt == ge::DT_FLOAT16) ? 2 : 4;
-
-    // 计算 inner 的 32B 对齐
-    uint32_t inner = ((n * dtypesize + 32 - 1) / 32) * 32 / dtypesize;
-
-    // 获取 Sum 所需的最小临时空间（与最大值一致）
-    uint32_t maxValue = 0;
-    uint32_t minValue = 0;
-    AscendC::GetSumMaxMinTmpSize(n, dtypesize, false, maxValue, minValue);
-
-    tiling.set_size(minValue);
-    tiling.set_outter(outter);
-    tiling.set_inner(inner);
-    tiling.set_n(n);
-
-    // 单核执行，便于一次性完成全量规约
-    context->SetBlockDim(1);
-
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -102,13 +80,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // MSE 返回标量，这里以 [1] 作为输出形状
-    std::vector<int64_t> out_dims = {1};
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    y_shape->SetDimNum(out_dims.size());
-    for (size_t i = 0; i < out_dims.size(); ++i) {
-        y_shape->SetDim(i, out_dims[i]);
-    }
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    out_shape->SetDimNum(0); // scalar
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
@@ -141,9 +114,7 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -154,114 +125,110 @@ OP_ADD(MseLossCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "mse_loss_custom_tiling_data.h"
 
-using namespace AscendC;
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
-class KernelMseLoss {
+class KernelMSE {
 public:
-    __aicore__ inline KernelMseLoss() {}
-    __aicore__ inline void Init(GM_ADDR predGm, GM_ADDR tgtGm, GM_ADDR lossGm, uint32_t tmpSize, uint32_t outter, uint32_t inner, uint32_t n)
+    __aicore__ inline KernelMSE() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
     {
-        this->height = outter; // 1
-        this->width = inner;   // 32B 对齐后长度
-        this->nNum = n;        // 实际元素数
+        // Use single block to avoid cross-block reduction
+        this->blockLength = (totalLength + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        // ceil for safety
+        uint32_t denom = (this->tileNum * BUFFER_NUM);
+        this->tileLength = (this->blockLength + denom - 1) / denom;
 
-        predGlobal.SetGlobalBuffer((__gm__ DTYPE_X *)predGm);
-        tgtGlobal.SetGlobalBuffer((__gm__ DTYPE_Y *)tgtGm);
-        lossGlobal.SetGlobalBuffer((__gm__ DTYPE_Z *)lossGm);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        // output is scalar
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z, 1);
 
-        // 输入缓冲：按 inner 对齐大小分配
-        pipe.InitBuffer(inPredQ, 1, this->width * sizeof(DTYPE_X));
-        pipe.InitBuffer(inTgtQ, 1, this->width * sizeof(DTYPE_Y));
-
-        // 输出本地缓冲：Sum 输出为 outter 个元素，这里 outter=1；UB 内做 32B 对齐
-        uint32_t outAlignedElems = (this->height * sizeof(DTYPE_Z) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(DTYPE_Z);
-        pipe.InitBuffer(outLossQ, 1, outAlignedElems * sizeof(DTYPE_Z));
-
-        // 临时工作空间
-        pipe.InitBuffer(workQ, 1, tmpSize);
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        // tmp buffer for ReduceSum needs extra workspace. Allocate 2x tileLength as temporary area.
+        pipe.InitBuffer(tmpQue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z) * 2);
+        // one small buffer for scalar output
+        pipe.InitBuffer(outQueueZ, 1, 32);
     }
-
     __aicore__ inline void Process()
     {
-        CopyIn();
-        Compute();
-        CopyOut();
+        uint32_t offset = 0;
+        float sumAcc = 0.0f;
+        while (offset < this->blockLength) {
+            uint32_t curLen = AscendC::Min(this->tileLength, this->blockLength - offset);
+            CopyIn(offset, curLen);
+            sumAcc += Compute(curLen);
+            offset += curLen;
+        }
+        float meanVal = 0.0f;
+        if (this->blockLength > 0) {
+            meanVal = sumAcc / static_cast<float>(this->blockLength);
+        }
+        // write scalar out
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+        AscendC::Dup(zLocal, static_cast<DTYPE_Z>(meanVal), 1);
+        AscendC::DataCopy(zGm, zLocal, 1);
+        outQueueZ.FreeTensor(zLocal);
     }
 
 private:
-    __aicore__ inline void CopyIn()
+    __aicore__ inline void CopyIn(uint32_t offset, uint32_t len)
     {
-        LocalTensor<DTYPE_X> predLocal = inPredQ.AllocTensor<DTYPE_X>();
-        LocalTensor<DTYPE_Y> tgtLocal  = inTgtQ.AllocTensor<DTYPE_Y>();
-        // 仅拷贝实际 n 个元素，剩余对齐部分留空
-        DataCopy(predLocal, predGlobal, this->nNum);
-        DataCopy(tgtLocal,  tgtGlobal,  this->nNum);
-        inPredQ.EnQue(predLocal);
-        inTgtQ.EnQue(tgtLocal);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(xLocal, xGm[offset], len);
+        AscendC::DataCopy(yLocal, yGm[offset], len);
+        inQueueX.EnQue(xLocal);
+        inQueueY.EnQue(yLocal);
     }
-
-    __aicore__ inline void Compute()
+    __aicore__ inline float Compute(uint32_t len)
     {
-        LocalTensor<DTYPE_X> predLocal = inPredQ.DeQue<DTYPE_X>();
-        LocalTensor<DTYPE_Y> tgtLocal  = inTgtQ.DeQue<DTYPE_Y>();
-        LocalTensor<uint8_t> workLocal = workQ.AllocTensor<uint8_t>();
-        LocalTensor<DTYPE_Z> lossLocal = outLossQ.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.DeQue<DTYPE_Y>();
+        // tmp buffers for ReduceSum: split the tmpQue buffer into two regions
+        AscendC::LocalTensor<DTYPE_Z> tmpA = tmpQue.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> tmpB = tmpQue.AllocTensor<DTYPE_Z>();
 
-        // 将输出对齐区清零（UB 内），便于 API 写入
-        uint32_t outAlignedElems = (this->height * sizeof(DTYPE_Z) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(DTYPE_Z);
-        DTYPE_Z zero(0);
-        Duplicate<DTYPE_Z>(lossLocal, zero, outAlignedElems);
+        // diff = x - y  ==> x + (-1) * y
+        AscendC::Muls(yLocal, yLocal, (DTYPE_Y)(-1.0f), len);
+        AscendC::Add(xLocal, xLocal, yLocal, len); // xLocal now holds diff
 
-        // 计算 (pred - tgt)^2，复用 predLocal 作为中间缓冲
-        Sub(predLocal, predLocal, tgtLocal, this->nNum);          // diff
-        Mul(predLocal, predLocal, predLocal, this->nNum);         // diff^2
+        // sq = diff * diff, reuse yLocal as output to save buffer
+        AscendC::Mul(yLocal, xLocal, xLocal, len);
 
-        // 对一维向量规约求和
-        AscendC::SumParams params{this->height, this->width, this->nNum}; // outter=1, inner=width, n=nNum
-        Sum(lossLocal, predLocal, workLocal, params);
+        // ReduceSum over this tile, use tmpA as dst and tmpB as work
+        AscendC::ReduceSum(tmpA, yLocal, tmpB, len);
+        float partSum = AscendC::GetAccVal<float>();
 
-        // 计算 mean：sum / n
-        float scale = 1.0f / static_cast<float>(this->nNum);
-        Muls(lossLocal, lossLocal, scale, 1); // 仅对第一个元素做缩放
-
-        outLossQ.EnQue<DTYPE_Z>(lossLocal);
-        workQ.FreeTensor(workLocal);
-        inPredQ.FreeTensor(predLocal);
-        inTgtQ.FreeTensor(tgtLocal);
-    }
-
-    __aicore__ inline void CopyOut()
-    {
-        LocalTensor<DTYPE_Z> lossLocal = outLossQ.DeQue<DTYPE_Z>();
-        // 仅拷贝 1 个标量到 GM
-        DataCopy(lossGlobal, lossLocal, 1);
-        outLossQ.FreeTensor(lossLocal);
+        // release queues
+        tmpQue.FreeTensor(tmpB);
+        tmpQue.FreeTensor(tmpA);
+        inQueueX.FreeTensor(xLocal);
+        inQueueY.FreeTensor(yLocal);
+        return partSum;
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, 1>  inPredQ;
-    AscendC::TQue<AscendC::TPosition::VECIN, 1>  inTgtQ;
-    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outLossQ;
-    AscendC::TQue<AscendC::TPosition::VECIN, 1>  workQ;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueY;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueZ;
 
-    AscendC::GlobalTensor<DTYPE_X> predGlobal;
-    AscendC::GlobalTensor<DTYPE_Y> tgtGlobal;
-    AscendC::GlobalTensor<DTYPE_Z> lossGlobal;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
 
-    uint32_t width = 0;   // inner
-    uint32_t height = 0;  // outter (1)
-    uint32_t nNum = 0;    // 实际元素数
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void mse_loss_custom(GM_ADDR predictions, GM_ADDR targets, GM_ADDR loss, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void mse_loss_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelMseLoss op;
-    op.Init(predictions, targets, loss, tiling_data.size, tiling_data.outter, tiling_data.inner, tiling_data.n);
+    KernelMSE op;
+    op.Init(x, y, z, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -273,8 +240,7 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor mse_loss_custom_impl_npu(const at::Tensor& predictions, const at::Tensor& targets) {
-    // 输出标量，形状 [1]
-    at::Tensor result = at::empty({1}, predictions.options());
+    at::Tensor result = at::empty({}, predictions.options());
     EXEC_NPU_CMD(aclnnMseLossCustom, predictions, targets, result);
     return result;
 }
@@ -284,7 +250,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("mse_loss_custom", &mse_loss_custom_impl_npu, "Mean Squared Error Loss");
+    m.def("mse_loss_custom", &mse_loss_custom_impl_npu, "mean squared error loss");
 }
 """
 

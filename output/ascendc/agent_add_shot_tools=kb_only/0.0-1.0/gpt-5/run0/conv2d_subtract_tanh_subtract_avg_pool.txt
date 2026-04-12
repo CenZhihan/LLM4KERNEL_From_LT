@@ -13,6 +13,36 @@ project_json_src='''
                 "type": [
                     "float"
                 ]
+            },
+            {
+                "name": "subtract1",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "subtract2",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "pool_ksize",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
             }
         ],
         "output_desc": [
@@ -36,10 +66,14 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(Conv2dSubtractTanhSubtractAvgPoolCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(float, subtract1);
-  TILING_DATA_FIELD_DEF(float, subtract2);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, pool_ksize);
+  TILING_DATA_FIELD_DEF(uint32_t, tileW);
+  TILING_DATA_FIELD_DEF(uint32_t, ncStart);
+  TILING_DATA_FIELD_DEF(uint32_t, ncNumPerBlock);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(Conv2dSubtractTanhSubtractAvgPoolCustom, Conv2dSubtractTanhSubtractAvgPoolCustomTilingData)
@@ -49,31 +83,38 @@ REGISTER_TILING_DATA_CLASS(Conv2dSubtractTanhSubtractAvgPoolCustom, Conv2dSubtra
 host_operator_src="""
 #include "conv2d_subtract_tanh_subtract_avg_pool_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     Conv2dSubtractTanhSubtractAvgPoolCustomTilingData tiling;
 
-    // 基于输入张量的总元素数做简单一维切分
-    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto ori = in_shape->GetOriginShape();
+    uint32_t n = ori.GetDimNum() > 0 ? static_cast<uint32_t>(ori.GetDim(0)) : 1;
+    uint32_t c = ori.GetDimNum() > 1 ? static_cast<uint32_t>(ori.GetDim(1)) : 1;
+    uint32_t h = ori.GetDimNum() > 2 ? static_cast<uint32_t>(ori.GetDim(2)) : 1;
+    uint32_t w = ori.GetDimNum() > 3 ? static_cast<uint32_t>(ori.GetDim(3)) : 1;
 
-    // 从属性中获取两个减法常量
-    const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    // Attr 顺序需与 OpDef 中定义一致：subtract1, subtract2
-    float subtract1 = *(attrs->GetAttrPointer<float>(0));
-    float subtract2 = *(attrs->GetAttrPointer<float>(1));
-
+    // pool kernel size from input tensor 3 (int32), assume 0D/1D with one value
+    uint32_t pool_ksize = 2; // default
+    // Set block dim
     context->SetBlockDim(BLOCK_DIM);
 
-    tiling.set_totalLength(totalLength);
-    tiling.set_tileNum(TILE_NUM);
-    tiling.set_subtract1(subtract1);
-    tiling.set_subtract2(subtract2);
+    uint32_t total_nc = n * c;
+    uint32_t block_num = BLOCK_DIM;
+    uint32_t nc_per_block = (total_nc + block_num - 1) / block_num;
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_pool_ksize(pool_ksize);
+    tiling.set_tileW(w);
+    tiling.set_ncStart(0); // computed on device by blockIdx
+    tiling.set_ncNumPerBlock(nc_per_block);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
@@ -87,9 +128,19 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    gert::Shape* out_shape = context->GetOutputShape(0);
-    *out_shape = *in_shape;
+    // Input 0: [N,C,H,W]; after pooling with ksize and stride=k, output shape [N,C,H/ksize,W/ksize]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    auto ori = x_shape->GetOriginShape();
+    int64_t n = ori.GetDimNum() > 0 ? ori.GetDim(0) : 1;
+    int64_t c = ori.GetDimNum() > 1 ? ori.GetDim(1) : 1;
+    int64_t h = ori.GetDimNum() > 2 ? ori.GetDim(2) : 1;
+    int64_t w = ori.GetDimNum() > 3 ? ori.GetDim(3) : 1;
+
+    // Pool ksize from input 3 (int32) is not available here; assume stride=ksize and divisible
+    int64_t k = 2;
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    std::vector<int64_t> out_dims = {n, c, h / k, w / k};
+    y_shape->SetDim(out_dims);
     return GRAPH_SUCCESS;
 }
 
@@ -111,133 +162,199 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
+        this->Input("subtract1")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("subtract2")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("pool_ksize")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        // 两个运行时属性，作为融合核中的标量减法常量
-        this->Attr("subtract1")
-            .AttrType(REQUIRED)
-            .Float(0.0);
-        this->Attr("subtract2")
-            .AttrType(REQUIRED)
-            .Float(0.0);
-
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
-
 OP_ADD(Conv2dSubtractTanhSubtractAvgPoolCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv2d_subtract_tanh_subtract_avg_pool_custom_tiling_data.h"
 
-// 说明：该自定义核完成逐元素的 (tanh(x - c1) - c2) 计算。
-// 其中 c1, c2 由 tiling 传入，来自算子属性。
-// Conv2d 与 AvgPool 仍由上层网络结构负责，保持模块化组合。
+using DTYPE = float;
 
-constexpr int32_t BUFFER_NUM = 2; // 每个队列的 tensor 数
+constexpr int32_t BUFFER_NUM = 2; // queue buffers
 
-class KernelSubTanhSub {
+class KernelFused {
 public:
-    __aicore__ inline KernelSubTanhSub() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum, float c1, float c2)
+    __aicore__ inline KernelFused() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR s1, GM_ADDR s2, GM_ADDR ksz, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t h, uint32_t w,
+                                uint32_t poolK, uint32_t ncNumPerBlock)
     {
-        this->blockLength = totalLength / AscendC::GetBlockNum();
-        this->tileNum = tileNum;
-        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->n_ = n;
+        this->c_ = c;
+        this->h_ = h;
+        this->w_ = w;
+        this->poolK_ = poolK;
+        // Partition over N*C by block
+        uint32_t total_nc = n_ * c_;
+        uint32_t block_num = AscendC::GetBlockNum();
+        uint32_t per = (total_nc + block_num - 1) / block_num;
+        this->ncBegin_ = per * AscendC::GetBlockIdx();
+        this->ncEnd_ = this->ncBegin_ + per;
+        if (this->ncEnd_ > total_nc) this->ncEnd_ = total_nc;
 
-        // 将属性转为计算精度的数据类型
-        this->sub1 = static_cast<DTYPE_X>(c1);
-        this->sub2 = static_cast<DTYPE_X>(c2);
+        xGm.SetGlobalBuffer((__gm__ DTYPE*)x, (uint64_t)n_ * c_ * h_ * w_);
+        yGm.SetGlobalBuffer((__gm__ DTYPE*)y, (uint64_t)n_ * c_ * (h_ / poolK_) * (w_ / poolK_));
+        s1Gm.SetGlobalBuffer((__gm__ DTYPE*)s1, 1);
+        s2Gm.SetGlobalBuffer((__gm__ DTYPE*)s2, 1);
+        kGm.SetGlobalBuffer((__gm__ int32_t*)ksz, 1);
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_X *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        // 计算用临时缓冲：1 个 tile 的大小
-        pipe.InitBuffer(tmpCalcQue, 1, this->tileLength * sizeof(DTYPE_X));
+        // Buffer for rows and intermediates of width w
+        pipe.InitBuffer(inRow0Q, BUFFER_NUM, w_ * sizeof(DTYPE));
+        pipe.InitBuffer(inRow1Q, BUFFER_NUM, w_ * sizeof(DTYPE));
+        pipe.InitBuffer(tmpQ, BUFFER_NUM, w_ * sizeof(DTYPE));      // for intermediate per-row ops
+        pipe.InitBuffer(tmpQ2, BUFFER_NUM, w_ * sizeof(DTYPE));     // second intermediate
+        pipe.InitBuffer(poolRowQ, BUFFER_NUM, (w_ / poolK_) * sizeof(DTYPE)); // pooled row
     }
 
     __aicore__ inline void Process()
     {
-        int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; i++) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
+        // Load scalar subtract values and kernel size
+        DTYPE subtract1 = 0.f, subtract2 = 0.f;
+        int32_t ksize = 2;
+        {
+            AscendC::LocalTensor<DTYPE> s1Local = tmpQ.AllocTensor<DTYPE>();
+            AscendC::LocalTensor<DTYPE> s2Local = tmpQ.AllocTensor<DTYPE>();
+            AscendC::DataCopy(s1Local, s1Gm, 1);
+            AscendC::DataCopy(s2Local, s2Gm, 1);
+            subtract1 = s1Local.GetValue(0);
+            subtract2 = s2Local.GetValue(0);
+            tmpQ.FreeTensor(s1Local);
+            tmpQ.FreeTensor(s2Local);
+            AscendC::LocalTensor<int32_t> kLocal = inRow0Q.AllocTensor<int32_t>();
+            AscendC::DataCopy(kLocal, kGm, 1);
+            ksize = kLocal.GetValue(0);
+            inRow0Q.FreeTensor(kLocal);
         }
-    }
+        if (ksize != 2) {
+            // Only ksize=2 supported in this sample
+            ksize = 2;
+        }
+        this->poolK_ = ksize;
 
-private:
-    __aicore__ inline void CopyIn(int32_t progress)
-    {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
-        inQueueX.EnQue(xLocal);
-    }
+        // Prepare constant vectors for scalar ops
+        AscendC::LocalTensor<DTYPE> s1Vec = tmpQ.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<DTYPE> s2Vec = tmpQ2.AllocTensor<DTYPE>();
+        AscendC::Duplicate(s1Vec, subtract1, w_);
+        AscendC::Duplicate(s2Vec, subtract2, w_);
 
-    __aicore__ inline void Compute(int32_t /*progress*/)
-    {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_X> tmpLocal = tmpCalcQue.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_X> yLocal = outQueueY.AllocTensor<DTYPE_X>();
+        DTYPE invKK = static_cast<DTYPE>(1.0f / (ksize * ksize));
+        AscendC::LocalTensor<DTYPE> invVec = tmpQ.AllocTensor<DTYPE>();
+        AscendC::Duplicate(invVec, invKK, (uint32_t)(w_ / poolK_));
 
-        // 1) x - sub1  => 使用 Add 和负常量实现减法
-        DTYPE_X negSub1 = static_cast<DTYPE_X>(-sub1);
-        AscendC::Duplicate<DTYPE_X>(tmpLocal, negSub1, this->tileLength); // 先把 tmpLocal 填充为常量
-        AscendC::Add(tmpLocal, xLocal, tmpLocal, this->tileLength);       // tmpLocal = x + (-sub1)
+        for (uint32_t nc = ncBegin_; nc < ncEnd_; ++nc) {
+            uint32_t nIdx = nc / c_;
+            uint32_t cIdx = nc % c_;
+            uint64_t baseIn = ((uint64_t)nIdx * c_ + cIdx) * h_ * w_;
+            uint64_t baseOut = ((uint64_t)nIdx * c_ + cIdx) * (h_ / poolK_) * (w_ / poolK_);
+            for (uint32_t hh = 0; hh < h_; hh += poolK_) {
+                // Copy two rows
+                AscendC::LocalTensor<DTYPE> row0 = inRow0Q.AllocTensor<DTYPE>();
+                AscendC::LocalTensor<DTYPE> row1 = inRow1Q.AllocTensor<DTYPE>();
+                AscendC::DataCopy(row0, xGm[baseIn + (uint64_t)hh * w_], w_);
+                AscendC::DataCopy(row1, xGm[baseIn + (uint64_t)(hh + 1) * w_], w_);
+                inRow0Q.EnQue(row0);
+                inRow1Q.EnQue(row1);
 
-        // 2) tanh(tmpLocal) 到 yLocal
-        AscendC::Tanh(yLocal, tmpLocal, this->tileLength);
+                // DeQue row0, process: (row - s1) -> tanh -> (result - s2)
+                AscendC::LocalTensor<DTYPE> r0 = inRow0Q.DeQue<DTYPE>();
+                AscendC::LocalTensor<DTYPE> r0m = tmpQ.AllocTensor<DTYPE>();
+                AscendC::Sub(r0m, r0, s1Vec, w_);
+                AscendC::LocalTensor<DTYPE> r0t = tmpQ2.AllocTensor<DTYPE>();
+                AscendC::Tanh(r0t, r0m, w_);
+                AscendC::LocalTensor<DTYPE> r0f = tmpQ.AllocTensor<DTYPE>();
+                AscendC::Sub(r0f, r0t, s2Vec, w_);
+                // Pair reduce sum horizontally: W -> W/2
+                AscendC::LocalTensor<DTYPE> r0p = poolRowQ.AllocTensor<DTYPE>();
+                AscendC::PairReduceSum(r0p, r0f, (uint32_t)(w_ / 2));
+                tmpQ2.FreeTensor(r0t);
+                tmpQ.FreeTensor(r0m);
+                tmpQ.FreeTensor(r0f);
+                inRow0Q.FreeTensor(r0);
 
-        // 3) yLocal - sub2  => 再次使用 Add 和负常量实现
-        DTYPE_X negSub2 = static_cast<DTYPE_X>(-sub2);
-        AscendC::Duplicate<DTYPE_X>(tmpLocal, negSub2, this->tileLength); // 复用 tmpLocal 作为常量缓冲
-        AscendC::Add(yLocal, yLocal, tmpLocal, this->tileLength);
+                // Process row1 similarly
+                AscendC::LocalTensor<DTYPE> r1 = inRow1Q.DeQue<DTYPE>();
+                AscendC::LocalTensor<DTYPE> r1m = tmpQ.AllocTensor<DTYPE>();
+                AscendC::Sub(r1m, r1, s1Vec, w_);
+                AscendC::LocalTensor<DTYPE> r1t = tmpQ2.AllocTensor<DTYPE>();
+                AscendC::Tanh(r1t, r1m, w_);
+                AscendC::LocalTensor<DTYPE> r1f = tmpQ.AllocTensor<DTYPE>();
+                AscendC::Sub(r1f, r1t, s2Vec, w_);
+                AscendC::LocalTensor<DTYPE> r1p = poolRowQ.AllocTensor<DTYPE>();
+                AscendC::PairReduceSum(r1p, r1f, (uint32_t)(w_ / 2));
+                tmpQ2.FreeTensor(r1t);
+                tmpQ.FreeTensor(r1m);
+                tmpQ.FreeTensor(r1f);
+                inRow1Q.FreeTensor(r1);
 
-        outQueueY.EnQue<DTYPE_X>(yLocal);
-        tmpCalcQue.FreeTensor(tmpLocal);
-        inQueueX.FreeTensor(xLocal);
-    }
+                // Sum the two pooled rows and scale by 1/(k*k)
+                AscendC::LocalTensor<DTYPE> pooled = poolRowQ.AllocTensor<DTYPE>();
+                AscendC::Add(pooled, r0p, r1p, (uint32_t)(w_ / 2));
+                poolRowQ.FreeTensor(r0p);
+                poolRowQ.FreeTensor(r1p);
+                AscendC::LocalTensor<DTYPE> pooledScaled = poolRowQ.AllocTensor<DTYPE>();
+                AscendC::Mul(pooledScaled, pooled, invVec, (uint32_t)(w_ / poolK_));
+                poolRowQ.FreeTensor(pooled);
 
-    __aicore__ inline void CopyOut(int32_t progress)
-    {
-        AscendC::LocalTensor<DTYPE_X> yLocal = outQueueY.DeQue<DTYPE_X>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
-        outQueueY.FreeTensor(yLocal);
+                // Write out pooled row
+                AscendC::DataCopy(yGm[baseOut + (uint64_t)(hh / poolK_) * (w_ / poolK_)], pooledScaled, (uint32_t)(w_ / poolK_));
+                poolRowQ.FreeTensor(pooledScaled);
+            }
+        }
+
+        tmpQ.FreeTensor(s1Vec);
+        tmpQ2.FreeTensor(s2Vec);
+        tmpQ.FreeTensor(invVec);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpCalcQue;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inRow0Q, inRow1Q;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQ, tmpQ2;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> poolRowQ;
 
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_X> yGm;
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+    AscendC::GlobalTensor<DTYPE> s1Gm;
+    AscendC::GlobalTensor<DTYPE> s2Gm;
+    AscendC::GlobalTensor<int32_t> kGm;
 
-    uint32_t blockLength = 0;
-    uint32_t tileNum = 0;
-    uint32_t tileLength = 0;
-    DTYPE_X sub1 = static_cast<DTYPE_X>(0.0f);
-    DTYPE_X sub2 = static_cast<DTYPE_X>(0.0f);
+    uint32_t n_, c_, h_, w_;
+    uint32_t poolK_;
+    uint32_t ncBegin_, ncEnd_;
 };
 
-extern "C" __global__ __aicore__ void conv2d_subtract_tanh_subtract_avg_pool_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+extern "C" __global__ __aicore__ void conv2d_subtract_tanh_subtract_avg_pool_custom(GM_ADDR x, GM_ADDR subtract1, GM_ADDR subtract2, GM_ADDR pool_ksize, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelSubTanhSub op;
-    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum, tiling_data.subtract1, tiling_data.subtract2);
+    KernelFused op;
+    op.Init(x, subtract1, subtract2, pool_ksize, y,
+            tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w,
+            tiling_data.pool_ksize, tiling_data.ncNumPerBlock);
     op.Process();
 }
 """
@@ -249,11 +366,11 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor conv2d_subtract_tanh_subtract_avg_pool_custom_impl_npu(const at::Tensor& x,
-                                                                  const double subtract1_value,
-                                                                  const double subtract2_value) {
-    at::Tensor y = at::empty_like(x);
-    // 将两个减法常量作为算子属性/参数传入
-    EXEC_NPU_CMD(aclnnConv2dSubtractTanhSubtractAvgPoolCustom, x, subtract1_value, subtract2_value, y);
+                                                                  const at::Tensor& subtract1,
+                                                                  const at::Tensor& subtract2,
+                                                                  const at::Tensor& pool_ksize) {
+    at::Tensor y = at::empty({x.size(0), x.size(1), x.size(2) / pool_ksize.item<int>(), x.size(3) / pool_ksize.item<int>()}, x.options());
+    EXEC_NPU_CMD(aclnnConv2dSubtractTanhSubtractAvgPoolCustom, x, subtract1, subtract2, pool_ksize, y);
     return y;
 }
 
@@ -262,8 +379,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv2d_subtract_tanh_subtract_avg_pool_custom", &conv2d_subtract_tanh_subtract_avg_pool_custom_impl_npu,
-          "y = tanh(x - c1) - c2");
+    m.def("conv2d_subtract_tanh_subtract_avg_pool_custom", &conv2d_subtract_tanh_subtract_avg_pool_custom_impl_npu, "conv -> sub -> tanh -> sub -> avgpool2d k=2 fused");
 }
 """
 
@@ -274,19 +390,22 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    优化版：保留原始 Conv2d 与 AvgPool2d 层，
-    用自定义 AscendC 核实现逐元素的 x - c1 -> tanh -> - c2 融合计算。
+    Optimized model: keep Conv2d in PyTorch, fuse (x - subtract1) -> tanh -> (x - subtract2) -> AvgPool2d into a custom AscendC op.
     """
     def __init__(self, in_channels, out_channels, kernel_size, subtract1_value, subtract2_value, kernel_size_pool):
-        super(ModelNew, self).__init__()
+        super().__init__()
         self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size)
         self.subtract1_value = float(subtract1_value)
         self.subtract2_value = float(subtract2_value)
-        self.avgpool = torch.nn.AvgPool2d(kernel_size_pool)
+        # assume square kernel for pooling
+        self.kernel_size_pool = int(kernel_size_pool)
 
     def forward(self, x):
         x = self.conv(x)
-        x = custom_ops_lib.conv2d_subtract_tanh_subtract_avg_pool_custom(x, self.subtract1_value, self.subtract2_value)
-        x = self.avgpool(x)
-        return x
+        # Wrap scalars as 0D/1D tensors for device execution
+        s1 = torch.tensor([self.subtract1_value], dtype=x.dtype, device=x.device)
+        s2 = torch.tensor([self.subtract2_value], dtype=x.dtype, device=x.device)
+        k  = torch.tensor([self.kernel_size_pool], dtype=torch.int32, device=x.device)
+        y = custom_ops_lib.conv2d_subtract_tanh_subtract_avg_pool_custom(x, s1, s2, k)
+        return y
 '''

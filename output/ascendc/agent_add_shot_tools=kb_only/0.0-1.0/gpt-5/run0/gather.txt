@@ -46,9 +46,10 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(GatherCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, batch);
-  TILING_DATA_FIELD_DEF(uint32_t, srcCols);
-  TILING_DATA_FIELD_DEF(uint32_t, idxCols);
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, srcWidth);
+  TILING_DATA_FIELD_DEF(uint32_t, idxWidth);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(GatherCustom, GatherCustomTilingData)
@@ -58,34 +59,35 @@ REGISTER_TILING_DATA_CLASS(GatherCustom, GatherCustomTilingData)
 host_operator_src="""
 #include "gather_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     GatherCustomTilingData tiling;
 
-    const gert::StorageShape *x_shape = context->GetInputShape(0);
-    const gert::StorageShape *idx_shape = context->GetInputShape(1);
+    const gert::Shape* xShape = context->GetInputShape(0);
+    const gert::Shape* idxShape = context->GetInputShape(1);
 
-    // Expect 2D shapes: [N, C] for x and [N, K] for idx
-    uint32_t batch = x_shape->GetStorageShape().GetDim(0);
-    uint32_t srcCols = x_shape->GetStorageShape().GetDim(1);
-    uint32_t idxCols = idx_shape->GetStorageShape().GetDim(1);
+    // 假设输入为 [N, C]，按 dim=1 聚合
+    uint32_t rows = static_cast<uint32_t>(xShape->GetDim(0));
+    uint32_t srcWidth = static_cast<uint32_t>(xShape->GetDim(1));
+    uint32_t idxWidth = static_cast<uint32_t>(idxShape->GetDim(1));
 
     context->SetBlockDim(BLOCK_DIM);
-
-    tiling.set_batch(batch);
-    tiling.set_srcCols(srcCols);
-    tiling.set_idxCols(idxCols);
+    tiling.set_rows(rows);
+    tiling.set_srcWidth(srcWidth);
+    tiling.set_idxWidth(idxWidth);
+    tiling.set_tileNum(TILE_NUM);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
+    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -93,15 +95,18 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* idx_shape = context->GetInputShape(1);
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    *y_shape = *idx_shape;
+    // 输出形状与 idx 相同
+    const gert::Shape* idxShape = context->GetInputShape(1);
+    gert::Shape* yShape = context->GetOutputShape(0);
+    *yShape = *idxShape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const auto xType = context->GetInputDataType(0);
-    context->SetOutputDataType(0, xType);
+    // 输出 dtype 与 x 相同
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -116,11 +121,13 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Input("idx")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -134,117 +141,110 @@ public:
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(GatherCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "gather_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 1;
+using DTYPE_X = float;
+using DTYPE_Y = float;
+using ITYPE_IDX = uint32_t;
+
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的张量数
 
 class KernelGather {
 public:
     __aicore__ inline KernelGather() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR idx, GM_ADDR y, uint32_t batch, uint32_t srcCols, uint32_t idxCols)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR idx, GM_ADDR y,
+                                uint32_t rows, uint32_t srcWidth, uint32_t idxWidth, uint32_t tileNum)
     {
-        this->batch = batch;
-        this->srcCols = srcCols;
-        this->idxCols = idxCols;
+        this->rows = rows;
+        this->srcWidth = srcWidth;
+        this->idxWidth = idxWidth;
+        this->tileNum = tileNum;
 
-        uint32_t blockNum = AscendC::GetBlockNum();
-        uint32_t blockIdx = AscendC::GetBlockIdx();
-        this->rowsPerBlock = (batch + blockNum - 1) / blockNum;
-        this->rowStart = this->rowsPerBlock * blockIdx;
-        uint32_t rowEnd = this->rowStart + this->rowsPerBlock;
-        if (rowEnd > batch) rowEnd = batch;
-        this->myRows = (rowEnd > this->rowStart) ? (rowEnd - this->rowStart) : 0;
+        this->rowsPerBlock = rows / AscendC::GetBlockNum();
+        this->tileLength = this->idxWidth / this->tileNum / BUFFER_NUM;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + static_cast<uint64_t>(this->rowStart) * this->srcCols,
-                            static_cast<uint64_t>(this->myRows) * this->srcCols);
-        idxGm.SetGlobalBuffer((__gm__ int32_t *)idx + static_cast<uint64_t>(this->rowStart) * this->idxCols,
-                              static_cast<uint64_t>(this->myRows) * this->idxCols);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + static_cast<uint64_t>(this->rowStart) * this->idxCols,
-                            static_cast<uint64_t>(this->myRows) * this->idxCols);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->rowsPerBlock * this->srcWidth * AscendC::GetBlockIdx(),
+                            this->rowsPerBlock * this->srcWidth);
+        idxGm.SetGlobalBuffer((__gm__ ITYPE_IDX*)idx + this->rowsPerBlock * this->idxWidth * AscendC::GetBlockIdx(),
+                            this->rowsPerBlock * this->idxWidth);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + this->rowsPerBlock * this->idxWidth * AscendC::GetBlockIdx(),
+                            this->rowsPerBlock * this->idxWidth);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->srcCols * sizeof(DTYPE_X));
-        pipe.InitBuffer(inQueueIdx, BUFFER_NUM, this->idxCols * sizeof(int32_t));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->idxCols * sizeof(DTYPE_Y));
+        // 缓冲初始化
+        pipe.InitBuffer(inQueueXRow, 1, this->srcWidth * sizeof(DTYPE_X));              // 每次载入一整行 x
+        pipe.InitBuffer(inQueueIdx, BUFFER_NUM, this->tileLength * sizeof(ITYPE_IDX));  // 索引分块
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));     // 输出分块
     }
 
     __aicore__ inline void Process()
     {
-        for (uint32_t r = 0; r < myRows; ++r) {
-            CopyInRow(r);
-            ComputeRow();
-            CopyOutRow(r);
+        for (uint32_t r = 0; r < this->rowsPerBlock; ++r) {
+            // 拷贝一行 x 到 UB
+            AscendC::LocalTensor<DTYPE_X> xRowLocal = inQueueXRow.AllocTensor<DTYPE_X>();
+            AscendC::DataCopy(xRowLocal, xGm[r * this->srcWidth], this->srcWidth);
+
+            int32_t loopCount = this->tileNum * BUFFER_NUM;
+            for (int32_t i = 0; i < loopCount; ++i) {
+                // 拷贝一段 idx 到 UB（int32）
+                AscendC::LocalTensor<ITYPE_IDX> idxLocal = inQueueIdx.AllocTensor<ITYPE_IDX>();
+                AscendC::DataCopy(idxLocal, idxGm[r * this->idxWidth + i * this->tileLength], this->tileLength);
+                inQueueIdx.EnQue(idxLocal);
+
+                // 计算：将 idx(元素索引)转换为字节偏移，并使用 Gather
+                AscendC::LocalTensor<ITYPE_IDX> offsetLocal = inQueueIdx.DeQue<ITYPE_IDX>();
+                // 元素大小为4字节，左移2位得到字节偏移（计 this->tileLength 个元素）
+                // 使用向量左移标量的基础指令
+                AscendC::ShiftLeft(offsetLocal, offsetLocal, 2, this->tileLength);
+
+                AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+                // 从 xRowLocal 基址(0)按偏移表聚合 count = tileLength
+                AscendC::Gather(yLocal, xRowLocal, offsetLocal, (uint32_t)0, this->tileLength);
+
+                outQueueY.EnQue<DTYPE_Y>(yLocal);
+                inQueueIdx.FreeTensor(offsetLocal);
+
+                // 写回对应输出段
+                AscendC::LocalTensor<DTYPE_Y> yOutLocal = outQueueY.DeQue<DTYPE_Y>();
+                AscendC::DataCopy(yGm[r * this->idxWidth + i * this->tileLength], yOutLocal, this->tileLength);
+                outQueueY.FreeTensor(yOutLocal);
+            }
+            inQueueXRow.FreeTensor(xRowLocal);
         }
-    }
-
-private:
-    __aicore__ inline void CopyInRow(uint32_t r)
-    {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.AllocTensor<int32_t>();
-        AscendC::DataCopy(xLocal, xGm[r * this->srcCols], this->srcCols);
-        AscendC::DataCopy(idxLocal, idxGm[r * this->idxCols], this->idxCols);
-        inQueueX.EnQue(xLocal);
-        inQueueIdx.EnQue(idxLocal);
-    }
-
-    __aicore__ inline void ComputeRow()
-    {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.DeQue<int32_t>();
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
-
-        // Gather along dim=1 per row: y[j] = x[idx[j]]
-        for (uint32_t j = 0; j < this->idxCols; ++j) {
-            int32_t index = idxLocal.GetValue(j); // read index from local tensor
-            // bound check to avoid invalid access
-            if (index < 0) index = 0;
-            if (index >= static_cast<int32_t>(this->srcCols)) index = static_cast<int32_t>(this->srcCols) - 1;
-            AscendC::DataCopy(yLocal[j], xLocal[static_cast<uint32_t>(index)], 1);
-        }
-
-        outQueueY.EnQue<DTYPE_Y>(yLocal);
-        inQueueX.FreeTensor(xLocal);
-        inQueueIdx.FreeTensor(idxLocal);
-    }
-
-    __aicore__ inline void CopyOutRow(uint32_t r)
-    {
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
-        AscendC::DataCopy(yGm[r * this->idxCols], yLocal, this->idxCols);
-        outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueIdx;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueXRow;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueIdx;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
 
     AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<int32_t> idxGm;
+    AscendC::GlobalTensor<ITYPE_IDX> idxGm;
     AscendC::GlobalTensor<DTYPE_Y> yGm;
 
-    uint32_t batch;
-    uint32_t srcCols;
-    uint32_t idxCols;
+    uint32_t rows;
+    uint32_t srcWidth;
+    uint32_t idxWidth;
+    uint32_t tileNum;
 
     uint32_t rowsPerBlock;
-    uint32_t rowStart;
-    uint32_t myRows;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void gather_custom(GM_ADDR x, GM_ADDR idx, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
-    GET_TILING_DATA(tiling_data, tiling);
+extern "C" __global__ __aicore__ void gather_custom(GM_ADDR x, GM_ADDR idx, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
     KernelGather op;
-    op.Init(x, idx, y, tiling_data.batch, tiling_data.srcCols, tiling_data.idxCols);
-    op.Process();
+    op.Init(x, idx, y, tilingData.rows, tilingData.srcWidth, tilingData.idxWidth, tilingData.tileNum);
+    if (TILING_KEY_IS(1)) {
+        op.Process();
+    }
 }
 """
 
@@ -255,9 +255,10 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor gather_custom_impl_npu(const at::Tensor& x, const at::Tensor& idx) {
-    at::Tensor result = at::empty({x.size(0), idx.size(1)}, x.options());
-    EXEC_NPU_CMD(aclnnGatherCustom, x, idx, result);
-    return result;
+    at::Tensor idx_i32 = idx.to(at::kInt);
+    at::Tensor y = at::empty({idx.size(0), idx.size(1)}, x.options());
+    EXEC_NPU_CMD(aclnnGatherCustom, x, idx_i32, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -265,7 +266,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("gather_custom", &gather_custom_impl_npu, "gather along dim=1");
+    m.def("gather_custom", &gather_custom_impl_npu, "gather along dim=1 with indices");
 }
 """
 
@@ -279,5 +280,6 @@ class ModelNew(torch.nn.Module):
         super().__init__()
 
     def forward(self, x, idx):
-        return custom_ops_lib.gather_custom(x, idx)
+        # AscendC内核在dim=1做gather，idx需为int32
+        return custom_ops_lib.gather_custom(x, idx.to(torch.int32))
 '''

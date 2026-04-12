@@ -1,0 +1,323 @@
+project_json_src='''
+[
+    {
+        "op": "MeanReductionOverADimensionCustom",
+        "language": "cpp",
+        "attr": [
+            {
+                "name": "dim",
+                "type": "int"
+            }
+        ],
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(TilingData)
+TILING_DATA_FIELD_DEF(uint32_t, outer);      // 外侧展开
+TILING_DATA_FIELD_DEF(uint32_t, reduce);     // 需要被均值化的长度
+TILING_DATA_FIELD_DEF(uint32_t, inner);      // 内侧展开
+TILING_DATA_FIELD_DEF(int32_t,  dim);        // 归约的维度
+TILING_DATA_FIELD_DEF(uint32_t, outLength);  // 输出元素总数
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MeanReductionOverADimensionCustom, TilingData)
+} // namespace optiling
+"""
+
+host_operator_src="""
+#include "mean_reduction_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+constexpr uint32_t BLOCK_DIM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    TilingData tiling;
+    auto *shape = context->GetInputShape(0);
+    auto inShape = shape->GetOriginShape();
+    int64_t dimNum = inShape.GetDimNum();
+    // 仅示例处理3D张量：N x D1 x D2
+    if (dimNum != 3) {
+        return ge::GRAPH_FAILED;
+    }
+    int64_t N  = inShape.GetDim(0);
+    int64_t D1 = inShape.GetDim(1);
+    int64_t D2 = inShape.GetDim(2);
+
+    // 获取归约维度dim（默认1）
+    int64_t dim = 1;
+    (void)context->TryGetIntAttr("dim", dim);
+
+    uint32_t outer = 0, reduce = 0, inner = 0;
+    if (dim == 0) {
+        outer = 1;
+        reduce = static_cast<uint32_t>(N);
+        inner = static_cast<uint32_t>(D1 * D2);
+    } else if (dim == 1) {
+        outer = static_cast<uint32_t>(N);
+        reduce = static_cast<uint32_t>(D1);
+        inner = static_cast<uint32_t>(D2);
+    } else if (dim == 2 || dim == -1) {
+        outer = static_cast<uint32_t>(N * D1);
+        reduce = static_cast<uint32_t>(D2);
+        inner = 1;
+    } else {
+        return ge::GRAPH_FAILED;
+    }
+
+    tiling.set_outer(outer);
+    tiling.set_reduce(reduce);
+    tiling.set_inner(inner);
+    tiling.set_dim(static_cast<int32_t>(dim));
+    tiling.set_outLength(static_cast<uint32_t>(outer * inner));
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static graphStatus InferShape(gert::InferShapeContext *context)
+{
+    // 输入3D：N x D1 x D2；输出移除归约维
+    auto *x_shape = context->GetInputShape(0);
+    auto xOrigin = x_shape->GetOriginShape();
+    if (xOrigin.GetDimNum() != 3) {
+        return GRAPH_FAILED;
+    }
+    int64_t N  = xOrigin.GetDim(0);
+    int64_t D1 = xOrigin.GetDim(1);
+    int64_t D2 = xOrigin.GetDim(2);
+
+    // 默认dim=1
+    int64_t dim = 1;
+    (void)context->TryGetIntAttr("dim", dim);
+
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    if (dim == 0) {
+        *y_shape = {D1, D2};
+    } else if (dim == 1) {
+        *y_shape = {N, D2};
+    } else if (dim == 2 || dim == -1) {
+        *y_shape = {N, D1};
+    } else {
+        return GRAPH_FAILED;
+    }
+    return GRAPH_SUCCESS;
+}
+
+static graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class MeanReductionOverADimensionCustom : public OpDef {
+public:
+    explicit MeanReductionOverADimensionCustom(const char *name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+        this->Attr("dim").Int(1); // 默认沿第1维归约
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore()
+            .SetTiling(optiling::TilingFunc)
+            .AddConfig("ascend910b");
+    }
+};
+OP_ADD(MeanReductionOverADimensionCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+class KernelMeanReduce {
+public:
+    __aicore__ inline KernelMeanReduce() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t outer, uint32_t reduce, uint32_t inner, int32_t dim, uint32_t outLength)
+    {
+        this->outer = outer;
+        this->reduce = reduce;
+        this->inner = inner;
+        this->dim = dim;
+        this->outLength = outLength;
+
+        xGm.SetGlobalBuffer((__gm__ float *)x, static_cast<uint64_t>(outer) * reduce * inner);
+        yGm.SetGlobalBuffer((__gm__ float *)y, outLength);
+        // 为简单起见，示例一次性搬运与计算（实际工程请分块与流水）
+        pipe.InitBuffer(inQueueX, 1, static_cast<uint64_t>(outer) * reduce * inner * sizeof(float));
+        pipe.InitBuffer(outQueueY, 1, static_cast<uint64_t>(outLength) * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm, static_cast<uint64_t>(outer) * reduce * inner);
+        inQueueX.EnQue(xLocal);
+    }
+
+    // 简化实现：对每个(outer, inner)位置沿reduce维求和并除以reduce
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        // 这里使用简化的标量循环示意（实际工程中可通过PairReduceSum/BlockReduceSum等向量化优化）
+        for (uint32_t o = 0; o < outer; ++o) {
+            for (uint32_t i = 0; i < inner; ++i) {
+                float acc = 0.0f;
+                // 线性地址：idx = o * (reduce*inner) + r * inner + i
+                uint64_t base = static_cast<uint64_t>(o) * reduce * inner + i;
+                for (uint32_t r = 0; r < reduce; ++r) {
+                    uint64_t idx = base + static_cast<uint64_t>(r) * inner;
+                    // 简化：通过DataCopyOneToScalar方式不支持，这里假设可直接访问
+                    // 为了贴近AscendC范式，采用临时1元素拷贝的方式
+                    AscendC::LocalTensor<float> tmp = inQueueX.AllocTensor<float>();
+                    AscendC::DataCopy(tmp, xLocal[idx], 1);
+                    acc += tmp.GetValue(0);
+                    inQueueX.FreeTensor(tmp);
+                }
+                float mean = acc / static_cast<float>(reduce);
+                // 写回
+                uint64_t outIdx = static_cast<uint64_t>(o) * inner + i;
+                // 同理使用临时1元素写回
+                AscendC::LocalTensor<float> tmpOut = outQueueY.AllocTensor<float>();
+                tmpOut.SetValue(0, mean);
+                AscendC::DataCopy(yLocal[outIdx], tmpOut, 1);
+                outQueueY.FreeTensor(tmpOut);
+            }
+        }
+        outQueueY.EnQue<float>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::DataCopy(yGm, yLocal, outLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueY;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t outer;
+    uint32_t reduce;
+    uint32_t inner;
+    int32_t dim;
+    uint32_t outLength;
+};
+
+extern "C" __global__ __aicore__ void mean_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMeanReduce op;
+    op.Init(x, y,
+            tiling_data.outer,
+            tiling_data.reduce,
+            tiling_data.inner,
+            tiling_data.dim,
+            tiling_data.outLength);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor mean_reduction_over_a_dimension_impl_npu(const at::Tensor& x, int64_t dim) {
+    // 输出形状：移除dim
+    auto sizes = x.sizes().vec();
+    TORCH_CHECK(sizes.size() == 3, "Only 3D tensor is supported in this example.");
+    if (dim < 0) dim += sizes.size();
+    TORCH_CHECK(dim >= 0 && dim < (int64_t)sizes.size(), "Invalid dim.");
+    std::vector<int64_t> out_sizes;
+    for (int64_t i = 0; i < (int64_t)sizes.size(); ++i) {
+        if (i != dim) out_sizes.push_back(sizes[i]);
+    }
+    at::Tensor result = at::empty(out_sizes, x.options());
+    EXEC_NPU_CMD(aclnnMeanReductionOverADimensionCustom, x, dim, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("mean_reduction_over_a_dimension_custom", &mean_reduction_over_a_dimension_impl_npu);
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mean_reduction_over_a_dimension_custom", &mean_reduction_over_a_dimension_impl_npu, "mean reduction over a dimension");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.mean_reduction_over_a_dimension_custom(x, self.dim)
+'''

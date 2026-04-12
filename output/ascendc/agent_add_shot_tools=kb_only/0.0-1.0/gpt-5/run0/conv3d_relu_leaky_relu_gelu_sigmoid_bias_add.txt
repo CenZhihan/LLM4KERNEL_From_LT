@@ -65,7 +65,7 @@ const uint32_t TILE_NUM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     Conv3dReluLeakyReluGeluSigmoidBiasAddCustomTilingData tiling;
-    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
@@ -81,6 +81,9 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* bias_shape = context->GetInputShape(1);
+    // 简单设置：输出与x同形状，假设调用侧已将bias扩展为与x同形状
+    (void)bias_shape;
     gert::Shape* y_shape = context->GetOutputShape(0);
     *y_shape = *x_shape;
     return GRAPH_SUCCESS;
@@ -115,6 +118,7 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
@@ -126,11 +130,8 @@ OP_ADD(Conv3dReluLeakyReluGeluSigmoidBiasAddCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv3d_relu_leaky_relu_gelu_sigmoid_bias_add_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
-constexpr float NEGATIVE_SLOPE = 0.01f;
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的缓冲数
 
 class KernelConv3dReluLeakyReluGeluSigmoidBiasAdd {
 public:
@@ -142,15 +143,13 @@ public:
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
         xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        bGm.SetGlobalBuffer((__gm__ DTYPE_Y *)bias + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        bGm.SetGlobalBuffer((__gm__ DTYPE_B *)bias + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(inQueueB, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(inQueueB, BUFFER_NUM, this->tileLength * sizeof(DTYPE_B));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
-        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
     }
-
     __aicore__ inline void Process()
     {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
@@ -165,46 +164,36 @@ private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> bLocal = inQueueB.AllocTensor<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_B> bLocal = inQueueB.AllocTensor<DTYPE_B>();
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
         AscendC::DataCopy(bLocal, bGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
         inQueueB.EnQue(bLocal);
     }
-
     __aicore__ inline void Compute(int32_t /*progress*/)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> bLocal = inQueueB.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_B> bLocal = inQueueB.DeQue<DTYPE_B>();
         AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
-        AscendC::LocalTensor<DTYPE_X> tmpLocal = tmpQueue.AllocTensor<DTYPE_X>();
 
-        // Step 1: ReLU
+        // ReLU
         AscendC::Relu(yLocal, xLocal, this->tileLength);
 
-        // Step 2: LeakyReLU via piecewise: y = relu(x) + slope * (x - relu(x))
-        // tmp = x - y
-        AscendC::Sub(tmpLocal, xLocal, yLocal, this->tileLength);
-        // tmp = slope * tmp
-        AscendC::Muls(tmpLocal, tmpLocal, NEGATIVE_SLOPE, this->tileLength);
-        // y = y + tmp
-        AscendC::Add(yLocal, yLocal, tmpLocal, this->tileLength);
+        // （按顺序）LeakyReLU对非负输入无影响，此处可省略实际计算
 
-        // Step 3: GELU (in-place allowed by API constraints)
+        // GELU
         AscendC::Gelu(yLocal, yLocal, this->tileLength);
 
-        // Step 4: Sigmoid (in-place)
+        // Sigmoid
         AscendC::Sigmoid(yLocal, yLocal, this->tileLength);
 
-        // Step 5: Bias add
+        // + bias（已在Python端扩展为与x同形状）
         AscendC::Add(yLocal, yLocal, bLocal, this->tileLength);
 
         outQueueY.EnQue<DTYPE_Z>(yLocal);
         inQueueX.FreeTensor(xLocal);
         inQueueB.FreeTensor(bLocal);
-        tmpQueue.FreeTensor(tmpLocal);
     }
-
     __aicore__ inline void CopyOut(int32_t progress)
     {
         AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
@@ -214,12 +203,14 @@ private:
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueB;
-    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueB;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
     AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> bGm;
+    AscendC::GlobalTensor<DTYPE_B> bGm;
     AscendC::GlobalTensor<DTYPE_Z> yGm;
+
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
@@ -240,10 +231,8 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor conv3d_relu_leaky_relu_gelu_sigmoid_bias_add_custom_impl_npu(const at::Tensor& x, const at::Tensor& bias) {
-    // Expand bias to match x shape for element-wise add
-    at::Tensor bias_expanded = bias.expand_as(x).contiguous();
     at::Tensor result = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnConv3dReluLeakyReluGeluSigmoidBiasAddCustom, x, bias_expanded, result);
+    EXEC_NPU_CMD(aclnnConv3dReluLeakyReluGeluSigmoidBiasAddCustom, x, bias, result);
     return result;
 }
 
@@ -252,7 +241,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv3d_relu_leaky_relu_gelu_sigmoid_bias_add_custom", &conv3d_relu_leaky_relu_gelu_sigmoid_bias_add_custom_impl_npu, "post-activations + bias");
+    m.def("conv3d_relu_leaky_relu_gelu_sigmoid_bias_add_custom", &conv3d_relu_leaky_relu_gelu_sigmoid_bias_add_custom_impl_npu, "conv3d->ReLU->LeakyReLU->GELU->Sigmoid and +bias");
 }
 """
 
@@ -260,20 +249,15 @@ model_src='''
 import torch
 import torch_npu
 import custom_ops_lib
-import torch.nn as nn
 
-class ModelNew(nn.Module):
-    """
-    Fuses post-conv activations (ReLU -> LeakyReLU -> GELU -> Sigmoid) and bias add into one AscendC custom op.
-    Conv3d stays as nn.Conv3d for weight handling; the custom op accelerates the following elementwise chain.
-    """
+class ModelNew(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
-        super(ModelNew, self).__init__()
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
-        self.bias = nn.Parameter(torch.randn(bias_shape))
+        super().__init__()
+        self.conv = torch.nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.bias = torch.nn.Parameter(torch.randn(bias_shape))
 
     def forward(self, x):
         x = self.conv(x)
-        x = custom_ops_lib.conv3d_relu_leaky_relu_gelu_sigmoid_bias_add_custom(x, self.bias)
-        return x
+        # 调用自定义AscendC算子：将bias扩展为与x同形状，简化内核广播处理
+        return custom_ops_lib.conv3d_relu_leaky_relu_gelu_sigmoid_bias_add_custom(x, self.bias.expand_as(x))
 '''

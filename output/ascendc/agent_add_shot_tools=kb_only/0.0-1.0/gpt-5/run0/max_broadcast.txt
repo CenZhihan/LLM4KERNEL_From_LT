@@ -46,9 +46,15 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(MaxBroadcastCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, n);
-  TILING_DATA_FIELD_DEF(uint32_t, c);
-  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, d0);
+  TILING_DATA_FIELD_DEF(uint32_t, d1);
+  TILING_DATA_FIELD_DEF(uint32_t, d2);
+  TILING_DATA_FIELD_DEF(uint32_t, a0);
+  TILING_DATA_FIELD_DEF(uint32_t, a1);
+  TILING_DATA_FIELD_DEF(uint32_t, a2);
+  TILING_DATA_FIELD_DEF(uint32_t, b0);
+  TILING_DATA_FIELD_DEF(uint32_t, b1);
+  TILING_DATA_FIELD_DEF(uint32_t, b2);
   TILING_DATA_FIELD_DEF(uint32_t, tileK);
 END_TILING_DATA_DEF;
 
@@ -59,100 +65,94 @@ REGISTER_TILING_DATA_CLASS(MaxBroadcastCustom, MaxBroadcastCustomTilingData)
 host_operator_src="""
 #include "max_broadcast_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace {
-static inline int64_t GetDimSafe(const gert::Shape& s, int idx) {
-    if (s.GetDimNum() <= idx) return 1;
-    return s.GetDim(idx);
-}
-static inline int64_t BroadcastDim(int64_t a, int64_t b) {
-    return a == b ? a : (a == 1 ? b : (b == 1 ? a : -1));
+inline void Get3dDims(const gert::Shape& inShape, uint32_t &d0, uint32_t &d1, uint32_t &d2) {
+    // 假设输入为最多3维，若不足则左侧补1
+    int32_t dimNum = inShape.GetDimNum();
+    if (dimNum == 1) {
+        d0 = 1; d1 = 1; d2 = static_cast<uint32_t>(inShape.GetDim(0));
+    } else if (dimNum == 2) {
+        d0 = 1; d1 = static_cast<uint32_t>(inShape.GetDim(0)); d2 = static_cast<uint32_t>(inShape.GetDim(1));
+    } else {
+        d0 = static_cast<uint32_t>(inShape.GetDim(0));
+        d1 = static_cast<uint32_t>(inShape.GetDim(1));
+        d2 = static_cast<uint32_t>(inShape.GetDim(2));
+    }
 }
 }
 
 namespace optiling {
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 读取输入形状
-    const gert::Shape& aShape = context->GetInputShape(0)->GetOriginShape();
-    const gert::Shape& bShape = context->GetInputShape(1)->GetOriginShape();
+    // 读取输入形状，转换为3D
+    const gert::Shape& xShape = context->GetInputShape(0)->GetOriginShape();
+    const gert::Shape& yShape = context->GetInputShape(1)->GetOriginShape();
+    uint32_t ax0, ax1, ax2; Get3dDims(xShape, ax0, ax1, ax2);
+    uint32_t by0, by1, by2; Get3dDims(yShape, by0, by1, by2);
 
-    int64_t aN = GetDimSafe(aShape, 0);
-    int64_t aC = GetDimSafe(aShape, 1);
-    int64_t aK = GetDimSafe(aShape, 2);
+    // 广播后的输出形状
+    uint32_t dz0 = std::max(ax0, by0);
+    uint32_t dz1 = std::max(ax1, by1);
+    uint32_t dz2 = std::max(ax2, by2);
 
-    int64_t bN = GetDimSafe(bShape, 0);
-    int64_t bC = GetDimSafe(bShape, 1);
-    int64_t bK = GetDimSafe(bShape, 2);
-
-    int64_t N = BroadcastDim(aN, bN);
-    int64_t C = BroadcastDim(aC, bC);
-    int64_t K = BroadcastDim(aK, bK);
-    if (N <= 0 || C <= 0 || K <= 0) {
-        return ge::GRAPH_FAILED; // 非法广播
-    }
-
-    // 简单设置block维度
-    const uint32_t BLOCK_DIM = 8;
-    context->SetBlockDim(BLOCK_DIM);
-
-    // 简单沿最后一维K做分块
-    uint32_t tileK = 256;
-    if (K < tileK) tileK = static_cast<uint32_t>(K);
+    // 这里选择最保守的tile方案，沿最后一维按1元素计算，便于处理广播
+    uint32_t tileK = 1;
 
     MaxBroadcastCustomTilingData tiling;
-    tiling.set_n(static_cast<uint32_t>(N));
-    tiling.set_c(static_cast<uint32_t>(C));
-    tiling.set_k(static_cast<uint32_t>(K));
+    tiling.set_d0(dz0);
+    tiling.set_d1(dz1);
+    tiling.set_d2(dz2);
+    tiling.set_a0(ax0);
+    tiling.set_a1(ax1);
+    tiling.set_a2(ax2);
+    tiling.set_b0(by0);
+    tiling.set_b1(by1);
+    tiling.set_b2(by2);
     tiling.set_tileK(tileK);
 
-    // 保存tiling数据与workspace
+    context->SetBlockDim(1);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-
     return ge::GRAPH_SUCCESS;
 }
-} // namespace optiling
-
+}
 
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape& a = context->GetInputShape(0)->GetOriginShape();
-    const gert::Shape& b = context->GetInputShape(1)->GetOriginShape();
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* y_shape = context->GetInputShape(1);
+    const gert::Shape& xs = x_shape->GetOriginShape();
+    const gert::Shape& ys = y_shape->GetOriginShape();
 
-    int64_t aN = (a.GetDimNum() > 0) ? a.GetDim(0) : 1;
-    int64_t aC = (a.GetDimNum() > 1) ? a.GetDim(1) : 1;
-    int64_t aK = (a.GetDimNum() > 2) ? a.GetDim(2) : 1;
+    auto dim_max = [](int64_t a, int64_t b) -> int64_t { return a > b ? a : b; };
 
-    int64_t bN = (b.GetDimNum() > 0) ? b.GetDim(0) : 1;
-    int64_t bC = (b.GetDimNum() > 1) ? b.GetDim(1) : 1;
-    int64_t bK = (b.GetDimNum() > 2) ? b.GetDim(2) : 1;
+    // 统一到3D推导
+    int32_t xd = xs.GetDimNum(), yd = ys.GetDimNum();
+    int32_t od = std::max(xd, yd);
+    int64_t xd0=1, xd1=1, xd2=1;
+    int64_t yd0=1, yd1=1, yd2=1;
+    if (xd == 1) { xd2 = xs.GetDim(0); }
+    else if (xd == 2) { xd1 = xs.GetDim(0); xd2 = xs.GetDim(1); }
+    else if (xd >= 3) { xd0 = xs.GetDim(0); xd1 = xs.GetDim(1); xd2 = xs.GetDim(2); }
+    if (yd == 1) { yd2 = ys.GetDim(0); }
+    else if (yd == 2) { yd1 = ys.GetDim(0); yd2 = ys.GetDim(1); }
+    else if (yd >= 3) { yd0 = ys.GetDim(0); yd1 = ys.GetDim(1); yd2 = ys.GetDim(2); }
 
-    auto f = [](int64_t u, int64_t v)->int64_t {
-        if (u == v) return u;
-        if (u == 1) return v;
-        if (v == 1) return u;
-        return -1;
-    };
+    int64_t oz0 = dim_max(xd0, yd0);
+    int64_t oz1 = dim_max(xd1, yd1);
+    int64_t oz2 = dim_max(xd2, yd2);
 
-    int64_t N = f(aN, bN);
-    int64_t C = f(aC, bC);
-    int64_t K = f(aK, bK);
-    if (N <= 0 || C <= 0 || K <= 0) {
-        return GRAPH_FAILED;
-    }
-
-    gert::Shape* yShape = context->GetOutputShape(0);
-    std::vector<int64_t> out = {N, C, K};
-    yShape->SetDimNum(out.size());
-    for (size_t i = 0; i < out.size(); ++i) {
-        yShape->SetDim(i, out[i]);
-    }
+    // 输出保持为3D（与kernel假设一致）
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    out_shape->SetDimNum(3);
+    out_shape->SetDim(0, oz0);
+    out_shape->SetDim(1, oz1);
+    out_shape->SetDim(2, oz2);
     return GRAPH_SUCCESS;
 }
 
@@ -163,7 +163,6 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
     return ge::GRAPH_SUCCESS;
 }
 }
-
 
 namespace ops {
 class MaxBroadcastCustom : public OpDef {
@@ -192,93 +191,132 @@ public:
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(MaxBroadcastCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "max_broadcast_custom_tiling_data.h"
 
-using DTYPE = float;
 constexpr int32_t BUFFER_NUM = 1;
 
 class KernelMaxBroadcast {
 public:
     __aicore__ inline KernelMaxBroadcast() {}
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z,
-                                uint32_t n, uint32_t c, uint32_t k, uint32_t tileK)
+                                uint32_t d0, uint32_t d1, uint32_t d2,
+                                uint32_t a0, uint32_t a1, uint32_t a2,
+                                uint32_t b0, uint32_t b1, uint32_t b2,
+                                uint32_t tileK)
     {
-        this->n = n;
-        this->c = c;
-        this->k = k;
+        this->d0 = d0; this->d1 = d1; this->d2 = d2;
+        this->a0 = a0; this->a1 = a1; this->a2 = a2;
+        this->b0 = b0; this->b1 = b1; this->b2 = b2;
         this->tileK = tileK;
 
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(x), n * k);
-        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(y), c);
-        zGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(z), n * c * k);
+        uint32_t aTotal = a0 * a1 * a2;
+        uint32_t bTotal = b0 * b1 * b2;
+        uint32_t zTotal = d0 * d1 * d2;
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileK * sizeof(DTYPE));
-        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileK * sizeof(DTYPE));
+        aGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x), aTotal);
+        bGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(y), bTotal);
+        zGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(z), zTotal);
+
+        pipe.InitBuffer(inQueueA, BUFFER_NUM, this->tileK * sizeof(float));
+        pipe.InitBuffer(inQueueB, BUFFER_NUM, this->tileK * sizeof(float));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileK * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        // 将N维度在不同block间拆分
-        uint32_t blockNum = AscendC::GetBlockNum();
-        uint32_t blockIdx = AscendC::GetBlockIdx();
-        uint32_t nPerBlk = n / blockNum;
-        uint32_t nBeg = blockIdx * nPerBlk;
-        uint32_t nEnd = nBeg + nPerBlk;
-
-        for (uint32_t i = nBeg; i < nEnd; ++i) {
-            for (uint32_t j = 0; j < c; ++j) {
-                for (uint32_t off = 0; off < k; off += tileK) {
-                    uint32_t curr = AscendC::Min(tileK, k - off);
-
-                    // Copy X tile: shape [k], slice of length curr
-                    AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
-                    AscendC::DataCopy(xLocal, xGm[i * k + off], curr);
-
-                    // Load scalar y_j (broadcast on K)
-                    DTYPE yScalar = yGm.GetValue(j);
-
-                    // Compute max(xTile, yScalar)
-                    AscendC::LocalTensor<DTYPE> zLocal = outQueueZ.AllocTensor<DTYPE>();
-                    // 使用标量版本算子（类似LayerNorm示例中的 Adds/Muls），对每个元素执行 max(x, yScalar)
-                    AscendC::Maxs(zLocal, xLocal, yScalar, curr);
-
-                    // Enqueue & write back
-                    outQueueZ.EnQue<DTYPE>(zLocal);
-                    inQueueX.FreeTensor(xLocal);
-
-                    AscendC::LocalTensor<DTYPE> zLocalOut = outQueueZ.DeQue<DTYPE>();
-                    AscendC::DataCopy(zGm[(i * c + j) * k + off], zLocalOut, curr);
-                    outQueueZ.FreeTensor(zLocalOut);
+        for (uint32_t i = 0; i < d0; ++i) {
+            for (uint32_t j = 0; j < d1; ++j) {
+                for (uint32_t k = 0; k < d2; k += tileK) {
+                    uint32_t curK = (k + tileK <= d2) ? tileK : (d2 - k);
+                    CopyIn(i, j, k, curK);
+                    Compute(curK);
+                    CopyOut(i, j, k, curK);
                 }
             }
         }
     }
 
 private:
+    __aicore__ inline uint32_t OffsetA(uint32_t i, uint32_t j, uint32_t k) const
+    {
+        uint32_t ai = (a0 == 1) ? 0 : i;
+        uint32_t aj = (a1 == 1) ? 0 : j;
+        uint32_t ak = (a2 == 1) ? 0 : k;
+        return (ai * a1 * a2) + (aj * a2) + ak;
+    }
+
+    __aicore__ inline uint32_t OffsetB(uint32_t i, uint32_t j, uint32_t k) const
+    {
+        uint32_t bi = (b0 == 1) ? 0 : i;
+        uint32_t bj = (b1 == 1) ? 0 : j;
+        uint32_t bk = (b2 == 1) ? 0 : k;
+        return (bi * b1 * b2) + (bj * b2) + bk;
+    }
+
+    __aicore__ inline uint32_t OffsetZ(uint32_t i, uint32_t j, uint32_t k) const
+    {
+        return (i * d1 * d2) + (j * d2) + k;
+    }
+
+    __aicore__ inline void CopyIn(uint32_t i, uint32_t j, uint32_t k, uint32_t curK)
+    {
+        AscendC::LocalTensor<float> aLocal = inQueueA.AllocTensor<float>();
+        AscendC::LocalTensor<float> bLocal = inQueueB.AllocTensor<float>();
+
+        // 由于tileK=1，这里每次拷贝1个元素，方便处理任意维度的广播
+        AscendC::DataCopy(aLocal, aGm[OffsetA(i, j, k)], curK);
+        AscendC::DataCopy(bLocal, bGm[OffsetB(i, j, k)], curK);
+
+        inQueueA.EnQue(aLocal);
+        inQueueB.EnQue(bLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t curK)
+    {
+        AscendC::LocalTensor<float> aLocal = inQueueA.DeQue<float>();
+        AscendC::LocalTensor<float> bLocal = inQueueB.DeQue<float>();
+        AscendC::LocalTensor<float> zLocal = outQueueZ.AllocTensor<float>();
+
+        AscendC::Max(zLocal, aLocal, bLocal, static_cast<int32_t>(curK));
+
+        outQueueZ.EnQue<float>(zLocal);
+        inQueueA.FreeTensor(aLocal);
+        inQueueB.FreeTensor(bLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t i, uint32_t j, uint32_t k, uint32_t curK)
+    {
+        AscendC::LocalTensor<float> zLocal = outQueueZ.DeQue<float>();
+        AscendC::DataCopy(zGm[OffsetZ(i, j, k)], zLocal, curK);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueA, inQueueB;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueZ;
-    AscendC::GlobalTensor<DTYPE> xGm;
-    AscendC::GlobalTensor<DTYPE> yGm;
-    AscendC::GlobalTensor<DTYPE> zGm;
-    uint32_t n;
-    uint32_t c;
-    uint32_t k;
+    AscendC::GlobalTensor<float> aGm, bGm, zGm;
+
+    uint32_t d0, d1, d2;
+    uint32_t a0, a1, a2;
+    uint32_t b0, b1, b2;
     uint32_t tileK;
 };
 
-extern "C" __global__ __aicore__ void max_broadcast_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tilingData, tiling);
+extern "C" __global__ __aicore__ void max_broadcast_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
     KernelMaxBroadcast op;
-    op.Init(x, y, z, tilingData.n, tilingData.c, tilingData.k, tilingData.tileK);
+    op.Init(x, y, z,
+            tiling_data.d0, tiling_data.d1, tiling_data.d2,
+            tiling_data.a0, tiling_data.a1, tiling_data.a2,
+            tiling_data.b0, tiling_data.b1, tiling_data.b2,
+            tiling_data.tileK);
     op.Process();
 }
 """
@@ -289,10 +327,12 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor max_broadcast_custom_impl_npu(const at::Tensor& a, const at::Tensor& b) {
-    // 输出形状为广播后的形状，由算子实现与InferShape保证
-    at::Tensor result = at::empty_like(a.expand_as(a.broadcast_tensors({a, b})[0]));
-    EXEC_NPU_CMD(aclnnMaxBroadcastCustom, a, b, result);
+at::Tensor max_broadcast_custom_impl_npu(const at::Tensor& self, const at::Tensor& other) {
+    at::Tensor result;
+    // 输出形状为广播后的形状
+    auto out_sizes = at::infer_size(self.sizes(), other.sizes());
+    result = at::empty(out_sizes, self.options());
+    EXEC_NPU_CMD(aclnnMaxBroadcastCustom, self, other, result);
     return result;
 }
 
@@ -301,7 +341,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("max_broadcast_custom", &max_broadcast_custom_impl_npu, "max with broadcast (x, y) -> z");
+    m.def("max_broadcast_custom", &max_broadcast_custom_impl_npu, "maximum with broadcast");
 }
 """
 

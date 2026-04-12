@@ -33,6 +33,26 @@ project_json_src='''
                 "type": [
                     "float"
                 ]
+            },
+            {
+                "name": "lr",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "eps",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ],
         "output_desc": [
@@ -50,7 +70,6 @@ project_json_src='''
     }
 ]
 '''
-
 host_tiling_src="""
 #include "register/tilingdata_base.h"
 
@@ -58,14 +77,11 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(AdagradCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(float, lr);
-  TILING_DATA_FIELD_DEF(float, eps);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(AdagradCustom, AdagradCustomTilingData)
 }
 """
-
 host_operator_src="""
 #include "adagrad_custom_tiling.h"
 #include "register/op_def_registry.h"
@@ -81,13 +97,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-
-    const gert::RuntimeAttrs* attrs = context->GetAttrs();
-    float lr = *(attrs->GetAttrPointer<float>(0));
-    float eps = *(attrs->GetAttrPointer<float>(1));
-    tiling.set_lr(lr);
-    tiling.set_eps(eps);
-
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
@@ -99,11 +108,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* in_shape = context->GetInputShape(0);
+    const gert::Shape* p_shape = context->GetInputShape(0);
     gert::Shape* out_shape = context->GetOutputShape(0);
-    *out_shape = *in_shape;
+    *out_shape = *p_shape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -132,14 +142,21 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("lr")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("eps")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("out")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Attr("lr").AttrType(REQUIRED).Float(0.0);
-        this->Attr("eps").AttrType(REQUIRED).Float(0.0);
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
@@ -152,37 +169,34 @@ public:
 OP_ADD(AdagradCustom);
 }
 """
-
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "adagrad_custom_tiling_data.h"
 
 constexpr int32_t BUFFER_NUM = 2;
 
 class KernelAdagrad {
 public:
     __aicore__ inline KernelAdagrad() {}
-    __aicore__ inline void Init(GM_ADDR param, GM_ADDR grad, GM_ADDR accum, GM_ADDR out,
-                                uint32_t totalLength, uint32_t tileNum, float lr, float eps)
+    __aicore__ inline void Init(GM_ADDR param, GM_ADDR grad, GM_ADDR accum, GM_ADDR lr, GM_ADDR eps, GM_ADDR out,
+                                uint32_t totalLength, uint32_t tileNum)
     {
-        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
-        ASSERT(tileNum != 0 && "tile num can not be zero!");
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
-        this->lr = lr;
-        this->eps = eps;
 
         paramGm.SetGlobalBuffer((__gm__ float *)param + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         gradGm.SetGlobalBuffer((__gm__ float *)grad + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         accumGm.SetGlobalBuffer((__gm__ float *)accum + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        lrGm.SetGlobalBuffer((__gm__ float *)lr + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        epsGm.SetGlobalBuffer((__gm__ float *)eps + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         outGm.SetGlobalBuffer((__gm__ float *)out + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
         pipe.InitBuffer(inQueueParam, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(inQueueGrad,  BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(inQueueAccum, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(outQueueOut,  BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueLr,    BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueEps,   BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueue,     BUFFER_NUM, this->tileLength * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -201,22 +215,30 @@ private:
         AscendC::LocalTensor<float> pLocal = inQueueParam.AllocTensor<float>();
         AscendC::LocalTensor<float> gLocal = inQueueGrad.AllocTensor<float>();
         AscendC::LocalTensor<float> aLocal = inQueueAccum.AllocTensor<float>();
+        AscendC::LocalTensor<float> lrLocal = inQueueLr.AllocTensor<float>();
+        AscendC::LocalTensor<float> epsLocal = inQueueEps.AllocTensor<float>();
 
         AscendC::DataCopy(pLocal, paramGm[progress * this->tileLength], this->tileLength);
         AscendC::DataCopy(gLocal, gradGm[progress * this->tileLength], this->tileLength);
         AscendC::DataCopy(aLocal, accumGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(lrLocal, lrGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(epsLocal, epsGm[progress * this->tileLength], this->tileLength);
 
         inQueueParam.EnQue(pLocal);
         inQueueGrad.EnQue(gLocal);
         inQueueAccum.EnQue(aLocal);
+        inQueueLr.EnQue(lrLocal);
+        inQueueEps.EnQue(epsLocal);
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/)
+    __aicore__ inline void Compute(int32_t)
     {
         AscendC::LocalTensor<float> pLocal = inQueueParam.DeQue<float>();
         AscendC::LocalTensor<float> gLocal = inQueueGrad.DeQue<float>();
         AscendC::LocalTensor<float> aLocal = inQueueAccum.DeQue<float>();
-        AscendC::LocalTensor<float> outLocal = outQueueOut.AllocTensor<float>();
+        AscendC::LocalTensor<float> lrLocal = inQueueLr.DeQue<float>();
+        AscendC::LocalTensor<float> epsLocal = inQueueEps.DeQue<float>();
+        AscendC::LocalTensor<float> outLocal = outQueue.AllocTensor<float>();
 
         // outLocal = grad^2
         AscendC::Mul(outLocal, gLocal, gLocal, this->tileLength);
@@ -225,64 +247,64 @@ private:
         // outLocal = sqrt(accum + grad^2)
         AscendC::Sqrt(outLocal, outLocal, this->tileLength);
         // outLocal = sqrt(...) + eps
-        AscendC::Adds(outLocal, outLocal, (float)eps, this->tileLength);
-        // gLocal = grad / (sqrt(...) + eps)
-        AscendC::Div(gLocal, gLocal, outLocal, this->tileLength);
-        // gLocal = lr * gLocal
-        AscendC::Muls(gLocal, gLocal, (float)lr, this->tileLength);
-        // outLocal = param - lr * grad / (...)
-        AscendC::Sub(outLocal, pLocal, gLocal, this->tileLength);
+        AscendC::Add(outLocal, outLocal, epsLocal, this->tileLength);
+        // outLocal = grad / (sqrt(...) + eps)
+        AscendC::Div(outLocal, gLocal, outLocal, this->tileLength);
+        // outLocal = lr * (grad / denom)
+        AscendC::Mul(outLocal, outLocal, lrLocal, this->tileLength);
+        // outLocal = param - lr * (grad / denom)
+        AscendC::Sub(outLocal, pLocal, outLocal, this->tileLength);
 
-        outQueueOut.EnQue<float>(outLocal);
+        outQueue.EnQue<float>(outLocal);
+
         inQueueParam.FreeTensor(pLocal);
         inQueueGrad.FreeTensor(gLocal);
         inQueueAccum.FreeTensor(aLocal);
+        inQueueLr.FreeTensor(lrLocal);
+        inQueueEps.FreeTensor(epsLocal);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<float> outLocal = outQueueOut.DeQue<float>();
+        AscendC::LocalTensor<float> outLocal = outQueue.DeQue<float>();
         AscendC::DataCopy(outGm[progress * this->tileLength], outLocal, this->tileLength);
-        outQueueOut.FreeTensor(outLocal);
+        outQueue.FreeTensor(outLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> inQueueParam;
-    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> inQueueGrad;
-    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> inQueueAccum;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueOut;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueParam, inQueueGrad, inQueueAccum, inQueueLr, inQueueEps;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
 
     AscendC::GlobalTensor<float> paramGm;
     AscendC::GlobalTensor<float> gradGm;
     AscendC::GlobalTensor<float> accumGm;
+    AscendC::GlobalTensor<float> lrGm;
+    AscendC::GlobalTensor<float> epsGm;
     AscendC::GlobalTensor<float> outGm;
 
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
-    float lr;
-    float eps;
 };
 
-extern "C" __global__ __aicore__ void adagrad_custom(GM_ADDR param, GM_ADDR grad, GM_ADDR accum, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void adagrad_custom(GM_ADDR param, GM_ADDR grad, GM_ADDR accum, GM_ADDR lr, GM_ADDR eps, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelAdagrad op;
-    op.Init(param, grad, accum, out, tiling_data.totalLength, tiling_data.tileNum, tiling_data.lr, tiling_data.eps);
+    op.Init(param, grad, accum, lr, eps, out, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
-
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor adagrad_custom_impl_npu(const at::Tensor& param, const at::Tensor& grad, const at::Tensor& accum, double lr, double eps) {
+at::Tensor adagrad_custom_impl_npu(const at::Tensor& param, const at::Tensor& grad, const at::Tensor& accum,
+                                   const at::Tensor& lr, const at::Tensor& eps) {
     at::Tensor result = at::empty_like(param);
-    EXEC_NPU_CMD(aclnnAdagradCustom, param, grad, accum, static_cast<float>(lr), static_cast<float>(eps), result);
+    EXEC_NPU_CMD(aclnnAdagradCustom, param, grad, accum, lr, eps, result);
     return result;
 }
 
@@ -291,10 +313,9 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("adagrad_custom", &adagrad_custom_impl_npu, "AdaGrad update");
+    m.def("adagrad_custom", &adagrad_custom_impl_npu, "Adagrad update: param - lr * grad / (sqrt(accum + grad^2) + eps)");
 }
 """
-
 model_src='''
 import torch
 import torch_npu
@@ -303,9 +324,11 @@ import custom_ops_lib
 class ModelNew(torch.nn.Module):
     def __init__(self, lr=1e-2, eps=1e-10):
         super().__init__()
-        self.lr = float(lr)
-        self.eps = float(eps)
+        self.lr = lr
+        self.eps = eps
 
     def forward(self, param, grad, accum):
-        return custom_ops_lib.adagrad_custom(param, grad, accum, self.lr, self.eps)
+        lr_full = torch.full_like(param, self.lr)
+        eps_full = torch.full_like(param, self.eps)
+        return custom_ops_lib.adagrad_custom(param, grad, accum, lr_full, eps_full)
 '''

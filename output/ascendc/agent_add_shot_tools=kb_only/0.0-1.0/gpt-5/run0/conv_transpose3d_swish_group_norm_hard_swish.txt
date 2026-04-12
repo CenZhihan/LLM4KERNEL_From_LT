@@ -21,18 +21,6 @@ project_json_src='''
                 "param_type": "required",
                 "format": ["ND"],
                 "type": ["float"]
-            },
-            {
-                "name": "groups",
-                "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
-            },
-            {
-                "name": "eps",
-                "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
             }
         ],
         "output_desc": [
@@ -42,11 +30,20 @@ project_json_src='''
                 "format": ["ND"],
                 "type": ["float"]
             }
+        ],
+        "attr": [
+            {
+                "name": "groups",
+                "type": "int"
+            },
+            {
+                "name": "eps",
+                "type": "float"
+            }
         ]
     }
 ]
 '''
-
 host_tiling_src="""
 #include "register/tilingdata_base.h"
 
@@ -54,16 +51,23 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(ConvTranspose3dSwishGroupNormHardSwishCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(float, epsilon);
+  TILING_DATA_FIELD_DEF(uint32_t, groupNum);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, d);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF_STRUCT(GroupNormTiling, groupNormTilingData);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ConvTranspose3dSwishGroupNormHardSwishCustom, ConvTranspose3dSwishGroupNormHardSwishCustomTilingData)
 }
 """
-
 host_operator_src="""
-#include "register/op_def_registry.h"
-#include "register/tilingdata_base.h"
 #include "conv_transpose3d_swish_group_norm_hard_swish_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "kernel_operator.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
@@ -72,17 +76,49 @@ const uint32_t TILE_NUM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ConvTranspose3dSwishGroupNormHardSwishCustomTilingData tiling;
-    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
-    context->SetBlockDim(BLOCK_DIM);
+    // Infer shape from input 0
+    const gert::Shape& in_shape = context->GetInputShape(0)->GetOriginShape();
+    std::vector<int64_t> shapeVec;
+    for (size_t i = 0; i < in_shape.GetDimNum(); ++i) {
+        shapeVec.push_back(in_shape.GetDim(i));
+    }
+    // Expect [N, C, D, H, W]
+    uint32_t n = (shapeVec.size() >= 1) ? static_cast<uint32_t>(shapeVec[0]) : 1;
+    uint32_t c = (shapeVec.size() >= 2) ? static_cast<uint32_t>(shapeVec[1]) : 1;
+    uint32_t d = (shapeVec.size() >= 3) ? static_cast<uint32_t>(shapeVec[2]) : 1;
+    uint32_t h = (shapeVec.size() >= 4) ? static_cast<uint32_t>(shapeVec[3]) : 1;
+    uint32_t w = (shapeVec.size() >= 5) ? static_cast<uint32_t>(shapeVec[4]) : 1;
 
+    uint32_t totalLength = n * c * d * h * w;
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_d(d);
+    tiling.set_h(h);
+    tiling.set_w(w);
 
+    // Attributes
+    int64_t groups = 1;
+    (void)context->GetAttr("groups", groups);
+    double eps = 1e-5;
+    (void)context->GetAttr("eps", eps);
+    tiling.set_groupNum(static_cast<uint32_t>(groups));
+    tiling.set_epsilon(static_cast<float>(eps));
+
+    // GroupNorm tiling
+    ge::Shape srcShape(shapeVec);
+    uint32_t minSize = 0;
+    uint32_t maxSize = 0;
+    AscendC::GetGroupNormMaxMinTmpSize(srcShape, sizeof(float), false, static_cast<uint32_t>(groups), maxSize, minSize);
+    AscendC::GetGroupNormNDTilingInfo(srcShape, maxSize, sizeof(float), false, static_cast<uint32_t>(groups), tiling.mutable_groupNormTilingData());
+
+    context->SetBlockDim(BLOCK_DIM);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
+    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -95,7 +131,6 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
     *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -124,16 +159,6 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("groups")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("eps")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->Output("y")
             .ParamType(REQUIRED)
@@ -141,8 +166,10 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->Attr("groups").Int(1);
+        this->Attr("eps").Float(1e-5);
 
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
@@ -151,188 +178,143 @@ public:
 OP_ADD(ConvTranspose3dSwishGroupNormHardSwishCustom);
 }
 """
-
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_transpose3d_swish_group_norm_hard_swish_custom_tiling_data.h"
 
-// 本示例基于参考资料中的 Ascend C Kernel API 结构（TPipe/TQue/DataCopy 等）
-// 实现了对输入的 Swish 与 HardSwish 融合计算的示例代码框架。
-// GroupNorm 在工程化中可使用高阶 API 或自行按组做均值方差归一化（可扩展）。
-// 这里给出可运行的基础框架，便于后续在 Compute() 中扩展归一化逻辑。
+namespace CustomOp {
 
-constexpr int32_t BUFFER_NUM = 2;
-
-using DTYPE = float;
-
-class KernelFused {
-public:
-    __aicore__ inline KernelFused() {}
-
-    __aicore__ inline void Init(GM_ADDR x,
-                                GM_ADDR gamma,
-                                GM_ADDR beta,
-                                GM_ADDR groups,
-                                GM_ADDR eps,
-                                GM_ADDR y,
-                                uint32_t totalLength,
-                                uint32_t tileNum)
-    {
-        this->blockLength = totalLength / AscendC::GetBlockNum();
-        this->tileNum = tileNum;
-        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
-
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(x) + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        // gamma/beta/groups/eps 按需广播使用（示例中作为占位输入）
-        gammaGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(gamma), 1);
-        betaGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(beta), 1);
-        groupsGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(groups), 1);
-        epsGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(eps), 1);
-        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(y) + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE));
-        pipe.InitBuffer(inQueueGamma, 1, sizeof(DTYPE));
-        pipe.InitBuffer(inQueueBeta, 1, sizeof(DTYPE));
-        pipe.InitBuffer(inQueueGroups, 1, sizeof(DTYPE));
-        pipe.InitBuffer(inQueueEps, 1, sizeof(DTYPE));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE));
-    }
-
-    __aicore__ inline void Process()
-    {
-        // 只需读取一次标量参数
-        CopyInParams();
-
-        int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; ++i) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
-        }
-    }
-
-private:
-    __aicore__ inline void CopyInParams()
-    {
-        AscendC::LocalTensor<DTYPE> gLocal = inQueueGamma.AllocTensor<DTYPE>();
-        AscendC::LocalTensor<DTYPE> bLocal = inQueueBeta.AllocTensor<DTYPE>();
-        AscendC::LocalTensor<DTYPE> grpLocal = inQueueGroups.AllocTensor<DTYPE>();
-        AscendC::LocalTensor<DTYPE> epsLocal = inQueueEps.AllocTensor<DTYPE>();
-
-        AscendC::DataCopy(gLocal, gammaGm, 1);
-        AscendC::DataCopy(bLocal, betaGm, 1);
-        AscendC::DataCopy(grpLocal, groupsGm, 1);
-        AscendC::DataCopy(epsLocal, epsGm, 1);
-
-        inQueueGamma.EnQue(gLocal);
-        inQueueBeta.EnQue(bLocal);
-        inQueueGroups.EnQue(grpLocal);
-        inQueueEps.EnQue(epsLocal);
-    }
-
-    __aicore__ inline void CopyIn(int32_t progress)
-    {
-        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
-        inQueueX.EnQue(xLocal);
-    }
-
-    __aicore__ inline void Compute(int32_t /*progress*/)
-    {
-        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> yLocal = outQueueY.AllocTensor<DTYPE>();
-
-        // 读取参数（此示例中未展开使用 group/eps/gamma/beta 的完整 GroupNorm，保留占位以便扩展）
-        AscendC::LocalTensor<DTYPE> gLocal = inQueueGamma.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> bLocal = inQueueBeta.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> grpLocal = inQueueGroups.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> epsLocal = inQueueEps.DeQue<DTYPE>();
-
-        // 暂存张量
-        AscendC::LocalTensor<DTYPE> tmp0 = yLocal;  // 复用 yLocal 作为中间缓存
-        AscendC::LocalTensor<DTYPE> tmp1 = xLocal;  // 复用 xLocal 作为中间缓存
-
-        // 1) Swish: sigmoid(x) * x
-        AscendC::Sigmoid(tmp0, xLocal, this->tileLength);     // tmp0 = sigmoid(x)
-        AscendC::Mul(tmp0, tmp0, xLocal, this->tileLength);   // tmp0 = tmp0 * x
-
-        // 2) GroupNorm（可按组做均值/方差归一化，此处可扩展。
-        //    参考资料提供了向量计算/归约 API（如 ReduceSum、BlockReduceSum），
-        //    可在此处基于 tmp0 计算每组 mean/var 并做归一化，再与 gamma/beta 融合。
-        //    为了给出框架，当前示例先直通 tmp0，便于后续替换为真实 GroupNorm 实现。）
-        // tmp1 = normalized(tmp0) * gamma + beta
-        AscendC::Copy(tmp1, tmp0, this->tileLength); // 占位：直接复制
-
-        // 3) HardSwish: x * clamp(x + 3, 0, 6) / 6，应用于 GroupNorm 之后的结果 tmp1
-        // tmp0 = tmp1 + 3
-        AscendC::Adds(tmp0, tmp1, static_cast<DTYPE>(3.0f), this->tileLength);
-        // tmp0 = max(tmp0, 0)
-        AscendC::Maxs(tmp0, tmp0, static_cast<DTYPE>(0.0f), this->tileLength);
-        // tmp0 = min(tmp0, 6)
-        AscendC::Mins(tmp0, tmp0, static_cast<DTYPE>(6.0f), this->tileLength);
-        // yLocal = tmp1 * tmp0
-        AscendC::Mul(yLocal, tmp1, tmp0, this->tileLength);
-        // yLocal = yLocal * (1/6)
-        AscendC::Muls(yLocal, yLocal, static_cast<DTYPE>(1.0f/6.0f), this->tileLength);
-
-        // 参数张量放回队列，供后续 tile 复用
-        inQueueGamma.EnQue(gLocal);
-        inQueueBeta.EnQue(bLocal);
-        inQueueGroups.EnQue(grpLocal);
-        inQueueEps.EnQue(epsLocal);
-
-        inQueueX.FreeTensor(xLocal);
-        outQueueY.EnQue(yLocal);
-    }
-
-    __aicore__ inline void CopyOut(int32_t progress)
-    {
-        AscendC::LocalTensor<DTYPE> yLocal = outQueueY.DeQue<DTYPE>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
-        outQueueY.FreeTensor(yLocal);
-    }
-
-private:
-    AscendC::TPipe pipe;
-
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueGamma;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueBeta;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueGroups;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueEps;
-
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
-
-    AscendC::GlobalTensor<DTYPE> xGm;
-    AscendC::GlobalTensor<DTYPE> gammaGm;
-    AscendC::GlobalTensor<DTYPE> betaGm;
-    AscendC::GlobalTensor<DTYPE> groupsGm;
-    AscendC::GlobalTensor<DTYPE> epsGm;
-    AscendC::GlobalTensor<DTYPE> yGm;
-
-    uint32_t blockLength;
-    uint32_t tileNum;
-    uint32_t tileLength;
+struct MyTiling {
+  GroupNormTiling groupNormTilingData;
+  float epsilon;
+  uint32_t totalLength;
+  uint32_t tileNum;
+  uint32_t n, c, d, h, w;
+  uint32_t groupNum;
 };
 
-extern "C" __global__ __aicore__ void conv_transpose3d_swish_group_norm_hard_swish_custom(
-    GM_ADDR x,
-    GM_ADDR gamma,
-    GM_ADDR beta,
-    GM_ADDR groups,
-    GM_ADDR eps,
-    GM_ADDR y,
-    GM_ADDR workspace,
-    GM_ADDR tiling)
-{
-    GET_TILING_DATA(tilingData, tiling);
-    KernelFused op;
-    op.Init(x, gamma, beta, groups, eps, y, tilingData.totalLength, tilingData.tileNum);
+class KernelConvTranspose3dSwishGroupNormHardSwish {
+public:
+  __aicore__ inline KernelConvTranspose3dSwishGroupNormHardSwish() {}
+  __aicore__ inline void Init(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y, MyTiling tilingData) {
+    this->tiling_ = tilingData;
+    n_ = tiling_.n; c_ = tiling_.c; d_ = tiling_.d; h_ = tiling_.h; w_ = tiling_.w;
+    g_ = tiling_.groupNum;
+    total_ = tiling_.totalLength;
+
+    xGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(x), total_);
+    gammaGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(gamma), c_);
+    betaGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(beta), c_);
+    yGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y), total_);
+
+    // Allocate UB queues
+    pipe_.InitBuffer(inQueueX_, 1, sizeof(float) * total_);
+    pipe_.InitBuffer(inQueueGamma_, 1, ((sizeof(float) * c_ + 31) / 32) * 32);
+    pipe_.InitBuffer(inQueueBeta_, 1, ((sizeof(float) * c_ + 31) / 32) * 32);
+    pipe_.InitBuffer(outQueueY_, 1, sizeof(float) * total_);
+    pipe_.InitBuffer(meanBuf_, ((sizeof(float) * n_ * g_ + 31) / 32) * 32);
+    pipe_.InitBuffer(varBuf_, ((sizeof(float) * n_ * g_ + 31) / 32) * 32);
+    pipe_.InitBuffer(tmpBuf_, 1, sizeof(float) * total_);
+  }
+
+  __aicore__ inline void Process() {
+    CopyIn();
+    Compute();
+    CopyOut();
+  }
+
+private:
+  __aicore__ inline void CopyIn() {
+    auto xLocal = inQueueX_.AllocTensor<float>();
+    AscendC::DataCopy(xLocal, xGm_, total_);
+    inQueueX_.EnQue(xLocal);
+
+    auto gammaLocal = inQueueGamma_.AllocTensor<float>();
+    AscendC::DataCopy(gammaLocal, gammaGm_, c_);
+    inQueueGamma_.EnQue(gammaLocal);
+
+    auto betaLocal = inQueueBeta_.AllocTensor<float>();
+    AscendC::DataCopy(betaLocal, betaGm_, c_);
+    inQueueBeta_.EnQue(betaLocal);
+  }
+
+  __aicore__ inline void Compute() {
+    auto xLocal = inQueueX_.DeQue<float>();
+    auto gammaLocal = inQueueGamma_.DeQue<float>();
+    auto betaLocal = inQueueBeta_.DeQue<float>();
+    auto yLocal = outQueueY_.AllocTensor<float>();
+    auto meanLocal = meanBuf_.Get<float>();
+    auto varLocal = varBuf_.Get<float>();
+    auto tmpLocal = tmpBuf_.Get<float>(); // workspace for activations
+
+    // Step 1: Swish (SiLU) -> tmpLocal = SiLU(xLocal)
+    AscendC::Silu(tmpLocal, xLocal, total_);
+
+    // Step 2: GroupNorm -> yLocal = GN(tmpLocal)
+    AscendC::GroupNorm<float, false>(yLocal, meanLocal, varLocal, tmpLocal, gammaLocal, betaLocal,
+                                     (float)tiling_.epsilon, tiling_.groupNormTilingData);
+
+    // Step 3: HardSwish: y = y * clamp(y + 3, 0, 6) / 6
+    // tmpLocal = y + 3
+    AscendC::Adds(tmpLocal, yLocal, (float)3.0f, total_);
+    // tmpLocal = clamp_min(tmpLocal, 0)
+    AscendC::ClampMin(tmpLocal, tmpLocal, (float)0.0f, total_);
+    // tmpLocal = clamp_max(tmpLocal, 6)
+    AscendC::ClampMax(tmpLocal, tmpLocal, (float)6.0f, total_);
+    // tmpLocal = tmpLocal * (1/6)
+    AscendC::Muls(tmpLocal, tmpLocal, (float)(1.0f/6.0f), total_);
+    // yLocal = yLocal * tmpLocal
+    AscendC::Mul(yLocal, yLocal, tmpLocal, total_);
+
+    outQueueY_.EnQue<float>(yLocal);
+    inQueueX_.FreeTensor(xLocal);
+    inQueueGamma_.FreeTensor(gammaLocal);
+    inQueueBeta_.FreeTensor(betaLocal);
+  }
+
+  __aicore__ inline void CopyOut() {
+    auto yLocal = outQueueY_.DeQue<float>();
+    AscendC::DataCopy(yGm_, yLocal, total_);
+    outQueueY_.FreeTensor(yLocal);
+  }
+
+private:
+  AscendC::TPipe pipe_;
+  AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX_;
+  AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueGamma_;
+  AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueBeta_;
+  AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY_;
+  AscendC::TBuf<AscendC::QuePosition::VECCALC> meanBuf_;
+  AscendC::TBuf<AscendC::QuePosition::VECCALC> varBuf_;
+  AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuf_;
+  AscendC::GlobalTensor<float> xGm_;
+  AscendC::GlobalTensor<float> gammaGm_;
+  AscendC::GlobalTensor<float> betaGm_;
+  AscendC::GlobalTensor<float> yGm_;
+  MyTiling tiling_;
+  uint32_t n_, c_, d_, h_, w_, g_;
+  uint32_t total_;
+};
+
+} // namespace CustomOp
+
+extern "C" __global__ __aicore__ void conv_transpose3d_swish_group_norm_hard_swish_custom(GM_ADDR x,
+                                                                                           GM_ADDR gamma,
+                                                                                           GM_ADDR beta,
+                                                                                           GM_ADDR y,
+                                                                                           GM_ADDR workspace,
+                                                                                           GM_ADDR tiling) {
+  if ASCEND_IS_AIC {
+    return;
+  }
+  CustomOp::MyTiling t;
+  CopyTiling(&t, tiling);
+  CustomOp::KernelConvTranspose3dSwishGroupNormHardSwish op;
+  op.Init(x, gamma, beta, y, t);
+  if (TILING_KEY_IS(1)) {
     op.Process();
+  }
 }
 """
-
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
@@ -342,8 +324,8 @@ python_bind_src="""
 at::Tensor conv_transpose3d_swish_group_norm_hard_swish_custom_impl_npu(const at::Tensor& x,
                                                                         const at::Tensor& gamma,
                                                                         const at::Tensor& beta,
-                                                                        const at::Tensor& groups,
-                                                                        const at::Tensor& eps) {
+                                                                        int64_t groups,
+                                                                        double eps) {
     at::Tensor y = at::empty_like(x);
     EXEC_NPU_CMD(aclnnConvTranspose3dSwishGroupNormHardSwishCustom, x, gamma, beta, groups, eps, y);
     return y;
@@ -354,12 +336,10 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv_transpose3d_swish_group_norm_hard_swish_custom",
-          &conv_transpose3d_swish_group_norm_hard_swish_custom_impl_npu,
-          "ConvTranspose3d -> Swish -> GroupNorm -> HardSwish (fused)");
+    m.def("conv_transpose3d_swish_group_norm_hard_swish_custom", &conv_transpose3d_swish_group_norm_hard_swish_custom_impl_npu,
+          "Swish -> GroupNorm -> HardSwish fused op after ConvTranspose3d");
 }
 """
-
 model_src='''
 import torch
 import torch_npu
@@ -367,25 +347,20 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    仍然使用原生 ConvTranspose3d 计算反卷积，
-    将 Swish + GroupNorm + HardSwish 融合为自定义 AscendC 算子调用。
+    Optimized model: keep ConvTranspose3d; fuse Swish + GroupNorm + HardSwish into a custom AscendC op.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, groups, eps, bias=True):
         super().__init__()
         self.conv_transpose = torch.nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
+        self.groups = groups
+        self.eps = eps
+        # Create a GroupNorm module only to host learnable affine parameters (gamma/beta)
         self.group_norm = torch.nn.GroupNorm(num_groups=groups, num_channels=out_channels, eps=eps)
 
     def forward(self, x):
-        x = self.conv_transpose(x)
-        # 将组归一化的参数（gamma/beta）、以及 groups/eps 以张量形式传入自定义算子
-        groups_tensor = torch.tensor([float(self.group_norm.num_groups)], dtype=x.dtype, device=x.device)
-        eps_tensor = torch.tensor([float(self.group_norm.eps)], dtype=x.dtype, device=x.device)
-        y = custom_ops_lib.conv_transpose3d_swish_group_norm_hard_swish_custom(
-            x,
-            self.group_norm.weight,  # gamma
-            self.group_norm.bias,    # beta
-            groups_tensor,
-            eps_tensor
+        x = self.conv_transpose(x)  # Standard ConvTranspose3d
+        # Fused Swish + GroupNorm + HardSwish
+        return custom_ops_lib.conv_transpose3d_swish_group_norm_hard_swish_custom(
+            x, self.group_norm.weight, self.group_norm.bias, self.groups, float(self.eps)
         )
-        return y
 '''

@@ -1,0 +1,375 @@
+project_json_src='''
+[
+    {
+        "op": "CosineSimilarityLossCustom",
+        "input_desc": [
+            {
+                "name": "predict",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "target",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CosineSimilarityLossCustomTilingData)
+    TILING_DATA_FIELD_DEF(uint32_t, batch);
+    TILING_DATA_FIELD_DEF(uint32_t, featureLength);
+    TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+    TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+    TILING_DATA_FIELD_DEF(uint32_t, lasttileLength);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CosineSimilarityLossCustom, CosineSimilarityLossCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cosine_similarity_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_SIZE = 32; // 32 bytes per data block
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CosineSimilarityLossCustomTilingData tiling;
+
+    auto shape = context->GetInputShape(0)->GetStorageShape();
+    uint32_t batch = static_cast<uint32_t>(shape.GetDim(0));
+    uint32_t featureLength = static_cast<uint32_t>(shape.GetDim(1));
+    uint32_t sizeofdatatype = 4; // float32
+    uint32_t ALIGN_NUM = BLOCK_SIZE / sizeofdatatype; // 每个数据块能放的float数量
+
+    // 简单UB规划：每次处理的特征维tile长度（向下取整到ALIGN_NUM的倍数，保证对齐）
+    // 这里设定UB中用于本算子单次处理的元素块数量
+    uint32_t ub_block_num = 1024; // 示例策略，参考样例
+    if (ub_block_num % 2 != 0) {
+        ub_block_num -= 1;
+    }
+
+    uint32_t baseTileLen = ub_block_num * ALIGN_NUM;
+    if (baseTileLen == 0) {
+        baseTileLen = ALIGN_NUM;
+    }
+    uint32_t tileNum = (featureLength + baseTileLen - 1) / baseTileLen;
+    if (tileNum == 0) tileNum = 1;
+
+    uint32_t tileLength = baseTileLen;
+    uint32_t lasttileLength = featureLength - (tileNum - 1) * tileLength;
+    if (tileNum == 1) {
+        // 如果只需1个tile，则tileLength取实际长度向上对齐，最后一块长度即为真实长度
+        tileLength = ((featureLength + ALIGN_NUM - 1) / ALIGN_NUM) * ALIGN_NUM;
+        lasttileLength = featureLength;
+    }
+
+    tiling.set_batch(batch);
+    tiling.set_featureLength(featureLength);
+    tiling.set_tileNum(tileNum);
+    tiling.set_tileLength(tileLength);
+    tiling.set_lasttileLength(lasttileLength);
+
+    // 单核执行
+    context->SetBlockDim(1);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ops {
+class CosineSimilarityLossCustom : public OpDef {
+public:
+    explicit CosineSimilarityLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("predict")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("target")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CosineSimilarityLossCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelCosineSimilarityLoss {
+public:
+    __aicore__ inline KernelCosineSimilarityLoss() {}
+
+    __aicore__ inline void Init(GM_ADDR predict, GM_ADDR target, GM_ADDR y,
+                                uint32_t batch,
+                                uint32_t featureLength,
+                                uint32_t tileNum,
+                                uint32_t tileLength,
+                                uint32_t lasttileLength) {
+        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
+
+        this->batch = batch;
+        this->featureLength = featureLength;
+        this->tileNum = tileNum;
+        this->tileLength = tileLength;
+        this->lasttileLength = lasttileLength;
+
+        // GM缓冲区
+        predGm.SetGlobalBuffer((__gm__ float*)predict, batch * featureLength);
+        targGm.SetGlobalBuffer((__gm__ float*)target, batch * featureLength);
+        outGm.SetGlobalBuffer((__gm__ float*)y, 32); // 输出标量，留足空间
+
+        // 每行的分块个数
+        this->reduce_num = this->tileNum;
+
+        // 对齐到32，便于后续ReduceSum
+        uint32_t reduce_align = (this->reduce_num + 31) / 32 * 32;
+        uint32_t batch_align = (this->batch + 31) / 32 * 32;
+
+        // 输入双向缓存（同一tile内装入predict与target）
+        pipe.InitBuffer(inQueue, BUFFER_NUM, this->tileLength * 2 * sizeof(float));
+        // 三组分块累加（dot、p2、t2）的临时空间
+        pipe.InitBuffer(partialBuf, 1, reduce_align * 3 * sizeof(float));
+        // 行损失缓存（每个batch一项）
+        pipe.InitBuffer(rowLossBuf, 1, batch_align * sizeof(float));
+        // 通用工作空间（复用）
+        pipe.InitBuffer(workBuf, 1, this->tileLength * sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        // 局部视图：部分和与行损失
+        AscendC::LocalTensor<float> partial = partialBuf.Get<float>();
+        AscendC::LocalTensor<float> dotPart   = partial;                                // [0, reduce_align)
+        AscendC::LocalTensor<float> p2Part    = partial[this->AlignedReduceSize()];      // [reduce_align, 2*reduce_align)
+        AscendC::LocalTensor<float> t2Part    = partial[this->AlignedReduceSize() * 2];  // [2*reduce_align, 3*reduce_align)
+
+        AscendC::LocalTensor<float> rowLossLocal = rowLossBuf.Get<float>();
+
+        // 将行损失区预置为0
+        for (uint32_t i = 0; i < this->batch; ++i) {
+            rowLossLocal.SetValue(i, 0.0f);
+        }
+
+        // 针对每一行（batch）
+        for (uint32_t b = 0; b < this->batch; ++b) {
+            // 初始化分块和为0
+            for (uint32_t j = 0; j < this->AlignedReduceSize(); ++j) {
+                dotPart.SetValue(j, 0.0f);
+                p2Part.SetValue(j, 0.0f);
+                t2Part.SetValue(j, 0.0f);
+            }
+
+            // 分块遍历特征维
+            for (uint32_t i = 0; i < this->tileNum; ++i) {
+                uint32_t curLen = (i == this->tileNum - 1) ? this->lasttileLength : this->tileLength;
+                CopyIn(b, i, curLen);
+                ComputeTile(i, curLen, dotPart, p2Part, t2Part);
+            }
+
+            // 对每一类partial进行归约求和
+            ReduceToScalar(dotPart, this->reduce_num);
+            ReduceToScalar(p2Part, this->reduce_num);
+            ReduceToScalar(t2Part, this->reduce_num);
+
+            // 计算当前行的cosine相似度并转为损失(1 - cosine)
+            float dotSum = dotPart.GetValue(0);
+            float p2Sum  = p2Part.GetValue(0);
+            float t2Sum  = t2Part.GetValue(0);
+
+            // 避免除0
+            const float EPS = 1e-8f;
+
+            AscendC::LocalTensor<float> scBuf = workBuf.Get<float>();
+            scBuf.SetValue(0, p2Sum);
+            AscendC::Sqrt(scBuf, scBuf, 1); // scBuf[0] = sqrt(p2Sum)
+            float sqrtP = scBuf.GetValue(0);
+
+            scBuf.SetValue(0, t2Sum);
+            AscendC::Sqrt(scBuf, scBuf, 1); // scBuf[0] = sqrt(t2Sum)
+            float sqrtT = scBuf.GetValue(0);
+
+            float denom = sqrtP * sqrtT + EPS;
+            float cosine = (denom > 0.0f) ? (dotSum / denom) : 0.0f;
+            float lossRow = 1.0f - cosine;
+            rowLossLocal.SetValue(b, lossRow);
+        }
+
+        // 汇总所有行损失并取平均
+        ReduceToScalar(rowLossLocal, this->batch);
+        float totalLoss = rowLossLocal.GetValue(0);
+        float meanLoss = totalLoss / static_cast<float>(this->batch);
+
+        outGm.SetValue(0, meanLoss);
+    }
+
+private:
+    __aicore__ inline uint32_t AlignedReduceSize() const {
+        return (this->reduce_num + 31) / 32 * 32;
+    }
+
+    __aicore__ inline void CopyIn(uint32_t row, uint32_t tileIdx, uint32_t curLen) {
+        AscendC::LocalTensor<float> inLocal = inQueue.AllocTensor<float>();
+        AscendC::LocalTensor<float> xLocal = inLocal;
+        AscendC::LocalTensor<float> yLocal = inLocal[this->tileLength];
+
+        uint32_t base = row * this->featureLength + tileIdx * this->tileLength;
+
+        AscendC::DataCopy(xLocal, predGm[base], curLen);
+        AscendC::DataCopy(yLocal, targGm[base], curLen);
+
+        inQueue.EnQue(inLocal);
+    }
+
+    __aicore__ inline void ComputeTile(uint32_t tileIdx, uint32_t curLen,
+                                       AscendC::LocalTensor<float>& dotPart,
+                                       AscendC::LocalTensor<float>& p2Part,
+                                       AscendC::LocalTensor<float>& t2Part) {
+        AscendC::LocalTensor<float> inLocal = inQueue.DeQue<float>();
+        AscendC::LocalTensor<float> xLocal = inLocal;
+        AscendC::LocalTensor<float> yLocal = inLocal[this->tileLength];
+
+        // 使用workBuf作为临时空间
+        AscendC::LocalTensor<float> tmpLocal = workBuf.Get<float>();
+
+        // dot: sum(x * y)
+        AscendC::Mul(tmpLocal, xLocal, yLocal, curLen);                // tmpLocal = x * y
+        AscendC::ReduceSum<float>(tmpLocal, tmpLocal, xLocal, curLen); // 复用xLocal作为共享临时空间
+        dotPart.SetValue(tileIdx, tmpLocal.GetValue(0));
+
+        // p2: sum(x * x)
+        AscendC::Mul(tmpLocal, xLocal, xLocal, curLen);                // tmpLocal = x^2
+        AscendC::ReduceSum<float>(tmpLocal, tmpLocal, yLocal, curLen); // 复用yLocal作为共享临时空间
+        p2Part.SetValue(tileIdx, tmpLocal.GetValue(0));
+
+        // t2: sum(y * y)
+        AscendC::Mul(tmpLocal, yLocal, yLocal, curLen);                // tmpLocal = y^2
+        AscendC::ReduceSum<float>(tmpLocal, tmpLocal, xLocal, curLen); // 复用xLocal作为共享临时空间
+        t2Part.SetValue(tileIdx, tmpLocal.GetValue(0));
+
+        inQueue.FreeTensor(inLocal);
+    }
+
+    __aicore__ inline void ReduceToScalar(AscendC::LocalTensor<float>& vec, uint32_t length) {
+        // 将vec的前length个元素做ReduceSum，结果写回vec[0]
+        AscendC::LocalTensor<float> work = workBuf.Get<float>();
+        AscendC::Duplicate(work, 0.0f, this->tileLength); // 作为共享临时空间
+        AscendC::ReduceSum<float>(vec, vec, work, length);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueue;
+    AscendC::TBuf<> partialBuf;
+    AscendC::TBuf<> rowLossBuf;
+    AscendC::TBuf<> workBuf;
+
+    AscendC::GlobalTensor<float> predGm;
+    AscendC::GlobalTensor<float> targGm;
+    AscendC::GlobalTensor<float> outGm;
+
+    uint32_t batch;
+    uint32_t featureLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+    uint32_t lasttileLength;
+    uint32_t reduce_num;
+};
+
+extern "C" __global__ __aicore__ void cosine_similarity_loss_custom(GM_ADDR predict, GM_ADDR target, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCosineSimilarityLoss op;
+    op.Init(predict, target, y,
+            tiling_data.batch,
+            tiling_data.featureLength,
+            tiling_data.tileNum,
+            tiling_data.tileLength,
+            tiling_data.lasttileLength);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cosine_similarity_loss_impl_npu(const at::Tensor& predict, const at::Tensor& target) {
+    at::Tensor result = at::empty({}, predict.options());
+    EXEC_NPU_CMD(aclnnCosineSimilarityLossCustom, predict, target, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cosine_similarity_loss_custom", &cosine_similarity_loss_impl_npu);
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cosine_similarity_loss_custom", &cosine_similarity_loss_impl_npu, "cosine similarity loss");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.cosine_similarity_loss_custom(predictions, targets)
+'''

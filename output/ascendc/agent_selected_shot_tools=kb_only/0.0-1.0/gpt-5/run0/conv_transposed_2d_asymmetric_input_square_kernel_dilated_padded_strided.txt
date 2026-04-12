@@ -1,0 +1,456 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTransposed2dAsymmetricInputSquareKernelDilatedPaddedStridedCustom",
+        "language": "cpp",
+        "attr": [
+            {
+                "name": "stride",
+                "type": "int"
+            },
+            {
+                "name": "padding",
+                "type": "int"
+            },
+            {
+                "name": "dilation",
+                "type": "int"
+            }
+        ],
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTransposed2dAsymmetricInputSquareKernelDilatedPaddedStridedCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cin);
+  TILING_DATA_FIELD_DEF(uint32_t, cout);
+  TILING_DATA_FIELD_DEF(uint32_t, hin);
+  TILING_DATA_FIELD_DEF(uint32_t, win);
+  TILING_DATA_FIELD_DEF(uint32_t, hout);
+  TILING_DATA_FIELD_DEF(uint32_t, wout);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, stride);
+  TILING_DATA_FIELD_DEF(uint32_t, padding);
+  TILING_DATA_FIELD_DEF(uint32_t, dilation);
+  TILING_DATA_FIELD_DEF(uint32_t, cPerCore);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTransposed2dAsymmetricInputSquareKernelDilatedPaddedStridedCustom, ConvTransposed2dAsymmetricInputSquareKernelDilatedPaddedStridedCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transposed_2d_asymmetric_input_square_kernel_dilated_padded_strided_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <algorithm>
+
+namespace {
+inline int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+}
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 输入 x: [N, Cin, Hin, Win], 权重 w: [Cin, Cout, K, K]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+
+    int64_t N   = x_shape->GetOriginShape().GetDim(0);
+    int64_t Cin = x_shape->GetOriginShape().GetDim(1);
+    int64_t Hin = x_shape->GetOriginShape().GetDim(2);
+    int64_t Win = x_shape->GetOriginShape().GetDim(3);
+
+    int64_t WinCin = w_shape->GetOriginShape().GetDim(0); // should equal Cin
+    int64_t Cout   = w_shape->GetOriginShape().GetDim(1);
+    int64_t K      = w_shape->GetOriginShape().GetDim(2); // square kernel
+    (void)WinCin;
+
+    int64_t stride = 1;
+    int64_t padding = 0;
+    int64_t dilation = 1;
+
+    // 获取属性（若未设置则使用默认值）
+    (void)context->GetAttr("stride", stride);
+    (void)context->GetAttr("padding", padding);
+    (void)context->GetAttr("dilation", dilation);
+
+    int64_t Hout = (Hin - 1) * stride - 2 * padding + dilation * (K - 1) + 1;
+    int64_t Wout = (Win - 1) * stride - 2 * padding + dilation * (K - 1) + 1;
+
+    // 设置并行 block 数，沿 Cout 维度划分
+    uint32_t maxBlock = 32;
+    uint32_t usedBlock = static_cast<uint32_t>(std::min<int64_t>(Cout, maxBlock));
+    context->SetBlockDim(usedBlock);
+
+    uint32_t cPerCore = static_cast<uint32_t>(CeilDiv(Cout, static_cast<int64_t>(usedBlock)));
+
+    ConvTransposed2dAsymmetricInputSquareKernelDilatedPaddedStridedCustomTilingData tiling;
+    tiling.set_n(static_cast<uint32_t>(N));
+    tiling.set_cin(static_cast<uint32_t>(Cin));
+    tiling.set_cout(static_cast<uint32_t>(Cout));
+    tiling.set_hin(static_cast<uint32_t>(Hin));
+    tiling.set_win(static_cast<uint32_t>(Win));
+    tiling.set_hout(static_cast<uint32_t>(Hout));
+    tiling.set_wout(static_cast<uint32_t>(Wout));
+    tiling.set_k(static_cast<uint32_t>(K));
+    tiling.set_stride(static_cast<uint32_t>(stride));
+    tiling.set_padding(static_cast<uint32_t>(padding));
+    tiling.set_dilation(static_cast<uint32_t>(dilation));
+    tiling.set_cPerCore(static_cast<uint32_t>(cPerCore));
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x = context->GetInputShape(0);  // [N, Cin, Hin, Win]
+    const gert::Shape* w = context->GetInputShape(1);  // [Cin, Cout, K, K]
+    if (x == nullptr || w == nullptr) return GRAPH_FAILED;
+
+    int64_t N   = x->GetDim(0);
+    int64_t Hin = x->GetDim(2);
+    int64_t Win = x->GetDim(3);
+    int64_t Cout = w->GetDim(1);
+    int64_t K = w->GetDim(2);
+
+    int64_t stride = 1, padding = 0, dilation = 1;
+    (void)context->GetAttr("stride", stride);
+    (void)context->GetAttr("padding", padding);
+    (void)context->GetAttr("dilation", dilation);
+
+    int64_t Hout = (Hin - 1) * stride - 2 * padding + dilation * (K - 1) + 1;
+    int64_t Wout = (Win - 1) * stride - 2 * padding + dilation * (K - 1) + 1;
+
+    gert::Shape* y = context->GetOutputShape(0);
+    y->SetDimNum(4);
+    y->SetDim(0, N);
+    y->SetDim(1, Cout);
+    y->SetDim(2, Hout);
+    y->SetDim(3, Wout);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTransposed2dAsymmetricInputSquareKernelDilatedPaddedStridedCustom : public OpDef {
+public:
+    explicit ConvTransposed2dAsymmetricInputSquareKernelDilatedPaddedStridedCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // 属性注册（标量）
+        this->Attr("stride").SetInt(1);
+        this->Attr("padding").SetInt(0);
+        this->Attr("dilation").SetInt(1);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTransposed2dAsymmetricInputSquareKernelDilatedPaddedStridedCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+
+class KernelConvTransposed2D {
+public:
+    __aicore__ inline KernelConvTransposed2D() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                uint32_t n, uint32_t cin, uint32_t cout,
+                                uint32_t hin, uint32_t win,
+                                uint32_t hout, uint32_t wout,
+                                uint32_t k, uint32_t stride, uint32_t padding, uint32_t dilation,
+                                uint32_t cPerCore) {
+        this->N = n; this->Cin = cin; this->Cout = cout;
+        this->Hin = hin; this->Win = win;
+        this->Hout = hout; this->Wout = wout;
+        this->K = k; this->Stride = stride; this->Padding = padding; this->Dilation = dilation;
+        this->CPerCore = cPerCore;
+
+        uint32_t xSize = n * cin * hin * win;
+        uint32_t wSize = cin * cout * k * k;
+        uint32_t ySize = n * cout * hout * wout;
+
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(x), xSize);
+        wGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(w), wSize);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(y), ySize);
+
+        pipe.InitBuffer(inQueueX, 1, sizeof(DTYPE));
+        pipe.InitBuffer(inQueueW, 1, sizeof(DTYPE));
+        pipe.InitBuffer(outQueueY, 1, sizeof(DTYPE));
+        pipe.InitBuffer(tmpQueue, 1, sizeof(DTYPE));
+    }
+
+    __aicore__ inline void Process() {
+        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t startCout = coreIdx * CPerCore;
+        uint32_t endCout = startCout + CPerCore;
+        if (startCout >= Cout) { return; }
+        if (endCout > Cout) endCout = Cout;
+
+        for (uint32_t nIdx = 0; nIdx < N; ++nIdx) {
+            for (uint32_t co = startCout; co < endCout; ++co) {
+                for (uint32_t oh = 0; oh < Hout; ++oh) {
+                    for (uint32_t ow = 0; ow < Wout; ++ow) {
+                        // acc = 0
+                        AscendC::LocalTensor<DTYPE> accLocal = tmpQueue.AllocTensor<DTYPE>();
+                        // 将accLocal置零：用乘加的方式累加（首次累加前创建一个0值）
+                        // 这里采用将0从全局偏移0处复制的方式，要求调用方保证内存安全；若不可行，可使用算子Duplicate替代。
+                        // 简化：先写入0，再按需累加
+                        SetLocalZero(accLocal);
+
+                        bool has_valid = false;
+                        // 遍历 cin, kh, kw，计算有效 (hin, win)
+                        for (uint32_t ci = 0; ci < Cin; ++ci) {
+                            for (uint32_t kh = 0; kh < K; ++kh) {
+                                int32_t tmp_h = static_cast<int32_t>(oh) + static_cast<int32_t>(Padding) - static_cast<int32_t>(kh * Dilation);
+                                if (tmp_h % static_cast<int32_t>(Stride) != 0) continue;
+                                int32_t ih = tmp_h / static_cast<int32_t>(Stride);
+                                if (ih < 0 || ih >= static_cast<int32_t>(Hin)) continue;
+
+                                for (uint32_t kw = 0; kw < K; ++kw) {
+                                    int32_t tmp_w = static_cast<int32_t>(ow) + static_cast<int32_t>(Padding) - static_cast<int32_t>(kw * Dilation);
+                                    if (tmp_w % static_cast<int32_t>(Stride) != 0) continue;
+                                    int32_t iw = tmp_w / static_cast<int32_t>(Stride);
+                                    if (iw < 0 || iw >= static_cast<int32_t>(Win)) continue;
+
+                                    // 取 x[n, ci, ih, iw]
+                                    uint32_t xOff = ((nIdx * Cin + ci) * Hin + static_cast<uint32_t>(ih)) * Win + static_cast<uint32_t>(iw);
+                                    AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
+                                    AscendC::DataCopy(xLocal, xGm[xOff], 1);
+
+                                    // 取 w[ci, co, kh, kw]
+                                    uint32_t wOff = ((ci * Cout + co) * K + kh) * K + kw;
+                                    AscendC::LocalTensor<DTYPE> wLocal = inQueueW.AllocTensor<DTYPE>();
+                                    AscendC::DataCopy(wLocal, wGm[wOff], 1);
+
+                                    // temp = x * w
+                                    AscendC::LocalTensor<DTYPE> tmpLocal = tmpQueue.AllocTensor<DTYPE>();
+                                    AscendC::Mul(tmpLocal, xLocal, wLocal, 1);
+
+                                    if (!has_valid) {
+                                        // acc = temp
+                                        AscendC::DataCopy(accLocal, tmpLocal, 1);
+                                        has_valid = true;
+                                    } else {
+                                        // acc += temp
+                                        AscendC::Add(accLocal, accLocal, tmpLocal, 1);
+                                    }
+
+                                    inQueueX.FreeTensor(xLocal);
+                                    inQueueW.FreeTensor(wLocal);
+                                    tmpQueue.FreeTensor(tmpLocal);
+                                }
+                            }
+                        }
+
+                        // 写回 y[n, co, oh, ow]
+                        uint32_t yOff = ((nIdx * Cout + co) * Hout + oh) * Wout + ow;
+                        AscendC::LocalTensor<DTYPE> yLocal = outQueueY.AllocTensor<DTYPE>();
+                        if (has_valid) {
+                            AscendC::DataCopy(yLocal, accLocal, 1);
+                        } else {
+                            // 无有效贡献则写0
+                            SetLocalZero(yLocal);
+                        }
+                        AscendC::DataCopy(yGm[yOff], yLocal, 1);
+                        outQueueY.FreeTensor(yLocal);
+                        tmpQueue.FreeTensor(accLocal);
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    __aicore__ inline void SetLocalZero(AscendC::LocalTensor<DTYPE>& t) {
+        // 使用加法将局部张量清零：t = t - t
+        // 先分配一个临时零张量为t，再进行一次减法，确保为0
+        AscendC::LocalTensor<DTYPE> zeroLocal = tmpQueue.AllocTensor<DTYPE>();
+        // 采用自身相减得到0：zeroLocal = zeroLocal - zeroLocal
+        AscendC::Sub(zeroLocal, zeroLocal, zeroLocal, 1);
+        AscendC::DataCopy(t, zeroLocal, 1);
+        tmpQueue.FreeTensor(zeroLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1>  inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1>  inQueueW;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue;
+
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> wGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+
+    uint32_t N, Cin, Cout;
+    uint32_t Hin, Win, Hout, Wout;
+    uint32_t K, Stride, Padding, Dilation;
+    uint32_t CPerCore;
+};
+
+extern "C" __global__ __aicore__ void conv_transposed_2d_asymmetric_input_square_kernel_dilated_padded_strided_custom(
+    GM_ADDR x, GM_ADDR w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(ConvTransposed2dAsymmetricInputSquareKernelDilatedPaddedStridedCustomTilingData, tiling);
+    KernelConvTransposed2D op;
+    op.Init(x, w, y,
+            tiling_data.n(), tiling_data.cin(), tiling_data.cout(),
+            tiling_data.hin(), tiling_data.win(),
+            tiling_data.hout(), tiling_data.wout(),
+            tiling_data.k(), tiling_data.stride(), tiling_data.padding(), tiling_data.dilation(),
+            tiling_data.cPerCore());
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline int64_t deconv_out_size(int64_t in, int64_t kernel, int64_t stride, int64_t padding, int64_t dilation) {
+    return (in - 1) * stride - 2 * padding + dilation * (kernel - 1) + 1;
+}
+
+at::Tensor conv_transposed_2d_asymmetric_input_square_kernel_dilated_padded_strided_custom_impl_npu(
+    const at::Tensor& x, const at::Tensor& w, int64_t stride, int64_t padding, int64_t dilation) {
+    // x: [N, Cin, Hin, Win], w: [Cin, Cout, K, K]
+    TORCH_CHECK(x.dim() == 4, "x must be 4D");
+    TORCH_CHECK(w.dim() == 4, "w must be 4D");
+    auto N = x.size(0);
+    auto Cin = x.size(1);
+    auto Hin = x.size(2);
+    auto Win = x.size(3);
+    TORCH_CHECK(w.size(0) == Cin, "w.shape[0] must equal Cin");
+    auto Cout = w.size(1);
+    auto K = w.size(2);
+    TORCH_CHECK(w.size(2) == w.size(3), "kernel must be square");
+
+    auto Hout = deconv_out_size(Hin, K, stride, padding, dilation);
+    auto Wout = deconv_out_size(Win, K, stride, padding, dilation);
+
+    at::Tensor y = at::empty({N, Cout, Hout, Wout}, x.options());
+    EXEC_NPU_CMD(aclnnConvTransposed2dAsymmetricInputSquareKernelDilatedPaddedStridedCustom, x, w, stride, padding, dilation, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transposed_2d_asymmetric_input_square_kernel_dilated_padded_strided_custom",
+           &conv_transposed_2d_asymmetric_input_square_kernel_dilated_padded_strided_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transposed_2d_asymmetric_input_square_kernel_dilated_padded_strided_custom",
+          &conv_transposed_2d_asymmetric_input_square_kernel_dilated_padded_strided_custom_impl_npu,
+          "Custom 2D Transposed Convolution (square kernel, dilation/padding/stride)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    使用自定义 AscendC 算子执行 2D 反卷积（转置卷积），支持方形卷积核、stride / padding / dilation。
+    权重作为本模块参数保存，无偏置。
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super().__init__()
+        assert not bias, "当前自定义算子版本不支持 bias"
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        # PyTorch ConvTranspose2d 的权重形状: [in_channels, out_channels, K, K]
+        w = torch.empty(in_channels, out_channels, kernel_size, kernel_size)
+        torch.nn.init.kaiming_uniform_(w, a=5**0.5)
+        self.weight = torch.nn.Parameter(w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.conv_transposed_2d_asymmetric_input_square_kernel_dilated_padded_strided_custom(
+            x, self.weight, self.stride, self.padding, self.dilation
+        )
+'''

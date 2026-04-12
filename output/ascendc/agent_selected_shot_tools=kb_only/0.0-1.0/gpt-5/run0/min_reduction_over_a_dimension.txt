@@ -1,0 +1,390 @@
+project_json_src='''
+[
+    {
+        "op": "MinReductionOverADimensionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(TilingData)
+TILING_DATA_FIELD_DEF(uint32_t, outerSize);   // product of dims except last
+TILING_DATA_FIELD_DEF(uint32_t, reduceLen);   // last dim length
+TILING_DATA_FIELD_DEF(uint32_t, outSize);     // outerSize
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MinReductionOverADimensionCustom, TilingData)
+} // namespace optiling
+"""
+
+host_operator_src="""
+#include "min_reduction_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+#define MINREDUCE_TILING_0 1
+#define MINREDUCE_TILING_1 2
+#define MINREDUCE_TILING_2 3
+
+namespace optiling {
+constexpr uint32_t BLOCK_DIM = 1;
+constexpr uint32_t REP_LEN = 256; // bytes per repeat
+constexpr uint32_t BLK_LEN = 32;  // bytes per block
+
+// For half (2 bytes)
+constexpr uint32_t HALF_THRESHOLD0 = REP_LEN / sizeof(uint16_t);                             // 128 elements
+constexpr uint32_t HALF_THRESHOLD1 = (REP_LEN / sizeof(uint16_t)) * (BLK_LEN / sizeof(uint16_t)); // 128 * 16 = 2048
+constexpr uint32_t HALF_THRESHOLD2 = (REP_LEN / sizeof(uint16_t)) * (REP_LEN / sizeof(uint16_t)); // 128 * 128 = 16384
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    TilingData tiling;
+    const gert::Shape *inShape = context->GetInputShape(0);
+    const auto rank = inShape->GetDimNum();
+    uint64_t totalSize = inShape->GetOriginShape().GetShapeSize();
+    uint64_t reduceLen = 1;
+    if (rank > 0) {
+        reduceLen = static_cast<uint64_t>(inShape->GetOriginShape().GetDim(rank - 1));
+    }
+    uint64_t outerSize = (reduceLen == 0) ? 0 : (totalSize / reduceLen);
+
+    // Strategy selection by last-dimension length (half)
+    if (reduceLen <= HALF_THRESHOLD0) {
+        context->SetTilingKey(MINREDUCE_TILING_0);
+    } else if (reduceLen <= HALF_THRESHOLD1) {
+        context->SetTilingKey(MINREDUCE_TILING_1);
+    } else if (reduceLen <= HALF_THRESHOLD2) {
+        context->SetTilingKey(MINREDUCE_TILING_2);
+    } else {
+        // Fallback to the largest tiling
+        context->SetTilingKey(MINREDUCE_TILING_2);
+    }
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_outerSize(static_cast<uint32_t>(outerSize));
+    tiling.set_reduceLen(static_cast<uint32_t>(reduceLen));
+    tiling.set_outSize(static_cast<uint32_t>(outerSize));
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+
+    std::vector<int64_t> dims;
+    for (size_t i = 0; i + 1 < x_shape->GetDimNum(); ++i) {
+        dims.push_back(x_shape->GetDim(i));
+    }
+    if (dims.empty()) {
+        dims.push_back(1); // handle scalar-like reduction to 1 element
+    }
+    *y_shape = dims;
+    return GRAPH_SUCCESS;
+}
+
+static graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class MinReductionOverADimensionCustom : public OpDef {
+public:
+    explicit MinReductionOverADimensionCustom(const char *name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore()
+            .SetTiling(optiling::TilingFunc)
+            .AddConfig("ascend910b");
+    }
+};
+OP_ADD(MinReductionOverADimensionCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+#define MINREDUCE_TILING_0 1
+#define MINREDUCE_TILING_1 2
+#define MINREDUCE_TILING_2 3
+
+class KernelMinReduce {
+    static constexpr uint32_t DEFAULT_BLK_STRIDE = 1;
+    static constexpr uint32_t DEFAULT_REP_STRIDE = 8;
+    static constexpr uint32_t REP_LEN = 256; // bytes
+    static constexpr uint32_t BLK_LEN = 32;  // bytes
+public:
+    __aicore__ inline KernelMinReduce() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t outerSize, uint32_t reduceLen, uint32_t outSize)
+    {
+        this->outerSize = outerSize;
+        this->reduceLen = reduceLen;
+        this->outSize = outSize;
+
+        xGm.SetGlobalBuffer((__gm__ half *)x, static_cast<uint64_t>(outerSize) * reduceLen);
+        yGm.SetGlobalBuffer((__gm__ half *)y, outSize);
+        // Use simple single-queue buffers matching total elements sizes
+        pipe.InitBuffer(inQueueX, 1, static_cast<uint64_t>(outerSize) * reduceLen * sizeof(half));
+        pipe.InitBuffer(outQueueY, 1, outSize * sizeof(half));
+    }
+
+    __aicore__ inline void Process1()
+    {
+        CopyIn();
+        Compute1();
+        CopyOut();
+    }
+    __aicore__ inline void Process2()
+    {
+        CopyIn();
+        Compute2();
+        CopyOut();
+    }
+    __aicore__ inline void Process3()
+    {
+        CopyIn();
+        Compute3();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<half> xLocal = inQueueX.AllocTensor<half>();
+        AscendC::DataCopy(xLocal, xGm, static_cast<uint64_t>(outerSize) * reduceLen);
+        inQueueX.EnQue(xLocal);
+    }
+
+    // Strategy 1: reduceLen <= 128 (one repeat for half). Use WholeReduceMin per row.
+    __aicore__ inline void Compute1()
+    {
+        AscendC::LocalTensor<half> xLocal = inQueueX.DeQue<half>();
+        AscendC::LocalTensor<half> yLocal = outQueueY.AllocTensor<half>();
+        // temporary buffer for per-row [value,index], we keep only values
+        pipe.InitBuffer(calcBuf, static_cast<uint64_t>(outerSize) * 2 * sizeof(half));
+        AscendC::LocalTensor<half> tmpLocal = calcBuf.Get<half>();
+
+        const int32_t maskLen = static_cast<int32_t>(reduceLen); // <= 128
+        // Process per row
+        for (uint32_t r = 0; r < outerSize; ++r) {
+            // Row start
+            AscendC::LocalTensor<half> rowSrc = xLocal[r * reduceLen];
+            AscendC::LocalTensor<half> rowDst = tmpLocal[0];
+
+            // WholeReduceMin returns [value, index] for one repeat
+            AscendC::WholeReduceMin<half>(rowDst, rowSrc, maskLen, 1,
+                                          /*dstRepStride*/1, /*srcBlkStride*/1, /*srcRepStride*/DEFAULT_REP_STRIDE);
+            // Take the first half (value)
+            yLocal.SetValue(r, rowDst.GetValue(0));
+        }
+
+        outQueueY.EnQue<half>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    // Strategy 2: 128 < reduceLen <= 2048. First BlockReduceMin chunks, then WholeReduceMin
+    __aicore__ inline void Compute2()
+    {
+        AscendC::LocalTensor<half> xLocal = inQueueX.DeQue<half>();
+        AscendC::LocalTensor<half> yLocal = outQueueY.AllocTensor<half>();
+
+        pipe.InitBuffer(calcBuf, static_cast<uint64_t>(outerSize) * ((reduceLen + 127) / 128) * 8 * sizeof(half));
+        AscendC::LocalTensor<half> tmpLocal = calcBuf.Get<half>();
+
+        const uint32_t repeatsPerRow = (reduceLen + (REP_LEN / sizeof(half)) - 1) / (REP_LEN / sizeof(half));
+        const int32_t maskCnt = (reduceLen > (REP_LEN / sizeof(half))) ? (REP_LEN / sizeof(half)) : reduceLen;
+
+        for (uint32_t r = 0; r < outerSize; ++r) {
+            AscendC::LocalTensor<half> rowSrc = xLocal[r * reduceLen];
+            AscendC::LocalTensor<half> interDst = tmpLocal[r * repeatsPerRow * 8];
+
+            // First stage: block-wise reduce -> each repeat outputs 8 mins
+            AscendC::BlockReduceMin<half>(interDst, rowSrc, repeatsPerRow, maskCnt,
+                                          /*dstRepStride*/1, /*srcBlkStride*/1, /*srcRepStride*/DEFAULT_REP_STRIDE);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            // Second stage: reduce the 8*repeatsPerRow values to 1
+            // Use WholeReduceMin on the contiguous intermediate buffer
+            const uint32_t interCount = repeatsPerRow * 8;
+            AscendC::LocalTensor<half> finalTmp = interDst;
+            // reuse interDst as src, store result to first position
+            AscendC::WholeReduceMin<half>(finalTmp, interDst, static_cast<int32_t>(interCount), 1,
+                                          /*dstRepStride*/1, /*srcBlkStride*/1, /*srcRepStride*/DEFAULT_REP_STRIDE);
+            yLocal.SetValue(r, finalTmp.GetValue(0));
+        }
+
+        outQueueY.EnQue<half>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    // Strategy 3: 2048 < reduceLen <= 16384. Two-level WholeReduceMin
+    __aicore__ inline void Compute3()
+    {
+        AscendC::LocalTensor<half> xLocal = inQueueX.DeQue<half>();
+        AscendC::LocalTensor<half> yLocal = outQueueY.AllocTensor<half>();
+
+        const uint32_t perRepeat = REP_LEN / sizeof(half); // 128
+        const uint32_t repeatsPerRow = (reduceLen + perRepeat - 1) / perRepeat;
+
+        pipe.InitBuffer(calcBuf, static_cast<uint64_t>(outerSize) * repeatsPerRow * sizeof(half) * 2);
+        AscendC::LocalTensor<half> tmpLocal = calcBuf.Get<half>();
+
+        for (uint32_t r = 0; r < outerSize; ++r) {
+            AscendC::LocalTensor<half> rowSrc = xLocal[r * reduceLen];
+            AscendC::LocalTensor<half> interDst = tmpLocal[r * repeatsPerRow];
+
+            // First WholeReduceMin across segments of 128 elements -> repeatsPerRow partial mins
+            AscendC::WholeReduceMin<half>(interDst, rowSrc, static_cast<int32_t>(perRepeat), static_cast<int32_t>(repeatsPerRow),
+                                          /*dstRepStride*/1, /*srcBlkStride*/1, /*srcRepStride*/DEFAULT_REP_STRIDE);
+            AscendC::PipeBarrier<PIPE_V>();
+
+            // Second WholeReduceMin to combine partial mins
+            AscendC::LocalTensor<half> finalDst = interDst;
+            AscendC::WholeReduceMin<half>(finalDst, interDst, static_cast<int32_t>(repeatsPerRow), 1,
+                                          /*dstRepStride*/1, /*srcBlkStride*/1, /*srcRepStride*/DEFAULT_REP_STRIDE);
+            yLocal.SetValue(r, finalDst.GetValue(0));
+        }
+
+        outQueueY.EnQue<half>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<half> yLocal = outQueueY.DeQue<half>();
+        AscendC::DataCopy(yGm, yLocal, outSize);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueY;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> calcBuf;
+    AscendC::GlobalTensor<half> xGm;
+    AscendC::GlobalTensor<half> yGm;
+    uint32_t outerSize;
+    uint32_t reduceLen;
+    uint32_t outSize;
+};
+
+extern "C" __global__ __aicore__ void min_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMinReduce op;
+    op.Init(x, y, tiling_data.outerSize, tiling_data.reduceLen, tiling_data.outSize);
+    if (TILING_KEY_IS(MINREDUCE_TILING_0)) {
+        op.Process1();
+    } else if (TILING_KEY_IS(MINREDUCE_TILING_1)) {
+        op.Process2();
+    } else if (TILING_KEY_IS(MINREDUCE_TILING_2)) {
+        op.Process3();
+    } else {
+        op.Process3();
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor min_reduce_lastdim_impl_npu(const at::Tensor& x_half) {
+    // x_half is expected to be float16 and contiguous, reduce last dim
+    // Output shape = x_half.sizes()[:-1]
+    auto sizes = x_half.sizes().vec();
+    sizes.pop_back();
+    if (sizes.empty()) {
+        sizes.push_back(1);
+    }
+    at::Tensor y = at::empty(sizes, x_half.options());
+    EXEC_NPU_CMD(aclnnMinReductionOverADimensionCustom, x_half, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("min_reduction_over_a_dimension_custom", &min_reduce_lastdim_impl_npu);
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("min_reduction_over_a_dimension_custom", &min_reduce_lastdim_impl_npu, "min reduce last dim");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Reduce along arbitrary dim by permuting target dim to last, then call custom op
+        nd = x.dim()
+        dim = self.dim if self.dim >= 0 else (self.dim + nd)
+        assert 0 <= dim < nd, "dim out of range"
+        if dim != nd - 1:
+            perm = [i for i in range(nd) if i != dim] + [dim]
+            x_perm = x.permute(perm).contiguous()
+        else:
+            x_perm = x.contiguous()
+        dtype_orig = x_perm.dtype
+        if x_perm.dtype != torch.float16:
+            x_perm = x_perm.to(torch.float16)
+        y = custom_ops_lib.min_reduction_over_a_dimension_custom(x_perm)
+        # y already has dims except the last one (reduced), order matches original dims without target dim
+        if dtype_orig != torch.float16:
+            y = y.to(dtype_orig)
+        return y
+'''

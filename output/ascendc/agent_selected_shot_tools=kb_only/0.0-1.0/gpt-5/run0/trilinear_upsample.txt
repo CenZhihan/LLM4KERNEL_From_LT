@@ -1,0 +1,296 @@
+project_json_src='''
+[
+    {
+        "op": "TrilinearUpsampleCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(TrilinearUpsampleCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, d_in);
+  TILING_DATA_FIELD_DEF(uint32_t, h_in);
+  TILING_DATA_FIELD_DEF(uint32_t, w_in);
+  TILING_DATA_FIELD_DEF(uint32_t, d_out);
+  TILING_DATA_FIELD_DEF(uint32_t, h_out);
+  TILING_DATA_FIELD_DEF(uint32_t, w_out);
+  TILING_DATA_FIELD_DEF(uint64_t, totalInputLength);
+  TILING_DATA_FIELD_DEF(uint64_t, totalOutputLength);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(TrilinearUpsampleCustom, TrilinearUpsampleCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "trilinear_upsample_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    TrilinearUpsampleCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+
+    // 期望输入形状为 [N, C, D, H, W]
+    uint32_t n = origin.GetDim(0);
+    uint32_t c = origin.GetDim(1);
+    uint32_t d_in = origin.GetDim(2);
+    uint32_t h_in = origin.GetDim(3);
+    uint32_t w_in = origin.GetDim(4);
+
+    uint32_t d_out = d_in * 2;
+    uint32_t h_out = h_in * 2;
+    uint32_t w_out = w_in * 2;
+
+    uint64_t totalInputLength = static_cast<uint64_t>(n) * c * d_in * h_in * w_in;
+    uint64_t totalOutputLength = static_cast<uint64_t>(n) * c * d_out * h_out * w_out;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_d_in(d_in);
+    tiling.set_h_in(h_in);
+    tiling.set_w_in(w_in);
+    tiling.set_d_out(d_out);
+    tiling.set_h_out(h_out);
+    tiling.set_w_out(w_out);
+    tiling.set_totalInputLength(totalInputLength);
+    tiling.set_totalOutputLength(totalOutputLength);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0; // 不需要额外的workspace
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    auto in_origin = x_shape->GetOriginShape();
+    uint32_t n = in_origin.GetDim(0);
+    uint32_t c = in_origin.GetDim(1);
+    uint32_t d_in = in_origin.GetDim(2);
+    uint32_t h_in = in_origin.GetDim(3);
+    uint32_t w_in = in_origin.GetDim(4);
+
+    gert::Shape out_origin({n, c, d_in * 2, h_in * 2, w_in * 2});
+    *y_shape = out_origin;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class TrilinearUpsampleCustom : public OpDef {
+public:
+    explicit TrilinearUpsampleCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(TrilinearUpsampleCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+// 简化实现：按输出线性索引切分到不同核心处理，采用align_corners=True的三线性插值映射。
+// 输入输出数据类型：float
+// 输入/输出格式：ND，形状 [N, C, D, H, W]
+
+extern "C" __global__ __aicore__ void trilinear_upsample_custom(GM_ADDR xGm, GM_ADDR yGm, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+
+    const uint32_t n = tilingData.n();
+    const uint32_t c = tilingData.c();
+    const uint32_t d_in = tilingData.d_in();
+    const uint32_t h_in = tilingData.h_in();
+    const uint32_t w_in = tilingData.w_in();
+    const uint32_t d_out = tilingData.d_out();
+    const uint32_t h_out = tilingData.h_out();
+    const uint32_t w_out = tilingData.w_out();
+
+    const uint64_t totalOut = tilingData.totalOutputLength();
+
+    __gm__ float* inPtr  = reinterpret_cast<__gm__ float*>(xGm);
+    __gm__ float* outPtr = reinterpret_cast<__gm__ float*>(yGm);
+
+    const uint32_t blockNum = AscendC::GetBlockNum();
+    const uint32_t blockIdx = AscendC::GetBlockIdx();
+
+    uint64_t blockSize = (totalOut + blockNum - 1) / blockNum;
+    uint64_t start = blockIdx * blockSize;
+    uint64_t end = (blockIdx + 1) * blockSize;
+    if (end > totalOut) end = totalOut;
+
+    // 预计算align_corners=True的比例因子
+    const float sz_d = d_out > 1 ? static_cast<float>(d_in - 1) / static_cast<float>(d_out - 1) : 0.0f;
+    const float sz_h = h_out > 1 ? static_cast<float>(h_in - 1) / static_cast<float>(h_out - 1) : 0.0f;
+    const float sz_w = w_out > 1 ? static_cast<float>(w_in - 1) / static_cast<float>(w_out - 1) : 0.0f;
+
+    // 展开线性索引 -> [N, C, D_out, H_out, W_out]
+    for (uint64_t lin = start; lin < end; ++lin) {
+        uint64_t tmp = lin;
+
+        uint32_t ow = tmp % w_out; tmp /= w_out;
+        uint32_t oh = tmp % h_out; tmp /= h_out;
+        uint32_t od = tmp % d_out; tmp /= d_out;
+        uint32_t ic = tmp % c;     tmp /= c;
+        uint32_t inN = tmp % n;
+
+        // 对齐角点坐标映射
+        float fd = sz_d * static_cast<float>(od);
+        float fh = sz_h * static_cast<float>(oh);
+        float fw = sz_w * static_cast<float>(ow);
+
+        uint32_t d0 = static_cast<uint32_t>(AscendC::ScalarCast<int>(fd));
+        uint32_t h0 = static_cast<uint32_t>(AscendC::ScalarCast<int>(fh));
+        uint32_t w0 = static_cast<uint32_t>(AscendC::ScalarCast<int>(fw));
+
+        uint32_t d1 = d0 < (d_in - 1) ? (d0 + 1) : d0;
+        uint32_t h1 = h0 < (h_in - 1) ? (h0 + 1) : h0;
+        uint32_t w1 = w0 < (w_in - 1) ? (w0 + 1) : w0;
+
+        float wd = fd - static_cast<float>(d0);
+        float wh = fh - static_cast<float>(h0);
+        float ww = fw - static_cast<float>(w0);
+
+        // 计算输入八个顶点的线性偏移
+        auto offset = [&](uint32_t dn, uint32_t hn, uint32_t wn) -> uint64_t {
+            return (((static_cast<uint64_t>(inN) * c + ic) * d_in + dn) * h_in + hn) * w_in + wn;
+        };
+
+        float v000 = inPtr[offset(d0, h0, w0)];
+        float v001 = inPtr[offset(d0, h0, w1)];
+        float v010 = inPtr[offset(d0, h1, w0)];
+        float v011 = inPtr[offset(d0, h1, w1)];
+        float v100 = inPtr[offset(d1, h0, w0)];
+        float v101 = inPtr[offset(d1, h0, w1)];
+        float v110 = inPtr[offset(d1, h1, w0)];
+        float v111 = inPtr[offset(d1, h1, w1)];
+
+        float w00 = (1.0f - wd) * (1.0f - wh);
+        float w01 = (1.0f - wd) * wh;
+        float w10 = wd * (1.0f - wh);
+        float w11 = wd * wh;
+
+        float wx0 = (1.0f - ww);
+        float wx1 = ww;
+
+        float z0 = (v000 * wx0 + v001 * wx1) * w00
+                 + (v010 * wx0 + v011 * wx1) * w01;
+        float z1 = (v100 * wx0 + v101 * wx1) * w10
+                 + (v110 * wx0 + v111 * wx1) * w11;
+
+        float outVal = z0 + z1;
+
+        outPtr[lin] = outVal;
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor trilinear_upsample_custom_impl_npu(const at::Tensor& x) {
+    // 输出形状按 (D,H,W) 各维扩大2倍
+    auto sizes = x.sizes();
+    TORCH_CHECK(sizes.size() == 5, \"input must be 5D [N, C, D, H, W]\");
+    at::Tensor y = at::empty({sizes[0], sizes[1], sizes[2]*2, sizes[3]*2, sizes[4]*2}, x.options());
+    EXEC_NPU_CMD(aclnnTrilinearUpsampleCustom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY(myops, m) {
+    m.def(\"trilinear_upsample_custom(Tensor x) -> Tensor\");
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"trilinear_upsample_custom\", &trilinear_upsample_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"trilinear_upsample_custom\", &trilinear_upsample_custom_impl_npu, \"Trilinear Upsample (scale=2, align_corners=True)\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x):
+        return custom_ops_lib.trilinear_upsample_custom(x)
+'''

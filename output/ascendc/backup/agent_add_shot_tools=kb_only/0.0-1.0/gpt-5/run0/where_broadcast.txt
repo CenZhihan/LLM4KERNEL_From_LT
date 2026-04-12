@@ -1,0 +1,336 @@
+project_json_src='''
+[
+    {
+        "op": "WhereBroadcastCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "cond",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "bool"
+                ]
+            },
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(WhereBroadcastCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, srcLastAxis);
+  TILING_DATA_FIELD_DEF(uint32_t, tmpSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(WhereBroadcastCustom, WhereBroadcastCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "where_broadcast_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    WhereBroadcastCustomTilingData tiling;
+
+    // Shapes
+    const gert::Shape* cond_shape = context->GetInputShape(0);
+    const gert::Shape* x_shape = context->GetInputShape(1);
+    const gert::Shape* y_shape = context->GetInputShape(2);
+    (void)y_shape;
+
+    // Output follows x
+    uint32_t totalLength = x_shape->GetOriginShape().GetShapeSize();
+
+    // last axis of x
+    auto x_origin = x_shape->GetOriginShape();
+    int64_t rank = x_origin.GetDimNum();
+    uint32_t srcLastAxis = 1;
+    if (rank > 0) {
+        srcLastAxis = static_cast<uint32_t>(x_origin.GetDim(rank - 1));
+    }
+
+    // tmp size for SelectWithBytesMask (mask is bool, data is float)
+    // According to API: GetSelectWithBytesMaskMaxMinTmpSize(src0Shape, src1Shape, srcTypeSize, maskShape, maskTypeSize, isReuseMask, maxValue, minValue)
+    // Here we use x shape for src tensors and cond shape as provided (Python wrapper ensures broadcast to x's shape).
+    ge::Shape src0Shape = x_shape->GetOriginShape();
+    ge::Shape src1Shape = x_shape->GetOriginShape();
+    ge::Shape maskShape = cond_shape->GetOriginShape();
+    uint32_t maxValue = 0;
+    uint32_t minValue = 0;
+    AscendC::GetSelectWithBytesMaskMaxMinTmpSize(src0Shape, src1Shape, 4, maskShape, 1, true, maxValue, minValue);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_srcLastAxis(srcLastAxis);
+    tiling.set_tmpSize(minValue);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(1);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    *z_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    context->SetOutputDataType(0, context->GetInputDataType(1));
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class WhereBroadcastCustom : public OpDef {
+public:
+    explicit WhereBroadcastCustom(const char* name) : OpDef(name)
+    {
+        this->Input("cond")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_BOOL})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(WhereBroadcastCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "where_broadcast_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+using DTYPE = float;
+using MASKTYPE = bool;
+
+class KernelWhereBroadcast {
+public:
+    __aicore__ inline KernelWhereBroadcast() {}
+    __aicore__ inline void Init(GM_ADDR cond, GM_ADDR x, GM_ADDR y, GM_ADDR z,
+                                uint32_t totalLength, uint32_t tileNum, uint32_t srcLastAxis, uint32_t tmpSize)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->srcLastAxis = srcLastAxis;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        // ensure tileLength aligns with last axis
+        if (this->srcLastAxis > 0) {
+            this->tileLength = (this->tileLength / this->srcLastAxis) * this->srcLastAxis;
+        }
+
+        maskGm.SetGlobalBuffer((__gm__ MASKTYPE *)cond + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ DTYPE *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ DTYPE *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE));
+        pipe.InitBuffer(inQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE));
+        pipe.InitBuffer(inQueueMask, BUFFER_NUM, this->tileLength * sizeof(MASKTYPE));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE));
+        pipe.InitBuffer(tmpQueue, 1, tmpSize);
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<DTYPE> yLocal = inQueueY.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<MASKTYPE> maskLocal = inQueueMask.AllocTensor<MASKTYPE>();
+
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(yLocal, yGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(maskLocal, maskGm[progress * this->tileLength], this->tileLength);
+
+        inQueueX.EnQue(xLocal);
+        inQueueY.EnQue(yLocal);
+        inQueueMask.EnQue(maskLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.DeQue<DTYPE>();
+        AscendC::LocalTensor<DTYPE> yLocal = inQueueY.DeQue<DTYPE>();
+        AscendC::LocalTensor<MASKTYPE> maskLocal = inQueueMask.DeQue<MASKTYPE>();
+        AscendC::LocalTensor<uint8_t> tmpLocal = tmpQueue.AllocTensor<uint8_t>();
+        AscendC::LocalTensor<DTYPE> zLocal = outQueueZ.AllocTensor<DTYPE>();
+
+        AscendC::SelectWithBytesMaskShapeInfo info;
+        info.firstAxis = this->tileLength / this->srcLastAxis;
+        info.srcLastAxis = this->srcLastAxis;
+        info.maskLastAxis = this->srcLastAxis;
+
+        const DTYPE zero = static_cast<DTYPE>(0.0f);
+
+        // t0 = (mask==0) ? y : 0
+        AscendC::SelectWithBytesMask(zLocal, yLocal, zero, maskLocal, tmpLocal, info);
+        // t1 = (mask==0) ? 0 : x, store into yLocal to reuse buffer
+        AscendC::SelectWithBytesMask(yLocal, zero, xLocal, maskLocal, tmpLocal, info);
+        // z = t0 + t1
+        AscendC::Add(zLocal, zLocal, yLocal, this->tileLength);
+
+        outQueueZ.EnQue<DTYPE>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueY.FreeTensor(yLocal);
+        inQueueMask.FreeTensor(maskLocal);
+        tmpQueue.FreeTensor(tmpLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE> zLocal = outQueueZ.DeQue<DTYPE>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueMask;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue;
+
+    AscendC::GlobalTensor<MASKTYPE> maskGm;
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+    AscendC::GlobalTensor<DTYPE> zGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+    uint32_t srcLastAxis;
+};
+
+extern "C" __global__ __aicore__ void where_broadcast_custom(GM_ADDR cond, GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
+{
+    (void)workspace;
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelWhereBroadcast op;
+    op.Init(cond, x, y, z, tiling_data.totalLength(), tiling_data.tileNum(), tiling_data.srcLastAxis(), tiling_data.tmpSize());
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor where_broadcast_custom_impl_npu(const at::Tensor& cond, const at::Tensor& x, const at::Tensor& y) {
+    // Ensure cond is broadcast to x's shape and contiguous. API requires mask last axis 32B aligned and multiple of 16.
+    at::Tensor cond_b = cond.to(at::kBool).expand_as(x).contiguous();
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnWhereBroadcastCustom, cond_b, x, y, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("where_broadcast_custom", &where_broadcast_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("where_broadcast_custom", &where_broadcast_custom_impl_npu, "where(cond, x, y) with broadcasted cond");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, cond, x, y):
+        return custom_ops_lib.where_broadcast_custom(cond, x, y)
+'''

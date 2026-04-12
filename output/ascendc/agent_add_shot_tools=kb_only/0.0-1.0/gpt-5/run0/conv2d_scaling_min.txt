@@ -17,7 +17,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "y",
+                "name": "z",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -33,93 +33,19 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
-#include "tiling/tiling_api.h"
-#include "platform/platform_ascendc.h"
 
 namespace optiling {
-
 BEGIN_TILING_DATA_DEF(Conv2dScalingMinCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, outter);
-  TILING_DATA_FIELD_DEF(uint32_t, inner);
   TILING_DATA_FIELD_DEF(uint32_t, n);
-  TILING_DATA_FIELD_DEF(uint32_t, k);
-  TILING_DATA_FIELD_DEF(bool, islargest);
-  TILING_DATA_FIELD_DEF(bool, isinitindex);
-  TILING_DATA_FIELD_DEF(uint32_t, tmpsize);
-  TILING_DATA_FIELD_DEF_STRUCT(TopkTiling, topkTilingData);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, tileHW);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(Conv2dScalingMinCustom, Conv2dScalingMinCustomTilingData)
-
-static ge::graphStatus TilingFunc(gert::TilingContext* context)
-{
-    Conv2dScalingMinCustomTilingData tiling;
-
-    // 期望输入为 NHWC（在 Python 模型中进行 permute 后传入）
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    auto ori = in_shape->GetOriginShape();
-    if (ori.GetDimNum() != 4) {
-        return ge::GRAPH_FAILED;
-    }
-    uint32_t N = static_cast<uint32_t>(ori.GetDim(0));
-    uint32_t H = static_cast<uint32_t>(ori.GetDim(1));
-    uint32_t W = static_cast<uint32_t>(ori.GetDim(2));
-    uint32_t C = static_cast<uint32_t>(ori.GetDim(3));
-
-    // TopK 在最后一维上做 K=1 的最小值规约：outter=N*H*W, inner=对齐后的C, n=实际C
-    uint32_t outter = N * H * W;
-    auto dt = context->GetInputTensor(0)->GetDataType();
-    uint32_t typeSize = (dt == ge::DT_FLOAT16) ? 2 : 4;
-    uint32_t n = C;
-    uint32_t inner = ((n * typeSize + 32 - 1) / 32) * 32 / typeSize;
-
-    tiling.set_outter(outter);
-    tiling.set_inner(inner);
-    tiling.set_n(n);
-    tiling.set_k(1);                // 求每个位置的最小值
-    tiling.set_islargest(false);    // 升序（取最小）
-    tiling.set_isinitindex(false);  // 不需要索引
-
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-
-    // 获取 tiling 信息
-    AscendC::TopKTilingFunc(ascendcPlatform,
-                            (int32_t)inner,
-                            (int32_t)outter,
-                            (int32_t)1,
-                            typeSize,
-                            tiling.isinitindex(),
-                            AscendC::TopKMode::TOPK_NSMALL,
-                            tiling.islargest(),
-                            tiling.topkTilingData());
-
-    // 获取临时空间 min/max，并传入最小保证正确性
-    uint32_t maxsize = 0;
-    uint32_t minsize = 0;
-    const bool IS_REUSE_SOURCE = false;
-    AscendC::GetTopKMaxMinTmpSize(ascendcPlatform,
-                                  (int32_t)inner,
-                                  (int32_t)outter,
-                                  IS_REUSE_SOURCE,
-                                  tiling.isinitindex(),
-                                  AscendC::TopKMode::TOPK_NSMALL,
-                                  tiling.islargest(),
-                                  typeSize,
-                                  maxsize,
-                                  minsize);
-    tiling.set_tmpsize(minsize);
-
-    context->SetBlockDim(1); // 每核一份
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
-                        context->GetRawTilingData()->GetCapacity());
-    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
-    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0; // 不额外申请 workspace
-    return ge::GRAPH_SUCCESS;
 }
-
-} // namespace optiling
 """
 
 host_operator_src="""
@@ -127,25 +53,61 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 
 namespace optiling {
-extern ge::graphStatus TilingFunc(gert::TilingContext* context);
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 获取输入形状 NCHW
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    ge::Shape origin = in_shape->GetOriginShape();
+    int64_t dims = origin.GetDims();
+    if (dims != 4) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t n = static_cast<uint32_t>(origin.GetDim(0));
+    uint32_t c = static_cast<uint32_t>(origin.GetDim(1));
+    uint32_t h = static_cast<uint32_t>(origin.GetDim(2));
+    uint32_t w = static_cast<uint32_t>(origin.GetDim(3));
+    uint32_t hw = h * w;
+
+    Conv2dScalingMinCustomTilingData tiling;
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_tileNum(TILE_NUM);
+    // 简单切分 H*W 维度
+    uint32_t tileHW = (hw / TILE_NUM == 0) ? hw : (hw / TILE_NUM);
+    if (tileHW == 0) tileHW = hw;
+    tiling.set_tileHW(tileHW);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
 }
 
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 输入期望为 NHWC，输出为 NHW1
     const gert::Shape* x_shape = context->GetInputShape(0);
-    if (x_shape->GetDimNum() != 4) {
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    // 输出为 (N, 1, H, W)
+    ge::Shape out_origin = x_shape->GetOriginShape();
+    if (out_origin.GetDims() != 4) {
         return GRAPH_FAILED;
     }
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    *y_shape = *x_shape;
-    // 将最后一维（C）改为 1
-    y_shape->SetDim(3, 1);
+    out_origin.SetDim(1, 1);
+    z_shape->SetOriginShape(out_origin);
+    z_shape->SetStorageShape(out_origin);
     return GRAPH_SUCCESS;
 }
 
-static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
@@ -163,52 +125,135 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Output("y")
+        this->Output("z")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
 
 OP_ADD(Conv2dScalingMinCustom);
-} // namespace ops
+}
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv2d_scaling_min_custom_tiling_data.h"
 
-// 该算子接受 NHWC 输入，在通道维（最后一维）上进行 K=1 的 TopK 最小值规约
-// 输出为 NHW1（仅值，不返回索引）
+// 该内核实现对输入张量(N, C, H, W)在通道维度上取最小值，输出(N, 1, H, W)
+// 注意：模型中已将缩放因子融合到卷积权重/偏置中，本内核仅负责通道最小化
 
-extern "C" __global__ __aicore__ void conv2d_scaling_min_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的张量数量
+
+class KernelChannelMin {
+public:
+    __aicore__ inline KernelChannelMin() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR z,
+                                uint32_t n, uint32_t c, uint32_t h, uint32_t w,
+                                uint32_t tileHW, uint32_t tileNum)
+    {
+        this->n = n;
+        this->c = c;
+        this->h = h;
+        this->w = w;
+        this->hw = h * w;
+        this->tileNum = tileNum;
+        this->tileHW = tileHW;
+        // block 维度按 batch 划分
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->nPerBlock = (n + blockNum - 1) / blockNum;
+        this->nStart = blockIdx * this->nPerBlock;
+        if (this->nStart > n) this->nStart = n;
+        this->nEnd = this->nStart + this->nPerBlock;
+        if (this->nEnd > n) this->nEnd = n;
+
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x), static_cast<uint32_t>(n) * c * hw);
+        zGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(z), static_cast<uint32_t>(n) * hw);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileHW * sizeof(float));
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileHW * sizeof(float));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileHW * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // 遍历分配到本 block 的 batch
+        for (uint32_t nb = nStart; nb < nEnd; ++nb) {
+            // 针对本 batch 的 H*W 维度分块
+            uint32_t tiles = (hw + tileHW - 1) / tileHW;
+            for (uint32_t t = 0; t < tiles; ++t) {
+                uint32_t curLen = (t == tiles - 1) ? (hw - t * tileHW) : tileHW;
+                CopyComputeReduce(nb, t, curLen);
+            }
+        }
+    }
+
+private:
+    __aicore__ inline void CopyComputeReduce(uint32_t nb, uint32_t tileIdx, uint32_t curLen)
+    {
+        uint32_t baseHW = tileIdx * tileHW;
+        // 读取第0个通道块，作为初始最小值
+        AscendC::LocalTensor<float> accLocal = outQueueZ.AllocTensor<float>();
+        AscendC::LocalTensor<float> xLocal0 = inQueueX.AllocTensor<float>();
+        uint32_t off0 = ((nb * c + 0) * hw + baseHW);
+        AscendC::DataCopy(xLocal0, xGm[off0], curLen);
+        // 将初始块拷贝到累积缓冲
+        AscendC::DataCopy(accLocal, xLocal0, curLen);
+        inQueueX.FreeTensor(xLocal0);
+
+        // 遍历剩余通道，做逐元素最小
+        for (uint32_t cc = 1; cc < c; ++cc) {
+            AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+            uint32_t off = ((nb * c + cc) * hw + baseHW);
+            AscendC::DataCopy(xLocal, xGm[off], curLen);
+
+            AscendC::LocalTensor<float> tmpLocal = tmpQueue.AllocTensor<float>();
+            // tmpLocal = elementwise min(accLocal, xLocal)
+            AscendC::Min(tmpLocal, accLocal, xLocal, curLen);
+            // 交换：将tmp写回acc
+            AscendC::DataCopy(accLocal, tmpLocal, curLen);
+
+            inQueueX.FreeTensor(xLocal);
+            tmpQueue.FreeTensor(tmpLocal);
+        }
+
+        // 写回输出 (N,1,H,W) 按 batch 的 H*W 展平存储
+        uint32_t outOff = (nb * hw + baseHW);
+        outQueueZ.EnQue<float>(accLocal);
+        AscendC::LocalTensor<float> zLocal = outQueueZ.DeQue<float>();
+        AscendC::DataCopy(zGm[outOff], zLocal, curLen);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueZ;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> zGm;
+
+    uint32_t n, c, h, w, hw;
+    uint32_t tileNum, tileHW;
+    uint32_t nPerBlock, nStart, nEnd;
+};
+
+extern "C" __global__ __aicore__ void conv2d_scaling_min_custom(GM_ADDR x, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
 {
-    GET_TILING_DATA(tilingData, tiling);
-
-    // 使用 TopK 高级 API 实现最小值规约（K=1，ascending）
-    // 根据参考文档，KernelTopK 的模板与参数按示例使用。
-    // 未使用的索引相关 GM 指针通过 workspace 复用占位。
-    __gm__ uint8_t* ws = (__gm__ uint8_t*)workspace;
-    __gm__ uint8_t* dummyIdx = ws;      // 索引占位（未启用索引计算）
-    __gm__ uint8_t* finishLocal = ws;   // 完成标记占位
-
-    // 模板参数与参考示例保持一致，采用 TOPK_NSMALL 模式
-    KernelTopK<float, true, true, false, false, AscendC::TopKMode::TOPK_NSMALL> op;
-    op.Init(x, dummyIdx, finishLocal, y, dummyIdx,
-            tilingData.k,
-            tilingData.islargest,
-            tilingData.tmpsize,
-            tilingData.outter,
-            tilingData.inner,
-            tilingData.n,
-            tilingData.topkTilingData);
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelChannelMin op;
+    op.Init(x, z,
+            tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w,
+            tiling_data.tileHW, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -220,12 +265,12 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor conv2d_scaling_min_custom_impl_npu(const at::Tensor& x) {
-    // 输入期望为 NHWC，输出为 NHW1
-    auto out_sizes = x.sizes().vec();
-    out_sizes[3] = 1;
-    at::Tensor y = at::empty(out_sizes, x.options());
-    EXEC_NPU_CMD(aclnnConv2dScalingMinCustom, x, y);
-    return y;
+    auto sizes = x.sizes();
+    TORCH_CHECK(sizes.size() == 4, "Input must be NCHW 4D tensor");
+    // 输出 (N,1,H,W)
+    at::Tensor result = at::empty({sizes[0], 1, sizes[2], sizes[3]}, x.options());
+    EXEC_NPU_CMD(aclnnConv2dScalingMinCustom, x, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -233,19 +278,21 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv2d_scaling_min_custom", &conv2d_scaling_min_custom_impl_npu, "Reduce-min over channels (NHWC)");
+    m.def("conv2d_scaling_min_custom", &conv2d_scaling_min_custom_impl_npu, "channelwise min after conv scaling");
 }
 """
 
 model_src='''
 import torch
+import torch.nn.functional as F
 import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    优化版：保持 PyTorch 的 Conv2d，融合后续的缩放与通道维最小值为自定义 AscendC 算子。
-    自定义算子期望输入为 NHWC，因此在调用前后进行维度变换。
+    使用自定义 AscendC 内核，将通道最小化替换为 conv2d_scaling_min_custom。
+    将缩放因子预先融合到卷积权重与偏置中：y = conv2d(x, w*scale, b*scale)
+    然后调用自定义算子在通道维上取最小，保持 keepdim=True 输出为 (N,1,H,W)。
     """
     def __init__(self, in_channels, out_channels, kernel_size, scale_factor):
         super(ModelNew, self).__init__()
@@ -253,17 +300,19 @@ class ModelNew(torch.nn.Module):
         self.scale_factor = scale_factor
 
     def forward(self, x):
-        # Conv2d (N, C, H, W)
-        x = self.conv(x)
-
-        # 缩放（融合目标的一部分在 Python 侧完成，确保功能正确）
-        x = x * self.scale_factor
-
-        # 转为 NHWC，调用自定义算子在通道维（最后一维）做 min 规约
-        x_nhwc = x.permute(0, 2, 3, 1).contiguous()
-        y_nhw1 = custom_ops_lib.conv2d_scaling_min_custom(x_nhwc)  # 输出 (N, H, W, 1)
-
-        # 转回 NCHW
-        y = y_nhw1.permute(0, 3, 1, 2).contiguous()  # (N, 1, H, W)
-        return y
+        # 将缩放因子融合到卷积权重/偏置
+        w = self.conv.weight * self.scale_factor
+        b = None
+        if self.conv.bias is not None:
+            b = self.conv.bias * self.scale_factor
+        y = F.conv2d(
+            x, w, b,
+            stride=self.conv.stride,
+            padding=self.conv.padding,
+            dilation=self.conv.dilation,
+            groups=self.conv.groups
+        )
+        # 自定义通道最小化 (N, C, H, W) -> (N, 1, H, W)
+        z = custom_ops_lib.conv2d_scaling_min_custom(y)
+        return z
 '''

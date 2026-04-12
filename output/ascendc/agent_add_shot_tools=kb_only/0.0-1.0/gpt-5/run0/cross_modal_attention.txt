@@ -5,39 +5,29 @@ project_json_src='''
         "language": "cpp",
         "input_desc": [
             {
-                "name": "q",
+                "name": "x",
                 "param_type": "required",
                 "format": [
                     "ND"
                 ],
                 "type": [
-                    "float"
+                    "float16"
                 ]
             },
             {
-                "name": "k",
+                "name": "y",
                 "param_type": "required",
                 "format": [
                     "ND"
                 ],
                 "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "v",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
+                    "float16"
                 ]
             }
         ],
         "output_desc": [
             {
-                "name": "out",
+                "name": "z",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -53,95 +43,176 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/tiling_api.h"
+#include "tiling/op_def.h"
 
 namespace optiling {
+
 BEGIN_TILING_DATA_DEF(CrossModalAttentionCustomTilingData)
+  // 直接使用TCubeTiling的原始字节存入RawTilingData
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
   TILING_DATA_FIELD_DEF(uint32_t, batch);
-  TILING_DATA_FIELD_DEF(uint32_t, heads);
-  TILING_DATA_FIELD_DEF(uint32_t, seqQ);
-  TILING_DATA_FIELD_DEF(uint32_t, seqKV);
-  TILING_DATA_FIELD_DEF(uint32_t, headDim);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  // 仅作占位，实际TCubeTiling通过RawTilingData传递
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(CrossModalAttentionCustom, CrossModalAttentionCustomTilingData)
-}
-"""
-
-host_operator_src="""
-#include "cross_modal_attention_custom_tiling.h"
-#include "register/op_def_registry.h"
-
-namespace {
-inline uint32_t Clamp(uint32_t v, uint32_t lo, uint32_t hi) { return v < lo ? lo : (v > hi ? hi : v); }
-}
-
-namespace optiling {
-const uint32_t DEFAULT_BLOCK_DIM = 8;
-const uint32_t DEFAULT_TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 输入形状：q:[B, Lq, D], k:[B, Lk, D], v:[B, Lk, D]
-    auto qShape = context->GetInputShape(0)->GetOriginShape();
-    auto kShape = context->GetInputShape(1)->GetOriginShape();
+    // 输入x: [B, M, K], 输入y: [B, K, N]，输出z: [B, M, N]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* y_shape = context->GetInputShape(1);
 
-    if (qShape.GetDimNum() != 3 || kShape.GetDimNum() != 3) {
+    // 兼容2D/3D，若为2D则batch=1
+    uint32_t dims_x = x_shape->GetDimNum();
+    uint32_t dims_y = y_shape->GetDimNum();
+
+    uint32_t batch = 1;
+    uint32_t M = 0, Kx = 0, Ky = 0, N = 0;
+    if (dims_x == 3) {
+        batch = static_cast<uint32_t>(x_shape->GetDim(0));
+        M = static_cast<uint32_t>(x_shape->GetDim(1));
+        Kx = static_cast<uint32_t>(x_shape->GetDim(2));
+    } else if (dims_x == 2) {
+        batch = 1;
+        M = static_cast<uint32_t>(x_shape->GetDim(0));
+        Kx = static_cast<uint32_t>(x_shape->GetDim(1));
+    } else {
         return ge::GRAPH_FAILED;
     }
 
-    uint32_t B = static_cast<uint32_t>(qShape.GetDim(0));
-    uint32_t Lq = static_cast<uint32_t>(qShape.GetDim(1));
-    uint32_t D  = static_cast<uint32_t>(qShape.GetDim(2));
-    uint32_t Lk = static_cast<uint32_t>(kShape.GetDim(1));
-
-    // 头数：若无法从属性读取，则按常见配置8推断；也可从D整除关系推断。
-    uint32_t heads = 8;
-    if (D % heads != 0) {
-        // 简单回退：若8不整除，则根据D大小选择一个可整除头数
-        if (D % 16 == 0) heads = 16;
-        else if (D % 4 == 0) heads = 4;
-        else heads = 1;
+    if (dims_y == 3) {
+        uint32_t by = static_cast<uint32_t>(y_shape->GetDim(0));
+        Ky = static_cast<uint32_t>(y_shape->GetDim(1));
+        N = static_cast<uint32_t>(y_shape->GetDim(2));
+        if (by != batch) return ge::GRAPH_FAILED;
+    } else if (dims_y == 2) {
+        Ky = static_cast<uint32_t>(y_shape->GetDim(0));
+        N = static_cast<uint32_t>(y_shape->GetDim(1));
+    } else {
+        return ge::GRAPH_FAILED;
     }
-    uint32_t headDim = D / heads;
 
-    // 设置BlockDim（简化设定）
-    context->SetBlockDim(Clamp(DEFAULT_BLOCK_DIM, 1, 32));
+    if (Kx != Ky) return ge::GRAPH_FAILED;
 
-    CrossModalAttentionCustomTilingData tiling;
-    tiling.set_batch(B);
-    tiling.set_heads(heads);
-    tiling.set_seqQ(Lq);
-    tiling.set_seqKV(Lk);
-    tiling.set_headDim(headDim);
-    tiling.set_tileNum(DEFAULT_TILE_NUM);
+    // 设置blockDim
+    const uint32_t maxBlock = 32;
+    uint32_t blockDim = batch < maxBlock ? batch : maxBlock;
+    context->SetBlockDim(blockDim);
 
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
-    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    // 使用BatchMatmulTiling获取TCubeTiling
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    matmul_tiling::BatchMatmulTiling bmmTiling(ascendcPlatform);
+    bmmTiling.SetDim(blockDim);
+    // A/B: fp16，C: fp32
+    bmmTiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    bmmTiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    bmmTiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    bmmTiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    bmmTiling.SetBias(false);
 
-    // workspace大小（本示例无需workspace）
-    size_t* workspace = context->GetWorkspaceSizes(1);
-    workspace[0] = 0;
+    // 设置单次Matmul形状与原始形状
+    bmmTiling.SetShape(M, N, Kx);
+    bmmTiling.SetSingleShape(M, N, Kx);
+    bmmTiling.SetOrgShape(M, N, Kx);
+    bmmTiling.SetBufferSpace(-1, -1, -1);
+
+    optiling::TCubeTiling tilingData;
+    int ret = bmmTiling.GetTiling(tilingData);
+    if (ret != 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 将TCubeTiling原始字节写入RawTilingData
+    auto *raw = context->GetRawTilingData();
+    size_t needBytes = sizeof(optiling::TCubeTiling);
+    if (raw->GetCapacity() < needBytes) {
+        return ge::GRAPH_FAILED;
+    }
+    // 拷贝TCubeTiling
+    void *dst = raw->GetData();
+    const void *src = reinterpret_cast<const void *>(&tilingData);
+    (void)memcpy(dst, src, needBytes);
+    raw->SetDataSize(needBytes);
+
+    // 设置workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
 
     return ge::GRAPH_SUCCESS;
 }
-}
+
+} // namespace optiling
+"""
+
+host_operator_src="""
+#include "register/op_def_registry.h"
+#include "register/tilingdata_base.h"
 
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 输出形状与q一致
-    const gert::Shape* q_shape = context->GetInputShape(0);
-    gert::Shape* out_shape = context->GetOutputShape(0);
-    *out_shape = *q_shape;
+    // x: [B, M, K], y: [B, K, N] => z: [B, M, N]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* y_shape = context->GetInputShape(1);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+
+    uint32_t dims_x = x_shape->GetDimNum();
+    uint32_t dims_y = y_shape->GetDimNum();
+
+    int64_t batch = 1;
+    int64_t M = 0, Kx = 0, Ky = 0, N = 0;
+    if (dims_x == 3) {
+        batch = x_shape->GetDim(0);
+        M = x_shape->GetDim(1);
+        Kx = x_shape->GetDim(2);
+    } else if (dims_x == 2) {
+        batch = 1;
+        M = x_shape->GetDim(0);
+        Kx = x_shape->GetDim(1);
+    } else {
+        return GRAPH_FAILED;
+    }
+
+    if (dims_y == 3) {
+        if (y_shape->GetDim(0) != batch) return GRAPH_FAILED;
+        Ky = y_shape->GetDim(1);
+        N = y_shape->GetDim(2);
+    } else if (dims_y == 2) {
+        Ky = y_shape->GetDim(0);
+        N = y_shape->GetDim(1);
+    } else {
+        return GRAPH_FAILED;
+    }
+
+    if (Kx != Ky) return GRAPH_FAILED;
+
+    if (batch > 1) {
+        z_shape->SetDimNum(3);
+        z_shape->SetDim(0, batch);
+        z_shape->SetDim(1, M);
+        z_shape->SetDim(2, N);
+    } else {
+        z_shape->SetDimNum(2);
+        z_shape->SetDim(0, M);
+        z_shape->SetDim(1, N);
+    }
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const auto inputDataType = context->GetInputDataType(0);
-    context->SetOutputDataType(0, inputDataType);
+    // A/B: float16, C: float
+    context->SetOutputDataType(0, ge::DT_FLOAT);
     return ge::GRAPH_SUCCESS;
 }
+}
+
+namespace optiling {
+extern ge::graphStatus TilingFunc(gert::TilingContext* context);
 }
 
 namespace ops {
@@ -149,213 +220,84 @@ class CrossModalAttentionCustom : public OpDef {
 public:
     explicit CrossModalAttentionCustom(const char* name) : OpDef(name)
     {
-        this->Input("q")
+        this->Input("x")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
+            .DataType({ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("k")
+        this->Input("y")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
+            .DataType({ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("v")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("out")
+        this->Output("z")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
-
 OP_ADD(CrossModalAttentionCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "cross_modal_attention_custom_tiling_data.h"
+#include "lib/matmul_intf.h"
 
-// 简化实现：在核函数中按(B, H, Lq, Lk, Dh)三重循环完成Scaled Dot-Product Attention
-// 数据类型统一使用float
-constexpr int32_t BUFFER_NUM = 1;
+using A_T = half;
+using B_T = half;
+using C_T = float;
 
-class KernelCrossModalAttention {
-public:
-    __aicore__ inline KernelCrossModalAttention() {}
-
-    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out,
-                                uint32_t batch, uint32_t heads,
-                                uint32_t seqQ, uint32_t seqKV, uint32_t headDim, uint32_t tileNum)
-    {
-        this->B = batch;
-        this->H = heads;
-        this->Lq = seqQ;
-        this->Lk = seqKV;
-        this->Dh = headDim;
-        this->tileNum = tileNum;
-
-        // 计算每个block处理的batch分片（简化：按batch维度均分）
-        this->batchPerBlock = (B + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
-        this->batchStart = AscendC::GetBlockIdx() * this->batchPerBlock;
-        this->batchEnd = AscendC::Min(this->batchStart + this->batchPerBlock, B);
-
-        qGm.SetGlobalBuffer((__gm__ float*)q, static_cast<uint32_t>(B) * Lq * H * Dh); // 实际总元素>此值，SetGlobalBuffer只需>=访问范围
-        kGm.SetGlobalBuffer((__gm__ float*)k, static_cast<uint32_t>(B) * Lk * H * Dh);
-        vGm.SetGlobalBuffer((__gm__ float*)v, static_cast<uint32_t>(B) * Lk * H * Dh);
-        outGm.SetGlobalBuffer((__gm__ float*)out, static_cast<uint32_t>(B) * Lq * H * Dh);
-
-        // 初始化本地队列缓冲
-        pipe.InitBuffer(qBuf, BUFFER_NUM, Dh * sizeof(float));
-        pipe.InitBuffer(kBuf, BUFFER_NUM, Dh * sizeof(float));
-        pipe.InitBuffer(vBuf, BUFFER_NUM, Dh * sizeof(float));
-        pipe.InitBuffer(oBuf, BUFFER_NUM, Dh * sizeof(float));
+extern "C" __global__ __aicore__ void cross_modal_attention_custom(GM_ADDR xGM, GM_ADDR yGM, GM_ADDR zGM, GM_ADDR workspaceGM, GM_ADDR tilingGM) {
+    // 从GM中读取TCubeTiling
+    optiling::TCubeTiling tiling;
+    auto tempTilingGM = (__gm__ uint32_t*)tilingGM;
+    auto tempTiling = (uint32_t*)&tiling;
+    for (int i = 0; i < (int)(sizeof(optiling::TCubeTiling) / sizeof(uint32_t)); ++i, ++tempTilingGM, ++tempTiling) {
+        *tempTiling = *tempTilingGM;
     }
 
-    __aicore__ inline void Process()
-    {
-        // 注意：输入/输出布局为[B, L, D]，D按H份头维切分，每头维度Dh = D/H
-        // 为避免额外变形，直接通过偏移在GM上寻址到对应head slice
-        const float scale = 1.0f / AscendC::sqrt((float)Dh);
+    // 定义Matmul类型：A/B = fp16, C = fp32, ND NORMAL
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, A_T> aType;
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, B_T> bType;
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, C_T> cType;
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, C_T> biasType;
 
-        for (uint32_t b = batchStart; b < batchEnd; ++b) {
-            for (uint32_t h = 0; h < H; ++h) {
-                for (uint32_t iq = 0; iq < Lq; ++iq) {
-                    // 读入q(b, iq, h, :)
-                    AscendC::LocalTensor<float> qLocal = qBuf.AllocTensor<float>();
-                    GlobalLoadQ(b, iq, h, qLocal);
+    // 设置全局Tensor
+    AscendC::GlobalTensor<A_T> aGlobal;
+    AscendC::GlobalTensor<B_T> bGlobal;
+    AscendC::GlobalTensor<C_T> cGlobal;
 
-                    // pass1: 计算max logit
-                    float maxLogit = -1e30f;
-                    for (uint32_t jk = 0; jk < Lk; ++jk) {
-                        AscendC::LocalTensor<float> kLocal = kBuf.AllocTensor<float>();
-                        GlobalLoadK(b, jk, h, kLocal);
-                        float dot = Dot(qLocal, kLocal);
-                        dot *= scale;
-                        maxLogit = dot > maxLogit ? dot : maxLogit;
-                        kBuf.FreeTensor(kLocal);
-                    }
+    // 简单设置：直接绑定整块buffer
+    // 实际大小由框架保证
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(xGM), 0);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(yGM), 0);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(zGM), 0);
 
-                    // pass2: 计算sum(exp(logit - max))
-                    float sumExp = 0.0f;
-                    for (uint32_t jk = 0; jk < Lk; ++jk) {
-                        AscendC::LocalTensor<float> kLocal = kBuf.AllocTensor<float>();
-                        GlobalLoadK(b, jk, h, kLocal);
-                        float dot = Dot(qLocal, kLocal);
-                        dot = (dot * scale) - maxLogit;
-                        sumExp += AscendC::exp(dot);
-                        kBuf.FreeTensor(kLocal);
-                    }
-                    float invSum = 1.0f / (sumExp + 1e-6f);
-
-                    // pass3: 聚合输出  out = softmax(QK^T)V
-                    AscendC::LocalTensor<float> oLocal = oBuf.AllocTensor<float>();
-                    VecSet(oLocal, 0.0f);
-
-                    for (uint32_t jk = 0; jk < Lk; ++jk) {
-                        AscendC::LocalTensor<float> kLocal = kBuf.AllocTensor<float>();
-                        AscendC::LocalTensor<float> vLocal = vBuf.AllocTensor<float>();
-                        GlobalLoadK(b, jk, h, kLocal);
-                        GlobalLoadV(b, jk, h, vLocal);
-                        float dot = Dot(qLocal, kLocal);
-                        float w = AscendC::exp((dot * scale) - maxLogit) * invSum;
-                        Axpy(oLocal, vLocal, w);
-                        kBuf.FreeTensor(kLocal);
-                        vBuf.FreeTensor(vLocal);
-                    }
-
-                    // 写回 out(b, iq, h, :)
-                    GlobalStoreOut(b, iq, h, oLocal);
-
-                    oBuf.FreeTensor(oLocal);
-                    qBuf.FreeTensor(qLocal);
-                }
-            }
-        }
-    }
-
-private:
-    // GM寻址辅助：输入/输出均为[B, L, D]，D = H * Dh
-    __aicore__ inline uint64_t OffsetBLH(uint32_t b, uint32_t l, uint32_t h, uint32_t d_in_head, uint32_t L, uint32_t H, uint32_t Dh) {
-        // offset = ((b * L + l) * (H*Dh) + h*Dh + d)
-        return (uint64_t)(((uint64_t)b * L + l) * (uint64_t)(H * Dh) + (uint64_t)h * Dh + d_in_head);
-    }
-
-    __aicore__ inline void GlobalLoadQ(uint32_t b, uint32_t lq, uint32_t h, AscendC::LocalTensor<float>& qLocal) {
-        // 连续拷贝Dh长度
-        AscendC::DataCopy(qLocal, qGm[OffsetBLH(b, lq, h, 0, Lq, H, Dh)], Dh);
-    }
-    __aicore__ inline void GlobalLoadK(uint32_t b, uint32_t lk, uint32_t h, AscendC::LocalTensor<float>& kLocal) {
-        AscendC::DataCopy(kLocal, kGm[OffsetBLH(b, lk, h, 0, Lk, H, Dh)], Dh);
-    }
-    __aicore__ inline void GlobalLoadV(uint32_t b, uint32_t lk, uint32_t h, AscendC::LocalTensor<float>& vLocal) {
-        AscendC::DataCopy(vLocal, vGm[OffsetBLH(b, lk, h, 0, Lk, H, Dh)], Dh);
-    }
-    __aicore__ inline void GlobalStoreOut(uint32_t b, uint32_t lq, uint32_t h, AscendC::LocalTensor<float>& oLocal) {
-        AscendC::DataCopy(outGm[OffsetBLH(b, lq, h, 0, Lq, H, Dh)], oLocal, Dh);
-    }
-
-    __aicore__ inline float Dot(AscendC::LocalTensor<float>& a, AscendC::LocalTensor<float>& b) {
-        float acc = 0.0f;
-        for (uint32_t i = 0; i < Dh; ++i) {
-            acc += a.GetValue(i) * b.GetValue(i);
-        }
-        return acc;
-    }
-
-    __aicore__ inline void Axpy(AscendC::LocalTensor<float>& y, AscendC::LocalTensor<float>& x, float alpha) {
-        for (uint32_t i = 0; i < Dh; ++i) {
-            float v = y.GetValue(i) + alpha * x.GetValue(i);
-            y.SetValue(i, v);
-        }
-    }
-
-    __aicore__ inline void VecSet(AscendC::LocalTensor<float>& y, float v) {
-        for (uint32_t i = 0; i < Dh; ++i) {
-            y.SetValue(i, v);
-        }
-    }
-
-private:
+    // 创建Matmul对象并初始化
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> qBuf, kBuf, vBuf;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> oBuf;
+    matmul::Matmul<aType, bType, cType, biasType> mm;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
+    mm.Init(&tiling);
 
-    AscendC::GlobalTensor<float> qGm;
-    AscendC::GlobalTensor<float> kGm;
-    AscendC::GlobalTensor<float> vGm;
-    AscendC::GlobalTensor<float> outGm;
+    // 绑定输入输出
+    mm.SetTensorA(aGlobal[0], false);
+    mm.SetTensorB(bGlobal[0], false);
+    mm.SetWorkspace(workspaceGM, 0);
 
-    uint32_t B;
-    uint32_t H;
-    uint32_t Lq;
-    uint32_t Lk;
-    uint32_t Dh;
-    uint32_t tileNum;
-
-    uint32_t batchPerBlock;
-    uint32_t batchStart;
-    uint32_t batchEnd;
-};
-
-// 核函数入口
-extern "C" __global__ __aicore__ void cross_modal_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling) {
-    GET_TILING_DATA(tiling_data, tiling);
-    KernelCrossModalAttention op;
-    op.Init(q, k, v, out,
-            tiling_data.batch, tiling_data.heads,
-            tiling_data.seqQ, tiling_data.seqKV,
-            tiling_data.headDim, tiling_data.tileNum);
-    op.Process();
+    // 执行BMM/Matmul。对于NORMAL布局，host侧已完成tiling设置
+    // 这里执行一次IterateNBatch，按tiling批次循环
+    const uint32_t batchLoop = 1;
+    const uint32_t batchA = 1;
+    const uint32_t batchB = 1;
+    const bool enSequentialWrite = false;
+    mm.IterateNBatch(batchLoop, batchA, batchB, enSequentialWrite);
 }
 """
 
@@ -365,15 +307,17 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor cross_modal_attention_custom_impl_npu(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
-    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3, "Inputs must be [B, L, D]");
-    TORCH_CHECK(q.size(0) == k.size(0) && k.size(0) == v.size(0), "Batch sizes must match");
-    TORCH_CHECK(k.size(1) == v.size(1), "Key/Value sequence length must match");
-    TORCH_CHECK(q.size(2) == k.size(2) && k.size(2) == v.size(2), "Feature dim must match");
-
-    at::Tensor out = at::empty_like(q);
-    EXEC_NPU_CMD(aclnnCrossModalAttentionCustom, q, k, v, out);
-    return out;
+at::Tensor cross_modal_attention_custom_impl_npu(const at::Tensor& x, const at::Tensor& y) {
+    // x: [B, M, K] (fp16), y: [B, K, N] (fp16) => z: [B, M, N] (fp32)
+    std::vector<int64_t> out_sizes;
+    if (x.dim() == 3) {
+        out_sizes = {x.size(0), x.size(1), y.size(2)};
+    } else {
+        out_sizes = {x.size(0), y.size(1)};
+    }
+    at::Tensor result = at::empty(out_sizes, x.options().dtype(at::kFloat));
+    EXEC_NPU_CMD(aclnnCrossModalAttentionCustom, x, y, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -381,7 +325,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("cross_modal_attention_custom", &cross_modal_attention_custom_impl_npu, "Cross-modal Attention (Q,K,V)");
+    m.def("cross_modal_attention_custom", &cross_modal_attention_custom_impl_npu, "batched matmul for attention");
 }
 """
 
@@ -389,22 +333,59 @@ model_src='''
 import torch
 import torch_npu
 import custom_ops_lib
+import math
+from torch import nn
 
-class ModelNew(torch.nn.Module):
+class ModelNew(nn.Module):
     """
-    Cross-modal attention: text queries, visual keys/values.
-    Replace nn.MultiheadAttention with custom AscendC kernel.
+    使用自定义AscendC核（CrossModalAttentionCustom）替换注意力中的两次矩阵乘法：
+      1) scores = (Q @ K^T) / sqrt(dh)
+      2) out_heads = softmax(scores) @ V
+    其中CrossModalAttentionCustom实现通用的batched matmul: [B, M, K] x [B, K, N] -> [B, M, N]
     """
     def __init__(self, d_model_text=256, d_model_img=512, num_heads=8):
         super().__init__()
-        self.q_proj = torch.nn.Linear(d_model_text, d_model_text)
-        self.kv_proj = torch.nn.Linear(d_model_img, d_model_text)
+        self.d_model_text = d_model_text
+        self.d_model_img = d_model_img
         self.num_heads = num_heads
+        self.q_proj = nn.Linear(d_model_text, d_model_text)
+        self.kv_proj = nn.Linear(d_model_img, d_model_text)
+        # 输出投影可复用原MHA的效果
+        self.out_proj = nn.Linear(d_model_text, d_model_text)
 
     def forward(self, text, img):
-        q = self.q_proj(text)           # [B, Lq, D]
-        kv = self.kv_proj(img)          # [B, Lk, D]
-        # 自定义算子：内部实现Scaled Dot-Product Attention
-        out = custom_ops_lib.cross_modal_attention_custom(q, kv, kv)
+        # 线性投影
+        q = self.q_proj(text)              # [B, Lt, D]
+        kv = self.kv_proj(img)             # [B, Li, D]
+
+        B, Lt, D = q.shape
+        Li = kv.shape[1]
+        H = self.num_heads
+        dh = D // H
+
+        # 切分多头并reshape为[B*H, L, dh]
+        qh = q.view(B, Lt, H, dh).permute(0, 2, 1, 3).reshape(B*H, Lt, dh)
+        kh = kv.view(B, Li, H, dh).permute(0, 2, 1, 3).reshape(B*H, Li, dh)
+        vh = kv.view(B, Li, H, dh).permute(0, 2, 1, 3).reshape(B*H, Li, dh)
+
+        # 1) scores = Q @ K^T
+        q_fp16 = qh.to(torch.float16)
+        kT_fp16 = kh.transpose(1, 2).contiguous().to(torch.float16)   # [B*H, dh, Li]
+        scores_fp32 = custom_ops_lib.cross_modal_attention_custom(q_fp16, kT_fp16)  # [B*H, Lt, Li] fp32
+
+        # 缩放+softmax
+        scores_fp32 = scores_fp32 / math.sqrt(dh)
+        attn = torch.softmax(scores_fp32, dim=-1)                     # [B*H, Lt, Li] fp32
+
+        # 2) out_heads = attn @ V
+        attn_fp16 = attn.to(torch.float16)
+        v_fp16 = vh.to(torch.float16)                                 # [B*H, Li, dh]
+        out_heads_fp32 = custom_ops_lib.cross_modal_attention_custom(attn_fp16, v_fp16)  # [B*H, Lt, dh] fp32
+
+        # 合并多头
+        out_heads = out_heads_fp32.reshape(B, H, Lt, dh).permute(0, 2, 1, 3).reshape(B, Lt, D)
+
+        # 输出投影
+        out = self.out_proj(out_heads)
         return out
 '''

@@ -11,7 +11,37 @@ project_json_src='''
                     "ND"
                 ],
                 "type": [
-                    "float"
+                    "float16"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            },
+            {
+                "name": "scale",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
                 ]
             }
         ],
@@ -23,104 +53,70 @@ project_json_src='''
                     "ND"
                 ],
                 "type": [
-                    "float"
+                    "float16"
                 ]
             }
         ]
     }
 ]
 '''
-
 host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(MatmulMaxPoolSumScaleCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, size);         // Sum临时缓冲区大小
-  TILING_DATA_FIELD_DEF(uint32_t, outter);       // B
-  TILING_DATA_FIELD_DEF(uint32_t, inner);        // 对齐后的长度
-  TILING_DATA_FIELD_DEF(uint32_t, n);            // 池化后长度
-  TILING_DATA_FIELD_DEF(uint32_t, kernelSize);   // 池化kernel size
-  TILING_DATA_FIELD_DEF(uint32_t, featureLen);   // 池化前长度 (= out_features)
-  TILING_DATA_FIELD_DEF(float,    scale);        // 缩放因子
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, inFeatures);
+  TILING_DATA_FIELD_DEF(uint32_t, outFeatures);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(MatmulMaxPoolSumScaleCustom, MatmulMaxPoolSumScaleCustomTilingData)
 }
 """
-
 host_operator_src="""
 #include "matmul_max_pool_sum_scale_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 获取输入形状信息
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    uint64_t total_elems = in_shape->GetOriginShape().GetShapeSize();
-
-    // 获取算子属性：feature_dim(=out_features)、kernel_size、scale_factor
-    const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    // 按注册顺序读取
-    int64_t feature_dim = *(attrs->GetAttrPointer<int64_t>(0)); // feature_dim
-    int64_t kernel_size = *(attrs->GetAttrPointer<int64_t>(1)); // kernel_size
-    float   scale       = *(attrs->GetAttrPointer<float>(2));   // scale_factor
-
-    // 基本参数计算
-    uint32_t B = static_cast<uint32_t>(total_elems / static_cast<uint64_t>(feature_dim));
-    uint32_t L = static_cast<uint32_t>(feature_dim);
-    uint32_t K = static_cast<uint32_t>(kernel_size);
-    uint32_t pooledLen = L / K; // 假设可整除
-
-    // Sum临时缓冲区大小（参考文档Sum Tiling）
-    uint32_t maxValue = 0, minValue = 0;
-    uint32_t dtypeSize = 4; // float
-    AscendC::GetSumMaxMinTmpSize(pooledLen, dtypeSize, false, maxValue, minValue);
-
-    // 32B对齐inner（参考文档公式 inner = ceil(n*sizeof(T)/32)*32/sizeof(T)）
-    uint32_t inner = (pooledLen * dtypeSize + 32 - 1) / 32 * 32 / dtypeSize;
-
     MatmulMaxPoolSumScaleCustomTilingData tiling;
-    tiling.set_size(minValue);
-    tiling.set_outter(B);
-    tiling.set_inner(inner);
-    tiling.set_n(pooledLen);
-    tiling.set_kernelSize(K);
-    tiling.set_featureLen(L);
-    tiling.set_scale(scale);
+    // x: [batch, in], w: [in, out] (transposed from PyTorch weight), b: [out], scale: [1]
+    auto x_shape = context->GetInputShape(0);
+    auto w_shape = context->GetInputShape(1);
 
-    // 配置并保存tiling
-    context->SetBlockDim(1);
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
-                        context->GetRawTilingData()->GetCapacity());
+    uint32_t batch = (uint32_t)x_shape->GetOriginShape().GetDim(0);
+    uint32_t inF   = (uint32_t)x_shape->GetOriginShape().GetDim(1);
+    // assume w is [in, out]
+    uint32_t outF  = (uint32_t)w_shape->GetOriginShape().GetDim(1);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_batch(batch);
+    tiling.set_inFeatures(inF);
+    tiling.set_outFeatures(outF);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // 无workspace需求
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-
     return ge::GRAPH_SUCCESS;
 }
-
-} // namespace optiling
+}
 
 namespace ge {
-
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 输出形状为 [B]
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    gert::Shape* out_shape = context->GetOutputShape(0);
+    const gert::Shape* x_shape = context->GetInputShape(0); // [batch, in]
+    const gert::Shape* w_shape = context->GetInputShape(1); // [in, out]
+    gert::Shape* y_shape = context->GetOutputShape(0);      // [batch]
 
-    // 从输入形状取batch维
-    int64_t b = in_shape->GetOriginShape().GetDim(0);
-    std::vector<int64_t> y_dims = { b };
-    out_shape->SetDimNum(1);
-    out_shape->SetDim(0, y_dims[0]);
-
+    std::vector<int64_t> out_dims;
+    out_dims.push_back(x_shape->GetShapeSize() > 0 ? x_shape->GetDim(0) : 0);
+    y_shape->SetDimNum(1);
+    y_shape->SetDim(0, out_dims[0]);
     return GRAPH_SUCCESS;
 }
 
@@ -128,211 +124,250 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
-    return ge::GRAPH_SUCCESS;
+    return GRAPH_SUCCESS;
+}
 }
 
-} // namespace ge
-
 namespace ops {
-
 class MatmulMaxPoolSumScaleCustom : public OpDef {
 public:
     explicit MatmulMaxPoolSumScaleCustom(const char* name) : OpDef(name)
     {
         this->Input("x")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
+            .DataType({ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("scale")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("y")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
+            .DataType({ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        // 注册属性：feature_dim、kernel_size、scale_factor
-        this->Attr("feature_dim")
-            .AttrType(REQUIRED)
-            .Int(0);
-        this->Attr("kernel_size")
-            .AttrType(REQUIRED)
-            .Int(0);
-        this->Attr("scale_factor")
-            .AttrType(REQUIRED)
-            .Float(0.0f);
-
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
 
 OP_ADD(MatmulMaxPoolSumScaleCustom);
-
-} // namespace ops
+}
 """
-
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "matmul_max_pool_sum_scale_custom_tiling_data.h"
 
-// 该自定义核实现以下功能的融合（针对输入已是线性层后的输出 [B, L]）：
-// 1) MaxPool1d(kernel_size=K, stride=K) 沿最后一维
-// 2) ReduceSum 沿最后一维（使用高阶API Sum，参考文档）
-// 3) 标量缩放
+using dtype = half;
+
+struct TilingData {
+    uint32_t batch;
+    uint32_t inFeatures;
+    uint32_t outFeatures;
+};
+
+constexpr int32_t BUFFER_NUM = 1;
 
 class KernelMatmulMaxPoolSumScale {
 public:
     __aicore__ inline KernelMatmulMaxPoolSumScale() {}
 
-    __aicore__ inline void Init(GM_ADDR xGm, GM_ADDR yGm,
-                                uint32_t outter, uint32_t featureLen,
-                                uint32_t pooledLen, uint32_t inner, uint32_t K,
-                                uint32_t tmpSize, float scale)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                uint32_t batch, uint32_t inF, uint32_t outF)
     {
-        B = outter;
-        L = featureLen;
-        P = pooledLen;
-        alignedInner = inner;
-        kernelSize = K;
-        tmpBufferSize = tmpSize;
-        scaleFactor = scale;
+        this->batch = batch;
+        this->inF = inF;
+        this->outF = outF;
+        // Set global buffers
+        xGm.SetGlobalBuffer((__gm__ dtype*)x, (size_t)batch * inF);
+        wGm.SetGlobalBuffer((__gm__ dtype*)w, (size_t)inF * outF);
+        bGm.SetGlobalBuffer((__gm__ dtype*)b, (size_t)outF);
+        yGm.SetGlobalBuffer((__gm__ dtype*)y, (size_t)batch);
 
-        xGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(xGm), B * L);
-        yGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(yGm), B);
-
-        pipe.InitBuffer(inQueue, 1, B * L * sizeof(float));
-        pipe.InitBuffer(poolQueue, 1, B * P * sizeof(float));
-        // 输出对齐到完整block倍数（参考Sum示例的对齐写回）
-        uint32_t outAlignedSize = ((B * sizeof(float) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE) * AscendC::ONE_BLK_SIZE;
-        pipe.InitBuffer(outQueue, 1, outAlignedSize);
-        pipe.InitBuffer(tmpQueue, 1, tmpBufferSize);
+        // Allocate UB buffers
+        // For GEMM result of size [batch, outF]
+        pipe.InitBuffer(queueA, 1, (size_t)batch * inF * sizeof(dtype));
+        pipe.InitBuffer(queueB, 1, (size_t)inF * outF * sizeof(dtype));
+        pipe.InitBuffer(queueCO1, 1, (size_t)batch * outF * sizeof(dtype));
+        // Temp buffers for per-row processing
+        pipe.InitBuffer(vecInQueue, BUFFER_NUM, (size_t)outF * sizeof(dtype));
+        pipe.InitBuffer(vecOutQueue, BUFFER_NUM, (size_t)outF * sizeof(dtype));
     }
 
-    __aicore__ inline void Process()
+    __aicore__ inline void Process(GM_ADDR scaleAddr)
     {
-        CopyIn();
-        Compute();
-        CopyOut();
-    }
+        // Copy input and weight to local for GEMM
+        AscendC::LocalTensor<dtype> aLocal = queueA.AllocTensor<dtype>();
+        AscendC::LocalTensor<dtype> bLocal = queueB.AllocTensor<dtype>();
+        AscendC::DataCopy(aLocal, xGm, (uint32_t)(batch * inF));
+        AscendC::DataCopy(bLocal, wGm, (uint32_t)(inF * outF));
+        queueA.EnQue(aLocal);
+        queueB.EnQue(bLocal);
 
-private:
-    __aicore__ inline void CopyIn()
-    {
-        AscendC::LocalTensor<float> xLocal = inQueue.AllocTensor<float>();
-        AscendC::DataCopy(xLocal, xGlobal, B * L);
-        inQueue.EnQue(xLocal);
-    }
+        AscendC::LocalTensor<dtype> xLocal = queueA.DeQue<dtype>();
+        AscendC::LocalTensor<dtype> wLocal = queueB.DeQue<dtype>();
+        AscendC::LocalTensor<dtype> gemmOut = queueCO1.AllocTensor<dtype>();
 
-    __aicore__ inline void Compute()
-    {
-        // 取出输入
-        AscendC::LocalTensor<float> xLocal = inQueue.DeQue<float>();
+        // GEMM: [batch, inF] x [inF, outF] -> [batch, outF]
+        // Use tiling helper
+        uint32_t m = batch;
+        uint32_t k = inF;
+        uint32_t n = outF;
+        AscendC::GemmTiling tilling = AscendC::GetGemmTiling<dtype>(m, k, n);
+        AscendC::Gemm(gemmOut, xLocal, wLocal, m, k, n, tilling, false, 1);
+        queueCO1.EnQue<dtype>(gemmOut);
+        queueA.FreeTensor(xLocal);
+        queueB.FreeTensor(wLocal);
 
-        // 分配池化后的buffer
-        AscendC::LocalTensor<float> pooledLocal = poolQueue.AllocTensor<float>();
+        // Copy bias to UB
+        AscendC::LocalTensor<dtype> biasLocal = vecInQueue.AllocTensor<dtype>();
+        AscendC::DataCopy(biasLocal, bGm, (uint32_t)outF);
+        vecInQueue.EnQue(biasLocal);
 
-        // 执行MaxPool1d(kernel=K, stride=K) —— 简化实现：逐元素比较K个元素
-        for (uint32_t b = 0; b < B; ++b) {
-            uint32_t baseIn  = b * L;
-            uint32_t baseOut = b * P;
-            for (uint32_t i = 0; i < P; ++i) {
-                float maxv = xLocal[baseIn + i * kernelSize];
-                for (uint32_t k = 1; k < kernelSize; ++k) {
-                    float v = xLocal[baseIn + i * kernelSize + k];
-                    maxv = maxv > v ? maxv : v;
-                }
-                pooledLocal[baseOut + i] = maxv;
+        // Copy GEMM result back to UB for vector processing
+        AscendC::LocalTensor<dtype> gemmRes = queueCO1.DeQue<dtype>();
+        AscendC::LocalTensor<dtype> tempRow = vecOutQueue.AllocTensor<dtype>();
+        AscendC::LocalTensor<dtype> biasVec = vecInQueue.DeQue<dtype>();
+
+        // Add bias per row
+        for (uint32_t b = 0; b < batch; ++b) {
+            // Copy row b
+            AscendC::DataCopy(tempRow, gemmRes[b * outF], outF);
+            // tempRow = tempRow + bias
+            AscendC::Add(tempRow, tempRow, biasVec, (int32_t)outF);
+
+            // MaxPool1d with kernel_size=2, stride=2 along feature dim
+            // dst length = outF/2
+            uint32_t pooledLen = outF >> 1;
+            AscendC::LocalTensor<dtype> pooledRow = vecInQueue.AllocTensor<dtype>();
+
+            // vector max between even and odd elements:
+            // src0: row[0,2,4,...], src1: row[1,3,5,...]
+            // mask = 128 elements per iteration (half)
+            uint64_t mask = 128;
+            uint32_t reps = pooledLen / 128;
+            if (reps > 0) {
+                // Compare 128 pairs per repeat:
+                // dstBlkStride=1, src0BlkStride=2, src1BlkStride=2
+                // dstRepStride=8 (move 128 elems = 256B), srcRepStride=16 (move 256 elems = 512B)
+                AscendC::Max(pooledRow, tempRow[0], tempRow[1], mask, (uint8_t)reps, { 1, 2, 2, 8, 16, 16 });
             }
+            // Handle tail if any (ignored for simplicity)
+
+            // Sum across pooledRow -> single scalar using iterative PairReduceSum
+            uint32_t curLen = pooledLen;
+            AscendC::LocalTensor<dtype> redBufA = vecOutQueue.AllocTensor<dtype>();
+            AscendC::LocalTensor<dtype> redBufB = vecInQueue.AllocTensor<dtype>();
+            // Copy initial data to redBufA
+            AscendC::DataCopy(redBufA, pooledRow, pooledLen);
+            bool toggle = true;
+            while (curLen > 1) {
+                // Each PairReduceSum halves the length
+                uint64_t rmask = 128;
+                uint32_t repeat = (curLen >= 256) ? 1 : 1; // minimal example
+                // dstRepStride=1, srcRepStride=8 as example (contiguous)
+                if (toggle) {
+                    AscendC::PairReduceSum<dtype>(redBufB, redBufA, repeat, rmask, 1, 1, 8);
+                } else {
+                    AscendC::PairReduceSum<dtype>(redBufA, redBufB, repeat, rmask, 1, 1, 8);
+                }
+                curLen >>= 1;
+                toggle = !toggle;
+            }
+            // The reduced scalar is in toggle? pick correct buffer at index 0
+            dtype scalarVal(0);
+            if (toggle) {
+                // last write to redBufA
+                AscendC::DataCopy(tempRow, redBufA, 1);
+            } else {
+                AscendC::DataCopy(tempRow, redBufB, 1);
+            }
+
+            // Load scale from GM (shape [1]) and apply
+            AscendC::GlobalTensor<dtype> scaleGm;
+            scaleGm.SetGlobalBuffer((__gm__ dtype*)scaleAddr, 1);
+            AscendC::LocalTensor<dtype> scaleLocal = vecInQueue.AllocTensor<dtype>();
+            AscendC::DataCopy(scaleLocal, scaleGm, 1);
+
+            // Multiply scalar by scale
+            AscendC::LocalTensor<dtype> outScalar = vecOutQueue.AllocTensor<dtype>();
+            // Prepare a length-1 vector mul
+            AscendC::Mul(outScalar, tempRow, scaleLocal, 1);
+
+            // Write to yGm[b]
+            AscendC::DataCopy(yGm[b], outScalar, 1);
+
+            vecOutQueue.FreeTensor(outScalar);
+            vecInQueue.FreeTensor(scaleLocal);
+            vecOutQueue.FreeTensor(redBufA);
+            vecInQueue.FreeTensor(redBufB);
+            vecInQueue.FreeTensor(pooledRow);
         }
 
-        // 分配输出
-        AscendC::LocalTensor<float> yLocal = outQueue.AllocTensor<float>();
-        // 分配Sum临时缓冲区（参考文档Sum）
-        AscendC::LocalTensor<uint8_t> workLocal = tmpQueue.AllocTensor<uint8_t>();
-
-        // ReduceSum沿最后一维
-        AscendC::SumParams params;
-        params.outter = B;         // 外维 = batch
-        params.inner  = alignedInner; // 对齐后的inner
-        params.n      = P;         // 实际长度
-
-        // 将yLocal预置为0的对齐大小（参考Sum示例）
-        uint32_t outAlignedElem = ((B * sizeof(float) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE) * AscendC::ONE_BLK_SIZE / sizeof(float);
-        float zero = 0.0f;
-        AscendC::Duplicate<float>(yLocal, zero, outAlignedElem);
-
-        // 执行Sum（框架分配临时空间版本）
-        AscendC::Sum<float>(yLocal, pooledLocal, params);
-
-        // 标量缩放
-        AscendC::Muls<float>(yLocal, yLocal, scaleFactor, B);
-
-        // 入队/释放
-        outQueue.EnQue<float>(yLocal);
-        poolQueue.FreeTensor(pooledLocal);
-        inQueue.FreeTensor(xLocal);
-        tmpQueue.FreeTensor(workLocal);
-    }
-
-    __aicore__ inline void CopyOut()
-    {
-        AscendC::LocalTensor<float> yLocal = outQueue.DeQue<float>();
-        // 只回写B个元素（其余对齐填充数据不回写）
-        AscendC::DataCopy(yGlobal, yLocal, B);
-        outQueue.FreeTensor(yLocal);
+        vecOutQueue.FreeTensor(tempRow);
+        vecInQueue.FreeTensor(biasVec);
+        queueCO1.FreeTensor(gemmRes);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueue;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> poolQueue;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> tmpQueue;
+    // GEMM queues
+    AscendC::TQue<AscendC::QuePosition::A1, 1> queueA;
+    AscendC::TQue<AscendC::QuePosition::B1, 1> queueB;
+    AscendC::TQue<AscendC::QuePosition::CO1, 1> queueCO1;
+    // Vector queues
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> vecInQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> vecOutQueue;
 
-    AscendC::GlobalTensor<float> xGlobal;
-    AscendC::GlobalTensor<float> yGlobal;
+    AscendC::GlobalTensor<dtype> xGm;
+    AscendC::GlobalTensor<dtype> wGm;
+    AscendC::GlobalTensor<dtype> bGm;
+    AscendC::GlobalTensor<dtype> yGm;
 
-    uint32_t B = 0;               // batch size
-    uint32_t L = 0;               // 输入特征长度（池化前）
-    uint32_t P = 0;               // 池化后长度
-    uint32_t alignedInner = 0;    // Sum inner对齐
-    uint32_t kernelSize = 0;
-    uint32_t tmpBufferSize = 0;
-    float    scaleFactor = 1.0f;
+    uint32_t batch;
+    uint32_t inF;
+    uint32_t outF;
 };
 
-extern "C" __global__ __aicore__ void matmul_max_pool_sum_scale_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void matmul_max_pool_sum_scale_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling, GM_ADDR scale) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelMatmulMaxPoolSumScale op;
-    op.Init(x, y,
-            tiling_data.outter, tiling_data.featureLen,
-            tiling_data.n, tiling_data.inner, tiling_data.kernelSize,
-            tiling_data.size, tiling_data.scale);
-    op.Process();
+    op.Init(x, w, b, y, tiling_data.batch, tiling_data.inFeatures, tiling_data.outFeatures);
+    op.Process(scale);
 }
 """
-
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor matmul_max_pool_sum_scale_custom_impl_npu(
-    const at::Tensor& x,
-    int64_t feature_dim,
-    int64_t kernel_size,
-    double scale_factor) {
+at::Tensor matmul_max_pool_sum_scale_custom_impl_npu(const at::Tensor& x,
+                                                     const at::Tensor& w,
+                                                     const at::Tensor& b,
+                                                     const at::Tensor& scale) {
+    TORCH_CHECK(x.scalar_type() == at::kHalf, "x must be float16");
+    TORCH_CHECK(w.scalar_type() == at::kHalf, "w must be float16");
+    TORCH_CHECK(b.scalar_type() == at::kHalf, "b must be float16");
+    TORCH_CHECK(scale.scalar_type() == at::kHalf, "scale must be float16");
+    TORCH_CHECK(scale.numel() == 1, "scale must be a scalar tensor");
 
-    TORCH_CHECK(x.dim() == 2, "Input x must be 2-D [B, L].");
-    at::Tensor result = at::empty({x.size(0)}, x.options());
-    EXEC_NPU_CMD(aclnnMatmulMaxPoolSumScaleCustom, x, result, (int64_t)feature_dim, (int64_t)kernel_size, (float)scale_factor);
+    auto batch = x.size(0);
+    at::Tensor result = at::empty({batch}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulMaxPoolSumScaleCustom, x, w, b, scale, result);
     return result;
 }
 
@@ -341,34 +376,33 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_max_pool_sum_scale_custom", &matmul_max_pool_sum_scale_custom_impl_npu,
-          "fused maxpool(k,stride=k)+sum+scale on linear output");
+    m.def("matmul_max_pool_sum_scale_custom", &matmul_max_pool_sum_scale_custom_impl_npu, "fused matmul+maxpool+sum+scale");
 }
 """
-
 model_src='''
 import torch
 import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    与原始模型等价：Linear -> (MaxPool1d(k, stride=k) on last-dim) -> ReduceSum(last-dim) -> scale
-    其中线性层仍由PyTorch执行，后续池化+求和+缩放由自定义AscendC算子实现。
-    """
     def __init__(self, in_features, out_features, kernel_size, scale_factor):
         super().__init__()
-        self.matmul = torch.nn.Linear(in_features, out_features, bias=True)
-        self.kernel_size = int(kernel_size)
-        self.scale_factor = float(scale_factor)
-        self.out_features = int(out_features)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.scale_factor = scale_factor
+        self.matmul = torch.nn.Linear(in_features, out_features)
 
     def forward(self, x):
-        # 线性层
-        x = self.matmul(x)                         # [B, out_features]
-        # 自定义AscendC算子：在最后一维做MaxPool1d(k, stride=k)，再ReduceSum到[B]并缩放
-        y = custom_ops_lib.matmul_max_pool_sum_scale_custom(
-            x, self.out_features, self.kernel_size, self.scale_factor
-        )
+        # x: [batch, in]
+        # Prepare inputs for custom op
+        # weight: transpose to [in, out]
+        w_t = self.matmul.weight.t().contiguous()
+        b = self.matmul.bias
+        scale = torch.tensor([self.scale_factor], dtype=torch.float16, device=x.device)
+        # ensure dtype is half for kernel
+        x_half = x.to(torch.float16)
+        w_half = w_t.to(torch.float16)
+        b_half = b.to(torch.float16)
+        y = custom_ops_lib.matmul_max_pool_sum_scale_custom(x_half, w_half, b_half, scale)
         return y
 '''

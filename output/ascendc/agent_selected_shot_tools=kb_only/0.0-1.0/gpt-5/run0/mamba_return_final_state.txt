@@ -1,0 +1,339 @@
+project_json_src='''
+[
+    {
+        "op": "MambaReturnFinalStateCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MambaReturnFinalStateCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);        // R = B * H
+  TILING_DATA_FIELD_DEF(uint32_t, cols);        // L = P * N
+  TILING_DATA_FIELD_DEF(uint32_t, cLen);        // C = chunk_num + 1
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);     // tile number along cols
+  TILING_DATA_FIELD_DEF(uint32_t, tmpBufferSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MambaReturnFinalStateCustom, MambaReturnFinalStateCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "mamba_return_final_state_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MambaReturnFinalStateCustomTilingData tiling;
+
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    // Expect x shape: [R, C, L]
+    uint32_t dim0 = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t dim1 = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    uint32_t dim2 = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(2));
+
+    tiling.set_rows(dim0);
+    tiling.set_cLen(dim1);
+    tiling.set_cols(dim2);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_tmpBufferSize(0); // no extra tmp buffer needed in this kernel
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0); // [R, C, L]
+    gert::Shape* y_shape = context->GetOutputShape(0);      // [R, L]
+
+    int64_t R = x_shape->GetDim(0);
+    int64_t L = x_shape->GetDim(2);
+
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, R);
+    y_shape->SetDim(1, L);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MambaReturnFinalStateCustom : public OpDef {
+public:
+    explicit MambaReturnFinalStateCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MambaReturnFinalStateCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t IN_BUF_NUM = 2;
+constexpr int32_t OUT_BUF_NUM = 2;
+
+class KernelMambaReturnFinalState {
+public:
+    __aicore__ inline KernelMambaReturnFinalState() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t rows, uint32_t cols, uint32_t cLen, uint32_t tileNum, uint32_t tmpBufferSize)
+    {
+        this->rows = rows;
+        this->cols = cols;
+        this->cLen = cLen;
+        this->tileNum = tileNum;
+        this->tmpBufferSize = tmpBufferSize;
+
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+
+        // Split rows by blocks
+        this->rowsPerBlock = (rows + blockNum - 1) / blockNum;
+        this->rowStart = blockIdx * this->rowsPerBlock;
+        this->rowEnd = AscendC::Min(rows, this->rowStart + this->rowsPerBlock);
+        this->rowsThisBlock = (this->rowEnd > this->rowStart) ? (this->rowEnd - this->rowStart) : 0;
+
+        // tile length along cols
+        uint32_t denom = AscendC::Max<uint32_t>(1, tileNum * IN_BUF_NUM);
+        this->tileLength = (cols + denom - 1) / denom;
+        this->tileLength = AscendC::Min(this->tileLength, cols);
+        if (this->tileLength == 0) {
+            this->tileLength = cols;
+        }
+
+        xGm.SetGlobalBuffer((__gm__ float*)x + (uint64_t)rowStart * cLen * cols, (uint64_t)rowsThisBlock * cLen * cols);
+        yGm.SetGlobalBuffer((__gm__ float*)y + (uint64_t)rowStart * cols, (uint64_t)rowsThisBlock * cols);
+
+        pipe.InitBuffer(inQueueX, IN_BUF_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, OUT_BUF_NUM, this->tileLength * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (rowsThisBlock == 0) {
+            return;
+        }
+        for (uint32_t r = 0; r < rowsThisBlock; ++r) {
+            for (uint32_t colOff = 0; colOff < cols; colOff += tileLength) {
+                uint32_t curLen = AscendC::Min<uint32_t>(tileLength, cols - colOff);
+
+                // Allocate output tile buffer and initialize with first c-slice
+                AscendC::LocalTensor<float> zLocal = outQueueY.AllocTensor<float>();
+                AscendC::DataCopy(zLocal, xGm[((uint64_t)r * cLen + 0) * cols + colOff], curLen);
+
+                // Accumulate remaining c-slices
+                for (uint32_t c = 1; c < cLen; ++c) {
+                    AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+                    AscendC::DataCopy(xLocal, xGm[((uint64_t)r * cLen + c) * cols + colOff], curLen);
+                    AscendC::Add(zLocal, zLocal, xLocal, curLen);
+                    inQueueX.FreeTensor(xLocal);
+                }
+
+                outQueueY.EnQue<float>(zLocal);
+
+                // Copy out
+                AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+                AscendC::DataCopy(yGm[(uint64_t)r * cols + colOff], yLocal, curLen);
+                outQueueY.FreeTensor(yLocal);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, IN_BUF_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, OUT_BUF_NUM> outQueueY;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t cLen;
+    uint32_t tileNum;
+    uint32_t tmpBufferSize;
+
+    uint32_t rowsPerBlock;
+    uint32_t rowStart;
+    uint32_t rowEnd;
+    uint32_t rowsThisBlock;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void mamba_return_final_state_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMambaReturnFinalState op;
+    op.Init(x, y,
+            tiling_data.rows(),
+            tiling_data.cols(),
+            tiling_data.cLen(),
+            tiling_data.tileNum(),
+            tiling_data.tmpBufferSize());
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor mamba_return_final_state_custom_impl_npu(const at::Tensor& x) {
+    // x: [R, C, L]
+    TORCH_CHECK(x.dim() == 3, \"x must be 3D [R, C, L]\");
+    auto sizes = x.sizes();
+    int64_t R = sizes[0];
+    int64_t L = sizes[2];
+    at::Tensor y = at::empty({R, L}, x.options());
+    EXEC_NPU_CMD(aclnnMambaReturnFinalStateCustom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"mamba_return_final_state_custom\", &mamba_return_final_state_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"mamba_return_final_state_custom\", &mamba_return_final_state_custom_impl_npu, \"Reduce-sum across C for final state\");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        super(ModelNew, self).__init__()
+        assert seq_length % block_len == 0, "Sequence length must be divisible by block length"
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.block_len = block_len
+
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+
+    def segsum(self, x):
+        T = x.size(-1)
+        x_cumsum = torch.cumsum(x, dim=-1)
+        x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=0)
+        x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+        return x_segsum
+
+    def forward(self, X, initial_states=None):
+        # Rearrange into blocks/chunks
+        X_blocks, A_blocks, B_blocks, C_blocks = [
+            rearrange(x, "b (c l) ... -> b c l ...", l=self.block_len)
+            for x in (X, self.A, self.B, self.C)
+        ]
+
+        A_blocks = rearrange(A_blocks, "b c l h -> b h c l")
+        A_cumsum = torch.cumsum(A_blocks, dim=-1)
+
+        # 1. Compute diagonal block outputs (kept on PyTorch)
+        L = torch.exp(self.segsum(A_blocks))
+        _ = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C_blocks, B_blocks, L, X_blocks)
+
+        # 2. Compute intra-chunk states (kept on PyTorch)
+        decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
+        states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B_blocks, decay_states, X_blocks)
+
+        # 3. Compute inter-chunk recurrence
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+        states = torch.cat([initial_states, states], dim=1)  # [b, c_plus, h, p, n]
+
+        # decay weights over chunks: take the last row (z = -1) of exp(segsum(pad(A_last, (1,0))))
+        decay_chunk = torch.exp(self.segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))  # [b, h, z, c_plus], z=c_plus
+        weights = decay_chunk[:, :, -1, :]  # [b, h, c_plus]
+
+        # Prepare inputs for custom kernel:
+        # states_perm: [b, h, c_plus, p, n]
+        states_perm = states.permute(0, 2, 1, 3, 4).contiguous()
+        # Apply weights (broadcast over p, n) on PyTorch
+        states_weighted = states_perm * weights[:, :, :, None, None]
+        # Reshape to [R, C, L] where R = b*h, C = c_plus, L = p*n
+        b, h, c_plus, p, n = states_weighted.shape
+        R = b * h
+        L = p * n
+        x_for_kernel = states_weighted.reshape(R, c_plus, L).contiguous()
+
+        # Custom AscendC kernel reduces across C: y = sum_c x[r, c, :]
+        y_flat = custom_ops_lib.mamba_return_final_state_custom(x_for_kernel)  # [R, L]
+        y = y_flat.view(b, h, p, n)  # [b, h, p, n]
+        return y
+'''

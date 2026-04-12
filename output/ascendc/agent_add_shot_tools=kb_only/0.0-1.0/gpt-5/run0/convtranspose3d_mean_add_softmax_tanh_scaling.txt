@@ -23,6 +23,16 @@ project_json_src='''
                 "type": [
                     "float"
                 ]
+            },
+            {
+                "name": "scale",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ],
         "output_desc": [
@@ -46,8 +56,10 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(Convtranspose3dMeanAddSoftmaxTanhScalingCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, channels);
+  TILING_DATA_FIELD_DEF(uint32_t, height);
+  TILING_DATA_FIELD_DEF(uint32_t, width);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(Convtranspose3dMeanAddSoftmaxTanhScalingCustom, Convtranspose3dMeanAddSoftmaxTanhScalingCustomTilingData)
@@ -59,23 +71,40 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 8;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     Convtranspose3dMeanAddSoftmaxTanhScalingCustomTilingData tiling;
-    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
-    context->SetBlockDim(BLOCK_DIM);
-    tiling.set_totalLength(totalLength);
-    tiling.set_tileNum(TILE_NUM);
+
+    // Input x is expected to be [B, C, 1, H, W] (mean over D is done in Python before calling this op)
+    auto shape = context->GetInputShape(0)->GetOriginShape();
+    std::vector<int64_t> dims = shape.GetDims(); // [B, C, 1, H, W] or [B, C, H, W] when squeezed
+    uint32_t B = 1, C = 1, H = 1, W = 1;
+    if (dims.size() == 5) {
+        B = static_cast<uint32_t>(dims[0]);
+        C = static_cast<uint32_t>(dims[1]);
+        H = static_cast<uint32_t>(dims[3]);
+        W = static_cast<uint32_t>(dims[4]);
+    } else if (dims.size() == 4) { // [B, C, H, W]
+        B = static_cast<uint32_t>(dims[0]);
+        C = static_cast<uint32_t>(dims[1]);
+        H = static_cast<uint32_t>(dims[2]);
+        W = static_cast<uint32_t>(dims[3]);
+    }
+
+    // Set basic block dim (each block handles one batch if possible)
+    uint32_t blockDim = B > 0 ? ((B < 32) ? B : 32) : 1;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_batch(B);
+    tiling.set_channels(C);
+    tiling.set_height(H);
+    tiling.set_width(W);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
-    context->SetTilingKey(1);
+    currentWorkspace[0] = 0; // no extra workspace
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -83,9 +112,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
+    // y has the same shape as x
     const gert::Shape* x_shape = context->GetInputShape(0);
-    const gert::Shape* b_shape = context->GetInputShape(1);
-    (void)b_shape; // bias is broadcasted in PyTorch before calling kernel
     gert::Shape* y_shape = context->GetOutputShape(0);
     *y_shape = *x_shape;
     return GRAPH_SUCCESS;
@@ -114,6 +142,11 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("scale")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -121,9 +154,7 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -134,90 +165,156 @@ OP_ADD(Convtranspose3dMeanAddSoftmaxTanhScalingCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "convtranspose3d_mean_add_softmax_tanh_scaling_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2;
+using DTYPE = float;
 
-class KernelBiasAdd {
+class KernelConvtranspose3dMeanAddSoftmaxTanhScaling {
 public:
-    __aicore__ inline KernelBiasAdd() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR b, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
+    __aicore__ inline KernelConvtranspose3dMeanAddSoftmaxTanhScaling() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR scale, GM_ADDR y, uint32_t B, uint32_t C, uint32_t H, uint32_t W)
     {
-        this->blockLength = totalLength / AscendC::GetBlockNum();
-        this->tileNum = tileNum;
-        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->B = B;
+        this->C = C;
+        this->H = H;
+        this->W = W;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        bGm.SetGlobalBuffer((__gm__ DTYPE_Y *)b + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        // Each block processes one batch index if possible
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t idx = AscendC::GetBlockIdx();
+        uint32_t batchPerBlock = (B + blocks - 1) / blocks;
+        startB = idx * batchPerBlock;
+        endB = AscendC::Min(startB + batchPerBlock, B);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(inQueueB, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+        uint64_t hw = (uint64_t)H * (uint64_t)W;
+        uint64_t perBatchSize = (uint64_t)C * hw; // D already reduced to 1
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE *)x + startB * perBatchSize, (endB - startB) * perBatchSize);
+        yGm.SetGlobalBuffer((__gm__ DTYPE *)y + startB * perBatchSize, (endB - startB) * perBatchSize);
+        biasGm.SetGlobalBuffer((__gm__ DTYPE *)bias, C);
+        scaleGm.SetGlobalBuffer((__gm__ DTYPE *)scale, 1);
+
+        // Local buffers
+        // Channel vector per (h,w): length C
+        pipe.InitBuffer(vecQueue, 1, C * sizeof(DTYPE));
+        pipe.InitBuffer(tmpQueue, 1, C * sizeof(DTYPE));
+        // For SoftMax sum/max temporary
+        elementNumPerBlk = 32 / sizeof(DTYPE); // 8 for float
+        pipe.InitBuffer(sumQueue, 1, elementNumPerBlk * sizeof(DTYPE));
+        pipe.InitBuffer(maxQueue, 1, elementNumPerBlk * sizeof(DTYPE));
+        pipe.InitBuffer(biasQueue, 1, C * sizeof(DTYPE));
+        pipe.InitBuffer(scaleQueue, 1, sizeof(DTYPE));
     }
 
     __aicore__ inline void Process()
     {
-        int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; i++) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
+        // Load bias once per block
+        AscendC::LocalTensor<DTYPE> biasLocal = biasQueue.AllocTensor<DTYPE>();
+        AscendC::DataCopy(biasLocal, biasGm, C);
+        biasQueue.EnQue(biasLocal);
+
+        AscendC::LocalTensor<DTYPE> scaleLocal = scaleQueue.AllocTensor<DTYPE>();
+        AscendC::DataCopy(scaleLocal, scaleGm, 1);
+        scaleQueue.EnQue(scaleLocal);
+
+        uint64_t hw = (uint64_t)H * (uint64_t)W;
+        for (uint32_t b = startB; b < endB; ++b) {
+            uint64_t batchOffset = (uint64_t)(b - startB) * (uint64_t)C * hw;
+            for (uint32_t h = 0; h < H; ++h) {
+                for (uint32_t w = 0; w < W; ++w) {
+                    uint64_t pos = (uint64_t)h * W + w;
+
+                    // CopyIn: assemble channel vector for this (b,h,w)
+                    AscendC::LocalTensor<DTYPE> vecLocal = vecQueue.AllocTensor<DTYPE>();
+                    for (uint32_t c = 0; c < C; ++c) {
+                        uint64_t off = batchOffset + (uint64_t)c * hw + pos;
+                        AscendC::DataCopy(vecLocal[c], xGm[off], 1);
+                    }
+                    vecQueue.EnQue(vecLocal);
+
+                    // Compute: bias add -> softmax over channels -> tanh -> scaling
+                    AscendC::LocalTensor<DTYPE> inVec = vecQueue.DeQue<DTYPE>();
+                    AscendC::LocalTensor<DTYPE> tmpVec = tmpQueue.AllocTensor<DTYPE>();
+                    AscendC::LocalTensor<DTYPE> outVec = vecQueue.AllocTensor<DTYPE>(); // reuse vecQueue buffer for output
+                    AscendC::LocalTensor<DTYPE> biasLocal2 = biasQueue.DeQue<DTYPE>();
+                    AscendC::LocalTensor<DTYPE> scaleLocal2 = scaleQueue.DeQue<DTYPE>();
+
+                    // Bias add
+                    AscendC::Add(tmpVec, inVec, biasLocal2, C);
+
+                    // SoftMax over last axis of size C (m=1, n=C)
+                    AscendC::LocalTensor<DTYPE> sumTempLocal = sumQueue.AllocTensor<DTYPE>();
+                    AscendC::LocalTensor<DTYPE> maxTempLocal = maxQueue.AllocTensor<DTYPE>();
+                    AscendC::SoftMaxShapeInfo shapeInfo = {1, C, 1, C};
+                    AscendC::SoftMax<DTYPE>(outVec, sumTempLocal, maxTempLocal, tmpVec, softmaxTiling, shapeInfo);
+
+                    // Tanh via exp: tanh(x) = (e^(2x) - e^(-2x)) / (e^(2x) + e^(-2x))
+                    AscendC::Mul(tmpVec, outVec, (DTYPE)2.0, C);              // tmp = 2x
+                    AscendC::Exp(tmpVec, tmpVec, C);                          // tmp = e^(2x)
+                    // e^(-2x) = 1 / e^(2x)
+                    AscendC::LocalTensor<DTYPE> invTmp = maxQueue.AllocTensor<DTYPE>(); // reuse
+                    AscendC::Reciprocal(invTmp, tmpVec, C);                    // inv = e^(-2x)
+                    AscendC::Sub(outVec, tmpVec, invTmp, C);                   // out = e^(2x) - e^(-2x)
+                    AscendC::Add(tmpVec, tmpVec, invTmp, C);                   // tmp = e^(2x) + e^(-2x)
+                    AscendC::Div(outVec, outVec, tmpVec, C);                   // out = tanh
+
+                    // Scaling
+                    // Broadcast scalar scaleLocal2[0]
+                    AscendC::Mul(outVec, outVec, scaleLocal2[0], C);
+
+                    // Enqueue and free temps
+                    maxQueue.FreeTensor(invTmp);
+                    maxQueue.FreeTensor(maxTempLocal);
+                    sumQueue.FreeTensor(sumTempLocal);
+                    tmpQueue.FreeTensor(tmpVec);
+                    scaleQueue.EnQue(scaleLocal2);
+                    biasQueue.EnQue(biasLocal2);
+                    vecQueue.EnQue(outVec);
+
+                    // CopyOut: scatter back to GM
+                    AscendC::LocalTensor<DTYPE> resVec = vecQueue.DeQue<DTYPE>();
+                    for (uint32_t c = 0; c < C; ++c) {
+                        uint64_t off = batchOffset + (uint64_t)c * hw + pos;
+                        AscendC::DataCopy(yGm[off], resVec[c], 1);
+                    }
+                    vecQueue.FreeTensor(inVec);
+                    vecQueue.FreeTensor(resVec);
+                }
+            }
         }
-    }
 
-private:
-    __aicore__ inline void CopyIn(int32_t progress)
-    {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> bLocal = inQueueB.AllocTensor<DTYPE_Y>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
-        AscendC::DataCopy(bLocal, bGm[progress * this->tileLength], this->tileLength);
-        inQueueX.EnQue(xLocal);
-        inQueueB.EnQue(bLocal);
-    }
-
-    __aicore__ inline void Compute(int32_t /*progress*/)
-    {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> bLocal = inQueueB.DeQue<DTYPE_Y>();
-        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
-
-        AscendC::Add(yLocal, xLocal, bLocal, this->tileLength);
-
-        outQueueY.EnQue<DTYPE_Z>(yLocal);
-        inQueueX.FreeTensor(xLocal);
-        inQueueB.FreeTensor(bLocal);
-    }
-
-    __aicore__ inline void CopyOut(int32_t progress)
-    {
-        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
-        outQueueY.FreeTensor(yLocal);
+        // Free cached tensors
+        AscendC::LocalTensor<DTYPE> biasTmp = biasQueue.DeQue<DTYPE>();
+        biasQueue.FreeTensor(biasTmp);
+        AscendC::LocalTensor<DTYPE> scaleTmp = scaleQueue.DeQue<DTYPE>();
+        scaleQueue.FreeTensor(scaleTmp);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueB;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> bGm;
-    AscendC::GlobalTensor<DTYPE_Z> yGm;
-    uint32_t blockLength;
-    uint32_t tileNum;
-    uint32_t tileLength;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> vecQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> tmpQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> sumQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> maxQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> biasQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> scaleQueue;
+
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+    AscendC::GlobalTensor<DTYPE> biasGm;
+    AscendC::GlobalTensor<DTYPE> scaleGm;
+
+    uint32_t B, C, H, W;
+    uint32_t startB, endB;
+    uint32_t elementNumPerBlk = 0;
+    AscendC::SoftMaxTiling softmaxTiling; // use default; API will check and compute as needed
 };
 
-extern "C" __global__ __aicore__ void convtranspose3d_mean_add_softmax_tanh_scaling_custom(GM_ADDR x, GM_ADDR bias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void convtranspose3d_mean_add_softmax_tanh_scaling_custom(GM_ADDR x, GM_ADDR bias, GM_ADDR scale, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelBiasAdd op;
-    op.Init(x, bias, y, tiling_data.totalLength, tiling_data.tileNum);
-    if (TILING_KEY_IS(1)) {
-        op.Process();
-    }
+    KernelConvtranspose3dMeanAddSoftmaxTanhScaling op;
+    op.Init(x, bias, scale, y, tiling_data.batch, tiling_data.channels, tiling_data.height, tiling_data.width);
+    op.Process();
 }
 """
 
@@ -227,9 +324,9 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor convtranspose3d_mean_add_softmax_tanh_scaling_custom_impl_npu(const at::Tensor& x, const at::Tensor& bias) {
+at::Tensor convtranspose3d_mean_add_softmax_tanh_scaling_custom_impl_npu(const at::Tensor& x, const at::Tensor& bias, const at::Tensor& scale) {
     at::Tensor result = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnConvtranspose3dMeanAddSoftmaxTanhScalingCustom, x, bias, result);
+    EXEC_NPU_CMD(aclnnConvtranspose3dMeanAddSoftmaxTanhScalingCustom, x, bias, scale, result);
     return result;
 }
 
@@ -238,7 +335,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("convtranspose3d_mean_add_softmax_tanh_scaling_custom", &convtranspose3d_mean_add_softmax_tanh_scaling_custom_impl_npu, "bias add after convtranspose3d+mean");
+    m.def("convtranspose3d_mean_add_softmax_tanh_scaling_custom", &convtranspose3d_mean_add_softmax_tanh_scaling_custom_impl_npu, "bias+softmax+tanh+scale (channels last)");
 }
 """
 
@@ -249,23 +346,21 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Optimized model:
-    - Keep ConvTranspose3d, mean over depth, softmax, tanh, scaling in PyTorch.
-    - Replace bias add with custom AscendC kernel for better bandwidth utilization.
+    Optimized Model:
+    - Keep ConvTranspose3d in PyTorch
+    - Keep mean over depth in PyTorch
+    - Fuse bias add + softmax (channel dim) + tanh + scaling into a custom AscendC kernel
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scaling_factor):
-        super(ModelNew, self).__init__()
+        super().__init__()
         self.conv_transpose = torch.nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
         self.bias = torch.nn.Parameter(torch.randn(1, out_channels, 1, 1, 1))
-        self.scaling_factor = scaling_factor
+        # pass scaling as 1-element tensor to device for kernel
+        self.register_buffer("scaling_tensor", torch.tensor([float(scaling_factor)], dtype=torch.float32))
 
     def forward(self, x):
-        x = self.conv_transpose(x)                 # (B, C, D, H, W)
-        x = x.mean(dim=2, keepdim=True)            # (B, C, 1, H, W)
-        b = self.bias.expand_as(x)                 # broadcast to tensor, so kernel can do pure elementwise add
-        x = custom_ops_lib.convtranspose3d_mean_add_softmax_tanh_scaling_custom(x, b)
-        x = torch.softmax(x, dim=1)                # softmax over channels
-        x = torch.tanh(x)                          # tanh
-        x = x * self.scaling_factor                # scaling
-        return x
+        x = self.conv_transpose(x)                # (B, C, D, H, W)
+        x = x.mean(dim=2, keepdim=True)           # (B, C, 1, H, W)
+        # Custom fused kernel: bias add + softmax over channels + tanh + scaling
+        return custom_ops_lib.convtranspose3d_mean_add_softmax_tanh_scaling_custom(x, self.bias, self.scaling_tensor)
 '''

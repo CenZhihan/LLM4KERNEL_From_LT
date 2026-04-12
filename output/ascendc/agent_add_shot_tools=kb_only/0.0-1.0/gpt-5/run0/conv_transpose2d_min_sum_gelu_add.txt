@@ -27,7 +27,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "z",
+                "name": "y",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -46,10 +46,7 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ConvTranspose2dMinSumGeluAddCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, N);
-  TILING_DATA_FIELD_DEF(uint32_t, C);
-  TILING_DATA_FIELD_DEF(uint32_t, H);
-  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
@@ -64,30 +61,15 @@ host_operator_src="""
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
 const uint32_t TILE_NUM = 8;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ConvTranspose2dMinSumGeluAddCustomTilingData tiling;
-
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    auto origin = in_shape->GetOriginShape();
-
-    uint32_t N = static_cast<uint32_t>(origin.GetDim(0));
-    uint32_t C = static_cast<uint32_t>(origin.GetDim(1));
-    uint32_t H = static_cast<uint32_t>(origin.GetDim(2));
-    uint32_t W = static_cast<uint32_t>(origin.GetDim(3));
-
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
     context->SetBlockDim(BLOCK_DIM);
-
-    tiling.set_N(N);
-    tiling.set_C(C);
-    tiling.set_H(H);
-    tiling.set_W(W);
+    tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -98,18 +80,10 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* in_shape = context->GetInputShape(0);
-    auto origin = in_shape->GetOriginShape();
-    std::vector<int64_t> out_dims = {
-        origin.GetDim(0),  // N
-        1,                 // C_out = 1 after min along channel
-        1,                 // H_out = 1 after sum along height
-        origin.GetDim(3)   // W kept
-    };
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    y_shape->SetOriginShape(ge::Shape(out_dims));
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -133,7 +107,7 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("z")
+        this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -153,119 +127,90 @@ OP_ADD(ConvTranspose2dMinSumGeluAddCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_transpose2d_min_sum_gelu_add_custom_tiling_data.h"
 
-// 本算子输入: x (N,C,H,W), bias (1,1,1,W或可广播到W), 输出: z (N,1,1,W)
-// 计算: 对x在通道维做min(keepdim=True)->(N,1,H,W)，再对H维求和->(N,1,1,W)，GELU，再与bias相加。
+using DTYPE_X = float;
+using DTYPE_B = float;
+using DTYPE_Y = float;
 
-class KernelConvTranspose2dMinSumGeluAdd {
+constexpr int32_t BUFFER_NUM = 2; // number of tensors in each queue
+
+class KernelGeluAdd {
 public:
-    __aicore__ inline KernelConvTranspose2dMinSumGeluAdd() {}
-
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR z,
-                                uint32_t N, uint32_t C, uint32_t H, uint32_t W, uint32_t tileNum)
+    __aicore__ inline KernelGeluAdd() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
     {
-        this->N = N;
-        this->C = C;
-        this->H = H;
-        this->W = W;
+        this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        uint32_t coreNum = AscendC::GetBlockNum();
-        uint32_t coreId = AscendC::GetBlockIdx();
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        bGm.SetGlobalBuffer((__gm__ DTYPE_B *)bias + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        // 以batch维按core均分，最后一核可能少一些
-        uint32_t nPerCore = (N + coreNum - 1) / coreNum;
-        startN = coreId * nPerCore;
-        endN = (startN + nPerCore > N) ? N : (startN + nPerCore);
-
-        xGm.SetGlobalBuffer((__gm__ float*)x + startN * (uint64_t)C * H * W, (endN - startN) * (uint64_t)C * H * W);
-        biasGm.SetGlobalBuffer((__gm__ float*)bias, W); // 期望bias为长度W的向量
-        zGm.SetGlobalBuffer((__gm__ float*)z + startN * (uint64_t)W, (endN - startN) * (uint64_t)W);
-
-        // 为每个向量计算分配本地缓冲
-        pipe.InitBuffer(bufSum, 1, W * sizeof(float));
-        pipe.InitBuffer(bufCur, 1, W * sizeof(float));
-        pipe.InitBuffer(bufTmp, 1, W * sizeof(float));
-        pipe.InitBuffer(bufBias, 1, W * sizeof(float));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueB, BUFFER_NUM, this->tileLength * sizeof(DTYPE_B));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
     }
-
     __aicore__ inline void Process()
     {
-        if (startN >= endN) {
-            return;
-        }
-        // 预取bias宽度向量
-        AscendC::LocalTensor<float> biasLocal = bufBias.Get<float>();
-        AscendC::DataCopy(biasLocal, biasGm, W);
-
-        for (uint32_t n = 0; n < (endN - startN); ++n) {
-            // sum向量: 累加所有H上min_c(x[n,:,h,:])
-            AscendC::LocalTensor<float> sumLocal = bufSum.Get<float>();
-
-            // 先用h=0初始化sumLocal
-            MinOnChannelsTo(sumLocal, n, 0);
-
-            for (uint32_t h = 1; h < H; ++h) {
-                AscendC::LocalTensor<float> curLocal = bufCur.Get<float>();
-                MinOnChannelsTo(curLocal, n, h);
-                AscendC::Add(sumLocal, sumLocal, curLocal, W);
-            }
-
-            // GELU
-            AscendC::Gelu(sumLocal, sumLocal, W);
-
-            // + bias (宽度向量)
-            AscendC::Add(sumLocal, sumLocal, biasLocal, W);
-
-            // 写回 (N,1,1,W) => 线性(N*W)
-            AscendC::DataCopy(zGm[n * (uint64_t)W], sumLocal, W);
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
         }
     }
 
 private:
-    // 计算: cur(h,:) = min_c x[n,c,h,:] 向量写入dstLocal
-    __aicore__ inline void MinOnChannelsTo(AscendC::LocalTensor<float>& dstLocal, uint32_t nLocal, uint32_t h)
+    __aicore__ inline void CopyIn(int32_t progress)
     {
-        // 先拷入c=0
-        uint64_t baseOffset = ((uint64_t)nLocal * C * H + (uint64_t)0 * H + h) * W;
-        AscendC::DataCopy(dstLocal, xGm[baseOffset], W);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_B> bLocal = inQueueB.AllocTensor<DTYPE_B>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(bLocal, bGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+        inQueueB.EnQue(bLocal);
+    }
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_B> bLocal = inQueueB.DeQue<DTYPE_B>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
 
-        // 依次与其它c做elementwise min
-        for (uint32_t c = 1; c < C; ++c) {
-            AscendC::LocalTensor<float> tmpLocal = bufTmp.Get<float>();
-            uint64_t off = ((uint64_t)nLocal * C * H + (uint64_t)c * H + h) * W;
-            AscendC::DataCopy(tmpLocal, xGm[off], W);
-            AscendC::Min(dstLocal, dstLocal, tmpLocal, W);
-        }
+        // GELU activation
+        AscendC::Gelu(yLocal, xLocal, this->tileLength);
+        // Element-wise add with bias
+        AscendC::Add(yLocal, yLocal, bLocal, this->tileLength);
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueB.FreeTensor(bLocal);
+    }
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> bufSum;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> bufCur;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> bufTmp;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> bufBias;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueB;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
 
-    AscendC::GlobalTensor<float> xGm;
-    AscendC::GlobalTensor<float> biasGm;
-    AscendC::GlobalTensor<float> zGm;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_B> bGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
 
-    uint32_t N;
-    uint32_t C;
-    uint32_t H;
-    uint32_t W;
+    uint32_t blockLength;
     uint32_t tileNum;
-
-    uint32_t startN;
-    uint32_t endN;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void conv_transpose2d_min_sum_gelu_add_custom(GM_ADDR x, GM_ADDR bias, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+extern "C" __global__ __aicore__ void conv_transpose2d_min_sum_gelu_add_custom(GM_ADDR x, GM_ADDR bias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelConvTranspose2dMinSumGeluAdd op;
-    op.Init(x, bias, z, tiling_data.N, tiling_data.C, tiling_data.H, tiling_data.W, tiling_data.tileNum);
+    KernelGeluAdd op;
+    op.Init(x, bias, y, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -276,12 +221,9 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv_transpose2d_min_sum_gelu_add_custom_impl_npu(const at::Tensor& x, const at::Tensor& bias) {
-    TORCH_CHECK(x.dim() == 4, "x must be NCHW");
-    auto N = x.size(0);
-    auto W = x.size(3);
-    at::Tensor result = at::empty({N, 1, 1, W}, x.options());
-    EXEC_NPU_CMD(aclnnConvTranspose2dMinSumGeluAddCustom, x, bias, result);
+at::Tensor conv_transpose2d_min_sum_gelu_add_custom_impl_npu(const at::Tensor& self, const at::Tensor& bias) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnConvTranspose2dMinSumGeluAddCustom, self, bias, result);
     return result;
 }
 
@@ -290,7 +232,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv_transpose2d_min_sum_gelu_add_custom", &conv_transpose2d_min_sum_gelu_add_custom_impl_npu, "ConvTranspose2d->Min->Sum->GELU->Add fusion");
+    m.def("conv_transpose2d_min_sum_gelu_add_custom", &conv_transpose2d_min_sum_gelu_add_custom_impl_npu, "fused gelu + add after reductions");
 }
 """
 
@@ -300,18 +242,16 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    Optimized model: keep ConvTranspose2d in PyTorch, fuse Min(S=channel, keepdim=True) + Sum(H, keepdim=True) + GELU + Add(bias) into custom AscendC op.
-    """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
         super(ModelNew, self).__init__()
         self.conv_transpose = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, output_padding)
-        # bias as parameter, will be expanded to match width before calling custom op
         self.bias = torch.nn.Parameter(torch.randn(bias_shape))
 
     def forward(self, x):
-        y = self.conv_transpose(x)  # (N, C, H, W)
-        # custom op expects: x=y (N,C,H,W), bias shaped to width (1,1,1,W)
-        bias_vec = self.bias.view(1, 1, 1, 1).expand(1, 1, 1, y.size(3)).contiguous()
-        return custom_ops_lib.conv_transpose2d_min_sum_gelu_add_custom(y, bias_vec)
+        x = self.conv_transpose(x)                       # [N, C, H, W]
+        x = torch.min(x, dim=1, keepdim=True)[0]        # [N, 1, H, W]
+        x = torch.sum(x, dim=2, keepdim=True)           # [N, 1, 1, W]
+        bias_full = self.bias.expand_as(x)              # broadcast to [N, 1, 1, W]
+        x = custom_ops_lib.conv_transpose2d_min_sum_gelu_add_custom(x, bias_full)  # GELU + Add on NPU
+        return x
 '''

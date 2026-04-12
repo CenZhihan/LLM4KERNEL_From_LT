@@ -1,0 +1,334 @@
+project_json_src='''
+[
+    {
+        "op":"RmsNormCustom",
+        "input_desc":[
+            {
+                "name":"x",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ],
+                "param_type":"required"
+            }
+        ],
+        "output_desc":[
+            {
+                "name":"res_out",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ],
+                "param_type":"required"
+            }
+        ],
+        "attr":[
+            {
+                "name":"epsilon",
+                "type": [
+                    "float"
+                ],
+                "default_value":0.00001,
+                "param_type":"optional"
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(RmsNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, HW);
+  TILING_DATA_FIELD_DEF(uint32_t, rowNum);
+  TILING_DATA_FIELD_DEF(uint32_t, rowNumSp);
+  TILING_DATA_FIELD_DEF(uint32_t, blockPivot);
+  TILING_DATA_FIELD_DEF(uint32_t, tileSize);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(float, eps);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(RmsNormCustom, RmsNormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "rms_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 48;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context) {
+  RmsNormCustomTilingData tiling;
+
+  const gert::StorageShape* in_shape = context->GetInputShape(0);
+  const gert::Shape shape = in_shape->GetStorageShape();
+  int64_t dim_num = shape.GetDimNum();
+  // 假设输入为至少2维 (N, C, ...)，在本例中为 (N, C, H, W)
+  uint32_t N = static_cast<uint32_t>(shape.GetDim(0));
+  uint32_t C = static_cast<uint32_t>(shape.GetDim(1));
+  uint64_t hw_u64 = 1;
+  for (int64_t i = 2; i < dim_num; ++i) {
+    hw_u64 *= static_cast<uint64_t>(shape.GetDim(i));
+  }
+  uint32_t HW = static_cast<uint32_t>(hw_u64);
+
+  const float* epsilonAttr = context->GetAttrs()->GetAttrPointer<float>(0);
+  tiling.set_eps(*epsilonAttr);
+
+  // 计算Block并行在batch维度上的划分
+  uint32_t baseRows = N / BLOCK_DIM;
+  uint32_t pivot = N - baseRows * BLOCK_DIM; // 等价于 N % BLOCK_DIM
+  tiling.set_rowNum(baseRows);
+  tiling.set_rowNumSp(baseRows + 1);
+  tiling.set_blockPivot(pivot);
+
+  // 估算UB剩余空间，规划tile大小
+  auto platformInfo = context->GetPlatformInfo();
+  auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
+  uint64_t tailSize = 0; // UB剩余空间
+  ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, tailSize);
+
+  // 需要的缓冲：
+  // - xLocal (tileSize floats)
+  // - yLocal (tileSize floats)
+  // - denomBuf (tileSize floats)
+  // - tmpBuf (tileSize floats)
+  // - onesBuf (tileSize floats)
+  // 共计 ~5 * tileSize * sizeof(float)
+  // 再留出队列/其它开销，这里保守按6倍估算
+  const uint32_t bytesPerFloat = 4;
+  uint64_t maxTileByUb = (tailSize / (6 * bytesPerFloat));
+  if (maxTileByUb == 0) {
+    maxTileByUb = 1024; // 兜底
+  }
+  uint32_t tileSize = static_cast<uint32_t>(maxTileByUb);
+  if (tileSize > HW) tileSize = HW;
+  if (tileSize == 0) tileSize = 1;
+  uint32_t tileNum = (HW + tileSize - 1) / tileSize;
+
+  tiling.set_N(N);
+  tiling.set_C(C);
+  tiling.set_HW(HW);
+  tiling.set_tileSize(tileSize);
+  tiling.set_tileNum(tileNum);
+
+  context->SetBlockDim(BLOCK_DIM);
+  tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                      context->GetRawTilingData()->GetCapacity());
+  context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+  context->SetTilingKey(1);
+
+  return ge::GRAPH_SUCCESS;
+}
+}  // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context) {
+  const gert::Shape* x_shape = context->GetInputShape(0);
+  gert::Shape* y_shape = context->GetOutputShape(0);
+  *y_shape = *x_shape;
+  return GRAPH_SUCCESS;
+}
+}  // namespace ge
+
+namespace ops {
+class RmsNormCustom : public OpDef {
+ public:
+  explicit RmsNormCustom(const char* name) : OpDef(name) {
+    this->Input("x")
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_FLOAT})
+        .Format({ge::FORMAT_ND})
+        .UnknownShapeFormat({ge::FORMAT_ND});
+
+    this->Output("res_out")
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_FLOAT})
+        .Format({ge::FORMAT_ND})
+        .UnknownShapeFormat({ge::FORMAT_ND});
+
+    this->Attr("epsilon").AttrType(OPTIONAL).Float(1e-05);
+
+    this->SetInferShape(ge::InferShape);
+
+    this->AICore().SetTiling(optiling::TilingFunc);
+    this->AICore().AddConfig("ascend910b");
+  }
+};
+
+OP_ADD(RmsNormCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelRmsNorm {
+ public:
+  __aicore__ inline KernelRmsNorm() {}
+  __aicore__ inline void InitTiling(GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    N = tiling_data.N;
+    C = tiling_data.C;
+    HW = tiling_data.HW;
+    baseRowNum = tiling_data.rowNum;
+    rowNumSp = tiling_data.rowNumSp;
+    blockPivot = tiling_data.blockPivot;
+    tileSize = tiling_data.tileSize;
+    tileNum = tiling_data.tileNum;
+    eps = tiling_data.eps;
+  }
+  __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR tiling) {
+    InitTiling(tiling);
+
+    // 计算当前block负责的batch范围
+    uint32_t blockId = AscendC::GetBlockIdx();
+    myRowNum = baseRowNum;
+    if (blockId < blockPivot) {
+      myRowNum = rowNumSp;
+      startRow = blockId * rowNumSp;
+    } else {
+      startRow = blockPivot * rowNumSp + (blockId - blockPivot) * baseRowNum;
+    }
+
+    uint64_t blockLength = static_cast<uint64_t>(myRowNum) * C * HW;
+
+    xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x) + static_cast<uint64_t>(startRow) * C * HW, blockLength);
+    yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(y) + static_cast<uint64_t>(startRow) * C * HW, blockLength);
+
+    // 初始化队列和缓冲
+    pipe.InitBuffer(queueX, BUFFER_NUM, tileSize * sizeof(float));
+    pipe.InitBuffer(queueY, BUFFER_NUM, tileSize * sizeof(float));
+    pipe.InitBuffer(denomBuf, tileSize * sizeof(float));
+    pipe.InitBuffer(tmpBuf, tileSize * sizeof(float));
+    pipe.InitBuffer(onesBuf, tileSize * sizeof(float));
+  }
+  __aicore__ inline void Process() {
+    // 对 myRowNum 个batch进行处理，每个batch遍历HW维度的tiles
+    for (uint32_t bn = 0; bn < myRowNum; ++bn) {
+      for (uint32_t t = 0; t < HW; t += tileSize) {
+        uint32_t curLen = (t + tileSize <= HW) ? tileSize : (HW - t);
+        ComputeOneTile(bn, t, curLen);
+      }
+    }
+  }
+
+ private:
+  __aicore__ inline void ComputeOneTile(uint32_t bn, uint32_t t, uint32_t curLen) {
+    AscendC::LocalTensor<float> dLocal = denomBuf.Get<float>();
+    AscendC::LocalTensor<float> tmpLocal = tmpBuf.Get<float>();
+    AscendC::LocalTensor<float> onesLocal = onesBuf.Get<float>();
+
+    AscendC::Duplicate<float>(dLocal, 0.0f, curLen);
+    AscendC::Duplicate<float>(onesLocal, 1.0f, curLen);
+
+    // 第一遍：累计平方和
+    for (uint32_t c = 0; c < C; ++c) {
+      AscendC::LocalTensor<float> xLocal = queueX.AllocTensor<float>();
+      uint64_t off = static_cast<uint64_t>(bn) * C * HW + static_cast<uint64_t>(c) * HW + t;
+      AscendC::DataCopy(xLocal, xGm[off], curLen);
+      AscendC::Mul(tmpLocal, xLocal, xLocal, curLen);
+      AscendC::Add(dLocal, dLocal, tmpLocal, curLen);
+      queueX.FreeTensor(xLocal);
+    }
+
+    // 计算 inv_rms = 1.0 / sqrt(mean(x^2) + eps)
+    float factor = 1.0f / static_cast<float>(C);
+    AscendC::Muls(dLocal, dLocal, factor, curLen);
+    AscendC::Adds(dLocal, dLocal, eps, curLen);
+    AscendC::Sqrt(dLocal, dLocal, curLen);
+    AscendC::Div(dLocal, onesLocal, dLocal, curLen); // 现在dLocal为inv_rms
+
+    // 第二遍：输出 y = x * inv_rms
+    for (uint32_t c = 0; c < C; ++c) {
+      AscendC::LocalTensor<float> xLocal = queueX.AllocTensor<float>();
+      AscendC::LocalTensor<float> yLocal = queueY.AllocTensor<float>();
+      uint64_t off = static_cast<uint64_t>(bn) * C * HW + static_cast<uint64_t>(c) * HW + t;
+      AscendC::DataCopy(xLocal, xGm[off], curLen);
+      AscendC::Mul(yLocal, xLocal, dLocal, curLen);
+      queueY.EnQue<float>(yLocal);
+      queueX.FreeTensor(xLocal);
+
+      AscendC::LocalTensor<float> yOut = queueY.DeQue<float>();
+      AscendC::DataCopy(yGm[off], yOut, curLen);
+      queueY.FreeTensor(yOut);
+    }
+  }
+
+ private:
+  AscendC::TPipe pipe;
+  AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> queueX;
+  AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> queueY;
+  AscendC::TBuf<AscendC::QuePosition::VECCALC> denomBuf, tmpBuf, onesBuf;
+  AscendC::GlobalTensor<float> xGm;
+  AscendC::GlobalTensor<float> yGm;
+
+  uint32_t N = 0;
+  uint32_t C = 0;
+  uint32_t HW = 0;
+  uint32_t baseRowNum = 0;
+  uint32_t rowNumSp = 0;
+  uint32_t blockPivot = 0;
+  uint32_t tileSize = 0;
+  uint32_t tileNum = 0;
+  uint32_t myRowNum = 0;
+  uint32_t startRow = 0;
+  float eps = 1e-5f;
+};
+
+extern "C" __global__ __aicore__ void rms_norm_custom(
+    GM_ADDR x, GM_ADDR res_out, GM_ADDR workspace, GM_ADDR tiling) {
+  KernelRmsNorm op;
+  op.Init(x, res_out, tiling);
+  if (TILING_KEY_IS(1)) {
+    op.Process();
+  }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor rms_norm_impl_npu(const at::Tensor& x, double epsilon) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnRmsNormCustom, x, epsilon, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("rms_norm_custom", &rms_norm_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("rms_norm_custom", &rms_norm_impl_npu, "rms norm");
+}
+"""
+
+model_src='''
+import torch, torch_npu, custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, num_features: int, eps: float = 1e-5):
+        super(ModelNew, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.rms_norm_custom(x, self.eps)
+'''

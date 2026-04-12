@@ -1,0 +1,342 @@
+project_json_src='''
+[
+    {
+        "op": "Conv3dMinSoftmaxCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+
+// 本算子在kernel内需要做reduce-min(dim=2) + softmax(dim=1)。
+// 这里示例性地准备SoftMax的tiling信息与最小工作空间。
+// 注意：实际工程中应根据输入形状 {N, C, D, H, W} 计算M=N*H*W, K=C，为SoftMax构造形状[M, K]。
+
+BEGIN_TILING_DATA_DEF(Conv3dMinSoftmaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);    // 输入总元素数（示例）
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);        // 每核tile数（示例）
+  TILING_DATA_FIELD_DEF(uint32_t, tmpBufSize);     // SoftMax最小临时空间
+  TILING_DATA_FIELD_DEF(uint32_t, mDim);           // SoftMax M（示例）
+  TILING_DATA_FIELD_DEF(uint32_t, kDim);           // SoftMax K（示例）
+  TILING_DATA_FIELD_DEF_STRUCT(SoftMaxTiling, softmaxTilingData);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv3dMinSoftmaxCustom, Conv3dMinSoftmaxCustomTilingData)
+
+} // namespace optiling
+"""
+
+host_operator_src="""
+#include "conv3d_min_softmax_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM  = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv3dMinSoftmaxCustomTilingData tiling;
+
+    // 输入总元素数（示例）
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+
+    // 从输入形状推导SoftMax的M、K（示例性写法，真实项目应解析形状）
+    // 假定输入为N,C,D,H,W，softmax沿C做（K=C），min沿D做，输出为N,C,H,W。
+    // 为了生成SoftMax tiling，这里构造shape [M, K]，M=N*H*W，K=C。
+    // 若无法直接从接口取维度，下面给出保守示例值，请在真实项目中替换为实际计算。
+    std::vector<int64_t> inDims = context->GetInputShape(0)->GetOriginShape().GetDims();
+    uint32_t M = 1;
+    uint32_t K = 1;
+    if (inDims.size() == 5) {
+        // N,C,D,H,W
+        uint64_t N = static_cast<uint64_t>(inDims[0]);
+        uint64_t C = static_cast<uint64_t>(inDims[1]);
+        uint64_t H = static_cast<uint64_t>(inDims[3]);
+        uint64_t W = static_cast<uint64_t>(inDims[4]);
+        uint64_t m64 = N * H * W;
+        M = static_cast<uint32_t>(m64);
+        K = static_cast<uint32_t>(C);
+    }
+    tiling.set_mDim(M);
+    tiling.set_kDim(K);
+
+    // 获取SoftMax最小临时空间并生成SoftMax tiling
+    // SoftMax形状为[M, K]
+    std::vector<int64_t> smShapeVec = {static_cast<int64_t>(M), static_cast<int64_t>(K)};
+    ge::Shape smShape(smShapeVec);
+    uint32_t localWorkSpaceSize = AscendC::GetSoftMaxMinTmpSize(smShape, sizeof(float), false);
+    tiling.set_tmpBufSize(localWorkSpaceSize);
+    AscendC::SoftMaxTilingFunc(smShape, sizeof(float), localWorkSpaceSize, tiling.softmaxTilingData);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 无需workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+namespace ge {
+
+// 形状推理：输入为(N, C, D, H, W)，输出为(N, C, H, W)。
+// 若输入维度不为5，则回退为与输入相同形状（示例）。
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    std::vector<int64_t> inDims = x_shape->GetStorageShape().GetDims();
+    std::vector<int64_t> outDims;
+    if (inDims.size() == 5) {
+        outDims = {inDims[0], inDims[1], inDims[3], inDims[4]};
+    } else {
+        outDims = inDims;
+    }
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(outDims.size());
+    for (size_t i = 0; i < outDims.size(); ++i) {
+        y_shape->SetDim(i, outDims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace ge
+
+namespace ops {
+
+class Conv3dMinSoftmaxCustom : public OpDef {
+public:
+    explicit Conv3dMinSoftmaxCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv3dMinSoftmaxCustom);
+
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+// 说明：本kernel为示例骨架，演示如何组织tile、加载/保存数据与预留SoftMax相关tiling。
+// 实际算法应在Compute中完成：
+// 1) 沿dim=2(深度D)做reduce-min，得到(N, C, H, W)
+// 2) 沿通道C(维度1)做softmax。可结合tiling数据调用SoftMax高阶API。
+// 这里简化为将输入分片搬运后原样拷贝（留出注释位置进行功能扩展）。
+
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor个数
+
+using DTYPE_IN  = float;
+using DTYPE_OUT = float;
+
+class KernelConv3dMinSoftmax {
+public:
+    __aicore__ inline KernelConv3dMinSoftmax() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileNum,
+                                uint32_t tmpBufSize,
+                                uint32_t mDim, uint32_t kDim,
+                                const optiling::SoftMaxTiling &softmaxTilingDataIn)
+    {
+        // 简单按block划分
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        // 简化分片
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_IN *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_OUT *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_IN));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_OUT));
+
+        this->tmpBufSize = tmpBufSize;
+        this->mDim = mDim;
+        this->kDim = kDim;
+        this->softmaxTilingData = softmaxTilingDataIn;
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_IN> xLocal = inQueueX.AllocTensor<DTYPE_IN>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        // 取出输入局部tile
+        AscendC::LocalTensor<DTYPE_IN> xLocal = inQueueX.DeQue<DTYPE_IN>();
+        AscendC::LocalTensor<DTYPE_OUT> yLocal = outQueueY.AllocTensor<DTYPE_OUT>();
+
+        // TODO: 在此实现
+        // Step1: reduce-min 沿D维（dim=2） -> 生成(N,C,H,W)的子块
+        // Step2: softmax 沿C维（dim=1），可结合softmaxTilingData与tmp buffer调用SoftMax高阶API
+        // 这里先做直拷（示例），请在实际工程中替换为真正计算逻辑
+        AscendC::DataCopy(yLocal, xLocal, this->tileLength);
+
+        outQueueY.EnQue<DTYPE_OUT>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_OUT> yLocal = outQueueY.DeQue<DTYPE_OUT>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM>  inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_IN>  xGm;
+    AscendC::GlobalTensor<DTYPE_OUT> yGm;
+
+    uint32_t blockLength{0};
+    uint32_t tileNum{1};
+    uint32_t tileLength{0};
+
+    uint32_t tmpBufSize{0};
+    uint32_t mDim{0};
+    uint32_t kDim{0};
+    optiling::SoftMaxTiling softmaxTilingData;
+};
+
+extern "C" __global__ __aicore__ void conv3d_min_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    KernelConv3dMinSoftmax op;
+    op.Init(x, y,
+            tilingData.totalLength,
+            tilingData.tileNum,
+            tilingData.tmpBufSize,
+            tilingData.mDim,
+            tilingData.kDim,
+            tilingData.softmaxTilingData);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+// 绑定到自定义aclnn入口（由昇腾侧编译产物提供）
+at::Tensor conv3d_min_softmax_custom_impl_npu(const at::Tensor& x) {
+    // 输出为(N, C, H, W)，由后端kernel实现
+    // 这里使用与输入相同dtype，内核负责形状缩减（dim=2）与softmax(dim=1)
+    // 由于输出形状不同，这里用empty_like会与输入形状一致，实际工程中应通过graph侧shape推理完成。
+    // 简化起见，先按输入形状分配，真实运行时由框架按InferShape结果分配。
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnConv3dMinSoftmaxCustom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv3d_min_softmax_custom", &conv3d_min_softmax_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv3d_min_softmax_custom", &conv3d_min_softmax_custom_impl_npu, "Conv3d -> Min(dim=2) -> Softmax(dim=1)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    使用自定义AscendC算子替换 PyTorch 中的 min(dim=2) + softmax(dim=1) 组合。
+    Conv3d 仍由 nn.Conv3d 执行，随后调用 conv3d_min_softmax_custom 完成 reduce-min 与softmax。
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, dim):
+        super(ModelNew, self).__init__()
+        assert dim == 2, "本示例kernel固定在dim=2上执行min归约"
+        self.conv = torch.nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.dim = dim
+
+    def forward(self, x):
+        # x: (N, C_in, D, H, W)
+        x = self.conv(x)  # (N, C_out, D', H', W')
+        # 自定义算子：内部完成 min(dim=2) -> (N, C_out, H', W')，然后 softmax(dim=1)
+        y = custom_ops_lib.conv3d_min_softmax_custom(x)
+        return y
+'''

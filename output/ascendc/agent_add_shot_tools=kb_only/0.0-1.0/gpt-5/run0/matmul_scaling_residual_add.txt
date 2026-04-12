@@ -5,37 +5,7 @@ project_json_src='''
         "language": "cpp",
         "input_desc": [
             {
-                "name": "x",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "weight",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "bias",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "scale",
+                "name": "y",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -63,12 +33,12 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
-// 该文件用于注册占位 TilingData 类（不在内核侧使用），保持与工程模板一致。
-// 真正用于 Matmul 的常量 Tiling 参数在 host_operator_src 中通过 MatmulApiTiling
-// 直接写入 RawTilingData（TCubeTiling）。
+
 namespace optiling {
 BEGIN_TILING_DATA_DEF(MatmulScalingResidualAddCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, reserved);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(float, scalingFactor);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(MatmulScalingResidualAddCustom, MatmulScalingResidualAddCustomTilingData)
@@ -76,90 +46,45 @@ REGISTER_TILING_DATA_CLASS(MatmulScalingResidualAddCustom, MatmulScalingResidual
 """
 
 host_operator_src="""
-#include <cstring>
+#include "matmul_scaling_residual_add_custom_tiling.h"
 #include "register/op_def_registry.h"
 
-// AscendC Matmul Tiling 接口头文件命名在不同版本可能略有差异，
-// 这里给出常见包含，工程集成时请根据环境调整。
-#include "matmul_tiling.h"
-#include "lib/matmul_intf.h"
-#include "register/tilingdata_base.h"
-
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 输入0: x [M, K]
-    // 输入1: weight^T 或 weight(配合转置)；此处按 [K, N] 使用
-    const auto& x_shape = context->GetInputShape(0)->GetOriginShape();
-    const auto& w_shape = context->GetInputShape(1)->GetOriginShape();
+    MatmulScalingResidualAddCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
 
-    uint64_t M = 1;
-    for (size_t i = 0; i < x_shape.GetDimNum(); ++i) {
-        M *= x_shape.GetDim(i);
-    }
-    // x 是 [M, K]，w 是 [K, N]
-    // 这里简单按二维处理：M = x_shape[0], K = x_shape[1], N = w_shape[1]
-    // 若 x 为 2D，则如下：
-    if (x_shape.GetDimNum() == 2 && w_shape.GetDimNum() == 2) {
-        M = x_shape.GetDim(0);
-    }
-    const uint64_t K = (x_shape.GetDimNum() >= 2) ? x_shape.GetDim(x_shape.GetDimNum() - 1) : 1;
-    const uint64_t N = (w_shape.GetDimNum() >= 2) ? w_shape.GetDim(w_shape.GetDimNum() - 1) : 1;
-
-    // 构造 Matmul 单核 Tiling（参考文档 5.2.2.1.1/1.2）
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    matmul_tiling::MatmulApiTiling tiling(ascendcPlatform);
-    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetShape(static_cast<int64_t>(M), static_cast<int64_t>(N), static_cast<int64_t>(K));
-    tiling.SetOrgShape(static_cast<int64_t>(M), static_cast<int64_t>(N), static_cast<int64_t>(K));
-    tiling.SetBias(true);
-    tiling.SetBufferSpace(-1, -1, -1);
-
-    optiling::TCubeTiling tcube;
-    int ret = tiling.GetTiling(tcube);
-    if (ret == -1) {
-        return ge::GRAPH_FAILED;
+    // 默认从属性中读取缩放系数，若属性不存在则使用1.0f（仅残差相加等价于 scale=0）
+    float scalingFactor = 1.0f;
+    if (context->GetAttrs() != nullptr) {
+        // 若框架侧设置了名为"scaling_factor"的float属性，这里读取
+        context->GetAttrs()->GetFloat("scaling_factor", scalingFactor);
     }
 
-    // blockDim 简化设置为 1（也可根据平台信息/tiling结果设置）
-    context->SetBlockDim(1);
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_scalingFactor(scalingFactor);
 
-    // 将 TCubeTiling 直接序列化到 RawTilingData，kernel 内从 GM 读取解析（参考文档示例）
-    auto* raw = context->GetRawTilingData();
-    if (raw->GetCapacity() < sizeof(optiling::TCubeTiling)) {
-        return ge::GRAPH_FAILED;
-    }
-    std::memcpy(raw->GetData(), &tcube, sizeof(optiling::TCubeTiling));
-    raw->SetDataSize(sizeof(optiling::TCubeTiling));
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // 无额外 workspace
-    size_t* ws = context->GetWorkspaceSizes(1);
-    ws[0] = 0;
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
-
-} // namespace optiling
+}
 
 namespace ge {
-
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 输出形状为 Matmul 结果 [M, N]
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    const gert::Shape* w_shape = context->GetInputShape(1);
-    if (x_shape->GetDimNum() != 2 || w_shape->GetDimNum() != 2) {
-        return GRAPH_FAILED;
-    }
-    const int64_t M = x_shape->GetDim(0);
-    const int64_t N = w_shape->GetDim(1); // 假设 weight 传入为 [K, N]（即 Python 侧传入 weight.t()）
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    y_shape->SetDimNum(2);
-    y_shape->SetDim(0, M);
-    y_shape->SetDim(1, N);
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
     return GRAPH_SUCCESS;
 }
 
@@ -167,41 +92,20 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
-    return ge::GRAPH_SUCCESS;
+    return GRAPH_SUCCESS;
+}
 }
 
-} // namespace ge
-
 namespace ops {
-
 class MatmulScalingResidualAddCustom : public OpDef {
 public:
     explicit MatmulScalingResidualAddCustom(const char* name) : OpDef(name)
     {
-        this->Input("x")
+        this->Input("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Input("weight")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Input("bias")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Input("scale")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("z")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -210,135 +114,99 @@ public:
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore().SetTiling(optiling::TilingFunc);
+        // 可在图侧设置属性: scaling_factor
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
 
 OP_ADD(MatmulScalingResidualAddCustom);
-} // namespace ops
+}
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#include "lib/matmul_intf.h"
 
-// 融合算子：y = (x * W + bias) * (1 + scale)
-// 其中 W 在 Python 侧以转置形式传入 (weight.t())，使得 B 的形状为 [K, N]，避免在核内转置
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的Tensor数量
 
-extern "C" __global__ __aicore__ void matmul_scaling_residual_add_custom(
-    GM_ADDR xGM,          // [M, K]
-    GM_ADDR weightGM,     // [K, N] (Python 传入 weight.t())
-    GM_ADDR biasGM,       // [N]
-    GM_ADDR scaleGM,      // [1] 标量
-    GM_ADDR zGM,          // [M, N] 输出
-    GM_ADDR workspaceGM,
-    GM_ADDR tilingGM)
-{
-    // 1) 读取 Matmul 的 TCubeTiling（参考文档 5.2.1.24/5.2.1.1 示例）
-    optiling::TCubeTiling tiling;
+class KernelMatmulScalingResidualAddCustom {
+public:
+    __aicore__ inline KernelMatmulScalingResidualAddCustom() {}
+    __aicore__ inline void Init(GM_ADDR y, GM_ADDR z, float scalingFactor, uint32_t totalLength, uint32_t tileNum)
     {
-        auto tempTilingGM = (__gm__ uint32_t*)tilingGM;
-        auto tempTiling = (uint32_t*)&tiling;
-        for (int i = 0; i < (int)(sizeof(optiling::TCubeTiling) / sizeof(uint32_t)); ++i, ++tempTilingGM, ++tempTiling) {
-            *tempTiling = *tempTilingGM;
+        ASSERT(GetBlockNum() != 0 && "block dim can not be zero!");
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        ASSERT(tileNum != 0 && "tile num can not be zero!");
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->scale = scalingFactor;
+
+        yGm.SetGlobalBuffer((__gm__ DTYPE_X*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z*)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
         }
     }
 
-    // 2) 初始化 GM tensor
-    AscendC::GlobalTensor<float> aGlobal;
-    AscendC::GlobalTensor<float> bGlobal;
-    AscendC::GlobalTensor<float> cGlobal;
-    AscendC::GlobalTensor<float> biasGlobal;
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> yLocal = inQueueY.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(yLocal, yGm[progress * this->tileLength], this->tileLength);
+        inQueueY.EnQue(yLocal);
+    }
 
-    // NORMAL 布局示例中给出的尺寸计算方式
-    int32_t sizeA = tiling.ALayoutInfoB * tiling.singleCoreM * tiling.singleCoreK * sizeof(float);
-    int32_t sizeB = tiling.BLayoutInfoB * tiling.singleCoreK * tiling.singleCoreN * sizeof(float);
-    int32_t sizeC = tiling.CLayoutInfoB * tiling.singleCoreM * tiling.singleCoreN * sizeof(float);
-    int32_t sizeBias = tiling.CLayoutInfoB * tiling.singleCoreN * sizeof(float);
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE_X> yLocal = inQueueY.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
 
-    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(xGM), sizeA);
-    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(weightGM), sizeB);
-    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(zGM), sizeC); // 直接把 Matmul 输出写到 zGM
-    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(biasGM), sizeBias);
+        // 先做缩放：z = y * scale
+        AscendC::Muls(zLocal, yLocal, (DTYPE_Z)scale, this->tileLength);
+        // 再做残差相加：z = z + y  => 等价于 y * scale + y
+        AscendC::Add(zLocal, zLocal, yLocal, this->tileLength);
 
-    // 设置共享空间（示例值）
-    tiling.shareMode = 0;
-    tiling.shareL1Size = 512 * 1024;
-    tiling.shareL0CSize = 128 * 1024;
-    tiling.shareUbSize = 0;
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        inQueueY.FreeTensor(yLocal);
+    }
 
-    // 3) 定义 Matmul 类型（NORMAL 布局，float）
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> aType;
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> bType;
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> cType;
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, float> biasType;
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
+    }
 
-    // 4) 实例化 Matmul 并初始化
+private:
     AscendC::TPipe pipe;
-    g_cubeTPipePtr = &pipe;
-    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
-    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm1;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm1);
-    mm1.Init(&tiling);
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::GlobalTensor<DTYPE_X> yGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
 
-    // 5) 绑定张量与 Bias
-    AscendC::GlobalTensor<float> gm_a;
-    gm_a.SetGlobalBuffer(const_cast<__gm__ float*>(aGlobal[0].GetPhyAddr()), tiling.singleCoreM * tiling.singleCoreK);
-    AscendC::GlobalTensor<float> gm_b;
-    gm_b.SetGlobalBuffer(const_cast<__gm__ float*>(bGlobal[0].GetPhyAddr()), tiling.singleCoreK * tiling.singleCoreN);
-    AscendC::GlobalTensor<float> gm_c;
-    gm_c.SetGlobalBuffer(const_cast<__gm__ float*>(cGlobal[0].GetPhyAddr()), tiling.singleCoreM * tiling.singleCoreN);
-    AscendC::GlobalTensor<float> gm_bias;
-    gm_bias.SetGlobalBuffer(const_cast<__gm__ float*>(biasGlobal[0].GetPhyAddr()), tiling.singleCoreN);
+    float scale;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
 
-    mm1.SetTensorA(gm_a, false); // 不转置 A
-    mm1.SetTensorB(gm_b, false); // Python 侧传入 weight.t()，因此这里不再转置
-    mm1.SetWorkspace(workspaceGM, 0);
-    if (tiling.isBias) {
-        mm1.SetBias(gm_bias);
-    }
-
-    // 6) 执行单批次 Matmul
-    mm1.IterateBatch(gm_c, 1, 1, false);
-
-    // 7) 读取 scale，并做 (1 + scale) 的缩放：z = z * (1 + scale)
-    // 注意：为简化示例，这里以向量核完成标量缩放。tile 大小取一个经验值。
-    float scale_value = *reinterpret_cast<__gm__ float*>(scaleGM);
-    float factor = 1.f + scale_value;
-
-    const int32_t totalElems = tiling.CLayoutInfoB * tiling.singleCoreM * tiling.singleCoreN;
-    constexpr int32_t BUF_NUM = 2;
-    constexpr int32_t TILE_ELEMS = 1024; // 简单选取的 tile 大小
-    AscendC::TQue<AscendC::TPosition::VECIN, BUF_NUM> inQ;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUF_NUM> outQ;
-
-    pipe.InitBuffer(inQ, BUF_NUM, TILE_ELEMS * sizeof(float));
-    pipe.InitBuffer(outQ, BUF_NUM, TILE_ELEMS * sizeof(float));
-
-    int32_t offset = 0;
-    while (offset < totalElems) {
-        int32_t len = AscendC::min(TILE_ELEMS, totalElems - offset);
-
-        // CopyIn
-        auto inLocal = inQ.AllocTensor<float>();
-        AscendC::DataCopy(inLocal, gm_c[offset], len);
-        inQ.EnQue(inLocal);
-
-        // Compute
-        auto inBuf = inQ.DeQue<float>();
-        auto outLocal = outQ.AllocTensor<float>();
-        AscendC::Muls(outLocal, inBuf, factor, len); // out = in * factor
-        outQ.EnQue(outLocal);
-        inQ.FreeTensor(inBuf);
-
-        // CopyOut
-        auto outBuf = outQ.DeQue<float>();
-        AscendC::DataCopy(gm_c[offset], outBuf, len); // 就地回写到 zGM
-        outQ.FreeTensor(outBuf);
-
-        offset += len;
-    }
+extern "C" __global__ __aicore__ void matmul_scaling_residual_add_custom(GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulScalingResidualAddCustom op;
+    op.Init(y, z, tiling_data.scalingFactor, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
 }
 """
 
@@ -348,16 +216,10 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-// Python 端调用：matmul_scaling_residual_add_custom(x, weight_t, bias, scale) -> z
-// 其中 weight_t = weight.t()，避免在核内做转置
-at::Tensor matmul_scaling_residual_add_custom_impl_npu(const at::Tensor& x,
-                                                       const at::Tensor& weight_t,
-                                                       const at::Tensor& bias,
-                                                       const at::Tensor& scale) {
-    auto M = x.size(0);
-    auto N = weight_t.size(1);
-    at::Tensor result = at::empty({M, N}, x.options());
-    EXEC_NPU_CMD(aclnnMatmulScalingResidualAddCustom, x, weight_t, bias, scale, result);
+at::Tensor matmul_scaling_residual_add_custom_impl_npu(const at::Tensor& y, double scaling_factor) {
+    at::Tensor result = at::empty_like(y);
+    // 将缩放因子作为属性或参数传递给aclnn接口
+    EXEC_NPU_CMD(aclnnMatmulScalingResidualAddCustom, y, (float)scaling_factor, result);
     return result;
 }
 
@@ -366,7 +228,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_scaling_residual_add_custom", &matmul_scaling_residual_add_custom_impl_npu, "Matmul + scaling residual add");
+    m.def("matmul_scaling_residual_add_custom", &matmul_scaling_residual_add_custom_impl_npu, "y * s + y");
 }
 """
 
@@ -376,18 +238,14 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    使用自定义 AscendC 算子（MatmulScalingResidualAddCustom）替换原始的 Matmul + 缩放 + 残差加法。
-    为了避免在核内执行转置，权重在 Python 侧以 weight.t() 形式传入。
-    """
     def __init__(self, in_features, out_features, scaling_factor):
         super().__init__()
         self.matmul = torch.nn.Linear(in_features, out_features)
         self.scaling_factor = scaling_factor
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # scale 作为 1 元张量传递给算子
-        scale = torch.tensor(self.scaling_factor, dtype=x.dtype, device=x.device)
-        # 核内期望 B 为 [K, N]，因此传入 weight.t()
-        return custom_ops_lib.matmul_scaling_residual_add_custom(x, self.matmul.weight.t(), self.matmul.bias, scale)
+    def forward(self, x):
+        y = self.matmul(x)
+        # 自定义AscendC算子：y -> y * scaling_factor + y
+        z = custom_ops_lib.matmul_scaling_residual_add_custom(y, self.scaling_factor)
+        return z
 '''

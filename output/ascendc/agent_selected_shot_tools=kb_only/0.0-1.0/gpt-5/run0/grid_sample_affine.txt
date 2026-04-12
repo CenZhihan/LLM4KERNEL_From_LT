@@ -1,0 +1,343 @@
+project_json_src='''
+[
+    {
+        "op": "GridSampleAffineCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "theta",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GridSampleAffineCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, tileH);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GridSampleAffineCustom, GridSampleAffineCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "grid_sample_affine_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static const uint32_t BLOCK_DIM = 8;
+static const uint32_t TILE_H = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GridSampleAffineCustomTilingData tiling;
+
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    // Expecting x in [N, C, H, W]
+    uint32_t n = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t c = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    uint32_t h = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(2));
+    uint32_t w = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(3));
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_tileH(TILE_H);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace_sizes = context->GetWorkspaceSizes(1);
+    workspace_sizes[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GridSampleAffineCustom : public OpDef {
+public:
+    explicit GridSampleAffineCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("theta")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GridSampleAffineCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 1; // 每个队列的tensor数
+
+// 简单工具：标量floor，处理负数
+__aicore__ inline int FastFloor(float x) {
+    int xi = static_cast<int>(x);
+    return (x < static_cast<float>(xi)) ? (xi - 1) : xi;
+}
+
+class KernelGridSampleAffine {
+public:
+    __aicore__ inline KernelGridSampleAffine() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR theta, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t h, uint32_t w,
+                                uint32_t tileH)
+    {
+        this->N = n; this->C = c; this->H = h; this->W = w;
+        this->tileH = tileH;
+
+        // 划分H维到多Block
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t per = (H + blockNum - 1) / blockNum;
+        this->hStart = per * blockIdx;
+        uint32_t hEnd = hStart + per;
+        if (hEnd > H) hEnd = H;
+        this->hEnd = hEnd;
+
+        // 全局Tensor
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x, (uint64_t)N * C * H * W);
+        thetaGm.SetGlobalBuffer((__gm__ DTYPE_X*)theta, (uint64_t)N * 2 * 3);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y, (uint64_t)N * C * H * W);
+
+        // 行缓冲：两行输入 + 一行输出 + theta(6个float)
+        pipe.InitBuffer(inRow0Q, BUFFER_NUM, W * sizeof(DTYPE_X));
+        pipe.InitBuffer(inRow1Q, BUFFER_NUM, W * sizeof(DTYPE_X));
+        pipe.InitBuffer(outRowQ, BUFFER_NUM, W * sizeof(DTYPE_Y));
+        pipe.InitBuffer(thetaQ, 1, 6 * sizeof(DTYPE_X));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t n = 0; n < N; ++n) {
+            // 取该batch的theta（2x3 => 6个float）
+            AscendC::LocalTensor<DTYPE_X> thLocal = thetaQ.AllocTensor<DTYPE_X>();
+            AscendC::DataCopy(thLocal, thetaGm[n * 6], 6);
+            thetaQ.EnQue(thLocal);
+
+            // 预取theta
+            AscendC::LocalTensor<DTYPE_X> th = thetaQ.DeQue<DTYPE_X>();
+            float t00 = th[0]; float t01 = th[1]; float t02 = th[2];
+            float t10 = th[3]; float t11 = th[4]; float t12 = th[5];
+
+            for (uint32_t ho = hStart; ho < hEnd; ++ho) {
+                // 目标y方向标准化坐标（align_corners=False）
+                float yt = (2.0f * (static_cast<float>(ho) + 0.5f) / static_cast<float>(H)) - 1.0f;
+                // 通过theta得到源y的归一化坐标依赖于x,y；x在内层随w变化
+
+                for (uint32_t c = 0; c < C; ++c) {
+                    // 输出一行
+                    AscendC::LocalTensor<DTYPE_Y> outRow = outRowQ.AllocTensor<DTYPE_Y>();
+
+                    // 为了计算双线性，需要两行源数据：iy0与iy1
+                    // 先用xt=0估计ys，随后在内层随xt更新（为了简化，这里对每个w独立计算ys/ix/iy）
+                    // 行缓存按实际需要动态加载
+                    // 为减少GM访存，按通道逐行加载两行
+                    // 注意：越界行或列按0填充
+
+                    // 计算本行所有像素
+                    for (uint32_t wo = 0; wo < W; ++wo) {
+                        float xt = (2.0f * (static_cast<float>(wo) + 0.5f) / static_cast<float>(W)) - 1.0f;
+
+                        float xs = t00 * xt + t01 * yt + t02;
+                        float ys = t10 * xt + t11 * yt + t12;
+
+                        float ix = (xs + 1.0f) * 0.5f * static_cast<float>(W) - 0.5f;
+                        float iy = (ys + 1.0f) * 0.5f * static_cast<float>(H) - 0.5f;
+
+                        int ix0 = FastFloor(ix);
+                        int iy0 = FastFloor(iy);
+                        int ix1 = ix0 + 1;
+                        int iy1 = iy0 + 1;
+
+                        float wx1 = ix - static_cast<float>(ix0);
+                        float wy1 = iy - static_cast<float>(iy0);
+                        float wx0 = 1.0f - wx1;
+                        float wy0 = 1.0f - wy1;
+
+                        // 准备两行（如果需要的话）到本地UB
+                        AscendC::LocalTensor<DTYPE_X> row0 = inRow0Q.AllocTensor<DTYPE_X>();
+                        AscendC::LocalTensor<DTYPE_X> row1 = inRow1Q.AllocTensor<DTYPE_X>();
+
+                        bool row0_valid = (iy0 >= 0 && iy0 < static_cast<int>(H));
+                        bool row1_valid = (iy1 >= 0 && iy1 < static_cast<int>(H));
+
+                        if (row0_valid) {
+                            uint64_t base0 = Offset(n, c, static_cast<uint32_t>(iy0), 0);
+                            AscendC::DataCopy(row0, xGm[base0], W);
+                        } else {
+                            AscendC::Duplicate(row0, static_cast<DTYPE_X>(0), W);
+                        }
+                        if (row1_valid) {
+                            uint64_t base1 = Offset(n, c, static_cast<uint32_t>(iy1), 0);
+                            AscendC::DataCopy(row1, xGm[base1], W);
+                        } else {
+                            AscendC::Duplicate(row1, static_cast<DTYPE_X>(0), W);
+                        }
+
+                        // 列越界检查并取值
+                        float v00 = 0.f, v01 = 0.f, v10 = 0.f, v11 = 0.f;
+                        if (ix0 >= 0 && ix0 < static_cast<int>(W)) {
+                            v00 = row0[static_cast<uint32_t>(ix0)];
+                            v10 = row1[static_cast<uint32_t>(ix0)];
+                        }
+                        if (ix1 >= 0 && ix1 < static_cast<int>(W)) {
+                            v01 = row0[static_cast<uint32_t>(ix1)];
+                            v11 = row1[static_cast<uint32_t>(ix1)];
+                        }
+
+                        float val = (wy0 * (wx0 * v00 + wx1 * v01)) +
+                                    (wy1 * (wx0 * v10 + wx1 * v11));
+
+                        outRow[wo] = static_cast<DTYPE_Y>(val);
+
+                        inRow0Q.FreeTensor(row0);
+                        inRow1Q.FreeTensor(row1);
+                    } // end for wo
+
+                    // 写回该行
+                    outRowQ.EnQue(outRow);
+                    AscendC::LocalTensor<DTYPE_Y> outRowDeq = outRowQ.DeQue<DTYPE_Y>();
+                    uint64_t outBase = Offset(n, c, ho, 0);
+                    AscendC::DataCopy(yGm[outBase], outRowDeq, W);
+                    outRowQ.FreeTensor(outRowDeq);
+                } // end for c
+            } // end for ho
+
+            thetaQ.FreeTensor(th);
+        } // end for n
+    }
+
+private:
+    // NCHW布局下的全局偏移
+    __aicore__ inline uint64_t Offset(uint32_t n, uint32_t c, uint32_t h, uint32_t w) const {
+        return (((uint64_t)n * C + c) * H + h) * W + w;
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inRow0Q;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inRow1Q;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outRowQ;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> thetaQ;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_X> thetaGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t N, C, H, W;
+    uint32_t tileH;
+    uint32_t hStart, hEnd;
+};
+
+extern "C" __global__ __aicore__ void grid_sample_affine_custom(GM_ADDR x, GM_ADDR theta, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGridSampleAffine op;
+    op.Init(x, theta, y,
+            tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w,
+            tiling_data.tileH);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor grid_sample_affine_custom_impl_npu(const at::Tensor& x, const at::Tensor& theta) {
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnGridSampleAffineCustom, x, theta, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("grid_sample_affine_custom", &grid_sample_affine_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("grid_sample_affine_custom", &grid_sample_affine_custom_impl_npu, "grid_sample + affine");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, theta):
+        return custom_ops_lib.grid_sample_affine_custom(x, theta)
+'''

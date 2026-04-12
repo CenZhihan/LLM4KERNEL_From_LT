@@ -1,0 +1,37 @@
+**Exploring AscendC Implementation**
+
+I’m considering the AscendC TIK/AscendC process. The easiest approach might be to precompute a vector, `scaleVec`, using a length that’s a multiple of `innerSize`. But I wonder if I can simplify things by converting the scale to the shape N*C*H*W with hardware broadcasting in TBE. I'll need to see if AscendC supports BroadcastTo or Cast operations. 
+
+An alternative is managing tiles by groups of `innerSize`, ensuring tile lengths fit the memory pattern.**Considering Group Index Calculations**
+
+Computing group index values seems manageable since it’s based on integer division remainder at the group level, not for each element. For each group, I’ll load a tile of `innerSize` elements from `x` and divide by the scalar `scale[c]`. I can use `AscendC::Div` with a vector, `scaleLocal`, filled using the scalar repeated across `innerSize`. There's the option to fill via `AscendC::Dup` or perhaps broadcast this scalar. 
+
+To be safe, I might calculate the reciprocal of the scalar and multiply, as `AscendC::Muls` supports scalar multiplication.**Examining Division and Muls Functionality**
+
+I need to compute the reciprocal for division. This can be done using the scalar `r = 1/scale[c]` on either the host or kernel, but calculating the float reciprocal in the host isn't possible. In the kernel, I can use `1.0f / scaleValue` computed on SPM. I think scalar values should exist on the CPU side of the kernel, so I’ll use float registers in the device kernel.
+
+Then I can proceed with `AscendC::Muls(zLocal, xLocal, r, tileLength)`. It seems that `AscendC` likely provides `Muls`, considering it's a common function. If it doesn't, I can create a local vector for the denominator by duplicating the scalar with `AscendC::Dup`. Another option is to use vector division with a vector denominator, but the usual API should cover my needs.**Setting Up Tiling and Computation**
+
+I'm planning to set `z = x * (1.0f / scale[c])`, treating the `scale` as a float type. For tiling, I'll define data parameters like `N`, `C`, `innerSize`, `blockGroupNum` per core, and set `tileNum` to 8 for simplicity. Each core will compute `startGroup` based on its index and the total groups divided by the number of blocks. 
+
+I’ll use ping-pong buffering to tile among groups, copying in the tile of `x`, multiplying with the scalar, and copying out. For mapping the progress group index to the channel `c`, I'll use `c = (globalGroupIdx % (C))`. Lastly, I'll define the `DTYPE_X`, `DTYPE_Y`, and `DTYPE_Z` macros, which are common in the example code.**Implementing Kernel Structure**
+
+I’ll adopt a similar style for the kernel header that defines the `DTYPE_*` macros according to the operation's datatype. I'll need to implement the host operator for compilation, ensuring consistency in naming, like using "division_broadcast_custom_tiling.h". 
+
+For the PyTorch custom op `myops::division_broadcast_custom`, which calls `aclnnDivisionBroadcastCustom`, I'll set up the operator signature with appropriate input and output types. The tiling function will calculate total elements and capture dimensions. 
+
+To manage groups, I’ll compute where to start and end for each block, ensuring I handle groups correctly, even if some adjustments are needed later. Implementing `CopyIn` and the compute stage will require me to manage scale values from shared memory. It’s essential to carefully allocate local tensors and use the appropriate data copying techniques for efficiency. Lastly, it's crucial to compute the scale values effectively and ensure they’re loaded and processed correctly through the course of the kernel.**Refining the Kernel Implementation**
+
+I need to define `inQueueS` for the scale storage with a buffer size of 1, allowing me to pre-load the entire scale vector into local memory at once. It's manageable since I can set up `pipe.InitBuffer(scaleQueue, 1, C*sizeof(DTYPE_Y))` during initialization. In the compute phase, I will dequeue the scale pointer once and reuse it throughout the loop.
+
+To simplify things, I can create a temporary local vector for the scale and fill it with the scalar using `AscendC::Dup`. However, I'll still need to read the scale from global memory.
+
+In the `Compute` function, I'll be using the scalar for multiplication. I could opt for a vector-based approach, generating a local tensor that contains the repeated scale value, ensuring compatibility with the kernel requirements. Finally, I plan to register the operator as `division_broadcast_custom`, keeping the semantics aligned with existing functions while expanding the scale dimension as needed without heavy computation costs.**Constructing the Kernel Code**
+
+First, I need to check the C++ includes for the tiling header, which is "division_broadcast_custom_tiling.h."
+
+Now, for the `kernel_src`, I’ll base it on an example but change the operation to division, so it'll be `zLocal = xLocal / yLocal` using `AscendC::Div`. I must ensure that the kernel function name matches exactly as "division_broadcast_custom."
+
+Next, I'll create the necessary strings, ensuring consistency in the host operator types like `class DivisionBroadcastCustom` and the tiling struct as `DivisionBroadcastCustomTilingData`. I'll define the macro as `REGISTER_TILING_DATA_CLASS(DivisionBroadcastCustom, DivisionBroadcastCustomTilingData)`.
+
+Finally, I’ll craft the code output precisely using triple quotes, referencing the `custom_ops_lib` module for the model source and defining the Python operator registration correctly with `TORCH_LIBRARY_IMPL(myops, PrivateUse1...)` for the final answer.

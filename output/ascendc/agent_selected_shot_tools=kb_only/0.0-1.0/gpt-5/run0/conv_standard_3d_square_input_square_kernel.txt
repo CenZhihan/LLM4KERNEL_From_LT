@@ -1,0 +1,390 @@
+project_json_src='''
+[
+  {
+    "op": "ConvStandard3dSquareInputSquareKernelCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "w",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvStandard3dSquareInputSquareKernelCustomTilingData)
+  // Input/weight dims and derived shapes
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c_in);
+  TILING_DATA_FIELD_DEF(uint32_t, d);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, c_out);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  // Stride/pad/dilation (defaults applied in host inference: stride=1, pad=0, dil=1)
+  TILING_DATA_FIELD_DEF(uint32_t, stride);
+  TILING_DATA_FIELD_DEF(uint32_t, pad);
+  TILING_DATA_FIELD_DEF(uint32_t, dilation);
+  // Output dims
+  TILING_DATA_FIELD_DEF(uint32_t, d_out);
+  TILING_DATA_FIELD_DEF(uint32_t, h_out);
+  TILING_DATA_FIELD_DEF(uint32_t, w_out);
+  // Tiling
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvStandard3dSquareInputSquareKernelCustom, ConvStandard3dSquareInputSquareKernelCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_standard_3d_square_input_square_kernel_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static inline uint32_t floor_div(int64_t a, int64_t b) { return static_cast<uint32_t>(a / b); }
+static inline uint32_t calc_out(uint32_t in, uint32_t k, uint32_t pad, uint32_t stride, uint32_t dilation) {
+    // Standard conv output formula: floor((in + 2*pad - dilation*(k-1) - 1) / stride + 1)
+    int64_t num = static_cast<int64_t>(in) + 2LL * pad - static_cast<int64_t>(dilation) * (static_cast<int64_t>(k) - 1) - 1;
+    return static_cast<uint32_t>(num / static_cast<int64_t>(stride) + 1);
+}
+
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    auto *x_shape = context->GetInputShape(0);
+    auto *w_shape = context->GetInputShape(1);
+    const auto &x_dims = x_shape->GetOriginShape();
+    const auto &w_dims = w_shape->GetOriginShape();
+
+    // Expect shapes:
+    // x: [N, C_in, D, H, W]
+    // w: [C_out, C_in, K, K, K] (square kernel)
+    uint32_t n    = static_cast<uint32_t>(x_dims.GetDim(0));
+    uint32_t c_in = static_cast<uint32_t>(x_dims.GetDim(1));
+    uint32_t d    = static_cast<uint32_t>(x_dims.GetDim(2));
+    uint32_t h    = static_cast<uint32_t>(x_dims.GetDim(3));
+    uint32_t w    = static_cast<uint32_t>(x_dims.GetDim(4));
+
+    uint32_t c_out = static_cast<uint32_t>(w_dims.GetDim(0));
+    uint32_t k     = static_cast<uint32_t>(w_dims.GetDim(2)); // K (square)
+
+    // Defaults for stride/pad/dilation; this sample assumes stride=1, pad=0, dilation=1
+    uint32_t stride   = 1;
+    uint32_t pad      = 0;
+    uint32_t dilation = 1;
+
+    uint32_t d_out = calc_out(d, k, pad, stride, dilation);
+    uint32_t h_out = calc_out(h, k, pad, stride, dilation);
+    uint32_t w_out = calc_out(w, k, pad, stride, dilation);
+
+    ConvStandard3dSquareInputSquareKernelCustomTilingData tiling;
+    tiling.set_n(n);
+    tiling.set_c_in(c_in);
+    tiling.set_d(d);
+    tiling.set_h(h);
+    tiling.set_w(w);
+
+    tiling.set_c_out(c_out);
+    tiling.set_k(k);
+
+    tiling.set_stride(stride);
+    tiling.set_pad(pad);
+    tiling.set_dilation(dilation);
+
+    tiling.set_d_out(d_out);
+    tiling.set_h_out(h_out);
+    tiling.set_w_out(w_out);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+
+    auto x_dims = x_shape->GetOriginShape();
+    auto w_dims = w_shape->GetOriginShape();
+
+    uint32_t N    = static_cast<uint32_t>(x_dims.GetDim(0));
+    uint32_t Cin  = static_cast<uint32_t>(x_dims.GetDim(1));
+    uint32_t D    = static_cast<uint32_t>(x_dims.GetDim(2));
+    uint32_t H    = static_cast<uint32_t>(x_dims.GetDim(3));
+    uint32_t W    = static_cast<uint32_t>(x_dims.GetDim(4));
+    uint32_t Cout = static_cast<uint32_t>(w_dims.GetDim(0));
+    uint32_t K    = static_cast<uint32_t>(w_dims.GetDim(2));
+
+    // Default: stride=1, pad=0, dilation=1
+    auto calc_out = [](uint32_t in, uint32_t k, uint32_t pad, uint32_t stride, uint32_t dilation) -> uint32_t {
+        int64_t num = static_cast<int64_t>(in) + 2LL * pad - static_cast<int64_t>(dilation) * (static_cast<int64_t>(k) - 1) - 1;
+        return static_cast<uint32_t>(num / static_cast<int64_t>(stride) + 1);
+    };
+
+    uint32_t Dout = calc_out(D, K, 0, 1, 1);
+    uint32_t Hout = calc_out(H, K, 0, 1, 1);
+    uint32_t Wout = calc_out(W, K, 0, 1, 1);
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    gert::Shape newY({(int64_t)N, (int64_t)Cout, (int64_t)Dout, (int64_t)Hout, (int64_t)Wout});
+    *y_shape = newY;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class ConvStandard3dSquareInputSquareKernelCustom : public OpDef {
+public:
+    explicit ConvStandard3dSquareInputSquareKernelCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(ConvStandard3dSquareInputSquareKernelCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+constexpr int32_t BUFFER_NUM = 1; // use scalar/very small tiles per iteration
+
+class KernelConv3D {
+public:
+    __aicore__ inline KernelConv3D() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                uint32_t n, uint32_t c_in, uint32_t d, uint32_t h, uint32_t wid,
+                                uint32_t c_out, uint32_t k,
+                                uint32_t stride, uint32_t pad, uint32_t dilation,
+                                uint32_t d_out, uint32_t h_out, uint32_t w_out, uint32_t tileNum) {
+        this->n = n; this->c_in = c_in; this->d = d; this->h = h; this->wid = wid;
+        this->c_out = c_out; this->k = k;
+        this->stride = stride; this->pad = pad; this->dilation = dilation;
+        this->d_out = d_out; this->h_out = h_out; this->w_out = w_out;
+        this->tileNum = tileNum;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE*)x, (uint64_t)n * c_in * d * h * wid);
+        wGm.SetGlobalBuffer((__gm__ DTYPE*)w, (uint64_t)c_out * c_in * k * k * k);
+        yGm.SetGlobalBuffer((__gm__ DTYPE*)y, (uint64_t)n * c_out * d_out * h_out * w_out);
+
+        // Scalar-sized queues
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, sizeof(DTYPE));
+        pipe.InitBuffer(inQueueW, BUFFER_NUM, sizeof(DTYPE));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, sizeof(DTYPE));
+    }
+
+    __aicore__ inline void Process() {
+        uint64_t totalY = (uint64_t)n * c_out * d_out * h_out * w_out;
+        uint64_t blockNum = AscendC::GetBlockNum();
+        uint64_t blockIdx = AscendC::GetBlockIdx();
+        // Simple 1D partition across output elements
+        uint64_t perBlock = (totalY + blockNum - 1) / blockNum;
+        uint64_t start = blockIdx * perBlock;
+        uint64_t end = start + perBlock;
+        if (end > totalY) end = totalY;
+
+        for (uint64_t outIndex = start; outIndex < end; ++outIndex) {
+            computeOne(outIndex);
+        }
+    }
+
+private:
+    __aicore__ inline void computeOne(uint64_t outIndex) {
+        // Decode outIndex -> (n, co, od, oh, ow)
+        uint64_t ow = outIndex % w_out;
+        uint64_t tmp1 = outIndex / w_out;
+        uint64_t oh = tmp1 % h_out;
+        uint64_t tmp2 = tmp1 / h_out;
+        uint64_t od = tmp2 % d_out;
+        uint64_t tmp3 = tmp2 / d_out;
+        uint64_t co = tmp3 % c_out;
+        uint64_t nn = tmp3 / c_out;
+
+        // Local scalar accumulator
+        AscendC::LocalTensor<DTYPE> accLocal = outQueueY.AllocTensor<DTYPE>();
+        AscendC::Duplicate<DTYPE>(accLocal, static_cast<DTYPE>(0), 1);
+
+        for (uint32_t ci = 0; ci < c_in; ++ci) {
+            for (uint32_t kz = 0; kz < k; ++kz) {
+                int64_t in_d = static_cast<int64_t>(od) * stride - pad + static_cast<int64_t>(kz) * dilation;
+                if (in_d < 0 || in_d >= d) continue;
+                for (uint32_t ky = 0; ky < k; ++ky) {
+                    int64_t in_h = static_cast<int64_t>(oh) * stride - pad + static_cast<int64_t>(ky) * dilation;
+                    if (in_h < 0 || in_h >= h) continue;
+                    for (uint32_t kx = 0; kx < k; ++kx) {
+                        int64_t in_w = static_cast<int64_t>(ow) * stride - pad + static_cast<int64_t>(kx) * dilation;
+                        if (in_w < 0 || in_w >= wid) continue;
+
+                        // Load x scalar
+                        uint64_t xOffset = (((nn * c_in + ci) * d + (uint32_t)in_d) * h + (uint32_t)in_h) * wid + (uint32_t)in_w;
+                        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
+                        AscendC::DataCopy(xLocal, xGm[xOffset], 1);
+                        inQueueX.EnQue(xLocal);
+                        AscendC::LocalTensor<DTYPE> xVal = inQueueX.DeQue<DTYPE>();
+
+                        // Load w scalar
+                        uint64_t wOffset = ((((co * c_in) + ci) * k + kz) * k + ky) * k + kx;
+                        AscendC::LocalTensor<DTYPE> wLocal = inQueueW.AllocTensor<DTYPE>();
+                        AscendC::DataCopy(wLocal, wGm[wOffset], 1);
+                        inQueueW.EnQue(wLocal);
+                        AscendC::LocalTensor<DTYPE> wVal = inQueueW.DeQue<DTYPE>();
+
+                        // temp = x * w
+                        AscendC::LocalTensor<DTYPE> tmpLocal = inQueueX.AllocTensor<DTYPE>();
+                        AscendC::Mul(tmpLocal, xVal, wVal, 1);
+                        // acc += temp
+                        AscendC::Add(accLocal, accLocal, tmpLocal, 1);
+
+                        inQueueX.FreeTensor(tmpLocal);
+                        inQueueW.FreeTensor(wVal);
+                        inQueueX.FreeTensor(xVal);
+                    }
+                }
+            }
+        }
+
+        // Store acc to y
+        uint64_t yOffset = (((nn * c_out + co) * d_out + (uint32_t)od) * h_out + (uint32_t)oh) * w_out + (uint32_t)ow;
+        AscendC::DataCopy(yGm[yOffset], accLocal, 1);
+        outQueueY.FreeTensor(accLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM>  inQueueX, inQueueW;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> wGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+
+    uint32_t n, c_in, d, h, wid;
+    uint32_t c_out, k;
+    uint32_t stride, pad, dilation;
+    uint32_t d_out, h_out, w_out;
+    uint32_t tileNum;
+};
+
+extern "C" __global__ __aicore__ void conv_standard_3d_square_input_square_kernel_custom(GM_ADDR x, GM_ADDR w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(t, tiling);
+    KernelConv3D op;
+    op.Init(x, w, y,
+            t.n(), t.c_in(), t.d(), t.h(), t.w(),
+            t.c_out(), t.k(),
+            t.stride(), t.pad(), t.dilation(),
+            t.d_out(), t.h_out(), t.w_out(), t.tileNum());
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_standard_3d_square_input_square_kernel_custom_impl_npu(const at::Tensor& x, const at::Tensor& w) {
+    // Output shape follows InferShape in host operator
+    auto N = x.size(0);
+    auto C_out = w.size(0);
+    auto D = x.size(2), H = x.size(3), W = x.size(4);
+    auto K = w.size(2);
+
+    // stride=1, pad=0, dilation=1
+    auto Dout = D - K + 1;
+    auto Hout = H - K + 1;
+    auto Wout = W - K + 1;
+
+    at::Tensor y = at::empty({N, C_out, Dout, Hout, Wout}, x.options());
+    EXEC_NPU_CMD(aclnnConvStandard3dSquareInputSquareKernelCustom, x, w, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_standard_3d_square_input_square_kernel_custom", &conv_standard_3d_square_input_square_kernel_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_standard_3d_square_input_square_kernel_custom", &conv_standard_3d_square_input_square_kernel_custom_impl_npu, "3D Conv (square input/kernel)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model using custom AscendC kernel for standard 3D convolution with square input and square kernel.
+    Assumptions: stride=1, padding=0, dilation=1, groups=1, no bias (weights only).
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1, bias: bool = False):
+        super().__init__()
+        # Keep a Conv3d module only to manage parameters; forward bypasses nn.Conv3d compute
+        assert stride == 1 and padding == 0 and dilation == 1 and groups == 1, "This custom kernel currently supports stride=1, padding=0, dilation=1, groups=1."
+        assert bias is False, "This custom kernel currently does not support bias."
+        self.conv3d = torch.nn.Conv3d(in_channels, out_channels, (kernel_size, kernel_size, kernel_size), stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Call custom op: inputs are x and weight
+        return custom_ops_lib.conv_standard_3d_square_input_square_kernel_custom(x, self.conv3d.weight)
+'''

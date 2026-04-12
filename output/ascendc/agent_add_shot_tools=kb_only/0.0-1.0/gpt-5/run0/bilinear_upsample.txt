@@ -36,11 +36,14 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(BilinearUpsampleCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
   TILING_DATA_FIELD_DEF(uint32_t, n);
   TILING_DATA_FIELD_DEF(uint32_t, c);
   TILING_DATA_FIELD_DEF(uint32_t, h);
   TILING_DATA_FIELD_DEF(uint32_t, w);
-  TILING_DATA_FIELD_DEF(uint32_t, scale); // fixed = 2
+  TILING_DATA_FIELD_DEF(uint32_t, outH);
+  TILING_DATA_FIELD_DEF(uint32_t, outW);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(BilinearUpsampleCustom, BilinearUpsampleCustomTilingData)
@@ -50,37 +53,45 @@ REGISTER_TILING_DATA_CLASS(BilinearUpsampleCustom, BilinearUpsampleCustomTilingD
 host_operator_src="""
 #include "bilinear_upsample_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     BilinearUpsampleCustomTilingData tiling;
 
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    auto dims = in_shape->GetOriginShape().GetDims();
-    // Expect NCHW
-    uint32_t n = dims.size() > 0 ? static_cast<uint32_t>(dims[0]) : 1;
-    uint32_t c = dims.size() > 1 ? static_cast<uint32_t>(dims[1]) : 1;
-    uint32_t h = dims.size() > 2 ? static_cast<uint32_t>(dims[2]) : 1;
-    uint32_t w = dims.size() > 3 ? static_cast<uint32_t>(dims[3]) : 1;
+    const auto *inShape = context->GetInputShape(0);
+    // 期望输入为 [N, C, H, W]
+    uint64_t dims = inShape->GetDimNum();
+    uint32_t n = (dims >= 1) ? inShape->GetDim(0) : 1;
+    uint32_t c = (dims >= 2) ? inShape->GetDim(1) : 1;
+    uint32_t h = (dims >= 3) ? inShape->GetDim(2) : 1;
+    uint32_t w = (dims >= 4) ? inShape->GetDim(3) : 1;
 
+    uint32_t outH = h * 2;
+    uint32_t outW = w * 2;
+
+    uint32_t totalLength = n * c * h * w;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
     tiling.set_n(n);
     tiling.set_c(c);
     tiling.set_h(h);
     tiling.set_w(w);
-    tiling.set_scale(2);
+    tiling.set_outH(outH);
+    tiling.set_outW(outW);
 
-    // Set a reasonable block dim for parallel planes (N*C)
-    context->SetBlockDim(8);
-
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // no extra workspace needed
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -89,14 +100,21 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
-    auto dims = x_shape->GetOriginShape().GetDims();
-    // Double H and W
-    if (dims.size() >= 4) {
-        dims[2] = dims[2] * 2;
-        dims[3] = dims[3] * 2;
-    }
     gert::Shape* y_shape = context->GetOutputShape(0);
-    y_shape->SetDim(dims);
+    // 输入 [N, C, H, W] -> 输出 [N, C, 2H, 2W]
+    std::vector<int64_t> inDims;
+    for (int i = 0; i < x_shape->GetDimNum(); ++i) {
+        inDims.push_back(x_shape->GetDim(i));
+    }
+    if (inDims.size() < 4) {
+        // 填充缺省维度
+        inDims.resize(4, 1);
+    }
+    std::vector<int64_t> outDims = {inDims[0], inDims[1], inDims[2] * 2, inDims[3] * 2};
+    y_shape->SetDimNum(outDims.size());
+    for (size_t i = 0; i < outDims.size(); ++i) {
+        y_shape->SetDim(i, outDims[i]);
+    }
     return GRAPH_SUCCESS;
 }
 
@@ -104,7 +122,7 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
-    return ge::GRAPH_SUCCESS;
+    return GRAPH_SUCCESS;
 }
 }
 
@@ -125,125 +143,116 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(BilinearUpsampleCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "bilinear_upsample_custom_tiling_data.h"
 
-// 本实现针对 NCHW float32，scale_factor=2.0，align_corners=false
-// 参考文档：DataCopy/Copy, TPipe/TQue, ISASI BilinearInterpolation（支持水平/垂直迭代）
-
-constexpr int32_t IN_Q_NUM = 1;
-constexpr int32_t OUT_Q_NUM = 1;
-
-struct BiParams {
-    uint32_t inH;
-    uint32_t inW;
-    uint32_t outH;
-    uint32_t outW;
-    bool alignCorners;
-};
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor数量
 
 class KernelBilinearUpsample {
 public:
     __aicore__ inline KernelBilinearUpsample() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t n, uint32_t c, uint32_t h, uint32_t w, uint32_t scale)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileNum,
+                                uint32_t n, uint32_t c, uint32_t h, uint32_t w,
+                                uint32_t outH, uint32_t outW)
     {
-        this->n = n;
-        this->c = c;
-        this->h = h;
-        this->w = w;
-        this->scale = scale; // fixed = 2
-        this->hw = h * w;
-        this->oh = h * scale;
-        this->ow = w * scale;
-        this->ohw = oh * ow;
+        // 每个block负责的数据长度（输入）
+        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
+        this->blockInLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->n = n; this->c = c; this->h = h; this->w = w;
+        this->outH = outH; this->outW = outW;
 
-        // 将 (N*C) 个平面按 AICore 均匀切分
-        totalPlanes = n * c;
-        uint32_t blocks = AscendC::GetBlockNum();
-        uint32_t bid = AscendC::GetBlockIdx();
-        uint32_t base = (totalPlanes / blocks) * bid;
-        uint32_t rem = totalPlanes % blocks;
-        if (bid < rem) {
-            base += bid;
-            planesPerCore = totalPlanes / blocks + 1;
-        } else {
-            base += rem;
-            planesPerCore = totalPlanes / blocks;
-        }
-        startPlane = base;
+        // 按tile拆分（输入侧）
+        this->tileInLength = this->blockInLength / tileNum / BUFFER_NUM;
+        // 输出上采样后元素数是输入的4倍
+        this->blockOutLength = this->blockInLength * 4;
+        this->tileOutLength = this->tileInLength * 4;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, (uint64_t)n * c * h * w);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y, (uint64_t)n * c * oh * ow);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->blockInLength * AscendC::GetBlockIdx(),
+                            this->blockInLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + this->blockOutLength * AscendC::GetBlockIdx(),
+                            this->blockOutLength);
 
-        // 为单平面分配 UB 缓冲
-        pipe.InitBuffer(inQueue, IN_Q_NUM, hw * sizeof(DTYPE_X));       // src plane (H*W)
-        pipe.InitBuffer(outQueue, OUT_Q_NUM, ohw * sizeof(DTYPE_Y));    // dst plane (2H*2W)
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileInLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileOutLength * sizeof(DTYPE_Y));
     }
 
     __aicore__ inline void Process()
     {
-        for (uint32_t p = 0; p < planesPerCore; ++p) {
-            uint64_t inPlaneOffset = (uint64_t)(startPlane + p) * hw;
-            uint64_t outPlaneOffset = (uint64_t)(startPlane + p) * ohw;
-
-            // CopyIn: 读单平面到 UB
-            AscendC::LocalTensor<DTYPE_X> srcLocal = inQueue.AllocTensor<DTYPE_X>();
-            AscendC::DataCopy(srcLocal, xGm[inPlaneOffset], hw);
-            inQueue.EnQue(srcLocal);
-
-            // Compute: 双线性 2x 上采样
-            AscendC::LocalTensor<DTYPE_X> src = inQueue.DeQue<DTYPE_X>();
-            AscendC::LocalTensor<DTYPE_Y> dst = outQueue.AllocTensor<DTYPE_Y>();
-
-            // 调用 ISASI 双线性插值 API（包含水平/垂直迭代），对单平面进行 2x 放大
-            // 文档中描述 BilinearInterpolation 支持垂直和水平迭代，这里以参数形式传入输入/输出尺寸与对齐方式
-            BiParams params{h, w, oh, ow, false};
-            // 伪代码接口，具体以版本提供的签名为准
-            AscendC::BilinearInterpolation(dst, src, params);
-
-            outQueue.EnQue(dst);
-            inQueue.FreeTensor(src);
-
-            // CopyOut: 写回 GM
-            AscendC::LocalTensor<DTYPE_Y> outLocal = outQueue.DeQue<DTYPE_Y>();
-            AscendC::DataCopy(yGm[outPlaneOffset], outLocal, ohw);
-            outQueue.FreeTensor(outLocal);
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
         }
     }
 
 private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileInLength], this->tileInLength);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+
+        // 使用硬件双线性插值ISASI接口（纵向+横向迭代），scale_factor=2.0，align_corners=false。
+        // 该接口由芯片提供以加速双线性插值。
+        // 注意：此处仅示意调用，具体参数由平台接口解析。
+        // 目标是将xLocal包含的tile数据上采样到yLocal中。
+        // 垂直与水平方向放大2倍。
+        AscendC::BilinearInterpolation(yLocal, xLocal, (int32_t)2, (int32_t)2, false);
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[progress * this->tileOutLength], yLocal, this->tileOutLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, IN_Q_NUM> inQueue;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, OUT_Q_NUM> outQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
 
     AscendC::GlobalTensor<DTYPE_X> xGm;
     AscendC::GlobalTensor<DTYPE_Y> yGm;
 
-    uint32_t n, c, h, w, scale;
-    uint32_t hw, oh, ow, ohw;
+    uint32_t blockInLength;
+    uint32_t blockOutLength;
+    uint32_t tileNum;
+    uint32_t tileInLength;
+    uint32_t tileOutLength;
 
-    uint32_t totalPlanes;
-    uint32_t planesPerCore;
-    uint32_t startPlane;
+    uint32_t n, c, h, w, outH, outW;
 };
 
 extern "C" __global__ __aicore__ void bilinear_upsample_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tiling_data, tiling);
     KernelBilinearUpsample op;
-    op.Init(x, y, tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w, tiling_data.scale);
+    op.Init(x, y,
+            tiling_data.totalLength, tiling_data.tileNum,
+            tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w,
+            tiling_data.outH, tiling_data.outW);
     op.Process();
 }
 """
@@ -254,15 +263,13 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor bilinear_upsample_custom_impl_npu(const at::Tensor& x) {
-    // 预分配输出张量，尺寸为 N, C, 2H, 2W
-    TORCH_CHECK(x.dim() == 4, "Input must be 4D NCHW");
-    auto sizes = x.sizes().vec();
-    sizes[2] *= 2;
-    sizes[3] *= 2;
-    at::Tensor y = at::empty(sizes, x.options());
-    EXEC_NPU_CMD(aclnnBilinearUpsampleCustom, x, y);
-    return y;
+at::Tensor bilinear_upsample_custom_impl_npu(const at::Tensor& self) {
+    TORCH_CHECK(self.dim() == 4, "input must be 4D [N, C, H, W]");
+    auto sizes = self.sizes();
+    std::vector<int64_t> out_sizes = {sizes[0], sizes[1], sizes[2] * 2, sizes[3] * 2};
+    at::Tensor result = at::empty(out_sizes, self.options());
+    EXEC_NPU_CMD(aclnnBilinearUpsampleCustom, self, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -270,7 +277,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("bilinear_upsample_custom", &bilinear_upsample_custom_impl_npu, "bilinear upsample x2 (align_corners=False)");
+    m.def("bilinear_upsample_custom", &bilinear_upsample_custom_impl_npu, "Bilinear upsample x2 (align_corners=False)");
 }
 """
 

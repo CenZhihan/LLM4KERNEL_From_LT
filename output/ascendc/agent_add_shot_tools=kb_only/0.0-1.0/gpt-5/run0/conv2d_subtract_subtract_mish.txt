@@ -7,24 +7,28 @@ project_json_src='''
             {
                 "name": "x",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "sub1",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "sub2",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
             }
         ],
         "output_desc": [
             {
                 "name": "y",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ]
     }
@@ -38,7 +42,6 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(Conv2dSubtractSubtractMishCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(float, subAddNeg);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(Conv2dSubtractSubtractMishCustom, Conv2dSubtractSubtractMishCustomTilingData)
@@ -48,7 +51,6 @@ REGISTER_TILING_DATA_CLASS(Conv2dSubtractSubtractMishCustom, Conv2dSubtractSubtr
 host_operator_src="""
 #include "conv2d_subtract_subtract_mish_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
@@ -57,28 +59,14 @@ const uint32_t TILE_NUM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     Conv2dSubtractSubtractMishCustomTilingData tiling;
-
-    // 获取输入总长度（按扁平化计算）
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
-
-    // 读取属性：两个相减的标量
-    const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    float subtract_value_1 = *(attrs->GetAttrPointer<float>(0));
-    float subtract_value_2 = *(attrs->GetAttrPointer<float>(1));
-    float subAddNeg = -(subtract_value_1 + subtract_value_2);
-
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-    tiling.set_subAddNeg(subAddNeg);
-
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
-    // 无需workspace
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -110,25 +98,25 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
+        this->Input("sub1")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("sub2")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        // 两个标量属性
-        this->Attr("subtract_value_1")
-            .AttrType(REQUIRED)
-            .Float(0.0f);
-        this->Attr("subtract_value_2")
-            .AttrType(REQUIRED)
-            .Float(0.0f);
-
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -139,32 +127,28 @@ OP_ADD(Conv2dSubtractSubtractMishCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv2d_subtract_subtract_mish_custom_tiling_data.h"
 
-// 说明：该核将执行以下融合：y = mish(x - s1 - s2)；
-// 这里使用可用API实现近似：mish(z) ≈ z * tanh(z)
-// 依据文档：Tanh支持框架分配临时空间; Mul为基础算子; Duplicate用于填充常量
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor个数
 
-constexpr int32_t BUFFER_NUM = 2; // 每个队列的张量数
-
-class KernelConv2dSubtractSubtractMish {
+class KernelSubSubMish {
 public:
-    __aicore__ inline KernelConv2dSubtractSubtractMish() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum, float subAddNeg)
+    __aicore__ inline KernelSubSubMish() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR sub1, GM_ADDR sub2, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileNum)
     {
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
-        this->subAddNeg = subAddNeg;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ float*)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        sub1Gm.SetGlobalBuffer((__gm__ float*)sub1 + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        sub2Gm.SetGlobalBuffer((__gm__ float*)sub2 + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
-        // 计算中间缓冲：常量、减法后结果、tanh结果
-        pipe.InitBuffer(calcQueue, 3, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueS1, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueS2, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -180,67 +164,77 @@ public:
 private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::LocalTensor<float> s1Local = inQueueS1.AllocTensor<float>();
+        AscendC::LocalTensor<float> s2Local = inQueueS2.AllocTensor<float>();
+
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(s1Local, sub1Gm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(s2Local, sub2Gm[progress * this->tileLength], this->tileLength);
+
         inQueueX.EnQue(xLocal);
+        inQueueS1.EnQue(s1Local);
+        inQueueS2.EnQue(s2Local);
     }
 
     __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> s1Local = inQueueS1.DeQue<float>();
+        AscendC::LocalTensor<float> s2Local = inQueueS2.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal  = outQueueY.AllocTensor<float>();
 
-        AscendC::LocalTensor<DTYPE_X> constLocal = calcQueue.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_X> subLocal   = calcQueue.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_X> tanhLocal  = calcQueue.AllocTensor<DTYPE_X>();
+        // v = x - sub1 - sub2
+        AscendC::Sub(yLocal, xLocal, s1Local, this->tileLength);
+        AscendC::Sub(yLocal, yLocal, s2Local, this->tileLength);
 
-        // constLocal 填充为 -(s1 + s2)
-        DTYPE_X c(this->subAddNeg);
-        AscendC::Duplicate<DTYPE_X>(constLocal, c, this->tileLength);
+        // softplus(v) = ln(1 + exp(v))
+        // 使用 xLocal 作为临时: xLocal = exp(v)
+        AscendC::Exp(xLocal, yLocal, this->tileLength);
+        // xLocal = xLocal + 1.0
+        AscendC::Adds(xLocal, xLocal, 1.0f, this->tileLength);
+        // s1Local = ln(xLocal)
+        AscendC::Ln(s1Local, xLocal, this->tileLength);
+        // xLocal = tanh(softplus(v))
+        AscendC::Tanh(xLocal, s1Local, this->tileLength);
+        // y = v * tanh(softplus(v))
+        AscendC::Mul(yLocal, yLocal, xLocal, this->tileLength);
 
-        // subLocal = x + (-(s1+s2))  等价于 x - s1 - s2
-        AscendC::Add(subLocal, xLocal, constLocal, this->tileLength);
+        outQueueY.EnQue<float>(yLocal);
 
-        // tanhLocal = tanh(subLocal)
-        // 文档：Tanh可以由框架分配临时空间，直接调用 calCount 版本
-        AscendC::Tanh<DTYPE_X>(tanhLocal, subLocal, this->tileLength);
-
-        // yLocal = subLocal * tanhLocal
-        AscendC::Mul<DTYPE_X>(yLocal, subLocal, tanhLocal, this->tileLength);
-
-        outQueueY.EnQue<DTYPE_Y>(yLocal);
         inQueueX.FreeTensor(xLocal);
-        calcQueue.FreeTensor(constLocal);
-        calcQueue.FreeTensor(subLocal);
-        calcQueue.FreeTensor(tanhLocal);
+        inQueueS1.FreeTensor(s1Local);
+        inQueueS2.FreeTensor(s2Local);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
         AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueS1, inQueueS2;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 3> calcQueue;
 
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> sub1Gm;
+    AscendC::GlobalTensor<float> sub2Gm;
+    AscendC::GlobalTensor<float> yGm;
 
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
-    DTYPE_X subAddNeg;
 };
 
-extern "C" __global__ __aicore__ void conv2d_subtract_subtract_mish_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+extern "C" __global__ __aicore__ void conv2d_subtract_subtract_mish_custom(GM_ADDR x, GM_ADDR sub1, GM_ADDR sub2,
+                                                                           GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
     GET_TILING_DATA(tiling_data, tiling);
-    KernelConv2dSubtractSubtractMish op;
-    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum, (float)tiling_data.subAddNeg);
+    KernelSubSubMish op;
+    op.Init(x, sub1, sub2, y, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -251,11 +245,12 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv2d_subtract_subtract_mish_custom_impl_npu(const at::Tensor& x, double subtract_value_1, double subtract_value_2) {
-    at::Tensor y = at::empty_like(x);
-    // 执行自定义核，传入两个标量属性
-    EXEC_NPU_CMD(aclnnConv2dSubtractSubtractMishCustom, x, static_cast<float>(subtract_value_1), static_cast<float>(subtract_value_2), y);
-    return y;
+at::Tensor conv2d_subtract_subtract_mish_custom_impl_npu(const at::Tensor& x,
+                                                         const at::Tensor& sub1,
+                                                         const at::Tensor& sub2) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnConv2dSubtractSubtractMishCustom, x, sub1, sub2, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -263,31 +258,28 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv2d_subtract_subtract_mish_custom", &conv2d_subtract_subtract_mish_custom_impl_npu, "conv2d -> subtract -> subtract -> mish (fused)");
+    m.def("conv2d_subtract_subtract_mish_custom", &conv2d_subtract_subtract_mish_custom_impl_npu,
+          "conv2d_subtract_subtract_mish_custom");
 }
 """
 
 model_src='''
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch_npu
 import custom_ops_lib
 
-class ModelNew(nn.Module):
-    """
-    使用自定义AscendC核，将 conv2d 之后的两次减法与Mish近似激活融合为一个算子：
-    y ≈ (x - s1 - s2) * tanh(x - s1 - s2)
-    """
+class ModelNew(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2):
         super(ModelNew, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size)
         self.subtract_value_1 = float(subtract_value_1)
         self.subtract_value_2 = float(subtract_value_2)
 
     def forward(self, x):
         x = self.conv(x)
-        # 调用自定义融合算子（对conv输出进行两次标量减法 + Mish近似）
-        x = custom_ops_lib.conv2d_subtract_subtract_mish_custom(x, self.subtract_value_1, self.subtract_value_2)
-        return x
+        # 将标量扩展为与x同形状的张量，便于在自定义核中进行逐元素运算
+        sub1 = torch.full_like(x, self.subtract_value_1)
+        sub2 = torch.full_like(x, self.subtract_value_2)
+        y = custom_ops_lib.conv2d_subtract_subtract_mish_custom(x, sub1, sub2)
+        return y
 '''

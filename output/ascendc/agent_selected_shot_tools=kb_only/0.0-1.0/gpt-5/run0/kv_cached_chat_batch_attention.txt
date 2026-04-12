@@ -1,0 +1,374 @@
+project_json_src='''
+[
+    {
+        "op": "KvCachedChatBatchAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "k",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "o",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(KvCachedChatBatchAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, qLen);
+  TILING_DATA_FIELD_DEF(uint32_t, kvLen);
+  TILING_DATA_FIELD_DEF(uint32_t, dModel);
+  TILING_DATA_FIELD_DEF(uint32_t, tileD);
+  TILING_DATA_FIELD_DEF(uint32_t, tileKV);
+  TILING_DATA_FIELD_DEF(float, invSqrtD);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(KvCachedChatBatchAttentionCustom, KvCachedChatBatchAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "kv_cached_chat_batch_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <cmath>
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    KvCachedChatBatchAttentionCustomTilingData tiling;
+
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    // Expect shape: [B, qLen, D]
+    uint32_t batch = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(0));
+    uint32_t qLen   = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(1));
+    uint32_t dModel = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(2));
+
+    const gert::Shape* k_shape = context->GetInputShape(1);
+    // Expect shape: [B, kvLen, D]
+    uint32_t kvLen  = static_cast<uint32_t>(k_shape->GetOriginShape().GetDim(1));
+
+    // Simple tiling setup
+    uint32_t tileD  = 256;  // vector tile along feature dim
+    uint32_t tileKV = 64;   // rows of K/V per iteration
+
+    float invSqrtD = 1.0f / std::sqrt(static_cast<float>(dModel));
+
+    // Set block dim: each block handles one batch if possible
+    uint32_t blockDim = batch > 0 ? batch : 1;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_batch(batch);
+    tiling.set_qLen(qLen);
+    tiling.set_kvLen(kvLen);
+    tiling.set_dModel(dModel);
+    tiling.set_tileD(tileD);
+    tiling.set_tileKV(tileKV);
+    tiling.set_invSqrtD(invSqrtD);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // Workspace: store exp(scores) per sequence for one batch element
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = static_cast<size_t>(kvLen) * sizeof(float);
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    gert::Shape* o_shape = context->GetOutputShape(0);
+    *o_shape = *q_shape; // output same shape as Q
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class KvCachedChatBatchAttentionCustom : public OpDef {
+public:
+    explicit KvCachedChatBatchAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("k")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("v")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("o")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(KvCachedChatBatchAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelKvCachedChatBatchAttention {
+public:
+    __aicore__ inline KernelKvCachedChatBatchAttention() {}
+
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o,
+                                GM_ADDR workspace,
+                                uint32_t batch, uint32_t qLen, uint32_t kvLen, uint32_t dModel,
+                                uint32_t tileD, uint32_t tileKV, float invSqrtD)
+    {
+        this->batch = batch;
+        this->qLen = qLen;
+        this->kvLen = kvLen;
+        this->dModel = dModel;
+        this->tileD = tileD;
+        this->tileKV = tileKV;
+        this->invSqrtD = invSqrtD;
+
+        uint32_t bIdx = AscendC::GetBlockIdx();
+        // Base offsets per batch
+        uint64_t qOffset = static_cast<uint64_t>(bIdx) * qLen * dModel;
+        uint64_t kOffset = static_cast<uint64_t>(bIdx) * kvLen * dModel;
+        uint64_t vOffset = static_cast<uint64_t>(bIdx) * kvLen * dModel;
+        uint64_t oOffset = static_cast<uint64_t>(bIdx) * qLen * dModel;
+
+        qGm.SetGlobalBuffer((__gm__ DTYPE*)q + qOffset, qLen * dModel);
+        kGm.SetGlobalBuffer((__gm__ DTYPE*)k + kOffset, kvLen * dModel);
+        vGm.SetGlobalBuffer((__gm__ DTYPE*)v + vOffset, kvLen * dModel);
+        oGm.SetGlobalBuffer((__gm__ DTYPE*)o + oOffset, qLen * dModel);
+        scoreWorkspace.SetGlobalBuffer((__gm__ DTYPE*)workspace + static_cast<uint64_t>(bIdx) * kvLen, kvLen);
+
+        // Queues
+        pipe.InitBuffer(inQueueQ, BUFFER_NUM, dModel * sizeof(DTYPE));
+        pipe.InitBuffer(inQueueK, BUFFER_NUM, dModel * sizeof(DTYPE));
+        pipe.InitBuffer(inQueueV, BUFFER_NUM, dModel * sizeof(DTYPE));
+        pipe.InitBuffer(outQueueO, BUFFER_NUM, dModel * sizeof(DTYPE));
+        pipe.InitBuffer(workQueue, 1, 64 * sizeof(DTYPE)); // temporary workspace for reductions
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Assume qLen == 1 for autoregressive decoding; general qLen supported by looping.
+        for (uint32_t qIdx = 0; qIdx < qLen; ++qIdx) {
+            ComputeOneQuery(qIdx);
+        }
+    }
+
+private:
+    __aicore__ inline void ComputeOneQuery(uint32_t qIdx)
+    {
+        // Load Q vector (length dModel)
+        AscendC::LocalTensor<DTYPE> qLocal = inQueueQ.AllocTensor<DTYPE>();
+        AscendC::DataCopy(qLocal, qGm[qIdx * dModel], dModel);
+        inQueueQ.EnQue(qLocal);
+        qLocal = inQueueQ.DeQue<DTYPE>();
+
+        // First pass: compute exp(scores) and accumulate sumExp
+        DTYPE sumExpScalar = static_cast<DTYPE>(0.0f);
+
+        // Temporary local buffers
+        AscendC::LocalTensor<DTYPE> kLocal = inQueueK.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<DTYPE> mulLocal = inQueueK.AllocTensor<DTYPE>(); // reuse queue memory for temp mul
+        AscendC::LocalTensor<DTYPE> redWork = workQueue.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<DTYPE> scalarBuf = outQueueO.AllocTensor<DTYPE>(); // 1-element buffer used as scalar
+        // We will only touch first element of scalarBuf as scalar storage.
+
+        for (uint32_t i = 0; i < kvLen; ++i) {
+            // load K[i, :]
+            AscendC::DataCopy(kLocal, kGm[i * dModel], dModel);
+            // elementwise multiply
+            AscendC::Mul(mulLocal, qLocal, kLocal, dModel);
+            // reduce sum to scalar
+            // ReduceSum(dst, src, workLocal, length, /*is_5d*/ false)
+            AscendC::ReduceSum<DTYPE>(scalarBuf, mulLocal, redWork, dModel, false);
+            // scale by 1/sqrt(d)
+            scalarBuf.SetValue(0, scalarBuf.GetValue(0) * invSqrtD);
+            // exp
+            AscendC::Exp(scalarBuf, scalarBuf, 1);
+            // write to workspace and accumulate sum
+            DTYPE e = scalarBuf.GetValue(0);
+            scoreWorkspace.SetValue(i, e);
+            sumExpScalar += e;
+        }
+
+        // Second pass: output = sum_i softmax_i * V[i]
+        AscendC::LocalTensor<DTYPE> oLocal = outQueueO.AllocTensor<DTYPE>();
+        // zero init
+        AscendC::Duplicate(oLocal, static_cast<DTYPE>(0.0f), dModel);
+
+        for (uint32_t i = 0; i < kvLen; ++i) {
+            // prob = exp(score_i) / sumExp
+            DTYPE prob = scoreWorkspace.GetValue(i) / sumExpScalar;
+
+            // load V[i, :]
+            AscendC::LocalTensor<DTYPE> vLocal = inQueueV.AllocTensor<DTYPE>();
+            AscendC::DataCopy(vLocal, vGm[i * dModel], dModel);
+
+            // scale V by prob and accumulate
+            // Create a local vector filled with prob
+            AscendC::LocalTensor<DTYPE> probVec = inQueueV.AllocTensor<DTYPE>();
+            AscendC::Duplicate(probVec, prob, dModel);
+
+            AscendC::Mul(probVec, vLocal, probVec, dModel);
+            AscendC::Add(oLocal, oLocal, probVec, dModel);
+
+            inQueueV.FreeTensor(vLocal);
+            inQueueV.FreeTensor(probVec);
+        }
+
+        // write output
+        outQueueO.EnQue<DTYPE>(oLocal);
+        AscendC::LocalTensor<DTYPE> oWrite = outQueueO.DeQue<DTYPE>();
+        AscendC::DataCopy(oGm[qIdx * dModel], oWrite, dModel);
+        outQueueO.FreeTensor(oWrite);
+
+        // free
+        inQueueQ.FreeTensor(qLocal);
+        inQueueK.FreeTensor(kLocal);
+        inQueueK.FreeTensor(mulLocal);
+        workQueue.FreeTensor(redWork);
+        outQueueO.FreeTensor(scalarBuf);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueQ;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueK;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueV;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueO;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> workQueue;
+
+    AscendC::GlobalTensor<DTYPE> qGm, kGm, vGm, oGm;
+    AscendC::GlobalTensor<DTYPE> scoreWorkspace;
+
+    uint32_t batch;
+    uint32_t qLen;
+    uint32_t kvLen;
+    uint32_t dModel;
+    uint32_t tileD;
+    uint32_t tileKV;
+    float invSqrtD;
+};
+
+extern "C" __global__ __aicore__ void kv_cached_chat_batch_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelKvCachedChatBatchAttention op;
+    op.Init(q, k, v, o,
+            workspace,
+            tiling_data.batch, tiling_data.qLen, tiling_data.kvLen, tiling_data.dModel,
+            tiling_data.tileD, tiling_data.tileKV, tiling_data.invSqrtD);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor kv_cached_chat_batch_attention_custom_impl_npu(const at::Tensor& Q, const at::Tensor& K, const at::Tensor& V) {
+    TORCH_CHECK(Q.sizes().size() == 3, "Q must be 3D [B, q_len, D]");
+    TORCH_CHECK(K.sizes().size() == 3, "K must be 3D [B, kv_len, D]");
+    TORCH_CHECK(V.sizes().size() == 3, "V must be 3D [B, kv_len, D]");
+    TORCH_CHECK(Q.size(0) == K.size(0) && Q.size(0) == V.size(0), "Batch dims must match");
+    TORCH_CHECK(Q.size(2) == K.size(2) && V.size(2) == K.size(2), "Feature dims must match");
+
+    at::Tensor result = at::empty_like(Q);
+    EXEC_NPU_CMD(aclnnKvCachedChatBatchAttentionCustom, Q, K, V, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("kv_cached_chat_batch_attention_custom", &kv_cached_chat_batch_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("kv_cached_chat_batch_attention_custom", &kv_cached_chat_batch_attention_custom_impl_npu, "Scaled Dot-Product Attention with KV Cache (q_len small)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, Q, K_cache, V_cache):
+        return custom_ops_lib.kv_cached_chat_batch_attention_custom(Q, K_cache, V_cache)
+'''

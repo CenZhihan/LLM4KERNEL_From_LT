@@ -46,8 +46,11 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(Densenet201CustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, lenX);
-  TILING_DATA_FIELD_DEF(uint32_t, lenY);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c0);
+  TILING_DATA_FIELD_DEF(uint32_t, c1);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
@@ -59,36 +62,35 @@ host_operator_src="""
 #include "densenet201_custom_tiling.h"
 #include "register/op_def_registry.h"
 
-namespace {
-inline uint64_t ShapeSize(const gert::Shape& s) {
-    uint64_t size = 1;
-    for (int i = 0; i < s.GetDimNum(); ++i) {
-        size *= static_cast<uint64_t>(s.GetDim(i));
-    }
-    return size;
-}
-}
-
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
 const uint32_t TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    const gert::Shape* xShape = context->GetInputShape(0);
-    const gert::Shape* yShape = context->GetInputShape(1);
+    // 输入0和输入1形状：NCHW
+    const gert::Shape* in0 = context->GetInputShape(0);
+    const gert::Shape* in1 = context->GetInputShape(1);
+    auto s0 = in0->GetOriginShape();
+    auto s1 = in1->GetOriginShape();
 
-    uint32_t lenX = static_cast<uint32_t>(ShapeSize(xShape->GetOriginShape()));
-    uint32_t lenY = static_cast<uint32_t>(ShapeSize(yShape->GetOriginShape()));
+    // 读取维度
+    uint32_t n = static_cast<uint32_t>(s0.GetDim(0));
+    uint32_t c0 = static_cast<uint32_t>(s0.GetDim(1));
+    uint32_t h = static_cast<uint32_t>(s0.GetDim(2));
+    uint32_t w = static_cast<uint32_t>(s0.GetDim(3));
+    uint32_t c1 = static_cast<uint32_t>(s1.GetDim(1));
 
     Densenet201CustomTilingData tiling;
-    context->SetBlockDim(BLOCK_DIM);
-    tiling.set_lenX(lenX);
-    tiling.set_lenY(lenY);
+    tiling.set_n(n);
+    tiling.set_c0(c0);
+    tiling.set_c1(c1);
+    tiling.set_h(h);
+    tiling.set_w(w);
     tiling.set_tileNum(TILE_NUM);
 
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
-                        context->GetRawTilingData()->GetCapacity());
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
@@ -100,31 +102,22 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* xShape = context->GetInputShape(0);
-    const gert::Shape* yShape = context->GetInputShape(1);
-    gert::Shape* zShape = context->GetOutputShape(0);
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* y_shape = context->GetInputShape(1);
 
-    // 期望输入都是4D NCHW，通道拼接：C_out = Cx + Cy
-    auto xDimNum = xShape->GetDimNum();
-    auto yDimNum = yShape->GetDimNum();
-    if (xDimNum != yDimNum || (xDimNum != 4 && xDimNum != 3 && xDimNum != 2 && xDimNum != 1)) {
-        // 简化处理：若维度不同，回传输入0形状
-        *zShape = *xShape;
-        return GRAPH_SUCCESS;
-    }
-    std::vector<int64_t> outDims(xDimNum, 0);
-    for (int i = 0; i < xDimNum; ++i) {
-        outDims[i] = xShape->GetDim(i);
-    }
-    if (xDimNum >= 2) {
-        // 以第1维为通道维（NCHW/NCH/NC/N）
-        outDims[1] = xShape->GetDim(1) + yShape->GetDim(1);
-        // 其他维度按输入0
-    }
-    zShape->SetDimNum(xDimNum);
-    for (int i = 0; i < xDimNum; ++i) {
-        zShape->SetDim(i, outDims[i]);
-    }
+    // 输出维度：N, Cx+Cy, H, W
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    auto xos = x_shape->GetOriginShape();
+    auto yos = y_shape->GetOriginShape();
+
+    std::vector<int64_t> out_dims(4);
+    out_dims[0] = xos.GetDim(0);
+    out_dims[1] = xos.GetDim(1) + yos.GetDim(1);
+    out_dims[2] = xos.GetDim(2);
+    out_dims[3] = xos.GetDim(3);
+
+    z_shape->SetOriginShape(out_dims);
+    z_shape->SetStorageShape(out_dims);
     return GRAPH_SUCCESS;
 }
 
@@ -158,7 +151,9 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -169,111 +164,101 @@ OP_ADD(Densenet201Custom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "densenet201_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // 队列中本地tensor个数
+// 基于NCHW按通道拼接：z = concat(x, y) on dim=1
+// 假设输入输出均为float32 ND，连续存储
+
+constexpr int32_t BUFFER_NUM = 2;
 
 class KernelConcatC {
 public:
     __aicore__ inline KernelConcatC() {}
 
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z,
-                                uint32_t lenX, uint32_t lenY, uint32_t tileNum)
+                                uint32_t n, uint32_t c0, uint32_t c1, uint32_t h, uint32_t w,
+                                uint32_t tileNum)
     {
-        this->lenX = lenX;
-        this->lenY = lenY;
+        this->n = n;
+        this->c0 = c0;
+        this->c1 = c1;
+        this->h = h;
+        this->w = w;
         this->tileNum = tileNum;
+
+        this->xBatchSize = static_cast<uint64_t>(c0) * h * w;
+        this->yBatchSize = static_cast<uint64_t>(c1) * h * w;
+        this->zBatchSize = static_cast<uint64_t>(c0 + c1) * h * w;
+
+        // 每批按元素tile，粗略划分
+        uint64_t perBatch = zBatchSize;
+        uint64_t denom = static_cast<uint64_t>(tileNum) * BUFFER_NUM;
+        this->tileLen = static_cast<uint32_t>((perBatch + denom - 1) / denom);
+        if (this->tileLen == 0) this->tileLen = 1;
 
         uint32_t blockNum = AscendC::GetBlockNum();
         uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->nStart = (static_cast<uint64_t>(n) * blockIdx) / blockNum;
+        this->nEnd   = (static_cast<uint64_t>(n) * (blockIdx + 1)) / blockNum;
+        this->localN = (nEnd > nStart) ? (nEnd - nStart) : 0;
 
-        this->blockLenX = lenX / blockNum;
-        this->blockLenY = lenY / blockNum;
-        uint32_t xOffset = this->blockLenX * blockIdx;
-        uint32_t yOffset = this->blockLenY * blockIdx;
-        uint32_t zOffset = (this->blockLenX + this->blockLenY) * blockIdx;
+        // 绑定GM起始地址到本核片段
+        xGm.SetGlobalBuffer((__gm__ float *)x + nStart * xBatchSize, localN * xBatchSize);
+        yGm.SetGlobalBuffer((__gm__ float *)y + nStart * yBatchSize, localN * yBatchSize);
+        zGm.SetGlobalBuffer((__gm__ float *)z + nStart * zBatchSize, localN * zBatchSize);
 
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x) + xOffset, this->blockLenX);
-        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(y) + yOffset, this->blockLenY);
-        zGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(z) + zOffset, this->blockLenX + this->blockLenY);
-
-        this->tileLenX = this->blockLenX / (this->tileNum * BUFFER_NUM);
-        this->tileLenY = this->blockLenY / (this->tileNum * BUFFER_NUM);
-
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLenX * sizeof(float));
-        pipe.InitBuffer(inQueueY, BUFFER_NUM, this->tileLenY * sizeof(float));
+        pipe.InitBuffer(inQueue, BUFFER_NUM, this->tileLen * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        // 先拷贝X到Z前半部分
-        int32_t loopX = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopX; ++i) {
-            CopyInX(i);
-            ComputeX(i);
-        }
-        // 再拷贝Y到Z后半部分
-        int32_t loopY = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopY; ++i) {
-            CopyInY(i);
-            ComputeY(i);
+        for (uint64_t b = 0; b < localN; ++b) {
+            // 1) 拷贝x到z（每批的前c0*h*w段）
+            CopyContiguous(xGm, b * xBatchSize, zGm, b * zBatchSize, xBatchSize);
+            // 2) 拷贝y到z（每批的后c1*h*w段）
+            CopyContiguous(yGm, b * yBatchSize, zGm, b * zBatchSize + xBatchSize, yBatchSize);
         }
     }
 
 private:
-    __aicore__ inline void CopyInX(int32_t progress)
+    __aicore__ inline void CopyContiguous(AscendC::GlobalTensor<float>& srcGm, uint64_t srcOff,
+                                          AscendC::GlobalTensor<float>& dstGm, uint64_t dstOff,
+                                          uint64_t totalElems)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLenX], this->tileLenX);
-        inQueueX.EnQue(xLocal);
-    }
+        uint64_t copied = 0;
+        while (copied < totalElems) {
+            uint32_t curr = static_cast<uint32_t>(AscendC::min<uint64_t>(tileLen, totalElems - copied));
+            AscendC::LocalTensor<float> buf = inQueue.AllocTensor<float>();
+            AscendC::DataCopy(buf, srcGm[srcOff + copied], curr);
+            inQueue.EnQue(buf);
 
-    __aicore__ inline void ComputeX(int32_t progress)
-    {
-        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
-        // 直接将本地块写到Z的对应位置（前半段）
-        AscendC::DataCopy(zGm[progress * this->tileLenX], xLocal, this->tileLenX);
-        inQueueX.FreeTensor(xLocal);
-    }
+            AscendC::LocalTensor<float> buf2 = inQueue.DeQue<float>();
+            AscendC::DataCopy(dstGm[dstOff + copied], buf2, curr);
+            inQueue.FreeTensor(buf2);
 
-    __aicore__ inline void CopyInY(int32_t progress)
-    {
-        AscendC::LocalTensor<float> yLocal = inQueueY.AllocTensor<float>();
-        AscendC::DataCopy(yLocal, yGm[progress * this->tileLenY], this->tileLenY);
-        inQueueY.EnQue(yLocal);
-    }
-
-    __aicore__ inline void ComputeY(int32_t progress)
-    {
-        AscendC::LocalTensor<float> yLocal = inQueueY.DeQue<float>();
-        // 写到Z的后半段，起始偏移为blockLenX
-        AscendC::DataCopy(zGm[this->blockLenX + progress * this->tileLenY], yLocal, this->tileLenY);
-        inQueueY.FreeTensor(yLocal);
+            copied += curr;
+        }
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueue;
 
     AscendC::GlobalTensor<float> xGm;
     AscendC::GlobalTensor<float> yGm;
     AscendC::GlobalTensor<float> zGm;
 
-    uint32_t lenX;
-    uint32_t lenY;
-    uint32_t tileNum;
-    uint32_t blockLenX;
-    uint32_t blockLenY;
-    uint32_t tileLenX;
-    uint32_t tileLenY;
+    uint32_t n, c0, c1, h, w, tileNum;
+    uint64_t xBatchSize, yBatchSize, zBatchSize;
+    uint32_t tileLen;
+    uint64_t nStart, nEnd, localN;
 };
 
 extern "C" __global__ __aicore__ void densenet201_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelConcatC op;
-    op.Init(x, y, z, tiling_data.lenX, tiling_data.lenY, tiling_data.tileNum);
+    op.Init(x, y, z,
+            tiling_data.n, tiling_data.c0, tiling_data.c1, tiling_data.h, tiling_data.w,
+            tiling_data.tileNum);
     op.Process();
 }
 """
@@ -285,82 +270,87 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor densenet201_custom_impl_npu(const at::Tensor& x, const at::Tensor& y) {
-    // 输出形状：(N, Cx+Cy, H, W)
-    auto outSizes = x.sizes().vec();
-    if (outSizes.size() >= 2) {
-        outSizes[1] = x.size(1) + y.size(1);
-    }
-    at::Tensor result = at::empty(outSizes, x.options());
+    // 假设输入为NCHW，float32，且两者N/H/W一致，C按通道拼接
+    TORCH_CHECK(x.dtype() == at::kFloat, \"x must be float32\");
+    TORCH_CHECK(y.dtype() == at::kFloat, \"y must be float32\");
+    TORCH_CHECK(x.dim() == 4 && y.dim() == 4, \"x and y must be 4D NCHW\");
+    TORCH_CHECK(x.size(0) == y.size(0) && x.size(2) == y.size(2) && x.size(3) == y.size(3),
+                \"x and y must have same N,H,W\");
+
+    auto sizes = x.sizes().vec();
+    sizes[1] = x.size(1) + y.size(1);
+    at::Tensor result = at::empty(sizes, x.options());
     EXEC_NPU_CMD(aclnnDensenet201Custom, x, y, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("densenet201_custom", &densenet201_custom_impl_npu);
+    m.impl(\"densenet201_custom\", &densenet201_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("densenet201_custom", &densenet201_custom_impl_npu, "Concat along channel for DenseNet");
+    m.def(\"densenet201_custom\", &densenet201_custom_impl_npu, \"Concat along C for DenseNet\");
 }
 """
 
 model_src='''
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch_npu
 import custom_ops_lib
 
-class DenseBlockNew(torch.nn.Module):
+class DenseBlockNew(nn.Module):
     def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
         super(DenseBlockNew, self).__init__()
         layers = []
         for i in range(num_layers):
             layers.append(self._make_layer(num_input_features + i * growth_rate, growth_rate))
-        self.layers = torch.nn.ModuleList(layers)
+        self.layers = nn.ModuleList(layers)
 
     def _make_layer(self, in_features: int, growth_rate: int):
-        return torch.nn.Sequential(
-            torch.nn.BatchNorm2d(in_features),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
-            torch.nn.Dropout(0.0)
+        return nn.Sequential(
+            nn.BatchNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
+            nn.Dropout(0.0)
         )
 
     def forward(self, x):
-        # 使用自定义AscendC算子进行通道拼接，替换torch.cat(features, 1)
+        # 逐层拼接：x_{k+1} = concat(x_k, new_feature_k) 沿通道维度
         for layer in self.layers:
             new_feature = layer(x)
             x = custom_ops_lib.densenet201_custom(x, new_feature)
         return x
 
-class TransitionLayer(torch.nn.Module):
+class TransitionLayer(nn.Module):
     def __init__(self, num_input_features: int, num_output_features: int):
         super(TransitionLayer, self).__init__()
-        self.transition = torch.nn.Sequential(
-            torch.nn.BatchNorm2d(num_input_features),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False),
-            torch.nn.AvgPool2d(kernel_size=2, stride=2)
+        self.transition = nn.Sequential(
+            nn.BatchNorm2d(num_input_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False),
+            nn.AvgPool2d(kernel_size=2, stride=2)
         )
 
     def forward(self, x):
         return self.transition(x)
 
-class ModelNew(torch.nn.Module):
+class ModelNew(nn.Module):
     def __init__(self, growth_rate: int = 32, num_classes: int = 1000):
         super(ModelNew, self).__init__()
-
-        self.features = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
-            torch.nn.BatchNorm2d(64),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         )
 
         num_features = 64
         block_layers = [6, 12, 48, 32]
 
-        self.dense_blocks = torch.nn.ModuleList()
-        self.transition_layers = torch.nn.ModuleList()
+        self.dense_blocks = nn.ModuleList()
+        self.transition_layers = nn.ModuleList()
 
         for i, num_layers in enumerate(block_layers):
             block = DenseBlockNew(num_layers=num_layers, num_input_features=num_features, growth_rate=growth_rate)
@@ -372,20 +362,18 @@ class ModelNew(torch.nn.Module):
                 self.transition_layers.append(transition)
                 num_features = num_features // 2
 
-        self.final_bn = torch.nn.BatchNorm2d(num_features)
-        self.classifier = torch.nn.Linear(num_features, num_classes)
+        self.final_bn = nn.BatchNorm2d(num_features)
+        self.classifier = nn.Linear(num_features, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
-
         for i, block in enumerate(self.dense_blocks):
             x = block(x)
             if i != len(self.dense_blocks) - 1:
                 x = self.transition_layers[i](x)
-
         x = self.final_bn(x)
-        x = torch.relu(x)
-        x = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+        x = F.relu(x, inplace=True)
+        x = F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
         x = self.classifier(x)
         return x
 '''

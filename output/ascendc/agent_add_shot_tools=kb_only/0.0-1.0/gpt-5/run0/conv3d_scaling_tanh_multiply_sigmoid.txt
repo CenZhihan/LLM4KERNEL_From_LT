@@ -15,7 +15,7 @@ project_json_src='''
                 ]
             },
             {
-                "name": "scale",
+                "name": "scale_nc",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -25,7 +25,7 @@ project_json_src='''
                 ]
             },
             {
-                "name": "mulbias",
+                "name": "bias_nc",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -53,61 +53,58 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
-#include "tiling/platform/platform_ascendc.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(Conv3dScalingTanhMultiplySigmoidCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(uint32_t, tmpBufferSize);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);   // N*C*D*H*W
+  TILING_DATA_FIELD_DEF(uint32_t, innerSize);     // D*H*W
+  TILING_DATA_FIELD_DEF(uint32_t, pairCount);     // N*C
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);       // reserved
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(Conv3dScalingTanhMultiplySigmoidCustom, Conv3dScalingTanhMultiplySigmoidCustomTilingData)
-} // namespace optiling
+}
 """
 
 host_operator_src="""
 #include "conv3d_scaling_tanh_multiply_sigmoid_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/platform/platform_ascendc.h"
 
 namespace optiling {
+static const uint32_t BLOCK_DIM = 8;
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 从输入张量形状获取总元素数
-    const auto *in_shape = context->GetInputShape(0);
-    uint32_t totalLength = static_cast<uint32_t>(in_shape->GetOriginShape().GetShapeSize());
-
-    // 获取平台信息以便设置block dim和临时缓冲大小
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    uint64_t ubSize = 0;
-    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
-
-    // 简化策略：固定blockDim为8，tileNum为8；临时缓冲给出可用UB大小
-    const uint32_t BLOCK_DIM = 8;
-    const uint32_t TILE_NUM = 8;
-
     Conv3dScalingTanhMultiplySigmoidCustomTilingData tiling;
-    context->SetBlockDim(BLOCK_DIM);
+
+    // x: shape [N, C, D, H, W] -> totalLength
+    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+    // scale_nc: shape [N, C] -> pairCount
+    uint32_t pairCount = static_cast<uint32_t>(context->GetInputShape(1)->GetOriginShape().GetShapeSize());
+
+    // innerSize = (D*H*W) = totalLength / (N*C)
+    uint32_t innerSize = (pairCount == 0) ? 0 : (totalLength / pairCount);
+
     tiling.set_totalLength(totalLength);
-    tiling.set_tileNum(TILE_NUM);
-    tiling.set_tmpBufferSize(static_cast<uint32_t>(ubSize));
+    tiling.set_pairCount(pairCount);
+    tiling.set_innerSize(innerSize);
+    tiling.set_tileNum(0); // not used in kernel, reserved
+
+    context->SetBlockDim(BLOCK_DIM);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // 无需workspace
-    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
-    workspaceSizes[0] = 0;
+    size_t *workspaceSize = context->GetWorkspaceSizes(1);
+    workspaceSize[0] = 0; // no workspace
 
     return ge::GRAPH_SUCCESS;
 }
-} // namespace optiling
+}
 
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 输出形状与输入x一致
     const gert::Shape* x_shape = context->GetInputShape(0);
     gert::Shape* y_shape = context->GetOutputShape(0);
     *y_shape = *x_shape;
@@ -119,7 +116,7 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
     context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
-} // namespace ge
+}
 
 namespace ops {
 class Conv3dScalingTanhMultiplySigmoidCustom : public OpDef {
@@ -131,12 +128,12 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("scale")
+        this->Input("scale_nc")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("mulbias")
+        this->Input("bias_nc")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -148,61 +145,51 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(Conv3dScalingTanhMultiplySigmoidCustom);
-} // namespace ops
+}
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv3d_scaling_tanh_multiply_sigmoid_custom_tiling_data.h"
 
-// 简化演示：使用float类型
-#define DTYPE_X float
-#define DTYPE_S float
-#define DTYPE_B float
-#define DTYPE_Y float
+constexpr int32_t BUFFER_NUM = 2; // double buffer
 
-constexpr int32_t BUFFER_NUM = 2; // 双缓冲
-
-// 该算子对输入x执行：y = sigmoid( tanh(x * scale) * mulbias )
-// 注：scale与mulbias在Python侧已expand为与x同形状，便于向量化计算。
-// 参考文档中共享临时缓冲(sharedTmpBuffer)用法，供Tanh/Sigmoid等数学库API内部使用。
 class KernelConv3dScalingTanhMultiplySigmoid {
 public:
     __aicore__ inline KernelConv3dScalingTanhMultiplySigmoid() {}
-
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR scale, GM_ADDR mulbias, GM_ADDR y,
-                                uint32_t totalLength, uint32_t tileNum, uint32_t tmpBufferSize)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR scale_nc, GM_ADDR bias_nc, GM_ADDR y,
+                                uint32_t totalLength, uint32_t innerSize, uint32_t pairCount)
     {
-        this->blockLength = totalLength / AscendC::GetBlockNum();
-        this->tileNum = tileNum;
-        // 以BUFFER_NUM分块，保证每个tile大小
-        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->innerSize = innerSize;
+        this->pairCount = pairCount;
+        this->blockLength = (AscendC::GetBlockNum() == 0) ? totalLength : (totalLength / AscendC::GetBlockNum());
+        this->pairsPerBlock = (innerSize == 0) ? 0 : (this->blockLength / innerSize);
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        sGm.SetGlobalBuffer((__gm__ DTYPE_S *)scale + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        bGm.SetGlobalBuffer((__gm__ DTYPE_B *)mulbias + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        // Global buffer binding
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x) + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(y) + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        scaleNcGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scale_nc), this->pairCount);
+        biasNcGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(bias_nc), this->pairCount);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(inQueueS, BUFFER_NUM, this->tileLength * sizeof(DTYPE_S));
-        pipe.InitBuffer(inQueueB, BUFFER_NUM, this->tileLength * sizeof(DTYPE_B));
-        pipe.InitBuffer(midQueue1, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y)); // 中间缓冲
-        pipe.InitBuffer(midQueue2, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y)); // 中间缓冲
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
-        // 共享临时缓冲，用于数学库内部临时数据（参考高阶API示例）
-        pipe.InitBuffer(tmpQueue, BUFFER_NUM, tmpBufferSize);
+        // Queues for tiles (each tile = one (N,C) pair of size innerSize)
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->innerSize * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->innerSize * sizeof(float));
+
+        // Queues for scalar loads (scale and bias per (N,C) pair)
+        pipe.InitBuffer(inQueueScale, BUFFER_NUM, sizeof(float));
+        pipe.InitBuffer(inQueueBias,  BUFFER_NUM, sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; i++) {
+        // Each iteration processes one (N,C) pair segment of length innerSize
+        for (uint32_t i = 0; i < this->pairsPerBlock; ++i) {
             CopyIn(i);
             Compute(i);
             CopyOut(i);
@@ -210,92 +197,134 @@ public:
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress)
+    __aicore__ inline void CopyIn(uint32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_S> sLocal = inQueueS.AllocTensor<DTYPE_S>();
-        AscendC::LocalTensor<DTYPE_B> bLocal = inQueueB.AllocTensor<DTYPE_B>();
+        // Load X tile
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->innerSize], this->innerSize);
 
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
-        AscendC::DataCopy(sLocal, sGm[progress * this->tileLength], this->tileLength);
-        AscendC::DataCopy(bLocal, bGm[progress * this->tileLength], this->tileLength);
+        // Load corresponding scale and bias scalars for the (N,C) pair
+        AscendC::LocalTensor<float> scaleLocal = inQueueScale.AllocTensor<float>();
+        AscendC::LocalTensor<float> biasLocal  = inQueueBias.AllocTensor<float>();
+
+        uint64_t globalPairStart = (static_cast<uint64_t>(this->blockLength) * AscendC::GetBlockIdx()) / this->innerSize;
+        uint64_t pairIndex = globalPairStart + progress;
+
+        AscendC::DataCopy(scaleLocal, scaleNcGm[pairIndex], 1);
+        AscendC::DataCopy(biasLocal,  biasNcGm[pairIndex],  1);
 
         inQueueX.EnQue(xLocal);
-        inQueueS.EnQue(sLocal);
-        inQueueB.EnQue(bLocal);
+        inQueueScale.EnQue(scaleLocal);
+        inQueueBias.EnQue(biasLocal);
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/)
+    __aicore__ inline void Compute(uint32_t /*progress*/)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_S> sLocal = inQueueS.DeQue<DTYPE_S>();
-        AscendC::LocalTensor<DTYPE_B> bLocal = inQueueB.DeQue<DTYPE_B>();
+        AscendC::LocalTensor<float> xLocal     = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> scaleLocal = inQueueScale.DeQue<float>();
+        AscendC::LocalTensor<float> biasLocal  = inQueueBias.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal     = outQueueY.AllocTensor<float>();
 
-        AscendC::LocalTensor<uint8_t> sharedTmpBuffer = tmpQueue.AllocTensor<uint8_t>();
+        // Read scalar values from local tensors
+        // Assuming LocalTensor supports direct pointer access via GetValue-like interface.
+        // If not, toolchain will map the first element to a scalar register as parameter.
+        float s = *reinterpret_cast<float *>(scaleLocal.GetPhyAddr());
+        float b = *reinterpret_cast<float *>(biasLocal.GetPhyAddr());
 
-        // mid1 = x * scale
-        AscendC::LocalTensor<DTYPE_Y> mid1 = midQueue1.AllocTensor<DTYPE_Y>();
-        AscendC::Mul(mid1, xLocal, sLocal, this->tileLength);
-        AscendC::PipeBarrier<PIPE_V>();
+        // u = x * s
+        AscendC::LocalTensor<float> uLocal = tmpVec.AllocTensor<float>();
+        AscendC::Muls(uLocal, xLocal, s);
 
-        // mid2 = tanh(mid1)
-        AscendC::LocalTensor<DTYPE_Y> mid2 = midQueue2.AllocTensor<DTYPE_Y>();
-        AscendC::Tanh<DTYPE_Y, false>(mid2, mid1, sharedTmpBuffer, this->tileLength);
-        AscendC::PipeBarrier<PIPE_V>();
-        midQueue1.FreeTensor(mid1);
+        // Compute tanh(u) = (exp(2u)-1)/(exp(2u)+1)
+        AscendC::LocalTensor<float> twouLocal = tmpVec.AllocTensor<float>();
+        AscendC::Muls(twouLocal, uLocal, 2.0f);
 
-        // mid1(reuse) = mid2 * bLocal
-        AscendC::LocalTensor<DTYPE_Y> mid3 = midQueue1.AllocTensor<DTYPE_Y>();
-        AscendC::Mul(mid3, mid2, bLocal, this->tileLength);
-        AscendC::PipeBarrier<PIPE_V>();
-        midQueue2.FreeTensor(mid2);
+        AscendC::LocalTensor<float> e2uLocal = tmpVec.AllocTensor<float>();
+        AscendC::Exp(e2uLocal, twouLocal);
 
-        // y = sigmoid(mid3)
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
-        AscendC::Sigmoid<DTYPE_Y, false>(yLocal, mid3, sharedTmpBuffer, this->tileLength);
-        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        AscendC::LocalTensor<float> numLocal = tmpVec.AllocTensor<float>();
+        AscendC::LocalTensor<float> denLocal = tmpVec.AllocTensor<float>();
+        // numerator = e2u - 1
+        AscendC::Sub(numLocal, e2uLocal, 1.0f);
+        // denominator = e2u + 1
+        AscendC::Add(denLocal, e2uLocal, 1.0f);
 
-        // 释放
-        midQueue1.FreeTensor(mid3);
+        AscendC::LocalTensor<float> tanhLocal = tmpVec.AllocTensor<float>();
+        AscendC::Div(tanhLocal, numLocal, denLocal);
+
+        // v = tanh(u) * b
+        AscendC::LocalTensor<float> vLocal = tmpVec.AllocTensor<float>();
+        AscendC::Muls(vLocal, tanhLocal, b);
+
+        // sigmoid(v) = 1 / (1 + exp(-v))
+        AscendC::LocalTensor<float> negLocal = tmpVec.AllocTensor<float>();
+        AscendC::Muls(negLocal, vLocal, -1.0f);
+
+        AscendC::LocalTensor<float> expNegLocal = tmpVec.AllocTensor<float>();
+        AscendC::Exp(expNegLocal, negLocal);
+
+        AscendC::LocalTensor<float> onePlusLocal = tmpVec.AllocTensor<float>();
+        AscendC::Add(onePlusLocal, expNegLocal, 1.0f);
+
+        AscendC::Reciprocal(yLocal, onePlusLocal);
+
+        outQueueY.EnQue<float>(yLocal);
+
+        // Free inputs and temporaries
         inQueueX.FreeTensor(xLocal);
-        inQueueS.FreeTensor(sLocal);
-        inQueueB.FreeTensor(bLocal);
-        tmpQueue.FreeTensor(sharedTmpBuffer);
+        inQueueScale.FreeTensor(scaleLocal);
+        inQueueBias.FreeTensor(biasLocal);
+
+        tmpVec.FreeTensor(uLocal);
+        tmpVec.FreeTensor(twouLocal);
+        tmpVec.FreeTensor(e2uLocal);
+        tmpVec.FreeTensor(numLocal);
+        tmpVec.FreeTensor(denLocal);
+        tmpVec.FreeTensor(tanhLocal);
+        tmpVec.FreeTensor(vLocal);
+        tmpVec.FreeTensor(negLocal);
+        tmpVec.FreeTensor(expNegLocal);
+        tmpVec.FreeTensor(onePlusLocal);
     }
 
-    __aicore__ inline void CopyOut(int32_t progress)
+    __aicore__ inline void CopyOut(uint32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::DataCopy(yGm[progress * this->innerSize], yLocal, this->innerSize);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueS;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueB;
-    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> midQueue1;
-    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> midQueue2;
-    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> inQueueScale;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> inQueueBias;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 12> tmpVec; // temporary vectors
 
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_S> sGm;
-    AscendC::GlobalTensor<DTYPE_B> bGm;
-    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+    AscendC::GlobalTensor<float> scaleNcGm;
+    AscendC::GlobalTensor<float> biasNcGm;
 
+    uint32_t innerSize;
+    uint32_t pairCount;
     uint32_t blockLength;
-    uint32_t tileNum;
-    uint32_t tileLength;
+    uint32_t pairsPerBlock;
 };
 
-extern "C" __global__ __aicore__ void conv3d_scaling_tanh_multiply_sigmoid_custom(
-    GM_ADDR x, GM_ADDR scale, GM_ADDR mulbias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void conv3d_scaling_tanh_multiply_sigmoid_custom(GM_ADDR x,
+                                                                                   GM_ADDR scale_nc,
+                                                                                   GM_ADDR bias_nc,
+                                                                                   GM_ADDR y,
+                                                                                   GM_ADDR workspace,
+                                                                                   GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelConv3dScalingTanhMultiplySigmoid op;
-    op.Init(x, scale, mulbias, y, tiling_data.totalLength, tiling_data.tileNum, tiling_data.tmpBufferSize);
+    op.Init(x, scale_nc, bias_nc, y,
+            tiling_data.totalLength,
+            tiling_data.innerSize,
+            tiling_data.pairCount);
     op.Process();
 }
 """
@@ -306,11 +335,12 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv3d_scaling_tanh_multiply_sigmoid_custom_impl_npu(
-    const at::Tensor& x, const at::Tensor& scale, const at::Tensor& mulbias) {
-    at::Tensor result = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnConv3dScalingTanhMultiplySigmoidCustom, x, scale, mulbias, result);
-    return result;
+at::Tensor conv3d_scaling_tanh_multiply_sigmoid_custom_impl_npu(const at::Tensor& x,
+                                                                const at::Tensor& scale_nc,
+                                                                const at::Tensor& bias_nc) {
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnConv3dScalingTanhMultiplySigmoidCustom, x, scale_nc, bias_nc, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -318,9 +348,8 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv3d_scaling_tanh_multiply_sigmoid_custom",
-          &conv3d_scaling_tanh_multiply_sigmoid_custom_impl_npu,
-          "y = sigmoid(tanh(x * scale) * mulbias)");
+    m.def("conv3d_scaling_tanh_multiply_sigmoid_custom", &conv3d_scaling_tanh_multiply_sigmoid_custom_impl_npu,
+          "fused: scale -> tanh -> bias -> sigmoid on 3D conv output");
 }
 """
 
@@ -331,19 +360,23 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    使用自定义AscendC算子优化：对Conv3d输出执行 y = sigmoid(tanh(x * scale) * mulbias)
+    Fused kernel after Conv3d: y = sigmoid( bias * tanh( scale * x ) )
+    scale_nc and bias_nc are prepared as [N, C] to avoid large broadcast.
     """
     def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape):
-        super(ModelNew, self).__init__()
+        super().__init__()
         self.conv = torch.nn.Conv3d(in_channels, out_channels, kernel_size)
-        # 与原模型一致：逐通道缩放与逐通道乘性“bias”（形状[C,1,1,1]）
+        # Parameters keep original shapes (C,1,1,1)
         self.scaling_factor = torch.nn.Parameter(torch.randn(bias_shape))
         self.bias = torch.nn.Parameter(torch.randn(bias_shape))
 
     def forward(self, x):
-        x = self.conv(x)
-        # 展开为与x同形状，便于核内向量化（广播在Python侧完成）
-        scale_b = self.scaling_factor.expand_as(x)
-        bias_b = self.bias.expand_as(x)
-        return custom_ops_lib.conv3d_scaling_tanh_multiply_sigmoid_custom(x, scale_b, bias_b)
+        x = self.conv(x)  # [N, C, D, H, W]
+        n, c, d, h, w = x.shape
+        # Prepare per-(N,C) scalars: [N, C]
+        scale_nc = self.scaling_factor.view(1, c).expand(n, c).contiguous()
+        bias_nc  = self.bias.view(1, c).expand(n, c).contiguous()
+        # Call fused custom kernel
+        y = custom_ops_lib.conv3d_scaling_tanh_multiply_sigmoid_custom(x, scale_nc, bias_nc)
+        return y
 '''

@@ -1,0 +1,280 @@
+project_json_src='''
+[
+    {
+        "op": "NearestNeighborUpsampleCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(NearestNeighborUpsampleCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, scale);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(NearestNeighborUpsampleCustom, NearestNeighborUpsampleCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "nearest_neighbor_upsample_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    NearestNeighborUpsampleCustomTilingData tiling;
+
+    auto inShape = context->GetInputShape(0)->GetOriginShape();
+    uint32_t n = static_cast<uint32_t>(inShape.GetDim(0));
+    uint32_t c = static_cast<uint32_t>(inShape.GetDim(1));
+    uint32_t h = static_cast<uint32_t>(inShape.GetDim(2));
+    uint32_t w = static_cast<uint32_t>(inShape.GetDim(3));
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_scale(4);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    // scale H and W by 4
+    y_shape->SetDim(2, x_shape->GetDim(2) * 4);
+    y_shape->SetDim(3, x_shape->GetDim(3) * 4);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class NearestNeighborUpsampleCustom : public OpDef {
+public:
+    explicit NearestNeighborUpsampleCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(NearestNeighborUpsampleCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2; // number of local buffers for pipeline
+
+class KernelNearestNeighborUpsample {
+public:
+    __aicore__ inline KernelNearestNeighborUpsample() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t h, uint32_t w,
+                                uint32_t scale, uint32_t tileNum)
+    {
+        this->n = n;
+        this->c = c;
+        this->h = h;
+        this->w = w;
+        this->scale = scale;
+        this->hout = h * scale;
+        this->wout = w * scale;
+
+        uint64_t totalOutLength = (uint64_t)n * c * this->hout * this->wout;
+        uint64_t totalInLength  = (uint64_t)n * c * h * w;
+
+        this->blockOutLength = totalOutLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockOutLength / tileNum / BUFFER_NUM;
+
+        // Input is read-only; set base to the beginning of the tensor
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, totalInLength);
+        // Output is partitioned by block
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y + this->blockOutLength * AscendC::GetBlockIdx(), this->blockOutLength);
+
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            ComputeAndStore(i);
+        }
+    }
+
+private:
+    __aicore__ inline void ComputeAndStore(int32_t progress)
+    {
+        uint64_t tileBase = (uint64_t)progress * this->tileLength;
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+
+        uint64_t blockBase = (uint64_t)this->blockOutLength * AscendC::GetBlockIdx();
+
+        for (uint64_t j = 0; j < this->tileLength; ++j) {
+            uint64_t outIdxGlobal = blockBase + tileBase + j;
+
+            uint64_t wOutIdx = outIdxGlobal % this->wout;
+            uint64_t tmp0 = outIdxGlobal / this->wout;
+            uint64_t hOutIdx = tmp0 % this->hout;
+            uint64_t tmp1 = tmp0 / this->hout;
+            uint64_t cIdx = tmp1 % this->c;
+            uint64_t nIdx = tmp1 / this->c;
+
+            uint64_t hInIdx = hOutIdx / this->scale;
+            uint64_t wInIdx = wOutIdx / this->scale;
+
+            uint64_t inIdx = (((nIdx * (uint64_t)this->c + cIdx) * (uint64_t)this->h + hInIdx) * (uint64_t)this->w + wInIdx);
+
+            AscendC::DataCopy(zLocal[j], xGm[inIdx], 1);
+        }
+
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+
+        AscendC::LocalTensor<DTYPE_Z> zLocalOut = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[tileBase], zLocalOut, this->tileLength);
+        outQueueZ.FreeTensor(zLocalOut);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    uint32_t n;
+    uint32_t c;
+    uint32_t h;
+    uint32_t w;
+    uint32_t scale;
+    uint32_t hout;
+    uint32_t wout;
+
+    uint64_t blockOutLength;
+    uint32_t tileNum;
+    uint64_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void nearest_neighbor_upsample_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelNearestNeighborUpsample op;
+    op.Init(x, y,
+            tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w,
+            tiling_data.scale, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor nearest_neighbor_upsample_custom_impl_npu(const at::Tensor& self) {
+    TORCH_CHECK(self.dim() == 4, \"Input must be a 4D tensor: NCHW\");
+    auto sizes = self.sizes();
+    const int64_t n = sizes[0];
+    const int64_t c = sizes[1];
+    const int64_t h = sizes[2];
+    const int64_t w = sizes[3];
+    const int64_t scale = 4;
+    std::vector<int64_t> out_sizes = {n, c, h * scale, w * scale};
+
+    at::Tensor result = at::empty(out_sizes, self.options());
+    EXEC_NPU_CMD(aclnnNearestNeighborUpsampleCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"nearest_neighbor_upsample_custom\", &nearest_neighbor_upsample_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"nearest_neighbor_upsample_custom\", &nearest_neighbor_upsample_custom_impl_npu, \"Nearest neighbor upsample x4\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x):
+        return custom_ops_lib.nearest_neighbor_upsample_custom(x)
+'''

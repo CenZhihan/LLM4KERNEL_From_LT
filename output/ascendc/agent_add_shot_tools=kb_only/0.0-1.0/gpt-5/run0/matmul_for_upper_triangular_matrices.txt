@@ -5,7 +5,7 @@ project_json_src='''
         "language": "cpp",
         "input_desc": [
             {
-                "name": "x",
+                "name": "A",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -15,7 +15,7 @@ project_json_src='''
                 ]
             },
             {
-                "name": "y",
+                "name": "B",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -27,7 +27,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "z",
+                "name": "C",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -42,42 +42,57 @@ project_json_src='''
 '''
 
 host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+// 这里定义一个占位的 TilingData 类以完成注册（实际我们会在 TilingFunc 中直接写入 TCubeTiling 的原始字节）
+BEGIN_TILING_DATA_DEF(MatmulForUpperTriangularMatricesCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, place_holder);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulForUpperTriangularMatricesCustom, MatmulForUpperTriangularMatricesCustomTilingData)
+} // namespace optiling
+"""
+
+host_operator_src="""
 #include <cstring>
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
+#include "register/tilingdata_base.h"
+#include "tiling/platform/platform_ascendc.h"
+
+// Matmul tiling APIs
+#include "matmul_tiling/matmul_api.h"
 
 namespace optiling {
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // Read input shapes (assume square matrices N x N)
-    const gert::Shape* aShape = context->GetInputShape(0);
-    const gert::Shape* bShape = context->GetInputShape(1);
-    if (aShape->GetOriginShape().GetDimNum() != 2 || bShape->GetOriginShape().GetDimNum() != 2) {
+    // 获取输入形状（假设 A、B 为 [N, N]）
+    const gert::Shape* a_shape = context->GetInputShape(0);
+    const gert::Shape* b_shape = context->GetInputShape(1);
+    if (a_shape == nullptr || b_shape == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    int64_t M = aShape->GetOriginShape().GetDim(0);
-    int64_t K = aShape->GetOriginShape().GetDim(1);
-    int64_t K2 = bShape->GetOriginShape().GetDim(0);
-    int64_t N = bShape->GetOriginShape().GetDim(1);
-    if (K != K2) {
+    int64_t M = a_shape->GetOriginShape().GetDim(0);
+    int64_t K = a_shape->GetOriginShape().GetDim(1);
+    int64_t Kb = b_shape->GetOriginShape().GetDim(0);
+    int64_t N = b_shape->GetOriginShape().GetDim(1);
+    // 简单健壮性检查
+    if (M <= 0 || N <= 0 || K <= 0 || K != Kb) {
         return ge::GRAPH_FAILED;
     }
 
-    // Build tiling using Matmul tiling API
+    // 使用 Ascend C 的单核 Matmul tiling（示例化）
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
-    tiling.SetDim(1); // default, will be updated by tiling result
+    matmul_tiling::MatmulApiTiling tiling(ascendcPlatform);
     tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
     tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
     tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
     tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    // Shapes
-    tiling.SetShape((uint32_t)M, (uint32_t)N, (uint32_t)K);
-    tiling.SetSingleShape((uint32_t)M, (uint32_t)N, (uint32_t)K);
-    tiling.SetOrgShape((uint32_t)M, (uint32_t)N, (uint32_t)K);
+    tiling.SetShape(static_cast<int32_t>(M), static_cast<int32_t>(N), static_cast<int32_t>(K));
+    tiling.SetOrgShape(static_cast<int32_t>(M), static_cast<int32_t>(N), static_cast<int32_t>(K)); // Ka=Kb=K
     tiling.SetBias(false);
-    tiling.SetBufferSpace(-1, -1, -1);
+    tiling.SetBufferSpace(-1, -1, -1); // 默认使用可用空间
 
     optiling::TCubeTiling tilingData;
     int ret = tiling.GetTiling(tilingData);
@@ -85,68 +100,63 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         return ge::GRAPH_FAILED;
     }
 
-    // Set block dim suggested by tiling
-    context->SetBlockDim(tiling.GetCoreNum());
+    // 设置 blockDim（单核示例设置为 1；若使用 MultiCoreMatmulTiling，可获取真实 core 数）
+    context->SetBlockDim(1);
 
-    // Serialize TCubeTiling directly to raw buffer
-    auto raw = context->GetRawTilingData();
-    if (raw->GetCapacity() < sizeof(optiling::TCubeTiling)) {
-        return ge::GRAPH_FAILED;
-    }
-    std::memcpy(raw->GetData(), &tilingData, sizeof(optiling::TCubeTiling));
-    raw->SetDataSize(sizeof(optiling::TCubeTiling));
+    // 传递 TCubeTiling 原始数据给 Kernel
+    auto* raw = context->GetRawTilingData();
+    std::memcpy(raw->GetData(), &tilingData, sizeof(tilingData));
+    raw->SetDataSize(sizeof(tilingData));
 
-    // No extra workspace
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+    // workspace（此处无需额外 workspace，设置为 0）
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
 
     return ge::GRAPH_SUCCESS;
 }
 
 } // namespace optiling
 
+
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* aShape = context->GetInputShape(0);
-    const gert::Shape* bShape = context->GetInputShape(1);
-    if (aShape->GetOriginShape().GetDimNum() != 2 || bShape->GetOriginShape().GetDimNum() != 2) {
+    // C 的形状为 [M, N]
+    const gert::Shape* a_shape = context->GetInputShape(0);
+    const gert::Shape* b_shape = context->GetInputShape(1);
+    if (a_shape == nullptr || b_shape == nullptr) {
         return GRAPH_FAILED;
     }
-    // Matmul [M,K] x [K,N] -> [M,N]
-    int64_t M = aShape->GetOriginShape().GetDim(0);
-    int64_t N = bShape->GetOriginShape().GetDim(1);
-    gert::Shape* outShape = context->GetOutputShape(0);
-    outShape->GetOriginShape().SetDimNum(2);
-    outShape->GetOriginShape().SetDim(0, M);
-    outShape->GetOriginShape().SetDim(1, N);
+    gert::Shape* c_shape = context->GetOutputShape(0);
+    *c_shape = gert::Shape({a_shape->GetOriginShape().GetDim(0), b_shape->GetOriginShape().GetDim(1)});
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
+    // 输出 dtype 与输入 A 一致（float）
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
-    return GRAPH_SUCCESS;
+    return ge::GRAPH_SUCCESS;
 }
 } // namespace ge
+
 
 namespace ops {
 class MatmulForUpperTriangularMatricesCustom : public OpDef {
 public:
     explicit MatmulForUpperTriangularMatricesCustom(const char* name) : OpDef(name)
     {
-        this->Input("x")
+        this->Input("A")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("y")
+        this->Input("B")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("z")
+        this->Output("C")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -154,19 +164,14 @@ public:
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(MatmulForUpperTriangularMatricesCustom);
 } // namespace ops
-"""
-
-host_operator_src="""
-#include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
-
-// Declaration only; implementation placed in host_tiling_src to avoid duplication.
 """
 
 kernel_src="""
@@ -175,47 +180,58 @@ kernel_src="""
 
 extern "C" __global__ __aicore__ void matmul_for_upper_triangular_matrices_custom(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
 {
-    // Load TCubeTiling data from GM
-    optiling::TCubeTiling tiling;
-    auto src = reinterpret_cast<__gm__ uint32_t*>(tilingGM);
-    auto dst = reinterpret_cast<uint32_t*>(&tiling);
-    for (uint32_t i = 0; i < sizeof(optiling::TCubeTiling) / sizeof(uint32_t); ++i) {
-        dst[i] = src[i];
+    // 类型定义：均为 float
+    typedef float A_T;
+    typedef float B_T;
+    typedef float C_T;
+
+    // 读取主机侧传入的 TCubeTiling
+    TCubeTiling tiling;
+    {
+        auto tempTilingGM = (__gm__ uint32_t*)tilingGM;
+        auto tempTiling = (uint32_t*)&tiling;
+        for (int i = 0; i < (int)(sizeof(TCubeTiling) / sizeof(uint32_t)); ++i, ++tempTilingGM, ++tempTiling) {
+            *tempTiling = *tempTilingGM;
+        }
     }
 
-    // Define Matmul types: A/B/C are float ND in GM
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NONE> aType;
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NONE> bType;
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NONE> cType;
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float> biasType;
+    // 准备 GM Tensor（按单核整矩阵计算）
+    AscendC::GlobalTensor<A_T> aGlobal;
+    AscendC::GlobalTensor<B_T> bGlobal;
+    AscendC::GlobalTensor<C_T> cGlobal;
 
-    // Init GM tensors (size params are not strictly used by the MM runtime here)
-    AscendC::GlobalTensor<float> aGlobal;
-    AscendC::GlobalTensor<float> bGlobal;
-    AscendC::GlobalTensor<float> cGlobal;
-    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(aGM), 0);
-    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(bGM), 0);
-    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(cGM), 0);
+    // A: [M, K], B: [K, N], C: [M, N]
+    int32_t M = tiling.M;
+    int32_t N = tiling.N;
+    int32_t K = tiling.Ka; // Ka == Kb == K
 
-    // Create and register Matmul instance
-    matmul::Matmul<aType, bType, cType, biasType> mm;
-    AscendC::TPipe pipe;
-    g_cubeTPipePtr = &pipe;
+    int64_t sizeA = static_cast<int64_t>(M) * static_cast<int64_t>(K);
+    int64_t sizeB = static_cast<int64_t>(K) * static_cast<int64_t>(N);
+    int64_t sizeC = static_cast<int64_t>(M) * static_cast<int64_t>(N);
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(aGM), sizeA);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(bGM), sizeB);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(cGM), sizeC);
+
+    // Matmul 类型定义（ND 布局）
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, false, LayoutMode::NORMAL> bType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+
+    // 构造 Matmul 对象并注册
+    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+    matmul::Matmul<aType, bType, cType, void, MM_CFG> mm;
+
+    TPipe pipe;
     REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
-    mm.Init(&tiling);
 
-    // Bind inputs; no transpose, no bias
-    mm.SetTensorA(aGlobal[0], false);
-    mm.SetTensorB(bGlobal[0], false);
+    // 初始化并设置输入输出
+    mm.Init(&tiling);
+    mm.SetTensorA(aGlobal, 0); // 不转置
+    mm.SetTensorB(bGlobal, 0); // 不转置
     mm.SetWorkspace(workspaceGM, 0);
 
-    // Single compute (non-batch)
-    // Use IterateNBatch with single loop for compatibility
-    const uint32_t batchLoop = 1;
-    const uint32_t batchA = 1;
-    const uint32_t batchB = 1;
-    const bool enSequentialWrite = false;
-    mm.IterateNBatch(batchLoop, batchA, batchB, enSequentialWrite);
+    // 非 batch，使用 IterateBatch 以单次 batch 执行
+    mm.IterateBatch(cGlobal, 1, 1, false);
 }
 """
 
@@ -225,12 +241,10 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor matmul_for_upper_triangular_matrices_custom_impl_npu(const at::Tensor& a, const at::Tensor& b) {
-    TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "Inputs must be 2D matrices.");
-    TORCH_CHECK(a.size(1) == b.size(0), "Incompatible matmul shapes.");
-    at::Tensor result = at::empty({a.size(0), b.size(1)}, a.options());
-    EXEC_NPU_CMD(aclnnMatmulForUpperTriangularMatricesCustom, a, b, result);
-    return result;
+at::Tensor matmul_for_upper_triangular_matrices_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    at::Tensor C = at::empty({A.size(0), B.size(1)}, A.options());
+    EXEC_NPU_CMD(aclnnMatmulForUpperTriangularMatricesCustom, A, B, C);
+    return C;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -238,7 +252,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_for_upper_triangular_matrices_custom", &matmul_for_upper_triangular_matrices_custom_impl_npu, "Upper-triangular matmul core (no masking)");
+    m.def("matmul_for_upper_triangular_matrices_custom", &matmul_for_upper_triangular_matrices_custom_impl_npu, "Upper triangular matmul (A@B)");
 }
 """
 
@@ -252,7 +266,7 @@ class ModelNew(torch.nn.Module):
         super().__init__()
 
     def forward(self, A, B):
-        # Replace heavy matmul with custom AscendC kernel, keep triangular masking in PyTorch
+        # 自定义 AscendC kernel 计算 A @ B，然后在前端做上三角截断以保持与原模型一致
         C = custom_ops_lib.matmul_for_upper_triangular_matrices_custom(A, B)
         return torch.triu(C)
 '''

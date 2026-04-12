@@ -3,6 +3,13 @@ project_json_src='''
     {
         "op": "SumReductionOverADimensionCustom",
         "language": "cpp",
+        "attr_desc": [
+            {
+                "name": "dim",
+                "param_type": "required",
+                "type": "int"
+            }
+        ],
         "input_desc": [
             {
                 "name": "x",
@@ -30,61 +37,87 @@ project_json_src='''
     }
 ]
 '''
+
 host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(SumReductionOverADimensionCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, size);   // tmp buffer size (UB) reserved by framework
-  TILING_DATA_FIELD_DEF(uint32_t, outter); // rows
-  TILING_DATA_FIELD_DEF(uint32_t, inner);  // padded inner length (elements)
-  TILING_DATA_FIELD_DEF(uint32_t, n);      // actual inner length (elements)
+  TILING_DATA_FIELD_DEF(uint32_t, beforeOuter);
+  TILING_DATA_FIELD_DEF(uint32_t, reduceLen);
+  TILING_DATA_FIELD_DEF(uint32_t, afterInner);
+  TILING_DATA_FIELD_DEF(uint32_t, tileInner);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(SumReductionOverADimensionCustom, SumReductionOverADimensionCustomTilingData)
 }
 """
+
 host_operator_src="""
 #include "sum_reduction_over_a_dimension_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
+#include <vector>
+#include <cstdint>
+
+namespace {
+inline void ComputeBeforeAfter(const std::vector<int64_t>& dims, int dim, uint32_t& before, uint32_t& reduce, uint32_t& after) {
+    before = 1;
+    for (int i = 0; i < dim; ++i) {
+        before *= static_cast<uint32_t>(dims[i]);
+    }
+    reduce = static_cast<uint32_t>(dims[dim]);
+    after = 1;
+    for (size_t i = dim + 1; i < dims.size(); ++i) {
+        after *= static_cast<uint32_t>(dims[i]);
+    }
+}
+}
 
 namespace optiling {
-static ge::graphStatus TilingFunc(gert::TilingContext *context)
+const uint32_t BLOCK_DIM = 8;
+const uint32_t DEFAULT_TILE_INNER = 1024;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     SumReductionOverADimensionCustomTilingData tiling;
 
-    // Read attributes passed from Python binding (outter and n for 2D input [outter, n])
-    const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    uint32_t outter = *(attrs->GetAttrPointer<uint32_t>(0)); // "outter"
-    uint32_t n = *(attrs->GetAttrPointer<uint32_t>(1));      // "n"
+    // 读取 dim 属性
+    const gert::RuntimeAttrs* attrs = context->GetAttrs();
+    int32_t dim = 0;
+    if (attrs != nullptr) {
+        dim = *(attrs->GetAttrPointer<int32_t>(0));
+    }
 
-    // Determine dtype size
-    auto dt = context->GetInputTensor(0)->GetDataType();
-    uint32_t dtypesize = (dt == ge::DT_FLOAT16) ? 2 : 4;
+    // 获取输入形状
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    std::vector<int64_t> dims = origin.GetDims();
 
-    // Compute padded inner according to Sum API requirement: inner*sizeof(T) is 32B-aligned
-    uint32_t inner = ((n * dtypesize + 32 - 1) / 32) * (32 / dtypesize);
+    // 规范 dim（支持负数）
+    if (dim < 0) {
+        dim += static_cast<int32_t>(dims.size());
+    }
 
-    // Query min tmp buffer via Sum tiling API
-    uint32_t maxValue = 0;
-    uint32_t minValue = 0;
-    AscendC::GetSumMaxMinTmpSize(n, dtypesize, false, maxValue, minValue);
+    uint32_t beforeOuter = 0, reduceLen = 0, afterInner = 0;
+    ComputeBeforeAfter(dims, dim, beforeOuter, reduceLen, afterInner);
 
-    tiling.set_outter(outter);
-    tiling.set_inner(inner);
-    tiling.set_n(n);
-    tiling.set_size(minValue);
+    // 简单内轴分块策略
+    uint32_t tileInner = afterInner > 0 ? (afterInner < DEFAULT_TILE_INNER ? afterInner : DEFAULT_TILE_INNER) : 0;
 
-    // Block dim config
-    context->SetBlockDim(8);
+    // 设置 BlockDim
+    context->SetBlockDim(BLOCK_DIM);
 
-    // Save tiling
+    // 写入 tiling 数据
+    tiling.set_beforeOuter(beforeOuter);
+    tiling.set_reduceLen(reduceLen);
+    tiling.set_afterInner(afterInner);
+    tiling.set_tileInner(tileInner);
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // No workspace
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    // 不申请 workspace
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
 
     return ge::GRAPH_SUCCESS;
@@ -92,14 +125,30 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 }
 
 namespace ge {
-static ge::graphStatus InferShape(gert::InferShapeContext *context)
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // Keep output shape same as input for simplicity; Python side will reshape/select first column.
-    const gert::Shape *x_shape = context->GetInputShape(0);
-    gert::Shape *y_shape = context->GetOutputShape(0);
-    *y_shape = *x_shape;
+    // 读取 dim 属性
+    const gert::RuntimeAttrs* attrs = context->GetAttrs();
+    int32_t dim = 0;
+    if (attrs != nullptr) {
+        dim = *(attrs->GetAttrPointer<int32_t>(0));
+    }
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    std::vector<int64_t> dims = origin.GetDims();
+    if (dim < 0) {
+        dim += static_cast<int32_t>(dims.size());
+    }
+    // keepdim=True => 将被约简的维度置为1
+    dims[dim] = 1;
+
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    out_shape->SetOriginShape(dims);
+    out_shape->SetStorageShape(dims);
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -109,26 +158,24 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 }
 
 namespace ops {
-class SumReductionOverADimensionCustom : public OpDef
-{
+class SumReductionOverADimensionCustom : public OpDef {
 public:
-    explicit SumReductionOverADimensionCustom(const char *name) : OpDef(name)
+    explicit SumReductionOverADimensionCustom(const char* name) : OpDef(name)
     {
         this->Input("x")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT, ge::DT_FLOAT16})
+            .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("y")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT, ge::DT_FLOAT16})
+            .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        // Attributes passed from Python for tiling (for 2D input [outter, n])
-        this->Attr("outter").AttrType(REQUIRED).Int(0);
-        this->Attr("n").AttrType(REQUIRED).Int(0);
+        this->Attr("dim")
+            .AttrType(REQUIRED)
+            .Int(0);
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
@@ -139,116 +186,102 @@ public:
 OP_ADD(SumReductionOverADimensionCustom);
 }
 """
+
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "sum_reduction_over_a_dimension_custom_tiling_data.h"
 
-template <typename T>
+constexpr int32_t BUFFER_NUM = 1; // 简化：每次处理一个切片
+
 class KernelSumReductionOverADimension {
 public:
     __aicore__ inline KernelSumReductionOverADimension() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t tmpSize, uint32_t outter, uint32_t inner, uint32_t n)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t beforeOuter, uint32_t reduceLen, uint32_t afterInner, uint32_t tileInner)
     {
-        height = outter;
-        width = inner;
-        nNum = n;
+        this->beforeOuter = beforeOuter;
+        this->reduceLen = reduceLen;
+        this->afterInner = afterInner;
+        this->tileInner = (tileInner == 0) ? afterInner : tileInner;
 
-        srcGlobal.SetGlobalBuffer((__gm__ T *)x);
-        dstGlobal.SetGlobalBuffer((__gm__ T *)y);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y);
 
-        // Initialize UB queues. Copy entire [outter x inner] once as in official example.
-        pipe.InitBuffer(inQueueSrc, 1, height * width * sizeof(T));
-        // Output buffer: align to ONE_BLK_SIZE by height elements
-        uint32_t outAlignElems = (height * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(T);
-        pipe.InitBuffer(outQueueDst, 1, outAlignElems * sizeof(T));
-        // Tmp buffer reserved for Sum internal computation
-        pipe.InitBuffer(workQueue, 1, tmpSize);
+        // 分配UB缓冲：一个累加缓冲 + 一个临时读入缓冲
+        pipe.InitBuffer(accQueue, BUFFER_NUM, this->tileInner * sizeof(DTYPE_Y));
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileInner * sizeof(DTYPE_X));
     }
 
     __aicore__ inline void Process()
     {
-        CopyIn();
-        Compute();
-        CopyOut();
-    }
+        // 以outer为并行单元，均匀划分到block
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t outerStart = (beforeOuter * blockIdx) / blockNum;
+        uint32_t outerEnd   = (beforeOuter * (blockIdx + 1)) / blockNum;
 
-private:
-    __aicore__ inline void CopyIn()
-    {
-        AscendC::LocalTensor<T> srcLocal = inQueueSrc.AllocTensor<T>();
-        AscendC::DataCopy(srcLocal, srcGlobal, height * width);
-        inQueueSrc.EnQue(srcLocal);
-    }
+        for (uint32_t outer = outerStart; outer < outerEnd; ++outer) {
+            // 内轴按 tileInner 分块
+            for (uint32_t innerOffset = 0; innerOffset < afterInner; innerOffset += tileInner) {
+                uint32_t curTile = (innerOffset + tileInner <= afterInner) ? tileInner : (afterInner - innerOffset);
 
-    __aicore__ inline void Compute()
-    {
-        AscendC::LocalTensor<T> srcLocal = inQueueSrc.DeQue<T>();
-        AscendC::LocalTensor<uint8_t> workLocal = workQueue.AllocTensor<uint8_t>();
-        AscendC::LocalTensor<T> dstLocal = outQueueDst.AllocTensor<T>();
+                // 累加缓冲置零
+                AscendC::LocalTensor<DTYPE_Y> accLocal = accQueue.AllocTensor<DTYPE_Y>();
+                DTYPE_Y zeroVal(0.0f);
+                AscendC::Duplicate<DTYPE_Y>(accLocal, zeroVal, curTile);
 
-        AscendC::SumParams params{height, width, nNum};
+                // 沿 reduceLen 维度累加
+                for (uint32_t r = 0; r < reduceLen; ++r) {
+                    uint64_t xOffset = ((uint64_t)outer * reduceLen + r) * afterInner + innerOffset;
+                    AscendC::LocalTensor<DTYPE_X> tmpLocal = tmpQueue.AllocTensor<DTYPE_X>();
+                    AscendC::DataCopy(tmpLocal, xGm[xOffset], curTile);
+                    AscendC::Add<DTYPE_Y, DTYPE_Y, DTYPE_X>(accLocal, accLocal, tmpLocal, curTile);
+                    tmpQueue.FreeTensor(tmpLocal);
+                }
 
-        // Zero init dst buffer for aligned region
-        uint32_t outAlignElems = (height * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(T);
-        T zeroVal(0);
-        AscendC::Duplicate<T>(dstLocal, zeroVal, outAlignElems);
-
-        // Call Sum API (reduce along last axis), framework-managed tmp buffer reserved via tiling
-        AscendC::Sum(dstLocal, srcLocal, params);
-
-        outQueueDst.EnQue<T>(dstLocal);
-        workQueue.FreeTensor(workLocal);
-        inQueueSrc.FreeTensor(srcLocal);
-    }
-
-    __aicore__ inline void CopyOut()
-    {
-        AscendC::LocalTensor<T> dstLocal = outQueueDst.DeQue<T>();
-        uint32_t outAlignElems = (height * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(T);
-        AscendC::DataCopy(dstGlobal, dstLocal, outAlignElems);
-        outQueueDst.FreeTensor(dstLocal);
+                // 写回到输出（keepdim=True => 输出shape: [beforeOuter, 1, afterInner]）
+                uint64_t yOffset = ((uint64_t)outer * /*1*/ 1 + 0) * afterInner + innerOffset;
+                AscendC::DataCopy(yGm[yOffset], accLocal, curTile);
+                accQueue.FreeTensor(accLocal);
+            }
+        }
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueSrc;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> workQueue;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueDst;
-    AscendC::GlobalTensor<T> srcGlobal, dstGlobal;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> accQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> tmpQueue;
 
-    uint32_t width = 0;   // inner (padded)
-    uint32_t height = 0;  // outter
-    uint32_t nNum = 0;    // actual inner
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t beforeOuter;
+    uint32_t reduceLen;
+    uint32_t afterInner;
+    uint32_t tileInner;
 };
 
-extern "C" __global__ __aicore__ void sum_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void sum_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-#ifdef DTYPE_X
-    using TypeT = DTYPE_X;
-#else
-    using TypeT = float;
-#endif
-    KernelSumReductionOverADimension<TypeT> op;
-    op.Init(x, y, tiling_data.size, tiling_data.outter, tiling_data.inner, tiling_data.n);
+    KernelSumReductionOverADimension op;
+    op.Init(x, y, tiling_data.beforeOuter, tiling_data.reduceLen, tiling_data.afterInner, tiling_data.tileInner);
     op.Process();
 }
 """
+
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
+#include <vector>
 
-at::Tensor sum_reduction_over_a_dimension_custom_impl_npu(const at::Tensor& self) {
-    // self is 2D: [outter, n], reduce along last dim
-    TORCH_CHECK(self.dim() == 2, "sum_reduction_over_a_dimension_custom expects 2D input");
-    uint32_t outter = static_cast<uint32_t>(self.size(0));
-    uint32_t n = static_cast<uint32_t>(self.size(1));
-    // Output kept same shape as input in kernel; we will take first column later in Python model
-    at::Tensor result = at::empty_like(self);
-    EXEC_NPU_CMD(aclnnSumReductionOverADimensionCustom, self, outter, n, result);
+at::Tensor sum_reduction_over_a_dimension_custom_impl_npu(const at::Tensor& self, int64_t dim) {
+    // 计算 keepdim=True 的输出形状
+    std::vector<int64_t> sizes = self.sizes().vec();
+    if (dim < 0) dim += static_cast<int64_t>(sizes.size());
+    sizes[dim] = 1;
+    at::Tensor result = at::empty(sizes, self.options());
+    EXEC_NPU_CMD(aclnnSumReductionOverADimensionCustom, self, dim, result);
     return result;
 }
 
@@ -257,9 +290,10 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("sum_reduction_over_a_dimension_custom", &sum_reduction_over_a_dimension_custom_impl_npu, "Sum reduction over last dimension (2D)");
+    m.def("sum_reduction_over_a_dimension_custom", &sum_reduction_over_a_dimension_custom_impl_npu, "sum over a dim (keepdim=True)");
 }
 """
+
 model_src='''
 import torch
 import torch_npu
@@ -267,39 +301,12 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Optimized model: reduce over arbitrary dim by
-    1) permuting target dim to last,
-    2) reshaping to 2D [outter, n],
-    3) calling custom AscendC Sum (reduces last axis),
-    4) reshaping back with keepdim=True.
+    使用自定义 AscendC Kernel 实现指定维度的求和归约（keepdim=True）
     """
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        d = self.dim
-        ndim = x.dim()
-        if d < 0:
-            d += ndim
-        # Move reduce dim to last
-        perm = [i for i in range(ndim) if i != d] + [d]
-        x_perm = x.permute(perm).contiguous()
-        n = x_perm.size(-1)
-        others_shape = [x_perm.size(i) for i in range(x_perm.dim() - 1)]
-        outter = 1
-        for s in others_shape:
-            outter *= s
-        # Flatten to 2D
-        x_2d = x_perm.reshape(outter, n)
-        # Call custom op: returns same shape as input; take first column as reduced result
-        y_2d_full = custom_ops_lib.sum_reduction_over_a_dimension_custom(x_2d)
-        y_2d = y_2d_full[:, :1]  # keepdim=True -> [outter, 1]
-        # Restore shape and permute back
-        y_perm = y_2d.reshape(*others_shape, 1)
-        inv_perm = [0] * ndim
-        for i, p in enumerate(perm):
-            inv_perm[p] = i
-        y = y_perm.permute(inv_perm).contiguous()
-        return y
+        return custom_ops_lib.sum_reduction_over_a_dimension_custom(x, self.dim)
 '''

@@ -1,0 +1,337 @@
+project_json_src='''
+[
+    {
+        "op": "Conv3dMaxLogSumExpReluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv3dMaxLogSumExpReluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, D);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint64_t, outerSize); // N*D*H*W
+  TILING_DATA_FIELD_DEF(uint32_t, tileOuter); // positions per tile (spatial locations)
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv3dMaxLogSumExpReluCustom, Conv3dMaxLogSumExpReluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv3d_max_log_sum_exp_relu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    auto *inShape = context->GetInputShape(0);
+    const auto &shape = inShape->GetOriginShape();
+
+    uint32_t N = static_cast<uint32_t>(shape.GetDim(0));
+    uint32_t C = static_cast<uint32_t>(shape.GetDim(1));
+    uint32_t D = static_cast<uint32_t>(shape.GetDim(2));
+    uint32_t H = static_cast<uint32_t>(shape.GetDim(3));
+    uint32_t W = static_cast<uint32_t>(shape.GetDim(4));
+    uint64_t outerSize = static_cast<uint64_t>(N) * D * H * W;
+
+    Conv3dMaxLogSumExpReluCustomTilingData tiling;
+    tiling.set_N(N);
+    tiling.set_C(C);
+    tiling.set_D(D);
+    tiling.set_H(H);
+    tiling.set_W(W);
+    tiling.set_outerSize(outerSize);
+    tiling.set_tileOuter(1); // 简化：每次处理一个空间位置
+
+    // 设置并行 block 数
+    context->SetBlockDim(8);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 无额外 workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+
+    // 输出形状: [N, 1, D, H, W]
+    std::vector<int64_t> dims(5);
+    dims[0] = in_shape->GetDim(0);
+    dims[1] = 1;
+    dims[2] = in_shape->GetDim(2);
+    dims[3] = in_shape->GetDim(3);
+    dims[4] = in_shape->GetDim(4);
+    out_shape->SetDimNum(5);
+    for (int i = 0; i < 5; ++i) {
+        out_shape->SetDim(i, dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv3dMaxLogSumExpReluCustom : public OpDef {
+public:
+    explicit Conv3dMaxLogSumExpReluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(Conv3dMaxLogSumExpReluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelConv3dMaxLogSumExpRelu {
+public:
+    __aicore__ inline KernelConv3dMaxLogSumExpRelu() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t N, uint32_t C, uint32_t D, uint32_t H, uint32_t W,
+                                uint64_t outerSize, uint32_t tileOuter)
+    {
+        this->N = N; this->C = C; this->D = D; this->H = H; this->W = W;
+        this->outerSize = outerSize;
+        this->tileOuter = tileOuter;
+
+        // 分块
+        this->blockNum = AscendC::GetBlockNum();
+        this->blockIdx = AscendC::GetBlockIdx();
+        this->blockOuter = static_cast<uint64_t>((outerSize + blockNum - 1) / blockNum);
+        uint64_t begin = this->blockOuter * this->blockIdx;
+        if (begin > outerSize) begin = outerSize;
+        uint64_t end = this->blockOuter * (this->blockIdx + 1);
+        if (end > outerSize) end = outerSize;
+        this->workOuter = (end > begin) ? (end - begin) : 0;
+        this->startOuter = begin;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE*)x, static_cast<uint64_t>(N) * C * D * H * W);
+        yGm.SetGlobalBuffer((__gm__ DTYPE*)y, outerSize);
+
+        // UB 分配：每次聚合一条通道向量（长度 C），以及若干临时缓冲
+        pipe.InitBuffer(inQueue, BUFFER_NUM, C * sizeof(DTYPE));            // x_line
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, C * sizeof(DTYPE) * 4);       // 临时缓冲: work, exp, etc.
+        pipe.InitBuffer(outQueue, BUFFER_NUM, sizeof(DTYPE));               // 输出标量
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint64_t pos = 0; pos < workOuter; ++pos) {
+            CopyIn(pos);
+            Compute(pos);
+            CopyOut(pos);
+        }
+    }
+
+private:
+    // 线性化假设：按最后一维为通道连续处理（示例代码，需与上层布局保持一致）
+    // 对于形状 [N, C, D, H, W]，此处简化为按某一空间位置聚合 C 个通道
+    __aicore__ inline void CopyIn(uint64_t progress)
+    {
+        AscendC::LocalTensor<DTYPE> xLine = inQueue.AllocTensor<DTYPE>();
+        // 起始外层位置
+        uint64_t outerIndex = startOuter + progress;
+        // 简化：假设通道作为最后一维连续存储（NDHWC风格）
+        // 若为 NCDHW 连续布局，上层可在调用前调整布局或以实际实现替换
+        uint64_t base = outerIndex * C;
+        AscendC::DataCopy(xLine, xGm[base], C);
+        inQueue.EnQue(xLine);
+    }
+
+    __aicore__ inline void Compute(uint64_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE> xLine = inQueue.DeQue<DTYPE>();
+        AscendC::LocalTensor<DTYPE> tmp0 = tmpQueue.AllocTensor<DTYPE>(); // workLocal / 中间缓冲
+        AscendC::LocalTensor<DTYPE> tmp1 = tmpQueue.AllocTensor<DTYPE>(); // exp buffer
+        AscendC::LocalTensor<DTYPE> outScalar = outQueue.AllocTensor<DTYPE>(); // 输出标量（1元素）
+
+        // 1) 计算通道维最大值 m
+        // ReduceMax 返回 [max, index]，此处作为示例，dstMax 长度设为 2
+        AscendC::LocalTensor<DTYPE> dstMax = tmpQueue.AllocTensor<DTYPE>();
+        // 为了简化，假定 tmp0 作为 workLocal 使用
+        AscendC::ReduceMax(dstMax, xLine, tmp0, static_cast<int32_t>(C), false);
+        DTYPE mVal = dstMax.GetValue(0);
+
+        // 2) 计算 y = exp(x - m)
+        // 使用 Adds 实现向量与标量相减：y = x + (-mVal)
+        AscendC::Adds(tmp1, xLine, -mVal, C);
+        AscendC::Exp(tmp1, tmp1, C);
+
+        // 3) 计算 s = sum(exp(x - m))
+        AscendC::LocalTensor<DTYPE> dstSum = tmpQueue.AllocTensor<DTYPE>();
+        // 简化调用形式：ReduceSum(dst, src, count)
+        AscendC::ReduceSum(dstSum, tmp1, static_cast<int32_t>(C));
+
+        // 4) 计算 logsumexp = m + ln(s)
+        DTYPE sVal = dstSum.GetValue(0);
+        AscendC::LocalTensor<DTYPE> oneVal = tmpQueue.AllocTensor<DTYPE>();
+        // 将 sVal 放入 oneVal[0]
+        // 利用 Duplicate 将标量写入 oneVal（长度1）
+        AscendC::Duplicate(oneVal, sVal, 1);
+        AscendC::Ln(oneVal, oneVal, 1);
+        DTYPE lnS = oneVal.GetValue(0);
+        DTYPE lse = mVal + lnS;
+
+        // 5) ReLU
+        // 写入 outScalar，执行 ReLU（长度1）
+        AscendC::Duplicate(outScalar, lse, 1);
+        AscendC::Relu(outScalar, outScalar, 1);
+
+        // 入队并释放临时
+        outQueue.EnQue(outScalar);
+        inQueue.FreeTensor(xLine);
+        tmpQueue.FreeTensor(tmp0);
+        tmpQueue.FreeTensor(tmp1);
+        tmpQueue.FreeTensor(dstMax);
+        tmpQueue.FreeTensor(dstSum);
+        tmpQueue.FreeTensor(oneVal);
+    }
+
+    __aicore__ inline void CopyOut(uint64_t progress)
+    {
+        AscendC::LocalTensor<DTYPE> outScalar = outQueue.DeQue<DTYPE>();
+        uint64_t outerIndex = startOuter + progress;
+        AscendC::DataCopy(yGm[outerIndex], outScalar, 1);
+        outQueue.FreeTensor(outScalar);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueue;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+
+    uint32_t N, C, D, H, W;
+    uint64_t outerSize, workOuter, startOuter;
+    uint32_t tileOuter;
+    uint32_t blockNum, blockIdx;
+    uint64_t blockOuter;
+};
+
+extern "C" __global__ __aicore__ void conv3d_max_log_sum_exp_relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    KernelConv3dMaxLogSumExpRelu op;
+    op.Init(x, y,
+            tilingData.N, tilingData.C, tilingData.D, tilingData.H, tilingData.W,
+            tilingData.outerSize, tilingData.tileOuter);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv3d_max_log_sum_exp_relu_custom_impl_npu(const at::Tensor& x) {
+    auto opts = x.options();
+    auto sizes = x.sizes();
+    TORCH_CHECK(sizes.size() == 5, "Input must be 5D [N,C,D,H,W]");
+    at::Tensor y = at::empty({sizes[0], 1, sizes[2], sizes[3], sizes[4]}, opts);
+    EXEC_NPU_CMD(aclnnConv3dMaxLogSumExpReluCustom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv3d_max_log_sum_exp_relu_custom", &conv3d_max_log_sum_exp_relu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv3d_max_log_sum_exp_relu_custom", &conv3d_max_log_sum_exp_relu_custom_impl_npu, "conv3d->maxpool->logsumexp->relu fused post kernel");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    以 PyTorch 完成 Conv3d 与 MaxPool3d，随后用自定义 AscendC Kernel 完成 logsumexp(dim=1, keepdim=True)+ReLU
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super().__init__()
+        self.conv = torch.nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.max_pool = torch.nn.MaxPool3d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.max_pool(x)
+        # 自定义AscendC算子：基于通道维的logsumexp并ReLU
+        x = custom_ops_lib.conv3d_max_log_sum_exp_relu_custom(x)
+        return x
+'''

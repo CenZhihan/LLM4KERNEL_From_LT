@@ -1,0 +1,371 @@
+project_json_src='''
+[
+    {
+        "op": "LinearAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "Q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "K",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "V",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(LinearAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, seqLen);
+  TILING_DATA_FIELD_DEF(uint32_t, dModel);
+  TILING_DATA_FIELD_DEF(uint32_t, tcubeSizeWords); // sizeof(optiling::TCubeTiling)/4
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(LinearAttentionCustom, LinearAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "register/tilingdata_base.h"
+#include <cstring>
+
+namespace {
+struct LinearAttnHeader {
+    uint32_t B;
+    uint32_t S;
+    uint32_t D;
+    uint32_t TCSizeBytes; // sizeof(TCubeTiling)
+    float epsilon;
+};
+}
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 读取输入形状
+    const auto* qShape = context->GetInputShape(0);
+    const auto& qDims = qShape->GetOriginShape();
+    // 期望形状: [B, S, D]
+    uint32_t B = static_cast<uint32_t>(qDims.GetDim(0));
+    uint32_t S = static_cast<uint32_t>(qDims.GetDim(1));
+    uint32_t D = static_cast<uint32_t>(qDims.GetDim(2));
+
+    // 选择blockDim
+    const uint32_t BLOCK_DIM = 8;
+    context->SetBlockDim(BLOCK_DIM);
+
+    // 使用Matmul Tiling生成两次GEMM的tiling数据
+    auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+
+    // KV = K^T @ V: A:[B, D, S] (K^T), B:[B, S, D] (V), C:[B, D, D]
+    matmul_tiling::MultiCoreMatmulTiling tilingKV(platform);
+    tilingKV->SetDim(1);
+    tilingKV->SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tilingKV->SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tilingKV->SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tilingKV->SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    int32_t M1 = static_cast<int32_t>(D);
+    int32_t N1 = static_cast<int32_t>(D);
+    int32_t K1 = static_cast<int32_t>(S);
+    tilingKV->SetShape(M1, N1, K1);
+    tilingKV->SetOrgShape(M1, N1, K1);
+    tilingKV->SetBias(false);
+    tilingKV->SetBufferSpace(-1, -1, -1);
+    tilingKV->SetBatchInfoForNormal(static_cast<int32_t>(B), static_cast<int32_t>(B), M1, N1, K1);
+    tilingKV->SetBufferSpace(-1, -1, -1);
+    optiling::TCubeTiling tcKV;
+    tilingKV.GetTiling(tcKV);
+
+    // OUT = Q @ KV: A:[B, S, D] (Q), B:[B, D, D] (KV), C:[B, S, D]
+    matmul_tiling::MultiCoreMatmulTiling tilingQKV(platform);
+    tilingQKV->SetDim(1);
+    tilingQKV->SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tilingQKV->SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tilingQKV->SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tilingQKV->SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    int32_t M2 = static_cast<int32_t>(S);
+    int32_t N2 = static_cast<int32_t>(D);
+    int32_t K2 = static_cast<int32_t>(D);
+    tilingQKV->SetShape(M2, N2, K2);
+    tilingQKV->SetOrgShape(M2, N2, K2);
+    tilingQKV->SetBias(false);
+    tilingQKV->SetBufferSpace(-1, -1, -1);
+    tilingQKV->SetBatchInfoForNormal(static_cast<int32_t>(B), static_cast<int32_t>(B), M2, N2, K2);
+    tilingQKV->SetBufferSpace(-1, -1, -1);
+    optiling::TCubeTiling tcQKV;
+    tilingQKV.GetTiling(tcQKV);
+
+    // 组织raw tiling buffer: header + tcKV + tcQKV
+    auto* raw = context->GetRawTilingData();
+    auto* buf = raw->GetData();
+    size_t cap = raw->GetCapacity();
+
+    LinearAttnHeader hdr;
+    hdr.B = B; hdr.S = S; hdr.D = D;
+    hdr.TCSizeBytes = sizeof(optiling::TCubeTiling);
+    hdr.epsilon = 1e-6f;
+
+    size_t need = sizeof(LinearAttnHeader) + sizeof(optiling::TCubeTiling) * 2;
+    if (need > cap) {
+        return ge::GRAPH_FAILED;
+    }
+    uint8_t* p = reinterpret_cast<uint8_t*>(buf);
+    std::memcpy(p, &hdr, sizeof(LinearAttnHeader)); p += sizeof(LinearAttnHeader);
+    std::memcpy(p, &tcKV, sizeof(optiling::TCubeTiling)); p += sizeof(optiling::TCubeTiling);
+    std::memcpy(p, &tcQKV, sizeof(optiling::TCubeTiling)); p += sizeof(optiling::TCubeTiling);
+
+    raw->SetDataSize(need);
+
+    // 工作空间: 存放KV [B, D, D]
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = static_cast<size_t>(B) * D * D * sizeof(float);
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* qShape = context->GetInputShape(0);
+    gert::Shape* outShape = context->GetOutputShape(0);
+    *outShape = *qShape; // 输出形状与Q一致 [B,S,D]
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto dt = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dt);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class LinearAttentionCustom : public OpDef {
+public:
+    explicit LinearAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("Q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("K")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("V")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("out")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(LinearAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+using namespace AscendC;
+
+namespace {
+struct LinearAttnHeader {
+    uint32_t B;
+    uint32_t S;
+    uint32_t D;
+    uint32_t TCSizeBytes;
+    float epsilon;
+};
+}
+
+typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, true,  LayoutMode::NORMAL> ATypeKV;  // K, 允许转置
+typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> BTypeKV;  // V
+typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> CTypeKV;  // KV
+
+typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> ATypeQ;   // Q
+typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> BTypeQ;   // KV
+typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> CTypeQ;   // OUT
+
+extern "C" __global__ __aicore__ void linear_attention_custom(
+    GM_ADDR Q, GM_ADDR K, GM_ADDR V, GM_ADDR OUT, GM_ADDR workspace, GM_ADDR tiling)
+{
+    // 从tiling GM读取头与两个TCubeTiling
+    __gm__ uint8_t* tilingGm = reinterpret_cast<__gm__ uint8_t*>(tiling);
+    LinearAttnHeader hdr;
+    // 复制header
+    __gm__ uint32_t* p32 = reinterpret_cast<__gm__ uint32_t*>(tilingGm);
+    uint32_t* h32 = reinterpret_cast<uint32_t*>(&hdr);
+    for (int i = 0; i < (int)(sizeof(LinearAttnHeader) / sizeof(uint32_t)); ++i) {
+        h32[i] = p32[i];
+    }
+    uint8_t* cursor = reinterpret_cast<uint8_t*>(tilingGm) + sizeof(LinearAttnHeader);
+
+    // 复制两份TCubeTiling到local
+    optiling::TCubeTiling tcKV;
+    optiling::TCubeTiling tcQKV;
+    {
+        // tcKV
+        __gm__ uint32_t* src = reinterpret_cast<__gm__ uint32_t*>(cursor);
+        uint32_t* dst = reinterpret_cast<uint32_t*>(&tcKV);
+        for (int i = 0; i < (int)(sizeof(optiling::TCubeTiling) / sizeof(uint32_t)); ++i) {
+            dst[i] = src[i];
+        }
+        cursor += sizeof(optiling::TCubeTiling);
+    }
+    {
+        // tcQKV
+        __gm__ uint32_t* src = reinterpret_cast<__gm__ uint32_t*>(cursor);
+        uint32_t* dst = reinterpret_cast<uint32_t*>(&tcQKV);
+        for (int i = 0; i < (int)(sizeof(optiling::TCubeTiling) / sizeof(uint32_t)); ++i) {
+            dst[i] = src[i];
+        }
+        cursor += sizeof(optiling::TCubeTiling);
+    }
+
+    // GM张量设置
+    GlobalTensor<float> qGm, kGm, vGm, outGm, kvGm;
+    uint64_t qSize = static_cast<uint64_t>(hdr.B) * hdr.S * hdr.D;
+    uint64_t kSize = qSize;
+    uint64_t vSize = qSize;
+    uint64_t outSize = qSize;
+    uint64_t kvSize = static_cast<uint64_t>(hdr.B) * hdr.D * hdr.D;
+
+    qGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(Q), qSize);
+    kGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(K), kSize);
+    vGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(V), vSize);
+    outGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(OUT), outSize);
+    kvGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workspace), kvSize);
+
+    // Pipe
+    TPipe pipe;
+    g_cubeTPipePtr = &pipe;
+
+    // Matmul 1: KV = K^T @ V
+    {
+        matmul::Matmul<ATypeKV, BTypeKV, CTypeKV> mmKV;
+        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mmKV);
+        mmKV.Init(&tcKV);
+        // NORMAL布局下多batch
+        mmKV.SetTensorA(kGm[0], true);   // K转置
+        mmKV.SetTensorB(vGm[0], false);  // V
+        mmKV.SetWorkspace(workspace, 0);
+        // 计算B个batch
+        mmKV.IterateNBatch<true, false>(hdr.B, 1, 1, false);
+        // 结果写入kvGm（C张量在mm内部对应SetTensorC/IterateAll流程绑定）
+        // 这里通过设置输出句柄为kvGm[0]
+        mmKV.GetBatchC(kvGm[0]);
+    }
+
+    // Matmul 2: OUT = Q @ KV
+    {
+        matmul::Matmul<ATypeQ, BTypeQ, CTypeQ> mmQKV;
+        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mmQKV);
+        mmQKV.Init(&tcQKV);
+        mmQKV.SetTensorA(qGm[0], false);   // Q
+        mmQKV.SetTensorB(kvGm[0], false);  // KV
+        mmQKV.SetWorkspace(workspace, 0);
+        mmQKV.IterateNBatch<true, false>(hdr.B, 1, 1, false);
+        mmQKV.GetBatchC(outGm[0]);
+    }
+
+    // 备注：ReLU与epsilon可在前后端融合或另行实现，这里聚焦高效GEMM计算。
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor linear_attention_custom_impl_npu(const at::Tensor& Q, const at::Tensor& K, const at::Tensor& V) {
+    TORCH_CHECK(Q.sizes() == K.sizes(), "Q and K must have same shape");
+    TORCH_CHECK(Q.sizes() == V.sizes(), "Q and V must have same shape");
+    at::Tensor out = at::empty_like(Q);
+    EXEC_NPU_CMD(aclnnLinearAttentionCustom, Q, K, V, out);
+    return out;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("linear_attention_custom", &linear_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("linear_attention_custom", &linear_attention_custom_impl_npu, "Linear Attention approx");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, Q, K, V):
+        # 前端可按需保留relu+epsilon，也可在后端融合
+        Q_ = torch.relu(Q) + 1e-6
+        K_ = torch.relu(K) + 1e-6
+        return custom_ops_lib.linear_attention_custom(Q_, K_, V)
+'''

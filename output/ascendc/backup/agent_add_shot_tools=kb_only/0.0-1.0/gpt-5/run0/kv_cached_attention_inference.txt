@@ -1,0 +1,325 @@
+project_json_src='''
+[
+    {
+        "op": "KvCachedAttentionInferenceCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "k_cache",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "v_cache",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(KvCachedAttentionInferenceCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, q_len);
+  TILING_DATA_FIELD_DEF(uint32_t, kv_len);
+  TILING_DATA_FIELD_DEF(uint32_t, d_model);
+  TILING_DATA_FIELD_DEF_STRUCT(SoftMaxTiling, softmaxTilingData);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(KvCachedAttentionInferenceCustom, KvCachedAttentionInferenceCustomTilingData)
+
+} // namespace optiling
+"""
+
+host_operator_src="""
+#include "kv_cached_attention_inference_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    KvCachedAttentionInferenceCustomTilingData tiling;
+
+    // 输入形状：Q:[B, q_len, D], K:[B, kv_len, D], V:[B, kv_len, D]
+    const gert::StorageShape* q_shape = context->GetInputShape(0);
+    const gert::StorageShape* k_shape = context->GetInputShape(1);
+
+    uint32_t batch  = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(0));
+    uint32_t q_len  = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(1));
+    uint32_t d_model= static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(2));
+    uint32_t kv_len = static_cast<uint32_t>(k_shape->GetOriginShape().GetDim(1));
+
+    tiling.set_batch(batch);
+    tiling.set_q_len(q_len);
+    tiling.set_kv_len(kv_len);
+    tiling.set_d_model(d_model);
+
+    // SoftMax over last axis N=kv_len, with M = B * q_len
+    std::vector<int64_t> shapeVec = {static_cast<int64_t>(batch * q_len), static_cast<int64_t>(kv_len)};
+    ge::Shape srcShape(shapeVec);
+
+    // 参考文档：使用最小临时空间确保功能正确
+    const uint32_t localWorkSpaceSize = AscendC::GetSoftMaxMinTmpSize(srcShape, sizeof(float), false);
+    AscendC::SoftMaxTilingFunc(srcShape, sizeof(float), localWorkSpaceSize, tiling.softmaxTilingData);
+
+    context->SetBlockDim(1);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    context->SetTilingKey(1);
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输出形状与 Q 一致：[B, q_len, D]
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *q_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto dt = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dt);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+
+namespace ops {
+class KvCachedAttentionInferenceCustom : public OpDef {
+public:
+    explicit KvCachedAttentionInferenceCustom(const char* name) : OpDef(name)
+    {
+        this->Input("q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("k_cache")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("v_cache")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("out")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(KvCachedAttentionInferenceCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "kv_cached_attention_inference_custom_tiling_data.h"
+
+// 本核实现对输入logits进行SoftMax（沿最后一维kv_len），用于KV缓存推理中的注意力权重计算。
+// 注意：为方便工程集成，本核的GM参数名沿用(q, k_cache, v_cache)，但仅使用q作为logits输入。
+
+class KernelKvCachedAttentionInfer {
+public:
+    __aicore__ inline KernelKvCachedAttentionInfer() {}
+
+    __aicore__ inline void Init(GM_ADDR logits, GM_ADDR dummy_k, GM_ADDR out_probs,
+                                uint32_t batch, uint32_t q_len, uint32_t kv_len, uint32_t d_model,
+                                const SoftMaxTiling &softmaxTilingData)
+    {
+        (void)dummy_k; // 未使用
+        this->batch = batch;
+        this->q_len = q_len;
+        this->kv_len = kv_len;
+        this->d_model = d_model;
+        this->height = batch * q_len;
+        this->width = kv_len;
+        this->tiling = softmaxTilingData;
+
+        srcGlobal.SetGlobalBuffer((__gm__ float*)logits);
+        dstGlobal.SetGlobalBuffer((__gm__ float*)out_probs);
+
+        // 缓冲区：一次性处理 [height, width]
+        pipe.InitBuffer(inQueueSrc, 1, height * width * sizeof(float));
+        pipe.InitBuffer(outQueueDst, 1, height * width * sizeof(float));
+        // SoftMax临时空间（参考最小空间，按kv_len尺度分配）
+        pipe.InitBuffer(tmpBuf, width * sizeof(float) * 4); // 参考文档：最小临时空间可保证功能正确
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<float> srcLocal = inQueueSrc.AllocTensor<float>();
+        AscendC::DataCopy(srcLocal, srcGlobal, height * width);
+        inQueueSrc.EnQue(srcLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<float> srcLocal = inQueueSrc.DeQue<float>();
+        AscendC::LocalTensor<float> dstLocal = outQueueDst.AllocTensor<float>();
+        AscendC::LocalTensor<uint8_t> tmpLocal = tmpBuf.Get<uint8_t>();
+
+        AscendC::SoftMaxShapeInfo shapeInfo = { height, width, height, width };
+        // 使用SoftMax高阶API（参考5.3.1.9 SoftMax/SimpleSoftMax Tiling）
+        AscendC::SoftMax<float>(dstLocal, srcLocal, tmpLocal, tiling, shapeInfo);
+
+        outQueueDst.EnQue<float>(dstLocal);
+        inQueueSrc.FreeTensor(srcLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<float> dstLocal = outQueueDst.DeQue<float>();
+        AscendC::DataCopy(dstGlobal, dstLocal, height * width);
+        outQueueDst.FreeTensor(dstLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueSrc;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueDst;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tmpBuf;
+
+    AscendC::GlobalTensor<float> srcGlobal;
+    AscendC::GlobalTensor<float> dstGlobal;
+
+    uint32_t batch;
+    uint32_t q_len;
+    uint32_t kv_len;
+    uint32_t d_model;
+    uint32_t height;
+    uint32_t width;
+    SoftMaxTiling tiling;
+};
+
+extern "C" __global__ __aicore__ void kv_cached_attention_inference_custom(GM_ADDR q, GM_ADDR k_cache, GM_ADDR v_cache, GM_ADDR workspace, GM_ADDR tiling)
+{
+    (void)workspace;
+    GET_TILING_DATA(tilingData, tiling);
+    KernelKvCachedAttentionInfer op;
+    op.Init(q, k_cache, v_cache,
+            tilingData.batch, tilingData.q_len, tilingData.kv_len, tilingData.d_model,
+            tilingData.softmaxTilingData);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+#include <cmath>
+
+at::Tensor kv_cached_attention_inference_custom_impl_npu(const at::Tensor& Q,
+                                                         const at::Tensor& K_cache,
+                                                         const at::Tensor& V_cache) {
+    // 计算注意力logits: [B, q_len, kv_len]
+    auto d_model = Q.size(-1);
+    at::Tensor Kt = K_cache.transpose(-2, -1); // [B, D, kv_len]
+    at::Tensor logits = at::matmul(Q, Kt) / std::sqrt(static_cast<double>(d_model));
+
+    // 调用自定义核进行SoftMax（沿最后一维kv_len）
+    at::Tensor probs = at::empty_like(logits);
+    // 说明：为匹配算子签名(3输入1输出)，这里将V_cache作为第三个输入传入，但内核仅使用第一个输入(logits)
+    EXEC_NPU_CMD(aclnnKvCachedAttentionInferenceCustom, logits, K_cache, probs);
+
+    // 输出：attn @ V_cache -> [B, q_len, D]
+    at::Tensor out = at::matmul(probs, V_cache);
+    return out;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("kv_cached_attention_inference_custom", &kv_cached_attention_inference_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("kv_cached_attention_inference_custom", &kv_cached_attention_inference_custom_impl_npu, "KV Cached Attention Inference (SoftMax fused)");
+}
+"""
+
+model_src='''
+import math
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, Q, K_cache, V_cache):
+        return custom_ops_lib.kv_cached_attention_inference_custom(Q, K_cache, V_cache)
+'''

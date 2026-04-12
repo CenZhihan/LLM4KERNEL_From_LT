@@ -1,0 +1,345 @@
+project_json_src='''
+[
+    {
+        "op": "GemmMaxSubtractGeluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "weight",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "bias",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "lib/matmul_intf.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmMaxSubtractGeluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);       // B
+  TILING_DATA_FIELD_DEF(uint32_t, inFeat);      // K
+  TILING_DATA_FIELD_DEF(uint32_t, outFeat);     // N
+  TILING_DATA_FIELD_DEF(int32_t, maxDim);       // reduce axis, default 1
+  TILING_DATA_FIELD_DEF(bool, hasBias);
+  TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, mmTiling); // Matmul tiling payload
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmMaxSubtractGeluCustom, GemmMaxSubtractGeluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gemm_max_subtract_gelu_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "graph/types.h"
+#include "lib/matmul_tiling.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // Shapes
+    const gert::Shape* xShape = context->GetInputShape(0);      // [B, K]
+    const gert::Shape* wShape = context->GetInputShape(1);      // [N, K]
+    if (xShape == nullptr || wShape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t B = xShape->GetOriginShape().GetDim(0);
+    uint32_t K = xShape->GetOriginShape().GetDim(1);
+    uint32_t N = wShape->GetOriginShape().GetDim(0);
+
+    // Set block dim
+    const uint32_t BLOCK_DIM = 8;
+    context->SetBlockDim(BLOCK_DIM);
+
+    // Build Matmul tiling (single-core example)
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    matmul_tiling::MatmulApiTiling mm(ascendcPlatform);
+    mm.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    mm.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    mm.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    mm.SetShape(B, N, K);
+    mm.SetOrgShape(B, N, K);
+    mm.SetBias(true);
+    // Use all available memory by default
+    mm.SetBufferSpace(-1, -1, -1);
+
+    optiling::TCubeTiling cubeTiling;
+    int ret = mm.GetTiling(cubeTiling);
+    if (ret == -1) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Pack tiling data
+    GemmMaxSubtractGeluCustomTilingData tiling;
+    tiling.set_batch(B);
+    tiling.set_inFeat(K);
+    tiling.set_outFeat(N);
+    tiling.set_maxDim(1);      // this model uses dim=1
+    tiling.set_hasBias(true);
+    tiling.set_mmTiling(cubeTiling);
+
+    // Serialize tiling
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // Workspace: store GEMM output [B, N] as float
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = static_cast<size_t>(B) * static_cast<size_t>(N) * sizeof(float);
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // x: [B, K], weight: [N, K] -> GEMM [B, N]
+    const gert::Shape* x = context->GetInputShape(0);
+    const gert::Shape* w = context->GetInputShape(1);
+    if (x == nullptr || w == nullptr) {
+        return GRAPH_FAILED;
+    }
+    gert::Shape* y = context->GetOutputShape(0);
+    // max over dim=1 with keepdim=True -> [B, 1]
+    std::vector<int64_t> outShape = {x->GetOriginShape().GetDim(0), 1};
+    y->GetOriginShape().SetDimNum(outShape.size());
+    for (size_t i = 0; i < outShape.size(); ++i) {
+        y->GetOriginShape().SetDim(i, outShape[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto dt = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dt);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GemmMaxSubtractGeluCustom : public OpDef {
+public:
+    explicit GemmMaxSubtractGeluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(GemmMaxSubtractGeluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+#define __NPU_TILING__
+#include "gemm_max_subtract_gelu_custom_tiling_data.h"
+
+using A_T = float;
+using B_T = float;
+using C_T = float;
+using BiasT = float;
+
+extern "C" __global__ __aicore__ void gemm_max_subtract_gelu_custom(GM_ADDR xGM, GM_ADDR wGM, GM_ADDR bGM,
+                                                                    GM_ADDR yGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+{
+    // Parse tiling
+    GET_TILING_DATA(tiling, tilingGM);
+    const uint32_t B = tiling.batch();
+    const uint32_t K = tiling.inFeat();
+    const uint32_t N = tiling.outFeat();
+
+    // Prepare GM tensors
+    AscendC::GlobalTensor<A_T> aGlobal;
+    AscendC::GlobalTensor<B_T> wGlobal;
+    AscendC::GlobalTensor<C_T> cGlobal;   // GEMM result in workspace
+    AscendC::GlobalTensor<BiasT> biasGlobal;
+    AscendC::GlobalTensor<C_T> yGlobal;
+
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(xGM), B * K);
+    wGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(wGM), N * K);
+    // workspace for C: [B, N]
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(workspaceGM), B * N);
+    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(bGM), N);
+    // output: [B, 1]
+    yGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(yGM), B * 1);
+
+    // Create Matmul instance: NORMAL layout
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL> bType; // weight [N,K], transpose -> [K,N]
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, BiasT> biasType;
+    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+
+    TPipe pipe;
+    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
+    TCubeTiling mmTiling = tiling.mmTiling();
+    mm.Init(&mmTiling);
+    mm.SetTensorA(aGlobal, false);
+    mm.SetTensorB(wGlobal, true);
+    mm.SetWorkspace(workspaceGM, 0);
+    if (tiling.hasBias()) {
+        mm.SetBias(biasGlobal);
+    }
+    // Compute GEMM to workspace cGlobal
+    mm.Run(cGlobal);
+
+    // After GEMM: x = max(x, dim=1, keepdim=True)
+    // Then subtract mean over dim=1 (keepdim=True), then GELU
+    // We produce final yGlobal [B, 1]
+
+    // Queues for row reduce and scalar ops
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQ;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQ;
+    pipe.InitBuffer(inQ, 1, N * sizeof(C_T));
+    pipe.InitBuffer(outQ, 1, 1 * sizeof(C_T));
+
+    for (uint32_t b = 0; b < B; ++b) {
+        // Copy one row [N]
+        AscendC::LocalTensor<C_T> rowLocal = inQ.AllocTensor<C_T>();
+        AscendC::DataCopy(rowLocal, cGlobal[b * N], N);
+        inQ.EnQue(rowLocal);
+
+        // DeQue and reduce max to [1]
+        rowLocal = inQ.DeQue<C_T>();
+        AscendC::LocalTensor<C_T> maxLocal = outQ.AllocTensor<C_T>();
+        // ReduceMax: compute maximum value across last axis
+        AscendC::ReduceMax(maxLocal, rowLocal, N);
+
+        // mean over dim=1 (for [1] vector, mean == itself)
+        AscendC::LocalTensor<C_T> meanLocal = outQ.AllocTensor<C_T>();
+        AscendC::Mean(meanLocal, maxLocal, 1);
+
+        // subtract: max - mean (will be 0 for [1] input)
+        AscendC::LocalTensor<C_T> subLocal = outQ.AllocTensor<C_T>();
+        AscendC::Sub(subLocal, maxLocal, meanLocal, 1);
+
+        // GELU
+        AscendC::LocalTensor<C_T> geluLocal = outQ.AllocTensor<C_T>();
+        AscendC::Gelu(geluLocal, subLocal, 1);
+
+        // write out [1]
+        AscendC::DataCopy(yGlobal[b * 1], geluLocal, 1);
+
+        // free locals
+        outQ.FreeTensor(geluLocal);
+        outQ.FreeTensor(subLocal);
+        outQ.FreeTensor(meanLocal);
+        outQ.FreeTensor(maxLocal);
+        inQ.FreeTensor(rowLocal);
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gemm_max_subtract_gelu_custom_impl_npu(const at::Tensor& x,
+                                                  const at::Tensor& weight,
+                                                  const c10::optional<at::Tensor>& bias_opt) {
+    TORCH_CHECK(x.is_cuda(), "x must be on NPU");
+    TORCH_CHECK(weight.is_cuda(), "weight must be on NPU");
+    at::Tensor bias = bias_opt.has_value() ? bias_opt.value() : at::zeros({weight.size(0)}, x.options());
+    // Output shape: [B, 1] (max over dim=1 with keepdim=True, then subtract mean and GELU)
+    at::Tensor y = at::empty({x.size(0), 1}, x.options());
+    EXEC_NPU_CMD(aclnnGemmMaxSubtractGeluCustom, x, weight, bias, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_max_subtract_gelu_custom", TORCH_FN(gemm_max_subtract_gelu_custom_impl_npu));
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_max_subtract_gelu_custom",
+          [](const at::Tensor& x, const at::Tensor& weight, const c10::optional<at::Tensor>& bias) {
+              return gemm_max_subtract_gelu_custom_impl_npu(x, weight, bias);
+          },
+          "GEMM + Max + Subtract Mean + GELU (custom AscendC)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Fused: GEMM -> max(dim=1, keepdim=True) -> subtract mean(dim=1, keepdim=True) -> GELU
+    Output shape: [B, 1]
+    """
+    def __init__(self, in_features, out_features, max_dim):
+        super().__init__()
+        self.gemm = torch.nn.Linear(in_features, out_features)
+        self.max_dim = max_dim  # expected 1
+
+    def forward(self, x):
+        # Use custom fused op
+        return custom_ops_lib.gemm_max_subtract_gelu_custom(x, self.gemm.weight, self.gemm.bias)
+
+def get_inputs():
+    batch_size = 1024
+    in_features = 8192
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    batch_size = 1024
+    in_features = 8192
+    out_features = 8192
+    max_dim = 1
+    return [in_features, out_features, max_dim]
+'''

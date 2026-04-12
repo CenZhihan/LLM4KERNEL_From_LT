@@ -1,0 +1,278 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulDivideGeluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "d",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulDivideGeluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, inSize);
+  TILING_DATA_FIELD_DEF(uint32_t, outSize);
+  TILING_DATA_FIELD_DEF(uint32_t, total);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulDivideGeluCustom, MatmulDivideGeluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "matmul_divide_gelu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MatmulDivideGeluCustomTilingData tiling;
+
+    const auto* x_shape = context->GetInputShape(0);
+    const auto* w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t batch = (x_shape->GetOriginShape().GetShapeSize() == 0) ? 0 :
+                     static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t inSize = (x_shape->GetOriginShape().GetShapeSize() < 2) ? 0 :
+                      static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    uint32_t outSize = (w_shape->GetOriginShape().GetShapeSize() == 0) ? 0 :
+                       static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(0));
+    uint32_t total = batch * outSize;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_batch(batch);
+    tiling.set_inSize(inSize);
+    tiling.set_outSize(outSize);
+    tiling.set_total(total);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return GRAPH_FAILED;
+    }
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    // x: [B, I], w: [O, I] -> y: [B, O]
+    int64_t B = x_shape->GetDimNum() > 0 ? x_shape->GetDim(0) : 0;
+    int64_t O = w_shape->GetDimNum() > 0 ? w_shape->GetDim(0) : 0;
+
+    gert::Shape out;
+    out.SetDimNum(2);
+    out.SetDim(0, B);
+    out.SetDim(1, O);
+    *y_shape = out;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MatmulDivideGeluCustom : public OpDef {
+public:
+    explicit MatmulDivideGeluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("d")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulDivideGeluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include <cmath>
+
+extern "C" __global__ __aicore__ void matmul_divide_gelu_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR d, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+
+    const uint32_t B = tiling_data.batch;
+    const uint32_t I = tiling_data.inSize;
+    const uint32_t O = tiling_data.outSize;
+    const uint32_t total = tiling_data.total;
+
+    __gm__ DTYPE_X* xGm = reinterpret_cast<__gm__ DTYPE_X*>(x);
+    __gm__ DTYPE_W* wGm = reinterpret_cast<__gm__ DTYPE_W*>(w);
+    __gm__ DTYPE_B* bGm = reinterpret_cast<__gm__ DTYPE_B*>(b);
+    __gm__ DTYPE_D* dGm = reinterpret_cast<__gm__ DTYPE_D*>(d);
+    __gm__ DTYPE_Z* yGm = reinterpret_cast<__gm__ DTYPE_Z*>(y);
+
+    if (B == 0 || I == 0 || O == 0) {
+        return;
+    }
+
+    DTYPE_D divisor_val = dGm[0];
+
+    const uint32_t blockNum = AscendC::GetBlockNum();
+    const uint32_t blockIdx = AscendC::GetBlockIdx();
+    uint32_t work = (total + blockNum - 1) / blockNum;
+    uint32_t start = work * blockIdx;
+    uint32_t end = start + work;
+    if (end > total) end = total;
+
+    for (uint32_t idx = start; idx < end; ++idx) {
+        uint32_t bIdx = idx / O;
+        uint32_t oIdx = idx % O;
+
+        float acc = 0.0f;
+        uint64_t x_base = static_cast<uint64_t>(bIdx) * I;
+        uint64_t w_base = static_cast<uint64_t>(oIdx) * I;
+
+        for (uint32_t k = 0; k < I; ++k) {
+            float xv = static_cast<float>(xGm[x_base + k]);
+            float wv = static_cast<float>(wGm[w_base + k]);
+            acc += xv * wv;
+        }
+        acc += static_cast<float>(bGm[oIdx]);
+        acc = acc / static_cast<float>(divisor_val);
+
+        // GELU approximate using tanh formulation
+        float x3 = acc * acc * acc;
+        float inner = 0.7978845608028654f * (acc + 0.044715f * x3);
+        float gelu = 0.5f * acc * (1.0f + tanhf(inner));
+
+        yGm[static_cast<uint64_t>(bIdx) * O + oIdx] = static_cast<DTYPE_Z>(gelu);
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_divide_gelu_custom_impl_npu(const at::Tensor& x,
+                                              const at::Tensor& w,
+                                              const at::Tensor& b,
+                                              const at::Tensor& d) {
+    TORCH_CHECK(x.dim() == 2, \"x must be 2D\");
+    TORCH_CHECK(w.dim() == 2, \"w must be 2D\");
+    TORCH_CHECK(b.dim() == 1, \"b must be 1D\");
+    auto B = x.size(0);
+    auto O = w.size(0);
+    at::Tensor result = at::empty({B, O}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulDivideGeluCustom, x, w, b, d, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"matmul_divide_gelu_custom\", &matmul_divide_gelu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"matmul_divide_gelu_custom\", &matmul_divide_gelu_custom_impl_npu, \"fused matmul/divide/gelu\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Fused MatMul + bias + divide + GELU using custom AscendC kernel.
+    """
+    def __init__(self, input_size, output_size, divisor):
+        super().__init__()
+        self.linear = torch.nn.Linear(input_size, output_size)
+        self.divisor = float(divisor)
+
+    def forward(self, x):
+        # Prepare inputs for fused kernel:
+        # x: [B, I], w: [O, I], b: [O], d: scalar as 1-element tensor
+        d = torch.tensor([self.divisor], dtype=x.dtype, device=x.device)
+        return custom_ops_lib.matmul_divide_gelu_custom(x, self.linear.weight, self.linear.bias, d)
+'''

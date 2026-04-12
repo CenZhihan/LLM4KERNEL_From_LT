@@ -3,15 +3,19 @@ project_json_src='''
     {
         "op": "EluCustom",
         "language": "cpp",
-        "attr": [
-            {
-                "name": "alpha",
-                "type": "float"
-            }
-        ],
         "input_desc": [
             {
                 "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "alpha",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -41,11 +45,9 @@ host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
-// 注册TilingData结构，包含长度、分块数以及alpha参数
 BEGIN_TILING_DATA_DEF(EluCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(float, alpha);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(EluCustom, EluCustomTilingData)
@@ -57,36 +59,28 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;  // 启动核数
-const uint32_t TILE_NUM = 8;   // 每核分tile数
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
 
-// 主机端tiling函数：计算总长度、分块，携带alpha到tiling数据
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     EluCustomTilingData tiling;
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
 
-    // 从属性读取alpha（若无则使用默认值1.0）
-    float alpha = 1.0f;
-    // 以下获取属性的接口为常见写法，具体实现以实际版本为准
-    // 若无法获取到属性，也不会影响编译运行（采用默认值）
-    // context->GetAttr("alpha", alpha);
-    tiling.set_alpha(alpha);
-
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
 
-
 namespace ge {
-// 形状推理：输出与输入一致
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
@@ -94,7 +88,7 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
     *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
-// 类型推理：输出dtype与输入一致
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -103,9 +97,7 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 }
 }
 
-
 namespace ops {
-// 原型注册：一个输入x，一个输出y，支持float ND，含float属性alpha
 class EluCustom : public OpDef {
 public:
     explicit EluCustom(const char* name) : OpDef(name)
@@ -115,14 +107,16 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("alpha")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        // 属性alpha（若实际SDK需显式声明，可按版本能力增加属性定义）
-        // this->Attr("alpha").Float(1.0f);
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
@@ -138,30 +132,26 @@ OP_ADD(EluCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "elu_custom_tiling_data.h"
 
-// 实现ELU：y = max(x, 0) + min(alpha * (exp(x) - 1), 0)
-// 通过Maxs/Mins/Exp/Adds/Muls组成，无需显式掩码
-constexpr int32_t BUFFER_NUM = 2; // 双缓冲
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor数量
 
 class KernelElu {
 public:
     __aicore__ inline KernelElu() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z, uint32_t totalLength, uint32_t tileNum, float alpha)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR alpha, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
     {
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
-        this->alpha = alpha;
 
         xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        // y为未使用输入，占位即可
-        yGm.SetGlobalBuffer((__gm__ DTYPE_X *)y + 0, 0);
-        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        aGm.SetGlobalBuffer((__gm__ DTYPE_Y *)alpha + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+        pipe.InitBuffer(inQueueA, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+        pipe.InitBuffer(calcBufs, this->tileLength * sizeof(DTYPE_X) * 2); // 两个中间buffer
     }
 
     __aicore__ inline void Process()
@@ -178,58 +168,72 @@ private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> aLocal = inQueueA.AllocTensor<DTYPE_Y>();
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(aLocal, aGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
+        inQueueA.EnQue(aLocal);
     }
 
-    __aicore__ inline void Compute(int32_t progress)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Y> aLocal = inQueueA.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
 
-        // y_pos = max(x, 0)
-        AscendC::Maxs(zLocal, xLocal, static_cast<DTYPE_X>(0.0f), this->tileLength);
+        AscendC::LocalTensor<DTYPE_X> tmp1 = calcBufs.Get<DTYPE_X>(); // 保存min(x,0)及其后续变换
+        AscendC::LocalTensor<DTYPE_X> tmp2 = calcBufs.Get<DTYPE_X>(); // 保存alpha*(exp(x)-1)
 
-        // 复用xLocal计算负支路：xLocal = alpha * (exp(x) - 1)
-        AscendC::Exp(xLocal, xLocal, this->tileLength);
-        AscendC::Adds(xLocal, xLocal, static_cast<DTYPE_X>(-1.0f), this->tileLength);
-        AscendC::Muls(xLocal, xLocal, static_cast<DTYPE_X>(this->alpha), this->tileLength);
-        // xLocal = min(xLocal, 0)
-        AscendC::Mins(xLocal, xLocal, static_cast<DTYPE_X>(0.0f), this->tileLength);
+        // y = max(0, x) + alpha * (exp(min(0, x)) - 1)
+        // 1) yLocal <- max(x, 0)
+        AscendC::Maxs(yLocal, xLocal, static_cast<DTYPE_X>(0), this->tileLength);
 
-        // y = y_pos + y_neg
-        AscendC::Add(zLocal, zLocal, xLocal, this->tileLength);
+        // 2) tmp1 <- min(x, 0)
+        AscendC::Mins(tmp1, xLocal, static_cast<DTYPE_X>(0), this->tileLength);
 
-        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        // 3) tmp1 <- exp(tmp1)
+        AscendC::Exp(tmp1, tmp1, this->tileLength);
+
+        // 4) tmp1 <- tmp1 - 1
+        AscendC::Adds(tmp1, tmp1, static_cast<DTYPE_X>(-1.0f), this->tileLength);
+
+        // 5) tmp2 <- tmp1 * alpha (alpha为向量输入)
+        AscendC::Mul(tmp2, tmp1, aLocal, this->tileLength);
+
+        // 6) yLocal <- yLocal + tmp2
+        AscendC::Add(yLocal, yLocal, tmp2, this->tileLength);
+
+        outQueueY.EnQue<DTYPE_Z>(yLocal);
         inQueueX.FreeTensor(xLocal);
+        inQueueA.FreeTensor(aLocal);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
-        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
-        outQueueZ.FreeTensor(zLocal);
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueA;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> calcBufs;
+
     AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_X> yGm; // 未使用，仅占位
-    AscendC::GlobalTensor<DTYPE_Z> zGm;
+    AscendC::GlobalTensor<DTYPE_Y> aGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
 
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
-    float alpha;
 };
 
-extern "C" __global__ __aicore__ void elu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void elu_custom(GM_ADDR x, GM_ADDR alpha, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelElu op;
-    op.Init(x, y, z, tiling_data.totalLength, tiling_data.tileNum, tiling_data.alpha);
+    op.Init(x, alpha, y, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -240,11 +244,10 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-// Python绑定：接受alpha并传递给自定义算子
-at::Tensor elu_custom_impl_npu(const at::Tensor& self, double alpha = 1.0) {
+at::Tensor elu_custom_impl_npu(const at::Tensor& self, double alpha) {
     at::Tensor result = at::empty_like(self);
-    // 约定：EXEC_NPU_CMD将按(输入, 属性..., 输出)顺序传参
-    EXEC_NPU_CMD(aclnnEluCustom, self, static_cast<float>(alpha), result);
+    at::Tensor alpha_tensor = at::full_like(self, alpha);
+    EXEC_NPU_CMD(aclnnEluCustom, self, alpha_tensor, result);
     return result;
 }
 
@@ -253,7 +256,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("elu_custom", &elu_custom_impl_npu, "ELU activation with alpha");
+    m.def("elu_custom", &elu_custom_impl_npu, "ELU activation");
 }
 """
 
@@ -268,5 +271,5 @@ class ModelNew(torch.nn.Module):
         self.alpha = alpha
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return custom_ops_lib.elu_custom(x, self.alpha)
+        return custom_ops_lib.elu_custom(x, float(self.alpha))
 '''

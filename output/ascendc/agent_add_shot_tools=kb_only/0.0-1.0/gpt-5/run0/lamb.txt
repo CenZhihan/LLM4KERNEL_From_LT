@@ -7,44 +7,28 @@ project_json_src='''
             {
                 "name": "param",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
                 "name": "m",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
                 "name": "v",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ],
         "output_desc": [
             {
                 "name": "out",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ]
     }
@@ -58,8 +42,9 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(LambCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(float, alpha);
+  TILING_DATA_FIELD_DEF(float, lr);
   TILING_DATA_FIELD_DEF(float, eps);
+  TILING_DATA_FIELD_DEF(float, trust);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(LambCustom, LambCustomTilingData)
@@ -69,7 +54,6 @@ REGISTER_TILING_DATA_CLASS(LambCustom, LambCustomTilingData)
 host_operator_src="""
 #include "lamb_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
@@ -78,31 +62,38 @@ const uint32_t TILE_NUM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     LambCustomTilingData tiling;
-
-    // 输入总元素个数
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+
+    // 从属性读取学习率、epsilon、以及信任比（由前端传入）
+    float lr = 0.001f;
+    float eps = 1e-6f;
+    float trust = 1.0f;
+    if (context->GetAttrs() != nullptr) {
+        auto attrs = context->GetAttrs();
+        if (attrs->Find("lr") != nullptr) {
+            lr = attrs->GetFloat("lr");
+        }
+        if (attrs->Find("eps") != nullptr) {
+            eps = attrs->GetFloat("eps");
+        }
+        if (attrs->Find("trust") != nullptr) {
+            trust = attrs->GetFloat("trust");
+        }
+    }
+
     context->SetBlockDim(BLOCK_DIM);
+
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-
-    // 从运行时属性读取 alpha(= lr * trust_ratio) 与 eps
-    const gert::RuntimeAttrs* attrs = context->GetAttrs();
-    float alpha = 0.f;
-    float eps = 0.f;
-    if (attrs != nullptr) {
-        alpha = *(attrs->GetAttrPointer<float>(0));  // alpha
-        eps   = *(attrs->GetAttrPointer<float>(1));  // eps
-    }
-    tiling.set_alpha(alpha);
+    tiling.set_lr(lr);
     tiling.set_eps(eps);
+    tiling.set_trust(trust);
 
-    // 保存tiling数据
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // 不需要workspace
-    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0; // 本算子无需workspace
 
     return ge::GRAPH_SUCCESS;
 }
@@ -145,21 +136,20 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Output("out")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        // 运行时标量属性
-        this->Attr("alpha")
-            .AttrType(REQUIRED)
-            .Float(0.0);
-        this->Attr("eps")
-            .AttrType(REQUIRED)
-            .Float(0.0);
+        // 可选：定义属性（学习率/epsilon/信任比）
+        this->Attr("lr").Float(1e-3);
+        this->Attr("eps").Float(1e-6);
+        this->Attr("trust").Float(1.0);
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
@@ -171,43 +161,47 @@ OP_ADD(LambCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "lamb_custom_tiling_data.h"
 
-// 基于Ascend C基础向量API：Sqrt、Adds、Div、Muls、Sub、DataCopy
-// 参考向量与两操作数标量指令：Adds/Muls，以及数据搬运DataCopy。
-// 队列/流水线组织参考官方样例。
+// 数据类型定义
+using DTYPE_PARAM = float;
+using DTYPE_M = float;
+using DTYPE_V = float;
+using DTYPE_Z = float;
 
-constexpr int32_t BUFFER_NUM = 2; // 每个队列的张量数量
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor数
 
 class KernelLamb {
 public:
     __aicore__ inline KernelLamb() {}
     __aicore__ inline void Init(GM_ADDR param, GM_ADDR m, GM_ADDR v, GM_ADDR out,
-                                uint32_t totalLength, uint32_t tileNum, float alpha, float eps)
+                                float lr, float eps, float trust,
+                                uint32_t totalLength, uint32_t tileNum)
     {
+        ASSERT(GetBlockNum() != 0 && "block dim can not be zero!");
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
+        ASSERT(tileNum != 0 && "tile num can not be zero!");
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
-        this->alpha = alpha;
-        this->eps = eps;
 
-        paramGm.SetGlobalBuffer((__gm__ DTYPE_X*)param + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        mGm.SetGlobalBuffer((__gm__ DTYPE_Y*)m + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        vGm.SetGlobalBuffer((__gm__ DTYPE_Z*)v + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        this->lr = lr;
+        this->eps = eps;
+        this->trust = trust;
+
+        paramGm.SetGlobalBuffer((__gm__ DTYPE_PARAM*)param + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        mGm.SetGlobalBuffer((__gm__ DTYPE_M*)m + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        vGm.SetGlobalBuffer((__gm__ DTYPE_V*)v + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         outGm.SetGlobalBuffer((__gm__ DTYPE_Z*)out + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQueueParam, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(inQueueM, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
-        pipe.InitBuffer(inQueueV, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
-        pipe.InitBuffer(outQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
-        pipe.InitBuffer(calcQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z)); // 计算中间缓冲
+        pipe.InitBuffer(inQueueParam, BUFFER_NUM, this->tileLength * sizeof(DTYPE_PARAM));
+        pipe.InitBuffer(inQueueM, BUFFER_NUM, this->tileLength * sizeof(DTYPE_M));
+        pipe.InitBuffer(inQueueV, BUFFER_NUM, this->tileLength * sizeof(DTYPE_V));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
     }
 
     __aicore__ inline void Process()
     {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; ++i) {
+        for (int32_t i = 0; i < loopCount; i++) {
             CopyIn(i);
             Compute(i);
             CopyOut(i);
@@ -217,9 +211,9 @@ public:
 private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_X> paramLocal = inQueueParam.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> mLocal = inQueueM.AllocTensor<DTYPE_Y>();
-        AscendC::LocalTensor<DTYPE_Z> vLocal = inQueueV.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_PARAM> paramLocal = inQueueParam.AllocTensor<DTYPE_PARAM>();
+        AscendC::LocalTensor<DTYPE_M> mLocal = inQueueM.AllocTensor<DTYPE_M>();
+        AscendC::LocalTensor<DTYPE_V> vLocal = inQueueV.AllocTensor<DTYPE_V>();
 
         AscendC::DataCopy(paramLocal, paramGm[progress * this->tileLength], this->tileLength);
         AscendC::DataCopy(mLocal, mGm[progress * this->tileLength], this->tileLength);
@@ -230,67 +224,68 @@ private:
         inQueueV.EnQue(vLocal);
     }
 
-    __aicore__ inline void Compute(int32_t progress)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        // 取出局部张量
-        AscendC::LocalTensor<DTYPE_X> paramLocal = inQueueParam.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> mLocal = inQueueM.DeQue<DTYPE_Y>();
-        AscendC::LocalTensor<DTYPE_Z> vLocal = inQueueV.DeQue<DTYPE_Z>(); // 将在此复用为中间r与缩放后的r
-        AscendC::LocalTensor<DTYPE_Z> outLocal = outQueue.AllocTensor<DTYPE_Z>();
-        AscendC::LocalTensor<DTYPE_Z> calcLocal = calcQueue.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_PARAM> paramLocal = inQueueParam.DeQue<DTYPE_PARAM>();
+        AscendC::LocalTensor<DTYPE_M> mLocal = inQueueM.DeQue<DTYPE_M>();
+        AscendC::LocalTensor<DTYPE_V> vLocal = inQueueV.DeQue<DTYPE_V>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
 
         // denom = sqrt(v) + eps
-        AscendC::Sqrt(calcLocal, vLocal, this->tileLength);
-        AscendC::Adds(calcLocal, calcLocal, (DTYPE_Z)this->eps, this->tileLength);
+        AscendC::Sqrt(zLocal, vLocal, this->tileLength);                          // zLocal = sqrt(v)
+        AscendC::Adds(zLocal, zLocal, (DTYPE_Z)this->eps, this->tileLength);      // zLocal = sqrt(v) + eps
 
-        // vLocal = r = m / denom
-        AscendC::Div(vLocal, mLocal, calcLocal, this->tileLength);
+        // r = m / denom  -> reuse zLocal as r
+        AscendC::Div(zLocal, mLocal, zLocal, this->tileLength);                   // zLocal = r
 
-        // vLocal = r * alpha (标量缩放)
-        AscendC::Muls(vLocal, vLocal, (DTYPE_Z)this->alpha, this->tileLength);
+        // scale r by trust and lr: r = r * trust * lr
+        AscendC::Muls(zLocal, zLocal, (DTYPE_Z)this->trust, this->tileLength);
+        AscendC::Muls(zLocal, zLocal, (DTYPE_Z)this->lr, this->tileLength);
 
-        // out = param - vLocal
-        AscendC::Sub(outLocal, paramLocal, vLocal, this->tileLength);
+        // out = param - r_scaled
+        AscendC::Sub(zLocal, paramLocal, zLocal, this->tileLength);               // zLocal = param - lr*trust*r
 
-        // 回收入队张量
-        outQueue.EnQue<DTYPE_Z>(outLocal);
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
         inQueueParam.FreeTensor(paramLocal);
         inQueueM.FreeTensor(mLocal);
         inQueueV.FreeTensor(vLocal);
-        calcQueue.FreeTensor(calcLocal);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Z> outLocal = outQueue.DeQue<DTYPE_Z>();
-        AscendC::DataCopy(outGm[progress * this->tileLength], outLocal, this->tileLength);
-        outQueue.FreeTensor(outLocal);
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(outGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueParam, inQueueM, inQueueV;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
-    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> calcQueue;
-    AscendC::GlobalTensor<DTYPE_X> paramGm;
-    AscendC::GlobalTensor<DTYPE_Y> mGm;
-    AscendC::GlobalTensor<DTYPE_Z> vGm;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueParam;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueM;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueV;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueZ;
+
+    AscendC::GlobalTensor<DTYPE_PARAM> paramGm;
+    AscendC::GlobalTensor<DTYPE_M> mGm;
+    AscendC::GlobalTensor<DTYPE_V> vGm;
     AscendC::GlobalTensor<DTYPE_Z> outGm;
+
+    float lr;
+    float eps;
+    float trust;
 
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
-    float alpha;
-    float eps;
 };
 
-extern "C" __global__ __aicore__ void lamb_custom(GM_ADDR param, GM_ADDR m, GM_ADDR v, GM_ADDR out,
-                                                   GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void lamb_custom(GM_ADDR param, GM_ADDR m, GM_ADDR v, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling)
 {
-    GET_TILING_DATA(tiling_data, tiling);
+    GET_TILING_DATA(tilingData, tiling);
     KernelLamb op;
-    op.Init(param, m, v, out, tiling_data.totalLength, tiling_data.tileNum,
-            tiling_data.alpha, tiling_data.eps);
+    op.Init(param, m, v, out,
+            tilingData.lr, tilingData.eps, tilingData.trust,
+            tilingData.totalLength, tilingData.tileNum);
     op.Process();
 }
 """
@@ -301,16 +296,25 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-// acL NN接口名称应与OP PascalCase一致：LambCustom
-// 运行时通过attrs传入 alpha(= lr * trust_ratio) 与 eps。
-at::Tensor lamb_custom_impl_npu(const at::Tensor& param,
-                                const at::Tensor& m,
-                                const at::Tensor& v,
-                                double alpha,
-                                double eps) {
+// 计算 trust_ratio = ||param||_2 / (||r||_2 + eps)，其中 r = m / (sqrt(v) + eps)
+static inline float compute_trust_ratio(const at::Tensor& param, const at::Tensor& m,
+                                        const at::Tensor& v, double eps) {
+    // 确保在同一设备上计算
+    auto denom = v.sqrt().add_(eps);
+    auto r = m / denom;
+    auto num = param.norm(2.0);
+    auto den = r.norm(2.0).add_(eps);
+    // 转为 CPU 标量
+    float trust = (num / den).item<float>();
+    return trust;
+}
+
+at::Tensor lamb_custom_impl_npu(const at::Tensor& param, const at::Tensor& m, const at::Tensor& v,
+                                double lr, double eps) {
     at::Tensor out = at::empty_like(param);
-    // 传参顺序：输入张量们、标量属性、输出张量
-    EXEC_NPU_CMD(aclnnLambCustom, param, m, v, (float)alpha, (float)eps, out);
+    float trust = compute_trust_ratio(param, m, v, eps);
+    // 通过属性将 lr/eps/trust 传递给后端（与主机侧 TilingFunc 对应）
+    EXEC_NPU_CMD(aclnnLambCustom, param, m, v, lr, eps, (double)trust, out);
     return out;
 }
 
@@ -319,7 +323,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("lamb_custom", &lamb_custom_impl_npu, "LAMB fused update (param - alpha * m / (sqrt(v)+eps))");
+    m.def("lamb_custom", &lamb_custom_impl_npu, "LAMB fused update");
 }
 """
 
@@ -331,14 +335,9 @@ import custom_ops_lib
 class ModelNew(torch.nn.Module):
     def __init__(self, lr=1e-3, eps=1e-6):
         super().__init__()
-        self.lr = lr
-        self.eps = eps
+        self.lr = float(lr)
+        self.eps = float(eps)
 
     def forward(self, param, m, v):
-        # 先在Python侧计算全局trust_ratio（避免在核内做跨块归约）
-        r = m / (v.sqrt() + self.eps)
-        trust_ratio = param.norm(p=2) / (r.norm(p=2) + self.eps)
-        alpha = float(self.lr * trust_ratio.item())
-        # 调用AscendC自定义融合核：完成 r 计算与参数更新 param - alpha * r
-        return custom_ops_lib.lamb_custom(param, m, v, alpha, float(self.eps))
+        return custom_ops_lib.lamb_custom(param, m, v, self.lr, self.eps)
 '''

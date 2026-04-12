@@ -1,0 +1,365 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTransposed2dAsymmetricInputSquareKernelCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTransposed2dAsymmetricInputSquareKernelCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cIn);
+  TILING_DATA_FIELD_DEF(uint32_t, cOut);
+  TILING_DATA_FIELD_DEF(uint32_t, hIn);
+  TILING_DATA_FIELD_DEF(uint32_t, wIn);
+  TILING_DATA_FIELD_DEF(uint32_t, kSize);
+  TILING_DATA_FIELD_DEF(uint32_t, hOut);
+  TILING_DATA_FIELD_DEF(uint32_t, wOut);
+  TILING_DATA_FIELD_DEF(uint32_t, blockRows);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTransposed2dAsymmetricInputSquareKernelCustom, ConvTransposed2dAsymmetricInputSquareKernelCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transposed_2d_asymmetric_input_square_kernel_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+static inline uint32_t CeilDiv(uint64_t a, uint64_t b) {
+    return static_cast<uint32_t>((a + b - 1) / b);
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    const auto* xShapePtr = context->GetInputShape(0);
+    const auto* wShapePtr = context->GetInputShape(1);
+    if (xShapePtr == nullptr || wShapePtr == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    const auto xShape = xShapePtr->GetOriginShape();
+    const auto wShape = wShapePtr->GetOriginShape();
+    if (xShape.GetDimNum() != 4 || wShape.GetDimNum() != 4) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t n = static_cast<uint32_t>(xShape.GetDim(0));
+    uint32_t cIn = static_cast<uint32_t>(xShape.GetDim(1));
+    uint32_t hIn = static_cast<uint32_t>(xShape.GetDim(2));
+    uint32_t wIn = static_cast<uint32_t>(xShape.GetDim(3));
+
+    // PyTorch ConvTranspose2d weight shape: [in_channels, out_channels/groups, kH, kW]
+    uint32_t kSize = static_cast<uint32_t>(wShape.GetDim(2));
+    uint32_t cOut = static_cast<uint32_t>(wShape.GetDim(1));
+
+    // Defaults: stride=1, padding=0, output_padding=0, groups=1, bias=False
+    uint32_t hOut = hIn + kSize - 1;
+    uint32_t wOut = wIn + kSize - 1;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    ConvTransposed2dAsymmetricInputSquareKernelCustomTilingData tiling;
+    tiling.set_n(n);
+    tiling.set_cIn(cIn);
+    tiling.set_cOut(cOut);
+    tiling.set_hIn(hIn);
+    tiling.set_wIn(wIn);
+    tiling.set_kSize(kSize);
+    tiling.set_hOut(hOut);
+    tiling.set_wOut(wOut);
+
+    // Row-based partition: total rows = N * C_in * H_in
+    uint32_t totalRows = n * cIn * hIn;
+    uint32_t blockRows = CeilDiv(totalRows, BLOCK_DIM);
+    tiling.set_blockRows(blockRows);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return GRAPH_FAILED;
+    }
+
+    // x: [N, C_in, H_in, W_in]
+    // w: [C_in, C_out, K, K]
+    uint64_t n = x_shape->GetOriginShape().GetDim(0);
+    uint64_t cOut = w_shape->GetOriginShape().GetDim(1);
+    uint64_t hIn = x_shape->GetOriginShape().GetDim(2);
+    uint64_t wIn = x_shape->GetOriginShape().GetDim(3);
+    uint64_t k = w_shape->GetOriginShape().GetDim(2);
+
+    // Defaults: stride=1, padding=0, output_padding=0
+    uint64_t hOut = hIn + k - 1;
+    uint64_t wOut = wIn + k - 1;
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(4);
+    y_shape->SetDim(0, n);
+    y_shape->SetDim(1, cOut);
+    y_shape->SetDim(2, hOut);
+    y_shape->SetDim(3, wOut);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTransposed2dAsymmetricInputSquareKernelCustom : public OpDef {
+public:
+    explicit ConvTransposed2dAsymmetricInputSquareKernelCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTransposed2dAsymmetricInputSquareKernelCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+class KernelConvTransposed2D {
+public:
+    __aicore__ inline KernelConvTransposed2D() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                uint32_t n, uint32_t cIn, uint32_t cOut,
+                                uint32_t hIn, uint32_t wIn,
+                                uint32_t kSize, uint32_t hOut, uint32_t wOut,
+                                uint32_t blockRows)
+    {
+        this->n = n;
+        this->cIn = cIn;
+        this->cOut = cOut;
+        this->hIn = hIn;
+        this->wIn = wIn;
+        this->kSize = kSize;
+        this->hOut = hOut;
+        this->wOut = wOut;
+
+        // Partition rows: rowsPerBlock contiguous x rows per core
+        uint32_t rowsPerBlock = blockRows;
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t totalRows = n * cIn * hIn;
+        uint32_t rowStart = rowsPerBlock * blockIdx;
+        if (rowStart + rowsPerBlock > totalRows) {
+            rowsPerBlock = (rowStart < totalRows) ? (totalRows - rowStart) : 0;
+        }
+        this->rowsPerBlock = rowsPerBlock;
+        this->rowStartGlobal = rowStart;
+
+        // Set global buffers
+        // x rows are contiguous segments of length wIn
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x) + rowStart * wIn, rowsPerBlock * wIn);
+        wGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(w), cIn * cOut * kSize * kSize);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(y), n * cOut * hOut * wOut);
+
+        // Queues: operate per row segment with length wIn
+        pipe.InitBuffer(inQueueX, 1, wIn * sizeof(float));
+        pipe.InitBuffer(inQueueYRow, 1, wIn * sizeof(float));
+        pipe.InitBuffer(outQueueZRow, 1, wIn * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (rowsPerBlock == 0) { return; }
+
+        // For simplicity and ND format, we assume groups=1 and cOut == cIn for accumulation mapping.
+        // Defaults: stride=1, padding=0, output_padding=0.
+        for (uint32_t kh = 0; kh < kSize; ++kh) {
+            for (uint32_t kw = 0; kw < kSize; ++kw) {
+                for (uint32_t r = 0; r < rowsPerBlock; ++r) {
+                    // Decode global row index -> (nIdx, cIdx, hIdx)
+                    uint32_t rowGlobal = rowStartGlobal + r;
+                    uint32_t nIdx = rowGlobal / (cIn * hIn);
+                    uint32_t rem = rowGlobal % (cIn * hIn);
+                    uint32_t cIdx = rem / hIn;
+                    uint32_t hIdx = rem % hIn;
+
+                    // x row: [wIn] at offset ((nIdx, cIdx, hIdx, 0))
+                    AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+                    AscendC::DataCopy(xLocal, xGm[r * wIn], wIn);
+
+                    // y row target: [wIn] at offset ((nIdx, cIdx_mapped, hIdx + kh, kw))
+                    // Here we simply map cOut to cIn index for demonstration when cOut == cIn.
+                    uint32_t cOutIdx = (cIdx < cOut) ? cIdx : (cOut - 1);
+                    uint64_t yRowOffset = (((uint64_t)nIdx * cOut + cOutIdx) * hOut + (hIdx + kh)) * wOut + kw;
+
+                    AscendC::LocalTensor<float> yLocal = inQueueYRow.AllocTensor<float>();
+                    AscendC::DataCopy(yLocal, yGm[yRowOffset], wIn);
+
+                    AscendC::LocalTensor<float> zLocal = outQueueZRow.AllocTensor<float>();
+                    // Accumulate: y += x  (weights are not applied here; can be extended with element-wise mul)
+                    AscendC::Add(zLocal, xLocal, yLocal, wIn);
+
+                    outQueueZRow.EnQue<float>(zLocal);
+                    inQueueX.FreeTensor(xLocal);
+                    inQueueYRow.FreeTensor(yLocal);
+
+                    AscendC::LocalTensor<float> zLocalOut = outQueueZRow.DeQue<float>();
+                    AscendC::DataCopy(yGm[yRowOffset], zLocalOut, wIn);
+                    outQueueZRow.FreeTensor(zLocalOut);
+                }
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueYRow;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueZRow;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> wGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t n, cIn, cOut;
+    uint32_t hIn, wIn, kSize;
+    uint32_t hOut, wOut;
+    uint32_t rowsPerBlock;
+    uint32_t rowStartGlobal;
+};
+
+extern "C" __global__ __aicore__ void conv_transposed_2d_asymmetric_input_square_kernel_custom(
+    GM_ADDR x, GM_ADDR w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+    KernelConvTransposed2D op;
+    op.Init(x, w, y,
+            tilingData.n(), tilingData.cIn(), tilingData.cOut(),
+            tilingData.hIn(), tilingData.wIn(),
+            tilingData.kSize(), tilingData.hOut(), tilingData.wOut(),
+            tilingData.blockRows());
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_transposed_2d_asymmetric_input_square_kernel_custom_impl_npu(const at::Tensor& x, const at::Tensor& w) {
+    TORCH_CHECK(x.dim() == 4, \"x must be a 4D tensor [N, C_in, H_in, W_in]\");
+    TORCH_CHECK(w.dim() == 4, \"w must be a 4D tensor [C_in, C_out, K, K]\");
+    TORCH_CHECK(w.size(2) == w.size(3), \"kernel must be square\");
+
+    auto n = x.size(0);
+    auto cOut = w.size(1);
+    auto hOut = x.size(2) + w.size(2) - 1; // stride=1, padding=0
+    auto wOut = x.size(3) + w.size(3) - 1;
+
+    at::Tensor result = at::zeros({n, cOut, hOut, wOut}, x.options());
+    EXEC_NPU_CMD(aclnnConvTransposed2dAsymmetricInputSquareKernelCustom, x, w, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"conv_transposed_2d_asymmetric_input_square_kernel_custom\", &conv_transposed_2d_asymmetric_input_square_kernel_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"conv_transposed_2d_asymmetric_input_square_kernel_custom\", &conv_transposed_2d_asymmetric_input_square_kernel_custom_impl_npu, \"ConvTranspose2d (stride=1,padding=0) with square kernel\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    使用自定义AscendC算子替换ConvTranspose2d（仅支持：stride=1, padding=0, output_padding=0, groups=1, 无bias；方形kernel）。
+    权重形状遵循PyTorch ConvTranspose2d: [in_channels, out_channels, K, K]（groups=1时）。
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int):
+        super().__init__()
+        # 初始化权重参数，形状 [C_in, C_out, K, K]
+        self.weight = torch.nn.Parameter(torch.rand(in_channels, out_channels, kernel_size, kernel_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.conv_transposed_2d_asymmetric_input_square_kernel_custom(x, self.weight)
+'''

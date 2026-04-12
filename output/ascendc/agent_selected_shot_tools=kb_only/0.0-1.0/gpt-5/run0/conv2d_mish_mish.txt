@@ -1,0 +1,288 @@
+project_json_src='''
+[
+    {
+        "op": "Conv2dMishMishCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv2dMishMishCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, tmpBufferSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv2dMishMishCustom, Conv2dMishMishCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv2d_mish_mish_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv2dMishMishCustomTilingData tiling;
+
+    // 输入与输出形状一致（逐元素激活）
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+
+    // 预留UB空间给高阶数学API的临时缓冲
+    auto platformInfo = context->GetPlatformInfo();
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
+    uint64_t tailSize = 0;
+    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, tailSize);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_tmpBufferSize(static_cast<uint32_t>(tailSize));
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv2dMishMishCustom : public OpDef {
+public:
+    explicit Conv2dMishMishCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv2dMishMishCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2; // queue内并行使用的tensor个数
+
+// 该Kernel对输入逐元素执行：y = mish(mish(x))，其中 mish(x) = x * tanh(softplus(x)), softplus(x)=ln(1+exp(x))
+// 注意：此Kernel假设数据类型为float，与project_json一致
+class KernelConv2dMishMish {
+public:
+    __aicore__ inline KernelConv2dMishMish() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum, uint32_t tmpBufferSize)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        // 每个block处理blockLength，进一步切分为 tileNum * BUFFER_NUM 份
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+        // 中间向量(tmp1/tmp2)
+        pipe.InitBuffer(tmpCalcQueue1, 1, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpCalcQueue2, 1, this->tileLength * sizeof(float));
+        // 高阶数学API的共享临时缓冲
+        pipe.InitBuffer(tmpSharedBufQueue, 1, tmpBufferSize);
+    }
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+    }
+
+    // 计算：y = mish(mish(x))
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+
+        AscendC::LocalTensor<float> tmp1 = tmpCalcQueue1.AllocTensor<float>();    // 存放中间exp/softplus结果
+        AscendC::LocalTensor<float> tmp2 = tmpCalcQueue2.AllocTensor<float>();    // 存放log/tanh结果
+        AscendC::LocalTensor<uint8_t> sharedTmpBuffer = tmpSharedBufQueue.AllocTensor<uint8_t>();
+
+        // 第一次 Mish：x -> y1
+        // tmp1 = exp(x)
+        AscendC::Exp<float, 15, false>(tmp1, xLocal, sharedTmpBuffer, this->tileLength);
+        // tmp1 = tmp1 + 1.0
+        AscendC::Adds(tmp1, tmp1, 1.0f, this->tileLength);
+        // tmp2 = log(tmp1)
+        AscendC::Log(tmp2, tmp1, sharedTmpBuffer, this->tileLength);
+        // tmp2 = tanh(tmp2)
+        AscendC::Tanh(tmp2, tmp2, sharedTmpBuffer, this->tileLength);
+        // yLocal = xLocal * tmp2
+        AscendC::Mul(yLocal, xLocal, tmp2, this->tileLength);
+
+        // 第二次 Mish：y1 -> y
+        // tmp1 = exp(yLocal)
+        AscendC::Exp<float, 15, false>(tmp1, yLocal, sharedTmpBuffer, this->tileLength);
+        // tmp1 = tmp1 + 1.0
+        AscendC::Adds(tmp1, tmp1, 1.0f, this->tileLength);
+        // tmp2 = log(tmp1)
+        AscendC::Log(tmp2, tmp1, sharedTmpBuffer, this->tileLength);
+        // tmp2 = tanh(tmp2)
+        AscendC::Tanh(tmp2, tmp2, sharedTmpBuffer, this->tileLength);
+        // yLocal = yLocal * tmp2
+        AscendC::Mul(yLocal, yLocal, tmp2, this->tileLength);
+
+        outQueueY.EnQue<float>(yLocal);
+
+        inQueueX.FreeTensor(xLocal);
+        tmpCalcQueue1.FreeTensor(tmp1);
+        tmpCalcQueue2.FreeTensor(tmp2);
+        tmpSharedBufQueue.FreeTensor(sharedTmpBuffer);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpCalcQueue1;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpCalcQueue2;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpSharedBufQueue;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void conv2d_mish_mish_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv2dMishMish op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum, tiling_data.tmpBufferSize);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv2d_mish_mish_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnConv2dMishMishCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv2d_mish_mish_custom", &conv2d_mish_mish_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv2d_mish_mish_custom", &conv2d_mish_mish_custom_impl_npu, "mish(mish(x))");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    使用AscendC自定义算子将连续两次Mish融合为一次kernel调用。
+    卷积仍使用PyTorch算子，随后由自定义算子完成 mish(mish(x))。
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = custom_ops_lib.conv2d_mish_mish_custom(x)
+        return x
+'''

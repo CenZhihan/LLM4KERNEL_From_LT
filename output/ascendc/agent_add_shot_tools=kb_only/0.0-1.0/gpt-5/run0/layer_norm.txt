@@ -45,6 +45,26 @@ project_json_src='''
                 "type": [
                     "float"
                 ]
+            },
+            {
+                "name": "mean",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "variance",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ]
     }
@@ -56,11 +76,7 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(LayerNormCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(uint32_t, bLength);
-  TILING_DATA_FIELD_DEF(uint32_t, hLength);
-  TILING_DATA_FIELD_DEF(float, epsilon);
+  TILING_DATA_FIELD_DEF_STRUCT(LayerNormTiling, layernormTilingData);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(LayerNormCustom, LayerNormCustomTilingData)
@@ -70,35 +86,40 @@ REGISTER_TILING_DATA_CLASS(LayerNormCustom, LayerNormCustomTilingData)
 host_operator_src="""
 #include "layer_norm_custom_tiling.h"
 #include "register/op_def_registry.h"
+#include "optiling/tiling_api.h"
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     LayerNormCustomTilingData tiling;
 
-    // x shape
-    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
-    // gamma shape equals normalized_shape (flattened size = H)
-    uint32_t hLength = static_cast<uint32_t>(context->GetInputShape(1)->GetOriginShape().GetShapeSize());
-    if (hLength == 0) {
-        return ge::GRAPH_FAILED;
+    // 获取输入原始形状，按 [B, 1, H] 方式传给 LayerNorm Tiling，H=除 Batch 外的元素个数
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    const auto& origin = in_shape->GetOriginShape();
+    int64_t dim0 = 1;
+    if (origin.GetDimNum() > 0) {
+        dim0 = origin.GetDim(0);
     }
-    uint32_t bLength = totalLength / hLength;
+    uint64_t total_elems = origin.GetShapeSize();
+    int64_t B = dim0;
+    int64_t H = static_cast<int64_t>(total_elems / (B > 0 ? B : 1));
+    // {B, S, storageHLength, originHLength}，此处 S=1，且不做 padding 对齐
+    std::vector<int64_t> shape_vec = {B, 1, H, H};
+    ge::Shape srcShape(shape_vec);
 
-    context->SetBlockDim(BLOCK_DIM);
-    tiling.set_totalLength(totalLength);
-    tiling.set_tileNum(TILE_NUM);
-    tiling.set_bLength(bLength);
-    tiling.set_hLength(hLength);
-    tiling.set_epsilon(1e-5f);
+    uint32_t maxTmp = 0;
+    uint32_t minTmp = 0;
+    // 输入类型 float -> sizeof(float)=4
+    AscendC::GetLayerNormMaxMinTmpSize(srcShape, sizeof(float), false, maxTmp, minTmp);
+    AscendC::GetLayerNormNDTillingInfo(srcShape, minTmp, sizeof(float), false, tiling.layernormTilingData);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
+    // 无需 workspace
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
+    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -106,15 +127,38 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
+    // y 形状与 x 相同；mean/variance 为 [B, 1]
     const gert::Shape* x_shape = context->GetInputShape(0);
+    const auto& origin = x_shape->GetOriginShape();
+
+    int64_t dim0 = 1;
+    if (origin.GetDimNum() > 0) {
+        dim0 = origin.GetDim(0);
+    }
+
+    // 设置输出 y 形状
     gert::Shape* y_shape = context->GetOutputShape(0);
     *y_shape = *x_shape;
+
+    // 设置 mean 与 variance 形状为 [B, 1]
+    gert::Shape* mean_shape = context->GetOutputShape(1);
+    gert::Shape* var_shape  = context->GetOutputShape(2);
+    std::vector<int64_t> mv = {dim0, 1};
+    mean_shape->SetDimNum(2);
+    mean_shape->SetDim(0, mv[0]);
+    mean_shape->SetDim(1, mv[1]);
+    var_shape->SetDimNum(2);
+    var_shape->SetDim(0, mv[0]);
+    var_shape->SetDim(1, mv[1]);
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
+    context->SetOutputDataType(1, inputDataType);
+    context->SetOutputDataType(2, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -129,13 +173,11 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Input("gamma")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Input("beta")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -147,11 +189,20 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("mean")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("variance")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -162,117 +213,127 @@ OP_ADD(LayerNormCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "layer_norm_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 1;
-
-template <typename dataType>
-class KernelLayerNorm {
+template <typename dataType, bool isReuseSource = false>
+class KernelLayernorm {
 public:
-    __aicore__ inline KernelLayerNorm() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y,
-                                uint32_t bLength, uint32_t hLength, float epsilon)
-    {
-        this->bLength = bLength;
-        this->hLength = hLength;
-        this->bshLength = bLength * hLength;
-        this->epsilon = static_cast<dataType>(epsilon);
+__aicore__ inline KernelLayernorm() {}
 
-        xGm.SetGlobalBuffer((__gm__ dataType *)x, this->bshLength);
-        gammaGm.SetGlobalBuffer((__gm__ dataType *)gamma, this->hLength);
-        betaGm.SetGlobalBuffer((__gm__ dataType *)beta, this->hLength);
-        yGm.SetGlobalBuffer((__gm__ dataType *)y, this->bshLength);
+__aicore__ inline void Init(GM_ADDR inputXGm, GM_ADDR gammaGm, GM_ADDR betaGm,
+                            GM_ADDR outputGm, GM_ADDR outputMeanGm, GM_ADDR outputVarianceGm,
+                            const LayerNormTiling &tiling)
+{
+    this->bLength = tiling.bLength;
+    this->sLength = tiling.sLength;
+    this->hLength = tiling.hLength;
+    this->tiling = tiling;
 
-        // Allocate queues: one-shot for simplicity
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->bshLength * sizeof(dataType));
-        pipe.InitBuffer(inQueueGamma, BUFFER_NUM, this->hLength * sizeof(dataType));
-        pipe.InitBuffer(inQueueBeta, BUFFER_NUM, this->hLength * sizeof(dataType));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->bshLength * sizeof(dataType));
-        // Temporary buffer if needed by high-level API
-        // Heuristic tmp size similar to RmsNorm reference
-        uint32_t tmpBufferSize = this->bshLength * 2 + this->bLength;
-        pipe.InitBuffer(tmpQueue, BUFFER_NUM, tmpBufferSize);
-    }
+    bshLength = bLength * sLength * hLength;
+    bsLength  = bLength * sLength;
 
-    __aicore__ inline void Process()
-    {
-        CopyIn();
-        Compute();
-        CopyOut();
-    }
+    inputXGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(inputXGm), bshLength);
+    gammaGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(gammaGm), hLength);
+    betaGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(betaGm), hLength);
+    outputGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(outputGm), bshLength);
+    outputMeanGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(outputMeanGm), bsLength);
+    outputVarianceGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(outputVarianceGm), bsLength);
 
-private:
-    __aicore__ inline void CopyIn()
-    {
-        AscendC::LocalTensor<dataType> xLocal = inQueueX.AllocTensor<dataType>();
-        AscendC::DataCopy(xLocal, xGm, this->bshLength);
-        inQueueX.EnQue(xLocal);
+    pipe.InitBuffer(inQueueX, 1, sizeof(dataType) * bshLength);
+    pipe.InitBuffer(inQueueGamma, 1, sizeof(dataType) * hLength);
+    pipe.InitBuffer(inQueueBeta, 1, sizeof(dataType) * hLength);
+    pipe.InitBuffer(outQueue, 1, sizeof(dataType) * bshLength);
+    pipe.InitBuffer(outQueueMean, 1, sizeof(dataType) * bsLength);
+    pipe.InitBuffer(outQueueVariance, 1, sizeof(dataType) * bsLength);
+}
 
-        AscendC::LocalTensor<dataType> gammaLocal = inQueueGamma.AllocTensor<dataType>();
-        AscendC::DataCopy(gammaLocal, gammaGm, this->hLength);
-        inQueueGamma.EnQue(gammaLocal);
-
-        AscendC::LocalTensor<dataType> betaLocal = inQueueBeta.AllocTensor<dataType>();
-        AscendC::DataCopy(betaLocal, betaGm, this->hLength);
-        inQueueBeta.EnQue(betaLocal);
-    }
-
-    __aicore__ inline void Compute()
-    {
-        AscendC::LocalTensor<dataType> xLocal = inQueueX.DeQue<dataType>();
-        AscendC::LocalTensor<dataType> gammaLocal = inQueueGamma.DeQue<dataType>();
-        AscendC::LocalTensor<dataType> betaLocal = inQueueBeta.DeQue<dataType>();
-        AscendC::LocalTensor<dataType> yLocal = outQueueY.AllocTensor<dataType>();
-        AscendC::LocalTensor<uint8_t> stackBuffer = tmpQueue.AllocTensor<uint8_t>();
-
-        // Use high-level LayerNorm API as per 5.4.1 LayerNorm reference style
-        // Normalize input of shape [B, H] where H equals product of normalized_shape
-        // The API is expected to internally handle mean/variance and use shared buffer.
-        AscendC::LayerNorm<dataType>(yLocal, xLocal, gammaLocal, betaLocal, this->epsilon, stackBuffer,
-                                     /*bLength*/ this->bLength, /*hLength*/ this->hLength);
-
-        inQueueX.FreeTensor(xLocal);
-        inQueueGamma.FreeTensor(gammaLocal);
-        inQueueBeta.FreeTensor(betaLocal);
-        tmpQueue.FreeTensor(stackBuffer);
-        outQueueY.EnQue(yLocal);
-    }
-
-    __aicore__ inline void CopyOut()
-    {
-        AscendC::LocalTensor<dataType> yLocal = outQueueY.DeQue<dataType>();
-        AscendC::DataCopy(yGm, yLocal, this->bshLength);
-        outQueueY.FreeTensor(yLocal);
-    }
+__aicore__ inline void Process()
+{
+    CopyIn();
+    Compute();
+    CopyOut();
+}
 
 private:
-    AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueGamma;
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueBeta;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue;
+__aicore__ inline void CopyIn()
+{
+    AscendC::LocalTensor<dataType> inputXLocal = inQueueX.AllocTensor<dataType>();
+    AscendC::LocalTensor<dataType> gammaLocal  = inQueueGamma.AllocTensor<dataType>();
+    AscendC::LocalTensor<dataType> betaLocal   = inQueueBeta.AllocTensor<dataType>();
+    AscendC::DataCopy(inputXLocal, inputXGlobal, bshLength);
+    AscendC::DataCopy(gammaLocal, gammaGlobal, hLength);
+    AscendC::DataCopy(betaLocal,  betaGlobal,  hLength);
+    inQueueX.EnQue(inputXLocal);
+    inQueueGamma.EnQue(gammaLocal);
+    inQueueBeta.EnQue(betaLocal);
+}
 
-    AscendC::GlobalTensor<dataType> xGm;
-    AscendC::GlobalTensor<dataType> gammaGm;
-    AscendC::GlobalTensor<dataType> betaGm;
-    AscendC::GlobalTensor<dataType> yGm;
+__aicore__ inline void Compute()
+{
+    AscendC::LocalTensor<dataType> inputXLocal = inQueueX.DeQue<dataType>();
+    AscendC::LocalTensor<dataType> gammaLocal  = inQueueGamma.DeQue<dataType>();
+    AscendC::LocalTensor<dataType> betaLocal   = inQueueBeta.DeQue<dataType>();
+    AscendC::LocalTensor<dataType> outputLocal = outQueue.AllocTensor<dataType>();
+    AscendC::LocalTensor<dataType> meanLocal   = outQueueMean.AllocTensor<dataType>();
+    AscendC::LocalTensor<dataType> varianceLocal = outQueueVariance.AllocTensor<dataType>();
 
-    uint32_t bLength;
-    uint32_t hLength;
-    uint32_t bshLength;
-    dataType epsilon;
+    AscendC::LayerNorm<dataType, isReuseSource>(
+        outputLocal, meanLocal, varianceLocal,
+        inputXLocal, gammaLocal, betaLocal,
+        static_cast<dataType>(epsilon), tiling);
+
+    outQueue.EnQue<dataType>(outputLocal);
+    outQueueMean.EnQue<dataType>(meanLocal);
+    outQueueVariance.EnQue<dataType>(varianceLocal);
+    inQueueX.FreeTensor(inputXLocal);
+    inQueueGamma.FreeTensor(gammaLocal);
+    inQueueBeta.FreeTensor(betaLocal);
+}
+
+__aicore__ inline void CopyOut()
+{
+    AscendC::LocalTensor<dataType> outputLocal   = outQueue.DeQue<dataType>();
+    AscendC::LocalTensor<dataType> meanLocal     = outQueueMean.DeQue<dataType>();
+    AscendC::LocalTensor<dataType> varianceLocal = outQueueVariance.DeQue<dataType>();
+    AscendC::DataCopy(outputGlobal, outputLocal, bshLength);
+    AscendC::DataCopy(outputMeanGlobal, meanLocal, bsLength);
+    AscendC::DataCopy(outputVarianceGlobal, varianceLocal, bsLength);
+    outQueue.FreeTensor(outputLocal);
+    outQueueMean.FreeTensor(meanLocal);
+    outQueueVariance.FreeTensor(varianceLocal);
+}
+
+private:
+AscendC::GlobalTensor<dataType> inputXGlobal;
+AscendC::GlobalTensor<dataType> gammaGlobal;
+AscendC::GlobalTensor<dataType> betaGlobal;
+AscendC::GlobalTensor<dataType> outputGlobal;
+AscendC::GlobalTensor<dataType> outputMeanGlobal;
+AscendC::GlobalTensor<dataType> outputVarianceGlobal;
+
+AscendC::TPipe pipe;
+AscendC::TQue<AscendC::QuePosition::VECIN, 1>  inQueueX;
+AscendC::TQue<AscendC::QuePosition::VECIN, 1>  inQueueGamma;
+AscendC::TQue<AscendC::QuePosition::VECIN, 1>  inQueueBeta;
+AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue;
+AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueMean;
+AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueVariance;
+
+uint32_t bLength;
+uint32_t sLength;
+uint32_t hLength;
+uint32_t bshLength;
+uint32_t bsLength;
+dataType epsilon = static_cast<dataType>(1e-5);
+LayerNormTiling tiling;
 };
 
-extern "C" __global__ __aicore__ void layer_norm_custom(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void layer_norm_custom(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta,
+                                                         GM_ADDR y, GM_ADDR mean, GM_ADDR variance,
+                                                         GM_ADDR workspace, GM_ADDR tiling)
 {
-    GET_TILING_DATA(tiling_data, tiling);
-    KernelLayerNorm<DTYPE_X> op;
-    op.Init(x, gamma, beta, y,
-            tiling_data.bLength,
-            tiling_data.hLength,
-            tiling_data.epsilon);
+    GET_TILING_DATA(tilingData, tiling);
+    KernelLayernorm<float, false> op;
+    op.Init(x, gamma, beta, y, mean, variance, tilingData.layernormTilingData);
     op.Process();
 }
 """
@@ -285,7 +346,13 @@ python_bind_src="""
 
 at::Tensor layer_norm_custom_impl_npu(const at::Tensor& x, const at::Tensor& gamma, const at::Tensor& beta) {
     at::Tensor y = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnLayerNormCustom, x, gamma, beta, y);
+    // mean/variance 输出形状 [B, 1]
+    auto B = x.size(0);
+    auto opts = x.options().dtype(at::kFloat);
+    at::Tensor mean = at::empty({B, 1}, opts);
+    at::Tensor variance = at::empty({B, 1}, opts);
+
+    EXEC_NPU_CMD(aclnnLayerNormCustom, x, gamma, beta, y, mean, variance);
     return y;
 }
 
@@ -294,7 +361,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("layer_norm_custom", &layer_norm_custom_impl_npu, "LayerNorm(x) with gamma, beta");
+    m.def("layer_norm_custom", &layer_norm_custom_impl_npu, "LayerNorm custom kernel");
 }
 """
 
@@ -305,19 +372,18 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Optimized model using custom AscendC LayerNorm kernel.
+    使用自定义 AscendC LayerNormCustom 内核替换 PyTorch LayerNorm。
+    将最后 normalized_shape 维度展平为 H，按 [B, 1, H] 进行 LayerNorm 计算。
     """
-    def __init__(self, normalized_shape: tuple, eps: float = 1e-5) -> None:
+    def __init__(self, normalized_shape: tuple):
         super().__init__()
-        self.normalized_shape = normalized_shape
-        self.eps = eps
-        # Mimic nn.LayerNorm parameterization
-        weight = torch.ones(normalized_shape, dtype=torch.float32)
-        bias = torch.zeros(normalized_shape, dtype=torch.float32)
-        self.weight = torch.nn.Parameter(weight)
-        self.bias = torch.nn.Parameter(bias)
+        self.normalized_shape = tuple(normalized_shape)
+        # 与 PyTorch nn.LayerNorm 的缺省初始化一致
+        self.weight = torch.nn.Parameter(torch.ones(self.normalized_shape, dtype=torch.float))
+        self.bias   = torch.nn.Parameter(torch.zeros(self.normalized_shape, dtype=torch.float))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Custom kernel expects gamma/beta shaped as normalized_shape
-        return custom_ops_lib.layer_norm_custom(x, self.weight, self.bias)
+        gamma = self.weight.reshape(-1).contiguous()
+        beta  = self.bias.reshape(-1).contiguous()
+        return custom_ops_lib.layer_norm_custom(x, gamma, beta)
 '''

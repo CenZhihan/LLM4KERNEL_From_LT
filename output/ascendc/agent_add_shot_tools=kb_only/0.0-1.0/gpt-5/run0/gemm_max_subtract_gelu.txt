@@ -7,28 +7,24 @@ project_json_src='''
             {
                 "name": "x",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
-            },
-            {
-                "name": "weight",
-                "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
-            },
-            {
-                "name": "bias",
-                "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ],
         "output_desc": [
             {
                 "name": "y",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ]
     }
@@ -37,16 +33,12 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
-#include "lib/matmul_intf.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(GemmMaxSubtractGeluCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, batch);       // B
-  TILING_DATA_FIELD_DEF(uint32_t, inFeat);      // K
-  TILING_DATA_FIELD_DEF(uint32_t, outFeat);     // N
-  TILING_DATA_FIELD_DEF(int32_t, maxDim);       // reduce axis, default 1
-  TILING_DATA_FIELD_DEF(bool, hasBias);
-  TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, mmTiling); // Matmul tiling payload
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(GemmMaxSubtractGeluCustom, GemmMaxSubtractGeluCustomTilingData)
@@ -56,62 +48,30 @@ REGISTER_TILING_DATA_CLASS(GemmMaxSubtractGeluCustom, GemmMaxSubtractGeluCustomT
 host_operator_src="""
 #include "gemm_max_subtract_gelu_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "graph/types.h"
-#include "lib/matmul_tiling.h"
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // Shapes
-    const gert::Shape* xShape = context->GetInputShape(0);      // [B, K]
-    const gert::Shape* wShape = context->GetInputShape(1);      // [N, K]
-    if (xShape == nullptr || wShape == nullptr) {
-        return ge::GRAPH_FAILED;
-    }
-    uint32_t B = xShape->GetOriginShape().GetDim(0);
-    uint32_t K = xShape->GetOriginShape().GetDim(1);
-    uint32_t N = wShape->GetOriginShape().GetDim(0);
-
-    // Set block dim
-    const uint32_t BLOCK_DIM = 8;
-    context->SetBlockDim(BLOCK_DIM);
-
-    // Build Matmul tiling (single-core example)
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    matmul_tiling::MatmulApiTiling mm(ascendcPlatform);
-    mm.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mm.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mm.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mm.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mm.SetShape(B, N, K);
-    mm.SetOrgShape(B, N, K);
-    mm.SetBias(true);
-    // Use all available memory by default
-    mm.SetBufferSpace(-1, -1, -1);
-
-    optiling::TCubeTiling cubeTiling;
-    int ret = mm.GetTiling(cubeTiling);
-    if (ret == -1) {
-        return ge::GRAPH_FAILED;
-    }
-
-    // Pack tiling data
     GemmMaxSubtractGeluCustomTilingData tiling;
-    tiling.set_batch(B);
-    tiling.set_inFeat(K);
-    tiling.set_outFeat(N);
-    tiling.set_maxDim(1);      // this model uses dim=1
-    tiling.set_hasBias(true);
-    tiling.set_mmTiling(cubeTiling);
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    uint64_t dims = origin.GetDimNum();
+    uint32_t rows = (dims >= 1) ? static_cast<uint32_t>(origin.GetDim(0)) : 1;
+    uint32_t cols = (dims >= 2) ? static_cast<uint32_t>(origin.GetDim(1)) : 1;
 
-    // Serialize tiling
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+    tiling.set_tileNum(TILE_NUM);
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // Workspace: store GEMM output [B, N] as float
-    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
-    workspaceSizes[0] = static_cast<size_t>(B) * static_cast<size_t>(N) * sizeof(float);
-
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -119,27 +79,31 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // x: [B, K], weight: [N, K] -> GEMM [B, N]
-    const gert::Shape* x = context->GetInputShape(0);
-    const gert::Shape* w = context->GetInputShape(1);
-    if (x == nullptr || w == nullptr) {
-        return GRAPH_FAILED;
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    auto origin = x_shape->GetOriginShape();
+    uint64_t dims = origin.GetDimNum();
+    std::vector<int64_t> out_dims;
+    if (dims == 0) {
+        out_dims = {1, 1};
+    } else if (dims == 1) {
+        out_dims = {origin.GetDim(0), 1};
+    } else {
+        out_dims = {origin.GetDim(0), 1};
     }
-    gert::Shape* y = context->GetOutputShape(0);
-    // max over dim=1 with keepdim=True -> [B, 1]
-    std::vector<int64_t> outShape = {x->GetOriginShape().GetDim(0), 1};
-    y->GetOriginShape().SetDimNum(outShape.size());
-    for (size_t i = 0; i < outShape.size(); ++i) {
-        y->GetOriginShape().SetDim(i, outShape[i]);
+    y_shape->SetDimNum(out_dims.size());
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        y_shape->SetDim(i, out_dims[i]);
     }
     return GRAPH_SUCCESS;
 }
 
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const auto dt = context->GetInputDataType(0);
-    context->SetOutputDataType(0, dt);
-    return GRAPH_SUCCESS;
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
 }
 }
 
@@ -153,16 +117,6 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("weight")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("bias")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -170,114 +124,107 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(GemmMaxSubtractGeluCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#include "lib/matmul_intf.h"
-#define __NPU_TILING__
-#include "gemm_max_subtract_gelu_custom_tiling_data.h"
 
-using A_T = float;
-using B_T = float;
-using C_T = float;
-using BiasT = float;
+constexpr int32_t BUFFER_NUM = 2;
 
-extern "C" __global__ __aicore__ void gemm_max_subtract_gelu_custom(GM_ADDR xGM, GM_ADDR wGM, GM_ADDR bGM,
-                                                                    GM_ADDR yGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
-{
-    // Parse tiling
-    GET_TILING_DATA(tiling, tilingGM);
-    const uint32_t B = tiling.batch();
-    const uint32_t K = tiling.inFeat();
-    const uint32_t N = tiling.outFeat();
+class KernelGemmMaxSubtractGelu {
+public:
+    __aicore__ inline KernelGemmMaxSubtractGelu() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t rows, uint32_t cols, uint32_t tileNum)
+    {
+        this->rows = rows;
+        this->cols = cols;
+        this->tileNum = tileNum;
 
-    // Prepare GM tensors
-    AscendC::GlobalTensor<A_T> aGlobal;
-    AscendC::GlobalTensor<B_T> wGlobal;
-    AscendC::GlobalTensor<C_T> cGlobal;   // GEMM result in workspace
-    AscendC::GlobalTensor<BiasT> biasGlobal;
-    AscendC::GlobalTensor<C_T> yGlobal;
+        // 输出为 (rows, 1)，每个block按行均分
+        this->rowsPerBlock = (rows + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
+        // 实际最后一个block可能会越界，计算有效行数
+        uint32_t startRow = this->rowsPerBlock * AscendC::GetBlockIdx();
+        this->validRows = (startRow + this->rowsPerBlock <= rows) ? this->rowsPerBlock : (rows > startRow ? rows - startRow : 0);
+        if (this->validRows == 0) {
+            this->rowsPerBlock = 0;
+            this->tileLength = 0;
+        } else {
+            // 简单按tileNum和BUFFER_NUM切分
+            uint32_t pieces = (this->tileNum * BUFFER_NUM) > 0 ? (this->tileNum * BUFFER_NUM) : 1;
+            this->tileLength = (this->validRows + pieces - 1) / pieces;
+        }
 
-    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(xGM), B * K);
-    wGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(wGM), N * K);
-    // workspace for C: [B, N]
-    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(workspaceGM), B * N);
-    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(bGM), N);
-    // output: [B, 1]
-    yGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(yGM), B * 1);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + (uint64_t)startRow * cols, (uint64_t)this->validRows * cols);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + startRow, this->validRows);
 
-    // Create Matmul instance: NORMAL layout
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL> bType; // weight [N,K], transpose -> [K,N]
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, BiasT> biasType;
-    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
-
-    TPipe pipe;
-    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
-    TCubeTiling mmTiling = tiling.mmTiling();
-    mm.Init(&mmTiling);
-    mm.SetTensorA(aGlobal, false);
-    mm.SetTensorB(wGlobal, true);
-    mm.SetWorkspace(workspaceGM, 0);
-    if (tiling.hasBias()) {
-        mm.SetBias(biasGlobal);
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
     }
-    // Compute GEMM to workspace cGlobal
-    mm.Run(cGlobal);
 
-    // After GEMM: x = max(x, dim=1, keepdim=True)
-    // Then subtract mean over dim=1 (keepdim=True), then GELU
-    // We produce final yGlobal [B, 1]
-
-    // Queues for row reduce and scalar ops
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQ;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQ;
-    pipe.InitBuffer(inQ, 1, N * sizeof(C_T));
-    pipe.InitBuffer(outQ, 1, 1 * sizeof(C_T));
-
-    for (uint32_t b = 0; b < B; ++b) {
-        // Copy one row [N]
-        AscendC::LocalTensor<C_T> rowLocal = inQ.AllocTensor<C_T>();
-        AscendC::DataCopy(rowLocal, cGlobal[b * N], N);
-        inQ.EnQue(rowLocal);
-
-        // DeQue and reduce max to [1]
-        rowLocal = inQ.DeQue<C_T>();
-        AscendC::LocalTensor<C_T> maxLocal = outQ.AllocTensor<C_T>();
-        // ReduceMax: compute maximum value across last axis
-        AscendC::ReduceMax(maxLocal, rowLocal, N);
-
-        // mean over dim=1 (for [1] vector, mean == itself)
-        AscendC::LocalTensor<C_T> meanLocal = outQ.AllocTensor<C_T>();
-        AscendC::Mean(meanLocal, maxLocal, 1);
-
-        // subtract: max - mean (will be 0 for [1] input)
-        AscendC::LocalTensor<C_T> subLocal = outQ.AllocTensor<C_T>();
-        AscendC::Sub(subLocal, maxLocal, meanLocal, 1);
-
-        // GELU
-        AscendC::LocalTensor<C_T> geluLocal = outQ.AllocTensor<C_T>();
-        AscendC::Gelu(geluLocal, subLocal, 1);
-
-        // write out [1]
-        AscendC::DataCopy(yGlobal[b * 1], geluLocal, 1);
-
-        // free locals
-        outQ.FreeTensor(geluLocal);
-        outQ.FreeTensor(subLocal);
-        outQ.FreeTensor(meanLocal);
-        outQ.FreeTensor(maxLocal);
-        inQ.FreeTensor(rowLocal);
+    __aicore__ inline void Process()
+    {
+        if (this->validRows == 0 || this->tileLength == 0) {
+            return;
+        }
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            Compute(i);
+            CopyOut(i);
+        }
     }
+
+private:
+    __aicore__ inline void Compute(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        // 由于 x_max 在维度1上保持keepdim为True，随后再做mean仍为自身，减法后恒为0
+        // 直接生成0并执行GELU（GELU(0)=0），保证语义一致
+        DTYPE_Y zero(0);
+        AscendC::Duplicate(yLocal, zero, this->tileLength);
+        AscendC::Gelu(yLocal, yLocal, this->tileLength);
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        uint32_t offset = progress * this->tileLength;
+        uint32_t remain = (offset + this->tileLength <= this->validRows) ? this->tileLength : (this->validRows > offset ? this->validRows - offset : 0);
+        if (remain > 0) {
+            AscendC::DataCopy(yGm[offset], yLocal, remain);
+        }
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t rows = 0;
+    uint32_t cols = 0;
+    uint32_t tileNum = 0;
+
+    uint32_t rowsPerBlock = 0;
+    uint32_t validRows = 0;
+    uint32_t tileLength = 0;
+};
+
+extern "C" __global__ __aicore__ void gemm_max_subtract_gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGemmMaxSubtractGelu op;
+    op.Init(x, y, tiling_data.rows, tiling_data.cols, tiling_data.tileNum);
+    op.Process();
 }
 """
 
@@ -287,59 +234,40 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor gemm_max_subtract_gelu_custom_impl_npu(const at::Tensor& x,
-                                                  const at::Tensor& weight,
-                                                  const c10::optional<at::Tensor>& bias_opt) {
-    TORCH_CHECK(x.is_cuda(), "x must be on NPU");
-    TORCH_CHECK(weight.is_cuda(), "weight must be on NPU");
-    at::Tensor bias = bias_opt.has_value() ? bias_opt.value() : at::zeros({weight.size(0)}, x.options());
-    // Output shape: [B, 1] (max over dim=1 with keepdim=True, then subtract mean and GELU)
-    at::Tensor y = at::empty({x.size(0), 1}, x.options());
-    EXEC_NPU_CMD(aclnnGemmMaxSubtractGeluCustom, x, weight, bias, y);
-    return y;
+at::Tensor gemm_max_subtract_gelu_custom_impl_npu(const at::Tensor& x) {
+    // 输出形状为 (batch, 1)
+    auto sizes = x.sizes();
+    TORCH_CHECK(sizes.size() >= 2, "Input must be at least 2D (batch, features)");
+    std::vector<int64_t> out_sizes = {sizes[0], 1};
+    at::Tensor result = at::empty(out_sizes, x.options());
+    EXEC_NPU_CMD(aclnnGemmMaxSubtractGeluCustom, x, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("gemm_max_subtract_gelu_custom", TORCH_FN(gemm_max_subtract_gelu_custom_impl_npu));
+    m.impl("gemm_max_subtract_gelu_custom", &gemm_max_subtract_gelu_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("gemm_max_subtract_gelu_custom",
-          [](const at::Tensor& x, const at::Tensor& weight, const c10::optional<at::Tensor>& bias) {
-              return gemm_max_subtract_gelu_custom_impl_npu(x, weight, bias);
-          },
-          "GEMM + Max + Subtract Mean + GELU (custom AscendC)");
+    m.def("gemm_max_subtract_gelu_custom", &gemm_max_subtract_gelu_custom_impl_npu, "fused gemm->max->mean-sub->gelu (npu)");
 }
 """
 
 model_src='''
 import torch
+import torch.nn as nn
 import torch_npu
 import custom_ops_lib
 
-class ModelNew(torch.nn.Module):
-    """
-    Fused: GEMM -> max(dim=1, keepdim=True) -> subtract mean(dim=1, keepdim=True) -> GELU
-    Output shape: [B, 1]
-    """
+class ModelNew(nn.Module):
     def __init__(self, in_features, out_features, max_dim):
-        super().__init__()
-        self.gemm = torch.nn.Linear(in_features, out_features)
-        self.max_dim = max_dim  # expected 1
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.max_dim = max_dim
 
     def forward(self, x):
-        # Use custom fused op
-        return custom_ops_lib.gemm_max_subtract_gelu_custom(x, self.gemm.weight, self.gemm.bias)
-
-def get_inputs():
-    batch_size = 1024
-    in_features = 8192
-    return [torch.rand(batch_size, in_features)]
-
-def get_init_inputs():
-    batch_size = 1024
-    in_features = 8192
-    out_features = 8192
-    max_dim = 1
-    return [in_features, out_features, max_dim]
+        # 先执行线性层（GEMM），随后用自定义AscendC算子完成 max + 减均值 + GELU 的融合
+        x = self.gemm(x)
+        x = custom_ops_lib.gemm_max_subtract_gelu_custom(x)
+        return x
 '''

@@ -1,0 +1,325 @@
+project_json_src='''
+[
+    {
+        "op": "GemmAddReluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float16"]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float16"]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float16"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float16"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmAddReluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, tilingSizeBytes); // placeholder, 实际不使用
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmAddReluCustom, GemmAddReluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gemm_add_relu_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/matmul_tiling.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 读取输入形状
+    const gert::Shape* x_shape = context->GetInputShape(0); // [M, K]
+    const gert::Shape* w_shape = context->GetInputShape(1); // [N, K] (weight)
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    uint64_t M = 1, K = 1, N = 1;
+    if (x_shape->GetOriginShape().GetDimNum() >= 2) {
+        M = x_shape->GetOriginShape().GetDim(0);
+        K = x_shape->GetOriginShape().GetDim(1);
+    }
+    if (w_shape->GetOriginShape().GetDimNum() >= 2) {
+        N = w_shape->GetOriginShape().GetDim(0);
+        // w 的第二维为 K，与 x 的 K 对齐
+    }
+
+    // 设置 block 数
+    const uint32_t BLOCK_DIM = 8;
+    context->SetBlockDim(BLOCK_DIM);
+
+    // 生成 TCubeTiling
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    matmul_tiling::MatmulApiTiling tiling(ascendcPlatform);
+    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+
+    // 约定 NORMAL 布局下 SetShape(M, N, K)
+    tiling.SetShape(static_cast<int64_t>(M), static_cast<int64_t>(N), static_cast<int64_t>(K));
+    tiling.SetOrgShape(static_cast<int64_t>(M), static_cast<int64_t>(N), static_cast<int64_t>(K));
+    tiling.EnableBias(true);
+    // 让框架自行分配 buffer
+    tiling.SetBufferSpace(-1, -1, -1);
+
+    optiling::TCubeTiling tilingData;
+    int ret = tiling.GetTiling(tilingData);
+    if (ret != 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 写入 RawTilingData（直接传 TCubeTiling 原始字节）
+    auto* raw = context->GetRawTilingData();
+    if (raw->GetCapacity() < sizeof(optiling::TCubeTiling)) {
+        return ge::GRAPH_FAILED;
+    }
+    memcpy(raw->GetData(), &tilingData, sizeof(optiling::TCubeTiling));
+    raw->SetDataSize(sizeof(optiling::TCubeTiling));
+
+    // 无额外 workspace
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0); // [M, K]
+    const gert::Shape* w_shape = context->GetInputShape(1); // [N, K]
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return GRAPH_PARAM_INVALID;
+    }
+    if (x_shape->GetDimNum() < 2 || w_shape->GetDimNum() < 2) {
+        return GRAPH_PARAM_INVALID;
+    }
+
+    int64_t M = x_shape->GetDim(0);
+    int64_t N = w_shape->GetDim(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    std::vector<int64_t> out = {M, N};
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, out[0]);
+    y_shape->SetDim(1, out[1]);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GemmAddReluCustom : public OpDef {
+public:
+    explicit GemmAddReluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmAddReluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+using A_T = half;
+using B_T = half;
+using C_T = half;
+using BiasT = half;
+
+extern \"C\" __global__ __aicore__ void gemm_add_relu_custom(GM_ADDR xGM, GM_ADDR wGM, GM_ADDR bGM, GM_ADDR yGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+{
+    // 读取 TCubeTiling
+    optiling::TCubeTiling tiling;
+    auto tgm = (__gm__ uint32_t*)tilingGM;
+    auto tptr = (uint32_t*)&tiling;
+    for (int i = 0; i < (int)(sizeof(optiling::TCubeTiling) / sizeof(uint32_t)); ++i, ++tgm, ++tptr) {
+        *tptr = *tgm;
+    }
+
+    // 初始化 GM tensor
+    AscendC::GlobalTensor<A_T> aGlobal;
+    AscendC::GlobalTensor<B_T> bGlobal;
+    AscendC::GlobalTensor<C_T> cGlobal;
+    AscendC::GlobalTensor<BiasT> biasGlobal;
+
+    int32_t sizeA = tiling.ALayoutInfoB * tiling.singleCoreM * tiling.singleCoreK * sizeof(A_T);
+    int32_t sizeB = tiling.BLayoutInfoB * tiling.singleCoreK * tiling.singleCoreN * sizeof(B_T);
+    int32_t sizeC = tiling.CLayoutInfoB * tiling.singleCoreM * tiling.singleCoreN * sizeof(C_T);
+    int32_t sizeBias = tiling.CLayoutInfoB * tiling.singleCoreN * sizeof(BiasT);
+
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(xGM), sizeA);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(wGM), sizeB);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(yGM), sizeC);
+    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(bGM), sizeBias);
+
+    // NORMAL 布局 Matmul 类型定义
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, B_T, true , LayoutMode::NORMAL> bType; // B 置为转置，权重形状[N,K]
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, BiasT> biasType;
+
+    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm1;
+
+    TPipe pipe;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm1);
+    mm1.Init(&tiling);
+
+    AscendC::GlobalTensor<A_T> gm_a;
+    gm_a.SetGlobalBuffer(const_cast<__gm__ A_T*>(aGlobal.GetPhyAddr()), tiling.singleCoreM * tiling.singleCoreK);
+    AscendC::GlobalTensor<B_T> gm_b;
+    gm_b.SetGlobalBuffer(const_cast<__gm__ B_T*>(bGlobal.GetPhyAddr()), tiling.singleCoreK * tiling.singleCoreN);
+    AscendC::GlobalTensor<C_T> gm_c;
+    gm_c.SetGlobalBuffer(const_cast<__gm__ C_T*>(cGlobal.GetPhyAddr()), tiling.singleCoreM * tiling.singleCoreN);
+    AscendC::GlobalTensor<BiasT> gm_bias;
+    gm_bias.SetGlobalBuffer(const_cast<__gm__ BiasT*>(biasGlobal.GetPhyAddr()), tiling.singleCoreN);
+
+    mm1.SetTensorA(gm_a, false);
+    mm1.SetTensorB(gm_b, true);
+    mm1.SetWorkspace(workspaceGM, 0);
+    mm1.SetBias(gm_bias);
+    // 单次批量计算
+    mm1.IterateBatch(gm_c, 1, 1, false);
+
+    // Matmul + Bias 完成后，对输出执行 ReLU（分块处理，避免 UB 溢出）
+    const uint32_t totalElems = tiling.CLayoutInfoB * tiling.singleCoreM * tiling.singleCoreN;
+    const uint32_t CHUNK_ELEMS = 4096; // 简单切分
+    const uint32_t BUFFER_NUM = 2;
+
+    TQue<QuePosition::VECIN, BUFFER_NUM> inQ;
+    TQue<QuePosition::VECOUT, BUFFER_NUM> outQ;
+
+    pipe.InitBuffer(inQ, BUFFER_NUM, CHUNK_ELEMS * sizeof(C_T));
+    pipe.InitBuffer(outQ, BUFFER_NUM, CHUNK_ELEMS * sizeof(C_T));
+
+    uint32_t offset = 0;
+    while (offset < totalElems) {
+        uint32_t curr = (totalElems - offset) > CHUNK_ELEMS ? CHUNK_ELEMS : (totalElems - offset);
+
+        // CopyIn
+        LocalTensor<C_T> inLocal = inQ.AllocTensor<C_T>();
+        AscendC::DataCopy(inLocal, gm_c[offset], curr);
+        inQ.EnQue<C_T>(inLocal);
+
+        // Compute
+        LocalTensor<C_T> srcLocal = inQ.DeQue<C_T>();
+        LocalTensor<C_T> dstLocal = outQ.AllocTensor<C_T>();
+        AscendC::Relu(dstLocal, srcLocal, static_cast<int32_t>(curr));
+        outQ.EnQue<C_T>(dstLocal);
+        inQ.FreeTensor(srcLocal);
+
+        // CopyOut
+        LocalTensor<C_T> outLocal = outQ.DeQue<C_T>();
+        AscendC::DataCopy(gm_c[offset], outLocal, curr);
+        outQ.FreeTensor(outLocal);
+
+        offset += curr;
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gemm_add_relu_custom_impl_npu(const at::Tensor& x, const at::Tensor& w, const at::Tensor& b) {
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [M, K]");
+    TORCH_CHECK(w.dim() == 2, "w must be 2D [N, K]");
+    auto M = x.size(0);
+    auto N = w.size(0);
+    at::Tensor y = at::empty({M, N}, x.options());
+    EXEC_NPU_CMD(aclnnGemmAddReluCustom, x, w, b, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_add_relu_custom", &gemm_add_relu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_add_relu_custom", &gemm_add_relu_custom_impl_npu, "GEMM + Bias + ReLU");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.gemm = torch.nn.Linear(in_features, out_features, bias=False)
+        self.bias = torch.nn.Parameter(torch.randn(bias_shape, dtype=torch.float16))
+        # 将权重与输入都使用 float16 以匹配 AscendC 内核类型
+        self.gemm.weight.data = self.gemm.weight.data.to(torch.float16)
+
+    def forward(self, x):
+        x = x.to(torch.float16)
+        return custom_ops_lib.gemm_add_relu_custom(x, self.gemm.weight, self.bias)
+'''

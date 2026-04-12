@@ -15,18 +15,8 @@ project_json_src='''
                 ]
             },
             {
-                "name": "w",
+                "name": "weight",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "b",
-                "param_type": "optional",
                 "format": [
                     "ND"
                 ],
@@ -37,7 +27,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "z",
+                "name": "y",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -57,11 +47,10 @@ host_tiling_src="""
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ConvPointwise2dCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, n);
-  TILING_DATA_FIELD_DEF(uint32_t, h);
-  TILING_DATA_FIELD_DEF(uint32_t, w);
   TILING_DATA_FIELD_DEF(uint32_t, cin);
   TILING_DATA_FIELD_DEF(uint32_t, cout);
-  TILING_DATA_FIELD_DEF(uint32_t, hasBias);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
@@ -72,53 +61,47 @@ REGISTER_TILING_DATA_CLASS(ConvPointwise2dCustom, ConvPointwise2dCustomTilingDat
 host_operator_src="""
 #include "conv_pointwise_2d_custom_tiling.h"
 #include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 8;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ConvPointwise2dCustomTilingData tiling;
 
-    // 输入x: [N, C_in, H, W]
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    auto dims = x_shape->GetOriginShape().GetDims();
-    if (dims.size() != 4) {
+    const gert::StorageShape *x_shape = context->GetInputShape(0);
+    const gert::StorageShape *w_shape = context->GetInputShape(1);
+
+    uint32_t n   = x_shape->GetStorageShape().GetDim(0);
+    uint32_t cin = x_shape->GetStorageShape().GetDim(1);
+    uint32_t h   = x_shape->GetStorageShape().GetDim(2);
+    uint32_t w   = x_shape->GetStorageShape().GetDim(3);
+
+    uint32_t cout = w_shape->GetStorageShape().GetDim(0);
+    uint32_t win  = w_shape->GetStorageShape().GetDim(1);
+    uint32_t kh   = w_shape->GetStorageShape().GetDim(2);
+    uint32_t kw   = w_shape->GetStorageShape().GetDim(3);
+
+    // 简单校验 1x1 权重匹配
+    if (win != cin || kh != 1 || kw != 1) {
         return ge::GRAPH_FAILED;
     }
-    uint32_t n = static_cast<uint32_t>(dims[0]);
-    uint32_t cin = static_cast<uint32_t>(dims[1]);
-    uint32_t h = static_cast<uint32_t>(dims[2]);
-    uint32_t w = static_cast<uint32_t>(dims[3]);
 
-    // 权重w: [C_out, C_in, 1, 1]
-    const gert::Shape* w_shape = context->GetInputShape(1);
-    auto wdims = w_shape->GetOriginShape().GetDims();
-    if (wdims.size() < 2) {
-        return ge::GRAPH_FAILED;
-    }
-    uint32_t cout = static_cast<uint32_t>(wdims[0]);
-
-    // 是否带bias
-    uint32_t hasBias = (context->GetNumInputs() >= 3 && context->GetInputShape(2)->GetOriginShape().GetShapeSize() > 0) ? 1U : 0U;
-
-    context->SetBlockDim(BLOCK_DIM);
+    const uint32_t TILE_NUM = 8; // 空间维度分块个数
 
     tiling.set_n(n);
-    tiling.set_h(h);
-    tiling.set_w(w);
     tiling.set_cin(cin);
     tiling.set_cout(cout);
-    tiling.set_hasBias(hasBias);
+    tiling.set_h(h);
+    tiling.set_w(w);
     tiling.set_tileNum(TILE_NUM);
+
+    context->SetBlockDim(1); // 简化实现，单块执行
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -126,16 +109,17 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // x: [N, C_in, H, W], w: [C_out, C_in, 1, 1], z: [N, C_out, H, W]
     const gert::Shape* x_shape = context->GetInputShape(0);
     const gert::Shape* w_shape = context->GetInputShape(1);
-    auto xdims = x_shape->GetDims();
-    auto wdims = w_shape->GetDims();
-    if (xdims.size() != 4 || wdims.size() < 2) {
-        return ge::GRAPH_FAILED;
-    }
-    std::vector<int64_t> out_dims = {xdims[0], wdims[0], xdims[2], xdims[3]};
     gert::Shape* y_shape = context->GetOutputShape(0);
+
+    // 输出形状: (N, Cout, H, W)
+    std::vector<int64_t> out_dims = {
+        x_shape->GetDim(0),
+        w_shape->GetDim(0),
+        x_shape->GetDim(2),
+        x_shape->GetDim(3)
+    };
     y_shape->SetDimNum(out_dims.size());
     for (size_t i = 0; i < out_dims.size(); ++i) {
         y_shape->SetDim(i, out_dims[i]);
@@ -161,17 +145,12 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("w")
+        this->Input("weight")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("b")
-            .ParamType(OPTIONAL)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("z")
+        this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -179,8 +158,7 @@ public:
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -191,167 +169,130 @@ OP_ADD(ConvPointwise2dCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_pointwise_2d_custom_tiling_data.h"
 
-// 本算子实现1x1点卷积：在Python侧将输入转为NHWC并展平成[M, Cin]，权重为[Cout, Cin]（按原始Conv2d存储），
-// 在核内做简化的分块计算。参照Ascend C API的TPipe/TQue及一元算子样例进行队列/拷贝组织。
+// 简化：使用 float 类型
+using dataType = float;
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的张量数量
 
-using DTYPE = float;
-constexpr int32_t BUFFER_NUM = 2;
-
-class KernelPWConv1x1 {
+class KernelConvPW2D {
 public:
-    __aicore__ inline KernelPWConv1x1() {}
+    __aicore__ inline KernelConvPW2D() {}
 
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR z,
-                                uint32_t n, uint32_t h, uint32_t wimg,
-                                uint32_t cin, uint32_t cout,
-                                uint32_t hasBias, uint32_t tileNum)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR y,
+                                uint32_t n, uint32_t cin, uint32_t cout,
+                                uint32_t h, uint32_t w, uint32_t tileNum)
     {
-        // 输入在Python端已变换为NHWC并重排为二维: X2D shape = [M, Cin], M = N*H*W
-        this->N = n;
-        this->H = h;
-        this->W = wimg;
-        this->Cin = cin;
-        this->Cout = cout;
-        this->hasBias = hasBias;
+        this->n = n;
+        this->cin = cin;
+        this->cout = cout;
+        this->h = h;
+        this->w = w;
         this->tileNum = tileNum;
 
-        this->M = N * H * W;
-
-        // 均分到各block
-        this->blockM = this->M / AscendC::GetBlockNum();
-        this->tileM = this->blockM / this->tileNum / BUFFER_NUM;
-
-        // 设定GM缓冲（按二维扁平内存设置长度）
-        xGm.SetGlobalBuffer((__gm__ DTYPE*)x + (size_t)AscendC::GetBlockIdx() * blockM * Cin, blockM * Cin);
-        wGm.SetGlobalBuffer((__gm__ DTYPE*)w, (size_t)Cout * Cin);
-        zGm.SetGlobalBuffer((__gm__ DTYPE*)z + (size_t)AscendC::GetBlockIdx() * blockM * Cout, blockM * Cout);
-        if (hasBias) {
-            bGm.SetGlobalBuffer((__gm__ DTYPE*)b, Cout);
+        spatial = h * w;
+        // 每个 batch 内的每个通道平面大小
+        tileLen = (spatial / (tileNum * BUFFER_NUM));
+        if (tileLen == 0) {
+            tileLen = spatial; // 很小的情况不分块
+            this->tileNum = 1;
         }
 
-        // 初始化队列
-        // X分块: tileM * Cin
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, tileM * Cin * sizeof(DTYPE));
-        // Z分块: tileM * Cout
-        pipe.InitBuffer(outQueueZ, BUFFER_NUM, tileM * Cout * sizeof(DTYPE));
-        // 权重和bias常驻UB一次性拷贝
-        pipe.InitBuffer(weightQueue, 1, (size_t)Cout * Cin * sizeof(DTYPE));
-        if (hasBias) {
-            pipe.InitBuffer(biasQueue, 1, Cout * sizeof(DTYPE));
-        }
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ dataType*>(x), (uint64_t)n * cin * spatial);
+        wGm.SetGlobalBuffer(reinterpret_cast<__gm__ dataType*>(weight), (uint64_t)cout * cin);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ dataType*>(y), (uint64_t)n * cout * spatial);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, tileLen * sizeof(dataType));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, tileLen * sizeof(dataType));
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, tileLen * sizeof(dataType));
+        pipe.InitBuffer(inQueueW, 1, cin * sizeof(dataType)); // 每次加载一个输出通道的权重向量
     }
 
     __aicore__ inline void Process()
     {
-        // 将权重、偏置拷贝至本地
-        AscendC::LocalTensor<DTYPE> wLocal = weightQueue.AllocTensor<DTYPE>();
-        AscendC::DataCopy(wLocal, wGm, (uint32_t)((size_t)Cout * Cin));
+        for (uint32_t bn = 0; bn < n; ++bn) {
+            for (uint32_t co = 0; co < cout; ++co) {
+                // 加载当前输出通道的 cin 权重
+                AscendC::LocalTensor<dataType> wLocal = inQueueW.AllocTensor<dataType>();
+                AscendC::DataCopy(wLocal, wGm[co * cin], cin);
+                inQueueW.EnQue(wLocal);
+                wLocal = inQueueW.DeQue<dataType>();
 
-        AscendC::LocalTensor<DTYPE> bLocal;
-        if (hasBias) {
-            bLocal = biasQueue.AllocTensor<DTYPE>();
-            AscendC::DataCopy(bLocal, bGm, Cout);
-        }
+                uint32_t rounds = (spatial + tileLen - 1) / tileLen;
+                for (uint32_t t = 0; t < rounds; ++t) {
+                    uint32_t offset = t * tileLen;
+                    uint32_t curr = (offset + tileLen <= spatial) ? tileLen : (spatial - offset);
 
-        // 按tile遍历
-        int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; ++i) {
-            CopyIn(i);
-            Compute(i, wLocal, bLocal);
-            CopyOut(i);
-        }
-    }
+                    AscendC::LocalTensor<dataType> yLocal = outQueueY.AllocTensor<dataType>();
 
-private:
-    __aicore__ inline void CopyIn(int32_t progress)
-    {
-        // 拷入X分块
-        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
-        uint32_t offset = progress * tileM * Cin;
-        AscendC::DataCopy(xLocal, xGm[offset], tileM * Cin);
-        inQueueX.EnQue(xLocal);
+                    // 使用第一输入通道初始化 yLocal = x * w
+                    {
+                        AscendC::LocalTensor<dataType> xLocal = inQueueX.AllocTensor<dataType>();
+                        // x 索引: ((bn * cin + 0) * spatial + offset)
+                        AscendC::DataCopy(xLocal, xGm[((uint64_t)bn * cin + 0) * spatial + offset], curr);
+                        inQueueX.EnQue(xLocal);
+                        xLocal = inQueueX.DeQue<dataType>();
 
-        // 预分配Z分块
-        AscendC::LocalTensor<DTYPE> zLocal = outQueueZ.AllocTensor<DTYPE>();
-        outQueueZ.EnQue<DTYPE>(zLocal); // 先入队占位，Compute中DeQue出来写入
-    }
+                        // 取标量权重 w[co, 0]
+                        dataType alpha0 = 0;
+                        // 假设 LocalTensor 支持按索引读出标量（设备侧编译器会内联）
+                        alpha0 = wLocal.GetValue(0);
 
-    __aicore__ inline void Compute(int32_t /*progress*/,
-                                   AscendC::LocalTensor<DTYPE> &wLocal,
-                                   AscendC::LocalTensor<DTYPE> &bLocal)
-    {
-        // 取出X/Z分块本地tensor
-        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> zLocal = outQueueZ.DeQue<DTYPE>();
+                        AscendC::Muls(yLocal, xLocal, alpha0, curr);
 
-        // 朴素GEMM: [tileM, Cin] * [Cout, Cin]^T -> [tileM, Cout]
-        // 内存布局:
-        //   xLocal: 行主序, 行长 Cin
-        //   wLocal: 连续存储为 [Cout, Cin]，权重按 oc*C_in + k 访问
-        //   zLocal: 行主序, 行长 Cout
-        for (uint32_t m = 0; m < tileM; ++m) {
-            for (uint32_t oc = 0; oc < Cout; ++oc) {
-                DTYPE acc = (hasBias ? bLocal[oc] : (DTYPE)0);
-                for (uint32_t k = 0; k < Cin; ++k) {
-                    DTYPE xv = xLocal[m * Cin + k];
-                    DTYPE wv = wLocal[oc * Cin + k];
-                    acc = acc + xv * wv;
+                        inQueueX.FreeTensor(xLocal);
+                    }
+
+                    // 累加后续输入通道
+                    for (uint32_t ci = 1; ci < cin; ++ci) {
+                        AscendC::LocalTensor<dataType> xLocal = inQueueX.AllocTensor<dataType>();
+                        AscendC::DataCopy(xLocal, xGm[((uint64_t)bn * cin + ci) * spatial + offset], curr);
+                        inQueueX.EnQue(xLocal);
+                        xLocal = inQueueX.DeQue<dataType>();
+
+                        dataType alpha = wLocal.GetValue(ci);
+
+                        AscendC::LocalTensor<dataType> tmpLocal = tmpQueue.AllocTensor<dataType>();
+                        AscendC::Muls(tmpLocal, xLocal, alpha, curr);
+                        AscendC::Add(yLocal, yLocal, tmpLocal, curr);
+
+                        tmpQueue.FreeTensor(tmpLocal);
+                        inQueueX.FreeTensor(xLocal);
+                    }
+
+                    // 写回输出: ((bn * cout + co) * spatial + offset)
+                    AscendC::DataCopy(yGm[((uint64_t)bn * cout + co) * spatial + offset], yLocal, curr);
+                    outQueueY.FreeTensor(yLocal);
                 }
-                zLocal[m * Cout + oc] = acc;
+
+                inQueueW.FreeTensor(wLocal);
             }
         }
-
-        // 回填到队列
-        outQueueZ.EnQue<DTYPE>(zLocal);
-        inQueueX.FreeTensor(xLocal);
-    }
-
-    __aicore__ inline void CopyOut(int32_t progress)
-    {
-        AscendC::LocalTensor<DTYPE> zLocal = outQueueZ.DeQue<DTYPE>();
-        uint32_t offset = progress * tileM * Cout;
-        AscendC::DataCopy(zGm[offset], zLocal, tileM * Cout);
-        outQueueZ.FreeTensor(zLocal);
     }
 
 private:
-    // 维度/参数
-    uint32_t N, H, W;
-    uint32_t Cin, Cout;
-    uint32_t M;          // N*H*W
-    uint32_t blockM;
-    uint32_t tileM;
-    uint32_t tileNum;
-    uint32_t hasBias;
-
-    // 管道与队列
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> weightQueue;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> biasQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueW;
 
-    // GM张量
-    AscendC::GlobalTensor<DTYPE> xGm;
-    AscendC::GlobalTensor<DTYPE> wGm;
-    AscendC::GlobalTensor<DTYPE> bGm;
-    AscendC::GlobalTensor<DTYPE> zGm;
+    AscendC::GlobalTensor<dataType> xGm;
+    AscendC::GlobalTensor<dataType> wGm;
+    AscendC::GlobalTensor<dataType> yGm;
+
+    uint32_t n, cin, cout, h, w, tileNum;
+    uint32_t spatial;
+    uint32_t tileLen;
 };
 
-extern "C" __global__ __aicore__ void conv_pointwise_2d_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void conv_pointwise_2d_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
-    GET_TILING_DATA(tilingData, tiling);
-    KernelPWConv1x1 op;
-    op.Init(x, w, b, z,
-            tilingData.n(), tilingData.h(), tilingData.w(),
-            tilingData.cin(), tilingData.cout(),
-            tilingData.hasBias(), tilingData.tileNum());
-    if (TILING_KEY_IS(1)) {
-        op.Process();
-    }
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConvPW2D op;
+    op.Init(x, weight, y,
+            tiling_data.n, tiling_data.cin, tiling_data.cout,
+            tiling_data.h, tiling_data.w, tiling_data.tileNum);
+    op.Process();
 }
 """
 
@@ -361,54 +302,17 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-static inline at::Tensor to_channels_last_2d(const at::Tensor& t) {
-    // NHWC contiguous
-    if (!t.is_contiguous(at::MemoryFormat::ChannelsLast)) {
-        return t.contiguous(at::MemoryFormat::ChannelsLast);
-    }
-    return t;
-}
+at::Tensor conv_pointwise_2d_custom_impl_npu(const at::Tensor& x, const at::Tensor& weight) {
+    // x: [N, Cin, H, W], weight: [Cout, Cin, 1, 1]
+    auto sizes = x.sizes();
+    auto N = sizes[0];
+    auto H = sizes[2];
+    auto W = sizes[3];
+    auto Cout = weight.size(0);
 
-at::Tensor conv_pointwise_2d_custom_impl_npu(const at::Tensor& x, const at::Tensor& w, c10::optional<at::Tensor> b_opt) {
-    // 预处理：
-    // 1) 将输入x转为channels_last并展平成[M, Cin]
-    // 2) 将权重w视为[Cout, Cin, 1, 1]，在核内按[Cout, Cin]访问
-    TORCH_CHECK(x.dim() == 4, "x must be 4D NCHW");
-    TORCH_CHECK(w.dim() >= 2, "w must be at least 2D [Cout, Cin, 1, 1]");
-
-    auto x_cl = to_channels_last_2d(x);
-    int64_t N = x_cl.size(0);
-    int64_t Cin = x_cl.size(1); // 原NCHW的C
-    int64_t H = x_cl.size(2);
-    int64_t W = x_cl.size(3);
-    int64_t Cout = w.size(0);
-
-    // 将NHWC视图重塑为二维[M, Cin]
-    auto x2d = x_cl.view({N * H * W, Cin}).contiguous();
-
-    // 权重按[Cout, Cin, 1, 1]展平为二维[Cout, Cin]
-    at::Tensor w2d = w.view({Cout, Cin}).contiguous();
-
-    // 输出二维[M, Cout]
-    at::Tensor z2d = at::empty({N * H * W, Cout}, x.options());
-
-    // 偏置
-    at::Tensor b = b_opt.has_value() ? b_opt.value() : at::Tensor();
-    if (b.defined()) {
-        TORCH_CHECK(b.numel() == Cout, "bias length must equal Cout");
-    }
-
-    if (b.defined()) {
-        EXEC_NPU_CMD(aclnnConvPointwise2dCustom, x2d, w2d, b, z2d);
-    } else {
-        // 传入空Tensor作为可选参数
-        EXEC_NPU_CMD(aclnnConvPointwise2dCustom, x2d, w2d, at::Tensor(), z2d);
-    }
-
-    // 还原为NHWC再转回NCHW
-    auto z_nhwc = z2d.view({N, H, W, Cout}).contiguous();
-    auto z_nchw = z_nhwc.permute({0, 3, 1, 2}).contiguous();
-    return z_nchw;
+    at::Tensor y = at::empty({N, Cout, H, W}, x.options());
+    EXEC_NPU_CMD(aclnnConvPointwise2dCustom, x, weight, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -416,7 +320,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv_pointwise_2d_custom", &conv_pointwise_2d_custom_impl_npu, "pointwise 1x1 conv2d");
+    m.def("conv_pointwise_2d_custom", &conv_pointwise_2d_custom_impl_npu, "1x1 conv2d (pointwise)");
 }
 """
 
@@ -426,13 +330,14 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    """
+    使用 AscendC 自定义核实现的 1x1 点卷积（无偏置）。
+    """
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.empty(out_channels, in_channels, 1, 1))
-        torch.nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
-        self.bias = None  # 与原模型默认bias=False一致，可按需扩展
+        # 权重形状与 nn.Conv2d 的 1x1 权重一致: [out_channels, in_channels, 1, 1]
+        self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, 1, 1) * (1.0 / (in_channels ** 0.5)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 调用自定义AscendC算子
-        return custom_ops_lib.conv_pointwise_2d_custom(x, self.weight, self.bias)
+        return custom_ops_lib.conv_pointwise_2d_custom(x, self.weight)
 '''

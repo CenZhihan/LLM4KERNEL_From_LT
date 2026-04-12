@@ -4,15 +4,25 @@ import re
 from dataset import dataset
 
 def _load_api_config():
-    """若设置 USE_API_CONFIG=1 且存在 api_config.py，则返回 (api_key, base_url, model)；否则返回 None。"""
+    """若设置 USE_API_CONFIG=1 且存在 api_config.py，则返回 (api_key, base_url, model)；否则返回 None。
+
+    优先读取 OPENAI_API_KEY / OPENAI_API_BASE；若 key 为空，则回退到 MultiKernelBench 风格的
+    XI_AI_API_KEY / XI_AI_BASE_URL，便于与同仓库内另一套 api_config 命名兼容。
+    """
     if os.environ.get("USE_API_CONFIG", "").strip().lower() not in ("1", "true"):
         return None
     try:
         import api_config as ac
-        if getattr(ac, "OPENAI_API_KEY", "").strip():
+        key = (getattr(ac, "OPENAI_API_KEY", None) or "").strip()
+        if not key:
+            key = (getattr(ac, "XI_AI_API_KEY", None) or "").strip()
+        base = (getattr(ac, "OPENAI_API_BASE", None) or "").strip()
+        if not base:
+            base = (getattr(ac, "XI_AI_BASE_URL", None) or "").strip()
+        if key:
             return (
-                ac.OPENAI_API_KEY.strip(),
-                (getattr(ac, "OPENAI_API_BASE", None) or "").strip() or "https://api.openai.com/v1",
+                key,
+                base or "https://api.openai.com/v1",
                 (getattr(ac, "MODEL", None) or "").strip() or "gpt-5",
             )
     except ImportError:

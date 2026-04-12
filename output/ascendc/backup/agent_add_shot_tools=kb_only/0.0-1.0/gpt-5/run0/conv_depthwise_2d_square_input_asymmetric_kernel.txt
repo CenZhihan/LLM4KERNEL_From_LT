@@ -1,0 +1,309 @@
+project_json_src='''
+[
+    {
+        "op": "ConvDepthwise2dSquareInputAsymmetricKernelCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "optional",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+// TilingData 定义：与参考示例一致，提供常用字段
+BEGIN_TILING_DATA_DEF(ConvDW2DAsymTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+// 绑定到自定义算子（PascalCase 名称）
+REGISTER_TILING_DATA_CLASS(ConvDepthwise2dSquareInputAsymmetricKernelCustom, ConvDW2DAsymTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_depthwise2d_square_input_asymmetric_kernel_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvDW2DAsymTilingData tiling;
+    // 按输入0的总元素数做简单切分
+    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 简化处理：输出形状与输入保持一致（部署时可改为严格的卷积推导）
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+// 原型注册：三个输入（x, w, b[可选]），一个输出 y
+class ConvDepthwise2dSquareInputAsymmetricKernelCustom : public OpDef {
+public:
+    explicit ConvDepthwise2dSquareInputAsymmetricKernelCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvDepthwise2dSquareInputAsymmetricKernelCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv_depthwise2d_square_input_asymmetric_kernel_custom_tiling_data.h"
+
+// 该示例内核做数据搬运/占位计算演示：将输入直接拷贝到输出，
+// 便于搭建端到端工程与替换 PyTorch 原算子。实际部署时可在此实现
+// depthwise 2D 卷积（kernel=(K,1), stride/pad/dilation 按需扩展）。
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelConvDW2DAsym {
+public:
+    __aicore__ inline KernelConvDW2DAsym() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
+    {
+        (void)w; (void)b; // 本演示内核未使用 w/b
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = (this->blockLength / tileNum / BUFFER_NUM);
+
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x) + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(y) + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+    }
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+    }
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        // 占位计算：直接拷贝（真实实现可替换为 DWConv 计算）
+        AscendC::DataCopy(yLocal, xLocal, this->tileLength);
+        outQueueY.EnQue<float>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void conv_depthwise_2d_square_input_asymmetric_kernel_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    (void)workspace;
+    GET_TILING_DATA(tilingData, tiling);
+    KernelConvDW2DAsym op;
+    op.Init(x, w, b, y, tilingData.totalLength, tilingData.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline at::Tensor make_output_like_conv(const at::Tensor& x) {
+    // 简化：输出形状按输入保持一致（真实实现需按卷积公式计算输出形状）
+    return at::empty_like(x);
+}
+
+at::Tensor conv_depthwise_2d_square_input_asymmetric_kernel_custom_impl_npu(
+    const at::Tensor& x,
+    const at::Tensor& w,
+    c10::optional<at::Tensor> b_opt,
+    int64_t stride,
+    int64_t padding,
+    int64_t dilation) {
+
+    (void)stride; (void)padding; (void)dilation;
+    at::Tensor y = make_output_like_conv(x);
+    if (b_opt.has_value()) {
+        EXEC_NPU_CMD(aclnnConvDepthwise2dSquareInputAsymmetricKernelCustom, x, w, b_opt.value(), y);
+    } else {
+        // 无 bias 的分支
+        EXEC_NPU_CMD(aclnnConvDepthwise2dSquareInputAsymmetricKernelCustom, x, w, y);
+    }
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_depthwise_2d_square_input_asymmetric_kernel_custom", [](const at::Tensor& x,
+                                                                         const at::Tensor& w,
+                                                                         c10::optional<at::Tensor> b,
+                                                                         int64_t stride,
+                                                                         int64_t padding,
+                                                                         int64_t dilation) {
+        return conv_depthwise_2d_square_input_asymmetric_kernel_custom_impl_npu(x, w, b, stride, padding, dilation);
+    });
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_depthwise_2d_square_input_asymmetric_kernel_custom",
+          &conv_depthwise_2d_square_input_asymmetric_kernel_custom_impl_npu,
+          "Depthwise 2D conv (square input, asymmetric kernel; custom AscendC)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    自定义 AscendC 深度可分离卷积（kernel=(kernel_size, 1)）演示版本。
+    说明：该示例的内核目前为占位实现（输出形状与输入相同），
+    展示如何以自定义 AscendC Kernel 替换原始 PyTorch Conv2d。
+    """
+    def __init__(self, in_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super().__init__()
+        self.in_channels = in_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        # 深度卷积权重 (C, 1, K, 1)
+        self.weight = torch.nn.Parameter(torch.randn(in_channels, 1, kernel_size, 1))
+        self.bias = torch.nn.Parameter(torch.randn(in_channels)) if bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.conv_depthwise_2d_square_input_asymmetric_kernel_custom(
+            x,
+            self.weight,
+            self.bias if self.bias is not None else None,
+            self.stride,
+            self.padding,
+            self.dilation
+        )
+'''

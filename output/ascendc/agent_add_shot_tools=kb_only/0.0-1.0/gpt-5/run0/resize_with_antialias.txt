@@ -38,14 +38,11 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(ResizeWithAntialiasCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, n);
   TILING_DATA_FIELD_DEF(uint32_t, c);
-  TILING_DATA_FIELD_DEF(uint32_t, hin);
-  TILING_DATA_FIELD_DEF(uint32_t, win);
-  TILING_DATA_FIELD_DEF(uint32_t, hout);
-  TILING_DATA_FIELD_DEF(uint32_t, wout);
-  TILING_DATA_FIELD_DEF(uint32_t, totalIn);
-  TILING_DATA_FIELD_DEF(uint32_t, totalOut);
-  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, inH);
+  TILING_DATA_FIELD_DEF(uint32_t, inW);
+  TILING_DATA_FIELD_DEF(uint32_t, outH);
+  TILING_DATA_FIELD_DEF(uint32_t, outW);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum); // N * C * outH
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ResizeWithAntialiasCustom, ResizeWithAntialiasCustomTilingData)
@@ -55,69 +52,44 @@ REGISTER_TILING_DATA_CLASS(ResizeWithAntialiasCustom, ResizeWithAntialiasCustomT
 host_operator_src="""
 #include "resize_with_antialias_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    // Expect NCHW
+    uint32_t n = (origin.GetDimNum() > 0) ? origin.GetDim(0) : 1;
+    uint32_t c = (origin.GetDimNum() > 1) ? origin.GetDim(1) : 1;
+    uint32_t inH = (origin.GetDimNum() > 2) ? origin.GetDim(2) : 1;
+    uint32_t inW = (origin.GetDimNum() > 3) ? origin.GetDim(3) : 1;
+
+    // Fixed target size per task requirement
+    uint32_t outH = 128;
+    uint32_t outW = 128;
+
+    // Each tile processes one output row (length outW) for a (n,c,oh)
+    uint32_t tileNum = n * c * outH;
+
+    // Set reasonable block dim
+    uint32_t blockDim = 8;
+    if (tileNum < blockDim) blockDim = tileNum == 0 ? 1 : tileNum;
+    context->SetBlockDim(blockDim);
+
     ResizeWithAntialiasCustomTilingData tiling;
-
-    // 输入形状按 NCHW 解析
-    const gert::Shape* inShape = context->GetInputShape(0);
-    auto ori = inShape->GetOriginShape();
-    std::vector<int64_t> dims = ori.GetDims(); // 期望为 [N, C, H, W]
-    if (dims.size() != 4) {
-        return ge::GRAPH_FAILED;
-    }
-
-    uint32_t n = static_cast<uint32_t>(dims[0]);
-    uint32_t c = static_cast<uint32_t>(dims[1]);
-    uint32_t hin = static_cast<uint32_t>(dims[2]);
-    uint32_t win = static_cast<uint32_t>(dims[3]);
-
-    // 固定将 (H, W) 下采样到 (128, 128)，align_corners=False, antialias=True
-    const uint32_t hout = 128;
-    const uint32_t wout = 128;
-
-    // 只支持整数 2 倍下采样(与 antialias 场景匹配)，若不满足则返回失败
-    if (hin != 2 * hout || win != 2 * wout) {
-        return ge::GRAPH_FAILED;
-    }
-
     tiling.set_n(n);
     tiling.set_c(c);
-    tiling.set_hin(hin);
-    tiling.set_win(win);
-    tiling.set_hout(hout);
-    tiling.set_wout(wout);
-
-    uint32_t totalIn  = n * c * hin * win;
-    uint32_t totalOut = n * c * hout * wout;
-    tiling.set_totalIn(totalIn);
-    tiling.set_totalOut(totalOut);
-
-    // 配置并行度
-    const uint32_t BLOCK_DIM = 8;
-    const uint32_t TILE_NUM  = 8;
-    context->SetBlockDim(BLOCK_DIM);
-    tiling.set_blockDim(BLOCK_DIM);
-    tiling.set_tileNum(TILE_NUM);
-
-    // 输出形状推断
-    gert::Shape* outShape = context->GetOutputShape(0);
-    std::vector<int64_t> outDims = { (int64_t)n, (int64_t)c, (int64_t)hout, (int64_t)wout };
-    outShape->SetDimNum(outDims.size());
-    for (size_t i = 0; i < outDims.size(); ++i) {
-        outShape->SetDim(i, outDims[i]);
-    }
-
-    // workspace
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+    tiling.set_inH(inH);
+    tiling.set_inW(inW);
+    tiling.set_outH(outH);
+    tiling.set_outW(outW);
+    tiling.set_tileNum(tileNum);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-    context->SetTilingKey(1);
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -125,18 +97,15 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* inShape = context->GetInputShape(0);
-    auto ori = inShape->GetOriginShape();
-    std::vector<int64_t> dims = ori.GetDims();
-    if (dims.size() != 4) {
-        return GRAPH_FAILED;
-    }
-    // 固定输出 [N, C, 128, 128]
-    gert::Shape* outShape = context->GetOutputShape(0);
-    std::vector<int64_t> outDims = { dims[0], dims[1], 128, 128 };
-    outShape->SetDimNum(outDims.size());
-    for (size_t i = 0; i < outDims.size(); ++i) {
-        outShape->SetDim(i, outDims[i]);
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    // Keep N, C from input; set H, W to 128, 128
+    int64_t n = (x_shape->GetDimNum() > 0) ? x_shape->GetDim(0) : 1;
+    int64_t c = (x_shape->GetDimNum() > 1) ? x_shape->GetDim(1) : 1;
+    std::vector<int64_t> out_dims = {n, c, 128, 128};
+    y_shape->SetDimNum(out_dims.size());
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        y_shape->SetDim(i, out_dims[i]);
     }
     return GRAPH_SUCCESS;
 }
@@ -178,134 +147,145 @@ OP_ADD(ResizeWithAntialiasCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "resize_with_antialias_custom_tiling_data.h"
 
-// 说明：本自定义核实现 NCHW 下采样 2x（256->128），对每个 2x2 邻域做均值，等效于 align_corners=False 的 bilinear+antialias 的面积平均近似。
-// 参照 CANN High-level API 的使用范式（如 Xor/RmsNorm/Pad 示例）：管道、队列、DataCopy、分块处理。
-
-constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t BUFFER_NUM = 1; // tiles buffered
 
 class KernelResizeWithAntialias {
 public:
     __aicore__ inline KernelResizeWithAntialias() {}
-
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t n, uint32_t c, uint32_t hin, uint32_t win,
-                                uint32_t hout, uint32_t wout,
+                                uint32_t n, uint32_t c,
+                                uint32_t inH, uint32_t inW,
+                                uint32_t outH, uint32_t outW,
                                 uint32_t tileNum)
     {
         this->n = n;
         this->c = c;
-        this->hin = hin;
-        this->win = win;
-        this->hout = hout;
-        this->wout = wout;
+        this->inH = inH;
+        this->inW = inW;
+        this->outH = outH;
+        this->outW = outW;
         this->tileNum = tileNum;
 
-        // 按 N*C*Hout 维度切分，每个 tile 处理若干个输出行
-        this->nc = n * c;
-        this->rowsPerNC = hout; // 每个 (n,c) 有 hout 行输出
-        this->blockNc = nc / AscendC::GetBlockNum();
-        if (blockNc == 0) { this->blockNc = 1; }
+        uint64_t totalIn = (uint64_t)n * c * inH * inW;
+        uint64_t totalOut = (uint64_t)n * c * outH * outW;
 
-        // 每个 block 负责连续的若干 (n,c) 平面
-        // 为简化实施，我们按单行宽度向量进行搬运与计算
-        inGm.SetGlobalBuffer((__gm__ DTYPE_X*)x);
-        outGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y);
+        // Split tiles across blocks: each tile is one output row for a (n,c,oh)
+        this->tilesPerBlock = tileNum / AscendC::GetBlockNum();
+        this->startTile = this->tilesPerBlock * AscendC::GetBlockIdx();
 
-        // 本地缓存：两行输入（win）、一行输出（wout）
-        pipe.InitBuffer(rowQueue0, BUFFER_NUM, win * sizeof(DTYPE_X));
-        pipe.InitBuffer(rowQueue1, BUFFER_NUM, win * sizeof(DTYPE_X));
-        pipe.InitBuffer(outRowQueue, BUFFER_NUM, wout * sizeof(DTYPE_Y));
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x, totalIn);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z*)y, totalOut);
+
+        // Each tile needs to load two input row segments of length 2*outW (contiguous),
+        // and produce one output row of length outW.
+        rowSegLen = 2 * outW;
+        outRowLen = outW;
+
+        pipe.InitBuffer(inQueueRow0, BUFFER_NUM, rowSegLen * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueRow1, BUFFER_NUM, rowSegLen * sizeof(DTYPE_X));
+        pipe.InitBuffer(tmpQueue0, BUFFER_NUM, outRowLen * sizeof(DTYPE_Z));
+        pipe.InitBuffer(tmpQueue1, BUFFER_NUM, outRowLen * sizeof(DTYPE_Z));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, outRowLen * sizeof(DTYPE_Z));
     }
 
     __aicore__ inline void Process()
     {
-        // 依据 (n,c) 平面循环
-        for (uint32_t idxNc = AscendC::GetBlockIdx() * blockNc;
-             idxNc < (AscendC::GetBlockIdx() + 1) * blockNc && idxNc < nc; ++idxNc) {
-
-            // 为每个输出行处理对应的两行输入
-            int32_t loopCount = this->tileNum * BUFFER_NUM;
-            // 简化：直接按所有行顺序处理（也可根据 tileNum 分段）
-            for (uint32_t oh = 0; oh < hout; ++oh) {
-                CopyIn(idxNc, oh);
-                Compute(idxNc, oh);
-                CopyOut(idxNc, oh);
-            }
+        int32_t loopCount = this->tilesPerBlock * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t idxNc, uint32_t oh)
+    __aicore__ inline void TileNCohFromIndex(uint32_t tileIndex, uint32_t &tn, uint32_t &tc, uint32_t &toh)
     {
-        // 计算输入/输出的全局偏移（NCHW 连续内存）
-        // 输入两行：ih0=2*oh, ih1=2*oh+1，行长度 win
-        uint32_t ih0 = 2 * oh;
-        uint32_t ih1 = ih0 + 1;
-
-        uint64_t baseIn = (uint64_t)idxNc * (uint64_t)hin * (uint64_t)win;
-        AscendC::LocalTensor<DTYPE_X> row0Local = rowQueue0.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_X> row1Local = rowQueue1.AllocTensor<DTYPE_X>();
-
-        AscendC::DataCopy(row0Local, inGm[baseIn + (uint64_t)ih0 * (uint64_t)win], win);
-        AscendC::DataCopy(row1Local, inGm[baseIn + (uint64_t)ih1 * (uint64_t)win], win);
-
-        rowQueue0.EnQue(row0Local);
-        rowQueue1.EnQue(row1Local);
+        // tileIndex in [0, N*C*outH)
+        uint32_t perNC = outH;
+        uint32_t nc_index = tileIndex / perNC;
+        toh = tileIndex % perNC;
+        tc = nc_index % c;
+        tn = nc_index / c;
     }
 
-    __aicore__ inline void Compute(uint32_t idxNc, uint32_t oh)
+    __aicore__ inline void CopyIn(int32_t progress)
     {
-        // 从队列取两行输入到本地
-        AscendC::LocalTensor<DTYPE_X> row0Local = rowQueue0.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_X> row1Local = rowQueue1.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> outRowLocal = outRowQueue.AllocTensor<DTYPE_Y>();
+        uint32_t tileIndex = this->startTile + (uint32_t)progress;
+        uint32_t tn, tc, toh;
+        TileNCohFromIndex(tileIndex, tn, tc, toh);
 
-        // 对应输出一行长度为 wout，计算 2x2 面积均值：
-        // out[ow] = 0.25*(row0[2*ow] + row0[2*ow+1] + row1[2*ow] + row1[2*ow+1])
-        // 这里采用标量循环计算，满足功能正确性
-        for (uint32_t ow = 0; ow < wout; ++ow) {
-            uint32_t iw = ow << 1;
-            DTYPE_X v00 = row0Local.GetValue(iw + 0);
-            DTYPE_X v01 = row0Local.GetValue(iw + 1);
-            DTYPE_X v10 = row1Local.GetValue(iw + 0);
-            DTYPE_X v11 = row1Local.GetValue(iw + 1);
-            DTYPE_Y val = (DTYPE_Y)((v00 + v01 + v10 + v11) * static_cast<DTYPE_X>(0.25f));
-            outRowLocal.SetValue(ow, val);
-        }
+        uint32_t ih0 = toh * 2;
 
-        rowQueue0.FreeTensor(row0Local);
-        rowQueue1.FreeTensor(row1Local);
-        outRowQueue.EnQue(outRowLocal);
+        uint64_t row0Offset = (((uint64_t)tn * c + tc) * inH + ih0) * inW;
+        uint64_t row1Offset = row0Offset + inW;
+
+        AscendC::LocalTensor<DTYPE_X> row0Local = inQueueRow0.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> row1Local = inQueueRow1.AllocTensor<DTYPE_X>();
+
+        AscendC::DataCopy(row0Local, xGm[row0Offset], rowSegLen);
+        AscendC::DataCopy(row1Local, xGm[row1Offset], rowSegLen);
+
+        inQueueRow0.EnQue(row0Local);
+        inQueueRow1.EnQue(row1Local);
     }
 
-    __aicore__ inline void CopyOut(uint32_t idxNc, uint32_t oh)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<DTYPE_Y> outRowLocal = outRowQueue.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_X> row0Local = inQueueRow0.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> row1Local = inQueueRow1.DeQue<DTYPE_X>();
 
-        // 输出行写回
-        uint64_t baseOut = (uint64_t)idxNc * (uint64_t)hout * (uint64_t)wout;
-        AscendC::DataCopy(outGm[baseOut + (uint64_t)oh * (uint64_t)wout], outRowLocal, wout);
+        AscendC::LocalTensor<DTYPE_Z> tmp0 = tmpQueue0.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> tmp1 = tmpQueue1.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
 
-        outRowQueue.FreeTensor(outRowLocal);
+        // Horizontal pairwise sum for two rows: sum of adjacent elements
+        AscendC::Add(tmp0, row0Local, row0Local[1], outRowLen);
+        AscendC::Add(tmp1, row1Local, row1Local[1], outRowLen);
+
+        // Sum the two rows and scale by 0.25 (average of 2x2)
+        AscendC::Add(tmp0, tmp0, tmp1, outRowLen);
+        AscendC::Muls(yLocal, tmp0, (DTYPE_Z)0.25f, outRowLen);
+
+        outQueueY.EnQue<DTYPE_Z>(yLocal);
+
+        inQueueRow0.FreeTensor(row0Local);
+        inQueueRow1.FreeTensor(row1Local);
+        tmpQueue0.FreeTensor(tmp0);
+        tmpQueue1.FreeTensor(tmp1);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        uint32_t tileIndex = this->startTile + (uint32_t)progress;
+        uint32_t tn, tc, toh;
+        TileNCohFromIndex(tileIndex, tn, tc, toh);
+
+        uint64_t outOffset = (((uint64_t)tn * c + tc) * outH + toh) * outW;
+
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[outOffset], yLocal, outRowLen);
+        outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> rowQueue0;
-    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> rowQueue1;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outRowQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueRow0;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueRow1;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> tmpQueue0;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> tmpQueue1;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
 
-    AscendC::GlobalTensor<DTYPE_X> inGm;
-    AscendC::GlobalTensor<DTYPE_Y> outGm;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
 
-    uint32_t n, c, hin, win, hout, wout;
-    uint32_t nc;
-    uint32_t rowsPerNC;
-    uint32_t blockNc;
+    uint32_t n, c, inH, inW, outH, outW;
     uint32_t tileNum;
+    uint32_t tilesPerBlock;
+    uint32_t startTile;
+    uint32_t rowSegLen;
+    uint32_t outRowLen;
 };
 
 extern "C" __global__ __aicore__ void resize_with_antialias_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
@@ -313,12 +293,14 @@ extern "C" __global__ __aicore__ void resize_with_antialias_custom(GM_ADDR x, GM
     GET_TILING_DATA(tilingData, tiling);
     KernelResizeWithAntialias op;
     op.Init(x, y,
-            tilingData.n(), tilingData.c(), tilingData.hin(), tilingData.win(),
-            tilingData.hout(), tilingData.wout(),
+            tilingData.n(),
+            tilingData.c(),
+            tilingData.inH(),
+            tilingData.inW(),
+            tilingData.outH(),
+            tilingData.outW(),
             tilingData.tileNum());
-    if (TILING_KEY_IS(1)) {
-        op.Process();
-    }
+    op.Process();
 }
 """
 
@@ -329,12 +311,14 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor resize_with_antialias_custom_impl_npu(const at::Tensor& x) {
-    TORCH_CHECK(x.dim() == 4, "Input must be 4D NCHW");
-    TORCH_CHECK(x.scalar_type() == at::kFloat, "Only float32 is supported");
+    TORCH_CHECK(x.dim() == 4, "Input must be NCHW");
+    auto opts = x.options();
     auto sizes = x.sizes();
-    TORCH_CHECK(sizes[2] == 256 && sizes[3] == 256, "This custom kernel expects H=W=256");
-    // 输出固定 128x128
-    auto y = at::empty({sizes[0], sizes[1], 128, 128}, x.options());
+    int64_t N = sizes[0];
+    int64_t C = sizes[1];
+    int64_t outH = 128;
+    int64_t outW = 128;
+    at::Tensor y = at::empty({N, C, outH, outW}, opts);
     EXEC_NPU_CMD(aclnnResizeWithAntialiasCustom, x, y);
     return y;
 }
@@ -344,7 +328,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("resize_with_antialias_custom", &resize_with_antialias_custom_impl_npu, "Resize bilinear antialias 256->128 (NCHW)");
+    m.def("resize_with_antialias_custom", &resize_with_antialias_custom_impl_npu, "Resize bilinear with antialias (downsample 2x)");
 }
 """
 
@@ -358,6 +342,5 @@ class ModelNew(torch.nn.Module):
         super().__init__()
 
     def forward(self, x):
-        # 固定替换为自定义 AscendC 核：bilinear + antialias，256->128
         return custom_ops_lib.resize_with_antialias_custom(x)
 '''

@@ -1,0 +1,431 @@
+project_json_src='''
+[
+    {
+        "op": "MultiHeadAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "k",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+// 依据检索示例，定义自定义TilingData并注册
+BEGIN_TILING_DATA_DEF(MultiHeadAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, b);            // batch
+  TILING_DATA_FIELD_DEF(uint32_t, h);            // num heads
+  TILING_DATA_FIELD_DEF(uint32_t, s);            // seq length
+  TILING_DATA_FIELD_DEF(uint32_t, d);            // head dim
+  TILING_DATA_FIELD_DEF(float, scale);           // 1/sqrt(d)
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);      // 流水tile数（简单示例）
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MultiHeadAttentionCustom, MultiHeadAttentionCustomTilingData)
+} // namespace optiling
+"""
+
+host_operator_src="""
+#include "multi_head_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <cmath>
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 输入形状: [B, H, S, D]（由Python端预先reshape后传入）
+    const ge::Shape &qShape = context->GetInputShape(0)->GetOriginShape();
+    // 形状维度获取
+    uint32_t b = 1;
+    uint32_t h = 1;
+    uint32_t s = 1;
+    uint32_t d = 1;
+    if (qShape.GetDimNum() == 4) {
+        b = static_cast<uint32_t>(qShape.GetDim(0));
+        h = static_cast<uint32_t>(qShape.GetDim(1));
+        s = static_cast<uint32_t>(qShape.GetDim(2));
+        d = static_cast<uint32_t>(qShape.GetDim(3));
+    }
+    // 这里的tileNum仅作示例，按检索样例固定值
+    const uint32_t TILE_NUM = 1;
+    const uint32_t BLOCK_DIM = 1;
+
+    MultiHeadAttentionCustomTilingData tiling;
+    tiling.set_b(b);
+    tiling.set_h(h);
+    tiling.set_s(s);
+    tiling.set_d(d);
+    float scale = 1.0f / std::sqrt(static_cast<float>(d));
+    tiling.set_scale(scale);
+    tiling.set_tileNum(TILE_NUM);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    // 无额外workspace
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输出形状与Q一致: [B, H, S, D]
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MultiHeadAttentionCustom : public OpDef {
+public:
+    explicit MultiHeadAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("k")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("v")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("out")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(MultiHeadAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "multi_head_attention_custom_tiling_data.h"
+
+// 参考检索示例：使用TPipe/TQue、GET_TILING_DATA、TILING_KEY_IS等基础API
+// 为简化演示，采用float计算，输入Q/K/V形状: [B, H, S, D]，输出同形状
+// 计算流程：对每个(B,H)，逐行(Q_i)与所有K_j做点积得到scores，再做softmax，最后与V做加权和
+// Softmax使用Exp进行实现（参考检索中Exp使用示例）
+
+using DTYPE = float;
+
+constexpr int32_t BUFFER_NUM = 1;
+
+__aicore__ inline void softmax_row(AscendC::LocalTensor<DTYPE>& row, uint32_t len)
+{
+    // 计算max
+    DTYPE maxv = row.GetValue(0);
+    for (uint32_t i = 1; i < len; ++i) {
+        DTYPE v = row.GetValue(i);
+        if (v > maxv) maxv = v;
+    }
+    // row = exp(row - max)
+    for (uint32_t i = 0; i < len; ++i) {
+        DTYPE shifted = row.GetValue(i) - maxv;
+        row.SetValue(i, shifted);
+    }
+    // 使用Exp API进行指数（参考文档示例：AscendC::Exp<float, 15, false>(dstLocal, srcLocal, length)）
+    AscendC::LocalTensor<DTYPE> tmp = row; // 直接复用
+    AscendC::Exp<DTYPE, 15, false>(tmp, row, len);
+    // 计算sum
+    DTYPE sumv = tmp.GetValue(0);
+    for (uint32_t i = 1; i < len; ++i) {
+        sumv += tmp.GetValue(i);
+    }
+    // 归一化
+    DTYPE inv = DTYPE(1.0f) / sumv;
+    for (uint32_t i = 0; i < len; ++i) {
+        DTYPE val = tmp.GetValue(i) * inv;
+        row.SetValue(i, val);
+    }
+}
+
+class KernelMHA {
+public:
+    __aicore__ inline KernelMHA() {}
+
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out,
+                                uint32_t b, uint32_t h, uint32_t s, uint32_t d, float scale, uint32_t /*tileNum*/)
+    {
+        this->B = b; this->H = h; this->S = s; this->D = d; this->scale = scale;
+
+        uint32_t total_elems = B * H * S * D;
+        qGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(q), total_elems);
+        kGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(k), total_elems);
+        vGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(v), total_elems);
+        outGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(out), total_elems);
+
+        // 为局部缓冲分配空间（使用队列管理）
+        // 单行scores长度S，一个向量长度D，一个输出向量长度D
+        pipe.InitBuffer(qVecQ, BUFFER_NUM, D * sizeof(DTYPE));
+        pipe.InitBuffer(kVecQ, BUFFER_NUM, D * sizeof(DTYPE));
+        pipe.InitBuffer(vVecQ, BUFFER_NUM, D * sizeof(DTYPE));
+        pipe.InitBuffer(scoreQ, BUFFER_NUM, S * sizeof(DTYPE));
+        pipe.InitBuffer(outVecQ, BUFFER_NUM, D * sizeof(DTYPE));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // 遍历 batch 和 head
+        for (uint32_t b = 0; b < B; ++b) {
+            for (uint32_t h = 0; h < H; ++h) {
+                process_one_head(b, h);
+            }
+        }
+    }
+
+private:
+    __aicore__ inline uint32_t offset_bh(uint32_t b, uint32_t h) const
+    {
+        return (b * H + h) * (S * D);
+    }
+    __aicore__ inline uint32_t offset_row(uint32_t row) const
+    {
+        return row * D;
+    }
+    __aicore__ inline uint32_t offset_elem(uint32_t row, uint32_t col) const
+    {
+        return row * D + col;
+    }
+
+    __aicore__ inline void process_one_head(uint32_t b, uint32_t h)
+    {
+        uint32_t base = offset_bh(b, h);
+        // 对每个query行
+        for (uint32_t i = 0; i < S; ++i) {
+            // 取出q_i
+            AscendC::LocalTensor<DTYPE> qLocal = qVecQ.AllocTensor<DTYPE>();
+            AscendC::DataCopy(qLocal, qGm[base + offset_row(i)], D);
+
+            // scores缓冲
+            AscendC::LocalTensor<DTYPE> scoreLocal = scoreQ.AllocTensor<DTYPE>();
+
+            // scores[j] = scale * dot(q_i, k_j)
+            for (uint32_t j = 0; j < S; ++j) {
+                AscendC::LocalTensor<DTYPE> kLocal = kVecQ.AllocTensor<DTYPE>();
+                AscendC::DataCopy(kLocal, kGm[base + offset_row(j)], D);
+
+                // 逐元素乘加
+                DTYPE acc = 0.0f;
+                for (uint32_t t = 0; t < D; ++t) {
+                    acc += qLocal.GetValue(t) * kLocal.GetValue(t);
+                }
+                acc *= static_cast<DTYPE>(scale);
+                scoreLocal.SetValue(j, acc);
+                kVecQ.FreeTensor(kLocal);
+            }
+
+            // softmax over j
+            softmax_row(scoreLocal, S);
+
+            // out_i = sum_j scores[j] * v_j
+            AscendC::LocalTensor<DTYPE> outLocal = outVecQ.AllocTensor<DTYPE>();
+            // 清零
+            for (uint32_t t = 0; t < D; ++t) {
+                outLocal.SetValue(t, 0.0f);
+            }
+            for (uint32_t j = 0; j < S; ++j) {
+                DTYPE w = scoreLocal.GetValue(j);
+                AscendC::LocalTensor<DTYPE> vLocal = vVecQ.AllocTensor<DTYPE>();
+                AscendC::DataCopy(vLocal, vGm[base + offset_row(j)], D);
+                for (uint32_t t = 0; t < D; ++t) {
+                    DTYPE tmp = outLocal.GetValue(t) + w * vLocal.GetValue(t);
+                    outLocal.SetValue(t, tmp);
+                }
+                vVecQ.FreeTensor(vLocal);
+            }
+
+            // 写回out
+            AscendC::DataCopy(outGm[base + offset_row(i)], outLocal, D);
+
+            // 释放本轮局部tensor
+            scoreQ.FreeTensor(scoreLocal);
+            outVecQ.FreeTensor(outLocal);
+            qVecQ.FreeTensor(qLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> qVecQ;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> kVecQ;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> vVecQ;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> scoreQ;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> outVecQ;
+
+    AscendC::GlobalTensor<DTYPE> qGm;
+    AscendC::GlobalTensor<DTYPE> kGm;
+    AscendC::GlobalTensor<DTYPE> vGm;
+    AscendC::GlobalTensor<DTYPE> outGm;
+
+    uint32_t B, H, S, D;
+    float scale;
+};
+
+extern "C" __global__ __aicore__ void multi_head_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    KernelMHA op;
+    op.Init(q, k, v, out,
+            tilingData.b, tilingData.h, tilingData.s, tilingData.d,
+            tilingData.scale, tilingData.tileNum);
+    if (TILING_KEY_IS(1)) {
+        op.Process();
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor multi_head_attention_custom_impl_npu(const at::Tensor& q,
+                                                const at::Tensor& k,
+                                                const at::Tensor& v) {
+    // 输出形状与q一致: [B, H, S, D]
+    at::Tensor result = at::empty_like(q);
+    EXEC_NPU_CMD(aclnnMultiHeadAttentionCustom, q, k, v, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("multi_head_attention_custom", &multi_head_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("multi_head_attention_custom", &multi_head_attention_custom_impl_npu, "Scaled Dot-Product Attention (Q,K,V -> out)");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    """
+    使用自定义AscendC核替换MHA中的注意力核算(Q,K,V->Context)，线性投影仍用PyTorch权重。
+    输入: x [B, S, D]
+    内部:
+      - 用原MultiheadAttention权重做Q/K/V线性
+      - 变形为[B, H, S, Dh]后调用自定义核 multi_head_attention_custom
+      - 将输出拼回[B, S, D]再用out_proj线性
+    """
+    def __init__(self, d_model=512, num_heads=8):
+        super().__init__()
+        # 保留原MHA模块以复用其权重
+        self.mha = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.d_model = d_model
+        self.num_heads = num_heads
+
+    def _in_proj(self, x):
+        # PyTorch MultiheadAttention使用in_proj_weight(in_proj_bias)拼接QKV
+        # in_proj_weight: [3D, D], in_proj_bias: [3D]
+        w = self.mha.in_proj_weight
+        b = self.mha.in_proj_bias
+        qkv = F.linear(x, w, b)  # [B, S, 3D]
+        q, k, v = qkv.chunk(3, dim=-1)  # 各为[B, S, D]
+        return q, k, v
+
+    def _reshape_to_bhsd(self, t):
+        # [B, S, D] -> [B, H, S, Dh]
+        B, S, D = t.shape
+        H = self.num_heads
+        Dh = D // H
+        return t.view(B, S, H, Dh).permute(0, 2, 1, 3).contiguous()
+
+    def _merge_from_bhsd(self, t):
+        # [B, H, S, Dh] -> [B, S, D]
+        B, H, S, Dh = t.shape
+        return t.permute(0, 2, 1, 3).contiguous().view(B, S, H * Dh)
+
+    def forward(self, x):
+        # 1) 线性投影得到Q/K/V
+        q, k, v = self._in_proj(x)
+        # 2) 调整为[B, H, S, Dh]，与自定义核约定对齐
+        q_bhsd = self._reshape_to_bhsd(q)
+        k_bhsd = self._reshape_to_bhsd(k)
+        v_bhsd = self._reshape_to_bhsd(v)
+        # 3) 自定义核计算Scaled Dot-Product Attention（内部完成softmax和加权求和）
+        ctx_bhsd = custom_ops_lib.multi_head_attention_custom(q_bhsd, k_bhsd, v_bhsd)
+        # 4) 合并heads -> [B, S, D]
+        ctx = self._merge_from_bhsd(ctx_bhsd)
+        # 5) 输出线性（使用原mha的out_proj权重）
+        out = F.linear(ctx, self.mha.out_proj.weight, self.mha.out_proj.bias)  # [B, S, D]
+        return out
+'''

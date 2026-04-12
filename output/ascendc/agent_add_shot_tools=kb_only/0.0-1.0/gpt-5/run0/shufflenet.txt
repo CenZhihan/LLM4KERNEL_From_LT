@@ -7,24 +7,28 @@ project_json_src='''
             {
                 "name": "x",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "shape",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["int32"]
+            },
+            {
+                "name": "g",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["int32"]
             }
         ],
         "output_desc": [
             {
                 "name": "y",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ]
     }
@@ -36,14 +40,8 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ShufflenetCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, n);
-  TILING_DATA_FIELD_DEF(uint32_t, c);
-  TILING_DATA_FIELD_DEF(uint32_t, h);
-  TILING_DATA_FIELD_DEF(uint32_t, w);
-  TILING_DATA_FIELD_DEF(uint32_t, planeSize);     // h * w
-  TILING_DATA_FIELD_DEF(uint32_t, totalPlanes);   // n * c
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);       // per-plane tiles, keep 1 for simplicity
-  TILING_DATA_FIELD_DEF(uint32_t, groups);        // channel shuffle groups
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLen);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ShufflenetCustom, ShufflenetCustomTilingData)
@@ -55,41 +53,24 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 1; // one whole plane per tile for simplicity
+const uint32_t BLOCK_DIM = 1;
+const uint32_t DEFAULT_TILE_LEN = 4096; // 按元素数切分
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    std::vector<int64_t> dims = in_shape->GetOriginShape().GetDims();
-    // Expect NCHW
-    uint32_t n = dims.size() > 0 ? static_cast<uint32_t>(dims[0]) : 1;
-    uint32_t c = dims.size() > 1 ? static_cast<uint32_t>(dims[1]) : 1;
-    uint32_t h = dims.size() > 2 ? static_cast<uint32_t>(dims[2]) : 1;
-    uint32_t w = dims.size() > 3 ? static_cast<uint32_t>(dims[3]) : 1;
-
-    uint32_t planeSize = h * w;
-    uint32_t totalPlanes = n * c;
-
     ShufflenetCustomTilingData tiling;
-    tiling.set_n(n);
-    tiling.set_c(c);
-    tiling.set_h(h);
-    tiling.set_w(w);
-    tiling.set_planeSize(planeSize);
-    tiling.set_totalPlanes(totalPlanes);
-    tiling.set_tileNum(TILE_NUM);
-
-    // Default groups = 3 if not provided by runtime attribute; keep conservative default
-    uint32_t groups = 3;
-    tiling.set_groups(groups);
-
+    // 输入0为特征图x
+    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
     context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileLen(DEFAULT_TILE_LEN);
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0; // no extra workspace
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -97,17 +78,16 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    gert::Shape* out_shape = context->GetOutputShape(0);
-    *out_shape = *in_shape; // channel shuffle keeps shape
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
-
-static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
-    return GRAPH_SUCCESS;
+    return ge::GRAPH_SUCCESS;
 }
 }
 
@@ -121,17 +101,24 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
+        this->Input("shape")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("g")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        // groups attribute (int)
-        this->Attr("groups").Int(3);
-
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
@@ -143,109 +130,93 @@ OP_ADD(ShufflenetCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "shufflenet_custom_tiling_data.h"
-#include "tiling/platform/platform_ascendc.h"
 
-using DTYPE = float;
-constexpr int32_t BUFFER_NUM = 1; // single-buffer per plane
-
-class KernelChannelShuffle {
+class KernelShuffle {
 public:
-    __aicore__ inline KernelChannelShuffle() {}
+    __aicore__ inline KernelShuffle() {}
 
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t n, uint32_t c, uint32_t h, uint32_t w,
-                                uint32_t groups, uint32_t tileNum)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR shape, GM_ADDR g, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileLen)
     {
-        this->n = n;
-        this->c = c;
-        this->h = h;
-        this->w = w;
-        this->groups = groups;
-        this->cpg = c / groups;
-        this->planeSize = h * w;
-        this->totalPlanes = n * c;
-        this->tileNum = tileNum;
+        totalLen = totalLength;
+        tileSize = tileLen;
 
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(x), static_cast<uint32_t>(n * c * h * w));
-        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(y), static_cast<uint32_t>(n * c * h * w));
+        xGm.SetGlobalBuffer((__gm__ float*)x, totalLen);
+        yGm.SetGlobalBuffer((__gm__ float*)y, totalLen);
 
-        // One whole plane per buffer to simplify
-        pipe.InitBuffer(inQueue, BUFFER_NUM, this->planeSize * sizeof(DTYPE));
-        pipe.InitBuffer(outQueue, BUFFER_NUM, this->planeSize * sizeof(DTYPE));
+        // 读取shape与groups
+        shapeGm.SetGlobalBuffer((__gm__ int32_t*)shape, 4);
+        gGm.SetGlobalBuffer((__gm__ int32_t*)g, 1);
+
+        pipe.InitBuffer(bufQueue, 1, tileSize * sizeof(float));
+        pipe.InitBuffer(auxQueue, 1, 4 * sizeof(int32_t));
+
+        // 将shape (N,C,H,W) 与 g 读入UB
+        AscendC::LocalTensor<int32_t> shapeLocal = auxQueue.AllocTensor<int32_t>();
+        AscendC::DataCopy(shapeLocal, shapeGm, 4);
+        N = static_cast<uint32_t>(shapeLocal.GetValue(0));
+        C = static_cast<uint32_t>(shapeLocal.GetValue(1));
+        H = static_cast<uint32_t>(shapeLocal.GetValue(2));
+        W = static_cast<uint32_t>(shapeLocal.GetValue(3));
+        auxQueue.FreeTensor(shapeLocal);
+
+        AscendC::LocalTensor<int32_t> gLocal = auxQueue.AllocTensor<int32_t>();
+        AscendC::DataCopy(gLocal, gGm, 1);
+        groups = static_cast<uint32_t>(gLocal.GetValue(0));
+        auxQueue.FreeTensor(gLocal);
+
+        Cg = C / groups;
+        HW = H * W;
     }
 
     __aicore__ inline void Process()
     {
-        // Static partition by block across planes (N*C)
-        uint32_t blkNum = AscendC::GetBlockNum();
-        uint32_t blkId = AscendC::GetBlockIdx();
+        // NCHW 连续内存；对每个n、每个输出通道c_out，找到输入通道src_c并按HW分块搬运
+        for (uint32_t n = 0; n < N; ++n) {
+            for (uint32_t c_out = 0; c_out < C; ++c_out) {
+                uint32_t src_c = (c_out % Cg) * groups + (c_out / Cg);
 
-        uint32_t base = (this->totalPlanes / blkNum) * blkId;
-        uint32_t tail = (blkId == blkNum - 1) ? (this->totalPlanes - (this->totalPlanes / blkNum) * (blkNum - 1)) : (this->totalPlanes / blkNum);
-        uint32_t startPlane = base;
-        uint32_t planeCount = tail;
+                uint64_t src_plane_off = (static_cast<uint64_t>(n) * C + src_c) * HW;
+                uint64_t dst_plane_off = (static_cast<uint64_t>(n) * C + c_out) * HW;
 
-        for (uint32_t p = 0; p < planeCount; ++p) {
-            uint32_t planeIdx = startPlane + p;   // [0, N*C)
-            uint32_t nIdx = planeIdx / this->c;
-            uint32_t cIn  = planeIdx % this->c;
+                uint64_t remaining = HW;
+                uint64_t prog = 0;
+                while (remaining > 0) {
+                    uint32_t step = remaining > tileSize ? tileSize : static_cast<uint32_t>(remaining);
 
-            uint32_t g = cIn / this->cpg;
-            uint32_t k = cIn % this->cpg;
-            uint32_t cOut = k * this->groups + g;
+                    AscendC::LocalTensor<float> tmp = bufQueue.AllocTensor<float>();
+                    AscendC::DataCopy(tmp, xGm[src_plane_off + prog], step);
+                    AscendC::DataCopy(yGm[dst_plane_off + prog], tmp, step);
+                    bufQueue.FreeTensor(tmp);
 
-            uint32_t outPlaneIdx = nIdx * this->c + cOut;
-
-            CopyPlane(planeIdx, outPlaneIdx);
+                    prog += step;
+                    remaining -= step;
+                }
+            }
         }
     }
 
 private:
-    __aicore__ inline void CopyPlane(uint32_t inPlaneIdx, uint32_t outPlaneIdx)
-    {
-        // Copy entire H*W plane from input to local
-        AscendC::LocalTensor<DTYPE> srcLocal = inQueue.AllocTensor<DTYPE>();
-        AscendC::DataCopy(srcLocal, xGm[inPlaneIdx * this->planeSize], this->planeSize);
-        inQueue.EnQue(srcLocal);
-
-        // Move through pipe
-        AscendC::LocalTensor<DTYPE> inLocal = inQueue.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> dstLocal = outQueue.AllocTensor<DTYPE>();
-        AscendC::DataCopy(dstLocal, inLocal, this->planeSize);
-        outQueue.EnQue<DTYPE>(dstLocal);
-        inQueue.FreeTensor(inLocal);
-
-        // Copy to output plane
-        AscendC::LocalTensor<DTYPE> outLocal = outQueue.DeQue<DTYPE>();
-        AscendC::DataCopy(yGm[outPlaneIdx * this->planeSize], outLocal, this->planeSize);
-        outQueue.FreeTensor(outLocal);
-    }
-
-private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM>  inQueue;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> auxQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> bufQueue;
 
-    AscendC::GlobalTensor<DTYPE> xGm;
-    AscendC::GlobalTensor<DTYPE> yGm;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+    AscendC::GlobalTensor<int32_t> shapeGm;
+    AscendC::GlobalTensor<int32_t> gGm;
 
-    uint32_t n, c, h, w;
-    uint32_t groups, cpg;
-    uint32_t planeSize;
-    uint32_t totalPlanes;
-    uint32_t tileNum;
+    uint32_t totalLen = 0;
+    uint32_t tileSize = 0;
+
+    uint32_t N = 0, C = 0, H = 0, W = 0, HW = 0;
+    uint32_t groups = 1, Cg = 1;
 };
 
-extern "C" __global__ __aicore__ void shufflenet_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void shufflenet_custom(GM_ADDR x, GM_ADDR shape, GM_ADDR g, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-
-    KernelChannelShuffle op;
-    op.Init(x, y,
-            tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w,
-            tiling_data.groups, tiling_data.tileNum);
+    KernelShuffle op;
+    op.Init(x, shape, g, y, tiling_data.totalLength, tiling_data.tileLen);
     op.Process();
 }
 """
@@ -257,8 +228,30 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor shufflenet_custom_impl_npu(const at::Tensor& x, int64_t groups) {
+    TORCH_CHECK(x.dim() == 4, "shufflenet_custom expects 4D NCHW tensor");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "shufflenet_custom expects float32 input");
+    auto sizes = x.sizes();
+    int64_t N = sizes[0], C = sizes[1], H = sizes[2], W = sizes[3];
+    TORCH_CHECK(C % groups == 0, "channels must be divisible by groups");
+
     at::Tensor y = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnShufflenetCustom, x, y, groups);
+    at::Tensor shape = at::empty({4}, at::dtype(at::kInt).device(x.device()));
+    at::Tensor g = at::empty({1}, at::dtype(at::kInt).device(x.device()));
+
+    // 填充shape与g
+    auto shape_acc = shape.cpu();
+    auto g_acc = g.cpu();
+    auto* sp = shape_acc.data_ptr<int32_t>();
+    sp[0] = static_cast<int32_t>(N);
+    sp[1] = static_cast<int32_t>(C);
+    sp[2] = static_cast<int32_t>(H);
+    sp[3] = static_cast<int32_t>(W);
+    auto* gp = g_acc.data_ptr<int32_t>();
+    gp[0] = static_cast<int32_t>(groups);
+    shape.copy_(shape_acc);
+    g.copy_(g_acc);
+
+    EXEC_NPU_CMD(aclnnShufflenetCustom, x, shape, g, y);
     return y;
 }
 
@@ -267,8 +260,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("shufflenet_custom", &shufflenet_custom_impl_npu, "ChannelShuffle NPU",
-          py::arg("x"), py::arg("groups") = 3);
+    m.def("shufflenet_custom", &shufflenet_custom_impl_npu, "Channel Shuffle");
 }
 """
 
@@ -283,6 +275,7 @@ class ChannelShuffleCustom(nn.Module):
     def __init__(self, groups: int):
         super().__init__()
         self.groups = groups
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return custom_ops_lib.shufflenet_custom(x, self.groups)
 
@@ -301,7 +294,6 @@ class ShuffleNetUnit(nn.Module):
         self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
         self.bn3 = nn.BatchNorm2d(out_channels)
 
-        # Replace with custom AscendC kernel
         self.shuffle = ChannelShuffleCustom(groups)
 
         if in_channels == out_channels:
@@ -317,7 +309,7 @@ class ShuffleNetUnit(nn.Module):
         out = self.bn2(self.conv2(out))
         out = self.shuffle(out)
         out = F.relu(self.bn3(self.conv3(out)))
-        out += self.shortcut(x)
+        out = out + self.shortcut(x)
         return out
 
 class ModelNew(nn.Module):
@@ -326,9 +318,11 @@ class ModelNew(nn.Module):
         self.conv1 = nn.Conv2d(3, stages_out_channels[0], kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(stages_out_channels[0])
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
         self.stage2 = self._make_stage(stages_out_channels[0], stages_out_channels[1], stages_repeats[0], groups)
         self.stage3 = self._make_stage(stages_out_channels[1], stages_out_channels[2], stages_repeats[1], groups)
         self.stage4 = self._make_stage(stages_out_channels[2], stages_out_channels[3], stages_repeats[2], groups)
+
         self.conv5 = nn.Conv2d(stages_out_channels[3], 1024, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn5 = nn.BatchNorm2d(1024)
         self.fc = nn.Linear(1024, num_classes)
@@ -343,9 +337,11 @@ class ModelNew(nn.Module):
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
         x = self.maxpool(x)
+
         x = self.stage2(x)
         x = self.stage3(x)
         x = self.stage4(x)
+
         x = F.relu(self.bn5(self.conv5(x)))
         x = F.adaptive_avg_pool2d(x, (1, 1))
         x = x.view(x.size(0), -1)

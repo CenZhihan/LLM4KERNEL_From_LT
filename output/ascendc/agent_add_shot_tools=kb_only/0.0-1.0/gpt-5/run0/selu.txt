@@ -61,7 +61,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling.set_tileNum(TILE_NUM);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -76,7 +75,6 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
     *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -103,7 +101,8 @@ public:
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -114,14 +113,13 @@ OP_ADD(SeluCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "selu_custom_tiling_data.h"
+
+typedef float DTYPE_X;
+typedef float DTYPE_Y;
 
 constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
-
-// SELU constants
-__aicore__ constexpr float SELU_ALPHA = 1.6732632423543772f;
-__aicore__ constexpr float SELU_SCALE = 1.0507009873554805f;
+constexpr float SELU_ALPHA = 1.6732632423543772848170429916717f;
+constexpr float SELU_LAMBDA = 1.0507009873554804934193349852946f;
 
 class KernelSelu {
 public:
@@ -135,11 +133,10 @@ public:
         xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
-        pipe.InitBuffer(calcBufs, this->tileLength * sizeof(DTYPE_Y)); // temp buffer
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DWORD));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DWORD));
+        pipe.InitBuffer(calcBufs, this->tileLength * sizeof(DWORD) * 2);
     }
-
     __aicore__ inline void Process()
     {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
@@ -151,6 +148,8 @@ public:
     }
 
 private:
+    using DWORD = DTYPE_X;
+
     __aicore__ inline void CopyIn(int32_t progress)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
@@ -162,21 +161,28 @@ private:
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
         AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
-        AscendC::LocalTensor<DTYPE_Y> tmpLocal = calcBufs.Get<DTYPE_Y>();
 
-        // y = relu(x)
-        AscendC::Relu(yLocal, xLocal, this->tileLength);
-        // tmp = x - relu(x)  (negative part, <= 0)
-        AscendC::Sub(tmpLocal, xLocal, yLocal, this->tileLength);
-        // tmp = exp(tmp) - 1
-        AscendC::Exp(tmpLocal, tmpLocal, this->tileLength);
-        AscendC::Adds(tmpLocal, tmpLocal, -1.0f, this->tileLength);
-        // tmp = alpha * (exp(neg) - 1)
-        AscendC::Muls(tmpLocal, tmpLocal, SELU_ALPHA, this->tileLength);
-        // y = relu(x) + tmp
-        AscendC::Add(yLocal, yLocal, tmpLocal, this->tileLength);
-        // y = scale * y
-        AscendC::Muls(yLocal, yLocal, SELU_SCALE, this->tileLength);
+        AscendC::LocalTensor<DTYPE_X> tmpPos = calcBufs.Get<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> tmpNeg = calcBufs.Get<DTYPE_X>();
+
+        // tmpPos = Relu(x)
+        AscendC::Relu(tmpPos, xLocal, this->tileLength);
+
+        // tmpNeg = min(x, 0.0)
+        AscendC::Mins(tmpNeg, xLocal, 0.0f, this->tileLength);
+
+        // tmpNeg = exp(tmpNeg) - 1
+        AscendC::Exp(tmpNeg, tmpNeg, this->tileLength);
+        AscendC::Adds(tmpNeg, tmpNeg, -1.0f, this->tileLength);
+
+        // tmpNeg = alpha * tmpNeg
+        AscendC::Muls(tmpNeg, tmpNeg, SELU_ALPHA, this->tileLength);
+
+        // yLocal = tmpPos + tmpNeg
+        AscendC::Add(yLocal, tmpPos, tmpNeg, this->tileLength);
+
+        // yLocal = lambda * yLocal
+        AscendC::Muls(yLocal, yLocal, SELU_LAMBDA, this->tileLength);
 
         outQueueY.EnQue<DTYPE_Y>(yLocal);
         inQueueX.FreeTensor(xLocal);
@@ -194,17 +200,14 @@ private:
     AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::TBuf<AscendC::TPosition::VECCALC> calcBufs;
-
     AscendC::GlobalTensor<DTYPE_X> xGm;
     AscendC::GlobalTensor<DTYPE_Y> yGm;
-
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void selu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void selu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelSelu op;
     op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum);

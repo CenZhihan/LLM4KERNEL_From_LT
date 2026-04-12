@@ -11,7 +11,7 @@ project_json_src='''
                     "ND"
                 ],
                 "type": [
-                    "float16"
+                    "float"
                 ]
             }
         ],
@@ -23,104 +23,102 @@ project_json_src='''
                     "ND"
                 ],
                 "type": [
-                    "float16"
+                    "float"
                 ]
             }
         ]
     }
 ]
 '''
+
 host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
-
 BEGIN_TILING_DATA_DEF(MaxReductionOverADimensionCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, outerRows);       // number of independent reductions (product of dims except the last)
-  TILING_DATA_FIELD_DEF(uint32_t, reduceLen);       // length of last axis to be reduced
-  TILING_DATA_FIELD_DEF(uint32_t, rowsPerBlock);    // rows processed by each core
-  TILING_DATA_FIELD_DEF(uint32_t, tmpBufferSize);   // bytes for workLocal in UB
+  TILING_DATA_FIELD_DEF(uint32_t, totalOuter);   // 总的行数（按最后一维作为约简维）
+  TILING_DATA_FIELD_DEF(uint32_t, inner);        // 约简长度（最后一维长度）
+  TILING_DATA_FIELD_DEF(uint32_t, tileRows);     // 每次处理的行数
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(MaxReductionOverADimensionCustom, MaxReductionOverADimensionCustomTilingData)
-
-} // namespace optiling
+}
 """
+
 host_operator_src="""
 #include "max_reduction_over_a_dimension_custom_tiling.h"
 #include "register/op_def_registry.h"
 
 namespace optiling {
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // Fetch input shape
-    const gert::Shape* inShape = context->GetInputShape(0);
-    auto originShape = inShape->GetOriginShape();
-    uint32_t dimNum = static_cast<uint32_t>(originShape.GetDimNum());
-    // Reduce over last dimension inside kernel. The Python wrapper will permute input if needed.
-    uint64_t totalLength = originShape.GetShapeSize();
-    uint32_t reduceLen = static_cast<uint32_t>(originShape.GetDim(dimNum - 1));
-    uint32_t outerRows = static_cast<uint32_t>(totalLength / reduceLen);
-
-    // Decide block dim
-    uint32_t blockDim = outerRows >= 8 ? 8 : (outerRows == 0 ? 1 : outerRows);
-    context->SetBlockDim(blockDim);
-
-    // rows per core (ceil-div)
-    uint32_t rowsPerBlock = (outerRows + blockDim - 1) / blockDim;
-
-    // workLocal temporary buffer in UB (bytes). For ReduceMax, workLocal is required on Atlas.
-    // Per CANN API reference, workLocal can share the same size as source operand and is <= source.
-    // We provision reduceLen * sizeof(half) here.
-    const uint32_t typeSize = 2; // float16
-    uint32_t tmpBufferSize = reduceLen * typeSize;
-
     MaxReductionOverADimensionCustomTilingData tiling;
-    tiling.set_outerRows(outerRows);
-    tiling.set_reduceLen(reduceLen);
-    tiling.set_rowsPerBlock(rowsPerBlock);
-    tiling.set_tmpBufferSize(tmpBufferSize);
+
+    // 输入形状
+    const gert::Shape* inShape = context->GetInputShape(0);
+    auto origin = inShape->GetOriginShape();
+
+    // 获取维度数与最后一维长度（作为约简维）
+    int64_t dimNum = origin.GetDimNum();
+    int64_t inner = origin.GetDim(dimNum - 1);
+    uint32_t totalLength = origin.GetShapeSize();
+    uint32_t innerU = static_cast<uint32_t>(inner);
+    uint32_t totalOuter = static_cast<uint32_t>(totalLength / innerU);
+
+    // 简化：每次处理1行
+    uint32_t tileRows = 1;
+
+    // 设置并保存tiling信息
+    tiling.set_totalOuter(totalOuter);
+    tiling.set_inner(innerU);
+    tiling.set_tileRows(tileRows);
+
+    // 设置Block数
+    context->SetBlockDim(8);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t* workspaces = context->GetWorkspaceSizes(1);
-    workspaces[0] = 0;
+    // 无需workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
-
 } // namespace optiling
 
+
 namespace ge {
-// Output shape = input shape with last dimension reduced.
+// 输出形状推导：去掉最后一维
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
     gert::Shape* y_shape = context->GetOutputShape(0);
 
-    // Build output dims by removing the last axis
     auto origin = x_shape->GetOriginShape();
-    int64_t ndim = origin.GetDimNum();
+    int64_t dimNum = origin.GetDimNum();
+
+    if (dimNum <= 0) {
+        return GRAPH_FAILED;
+    }
+
+    // 构造输出维度（去掉最后一维）
     std::vector<int64_t> outDims;
-    outDims.reserve(ndim > 0 ? ndim - 1 : 0);
-    for (int64_t i = 0; i < ndim - 1; ++i) {
+    outDims.reserve(static_cast<size_t>(dimNum - 1));
+    for (int64_t i = 0; i < dimNum - 1; ++i) {
         outDims.push_back(origin.GetDim(i));
     }
-    y_shape->SetDimNum(static_cast<uint32_t>(outDims.size()));
-    for (size_t i = 0; i < outDims.size(); ++i) {
-        y_shape->SetDim(i, outDims[i]);
-    }
+    y_shape->SetOriginShape(ge::Shape(outDims));
     return GRAPH_SUCCESS;
 }
 
-static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
 }
+
 
 namespace ops {
 class MaxReductionOverADimensionCustom : public OpDef {
@@ -129,17 +127,19 @@ public:
     {
         this->Input("x")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16})
+            .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("y")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16})
+            .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -147,49 +147,52 @@ public:
 OP_ADD(MaxReductionOverADimensionCustom);
 }
 """
+
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "max_reduction_over_a_dimension_custom_tiling_data.h"
 
-// This kernel reduces along the last dimension. Python wrapper permutes input if needed.
-using srcType = half;
-using dstType = half;
+using DTYPE_X = float;
+using DTYPE_Y = float;
+
+constexpr int32_t IN_Q_NUM = 1;
+constexpr int32_t OUT_Q_NUM = 1;
+constexpr int32_t WORK_Q_NUM = 1;
 
 class KernelMaxReduceLastDim {
 public:
     __aicore__ inline KernelMaxReduceLastDim() {}
 
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t outerRows, uint32_t reduceLen,
-                                uint32_t rowsPerBlock, uint32_t tmpBufferSize)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalOuter, uint32_t inner, uint32_t tileRows)
     {
-        this->outerRows = outerRows;
-        this->reduceLen = reduceLen;
-        this->rowsPerBlock = rowsPerBlock;
-        this->tmpBytes = tmpBufferSize;
+        this->inner = inner;
+        this->tileRows = tileRows;
 
-        uint32_t blockIdx = AscendC::GetBlockIdx();
+        // 将行数在Block之间划分
         uint32_t blockNum = AscendC::GetBlockNum();
-
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t rowsPerBlock = (totalOuter + blockNum - 1) / blockNum;
         uint32_t startRow = rowsPerBlock * blockIdx;
-        // clamp count for last block
-        uint32_t maxRowsThisBlock = (startRow >= outerRows) ? 0 : AscendC::Min(rowsPerBlock, outerRows - startRow);
-        this->rowsThisBlock = maxRowsThisBlock;
+        uint32_t endRow = startRow + rowsPerBlock;
+        endRow = endRow > totalOuter ? totalOuter : endRow;
+        this->rowsThisBlock = (endRow > startRow) ? (endRow - startRow) : 0;
+        this->startRow = startRow;
 
-        // Offset GM pointers to this core's start row
-        uint64_t offsetElems = static_cast<uint64_t>(startRow) * static_cast<uint64_t>(reduceLen);
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ srcType*>(x) + offsetElems, static_cast<uint64_t>(rowsThisBlock) * reduceLen);
-        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ dstType*>(y) + startRow, rowsThisBlock);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + static_cast<uint64_t>(startRow) * inner, static_cast<uint64_t>(rowsThisBlock) * inner);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + startRow, rowsThisBlock);
 
-        // Allocate UB queues
-        // One full row for input, one tmp buffer for workLocal, and one element for output
-        pipe.InitBuffer(inQueue, 1, static_cast<uint64_t>(reduceLen) * sizeof(srcType));
-        pipe.InitBuffer(tmpQueue, 1, tmpBufferSize); // workLocal
-        pipe.InitBuffer(outQueue, 1, sizeof(dstType));
+        // UB队列：输入为一行(inner)，输出为标量(1)，工作空间分配固定最小大小
+        pipe.InitBuffer(inQueueX, IN_Q_NUM, inner * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, OUT_Q_NUM, sizeof(DTYPE_Y));
+        // ReduceMax最小工作空间，示例中给出64字节（32 * half）；这里使用float，给定32 * sizeof(float)
+        pipe.InitBuffer(workQueue, WORK_Q_NUM, 32 * sizeof(DTYPE_Y));
     }
 
     __aicore__ inline void Process()
     {
+        if (rowsThisBlock == 0) {
+            return;
+        }
+        // 每次处理1行
         for (uint32_t r = 0; r < rowsThisBlock; ++r) {
             CopyIn(r);
             Compute(r);
@@ -200,113 +203,97 @@ public:
 private:
     __aicore__ inline void CopyIn(uint32_t r)
     {
-        AscendC::LocalTensor<srcType> srcLocal = inQueue.AllocTensor<srcType>();
-        AscendC::DataCopy(srcLocal, xGm[static_cast<uint64_t>(r) * reduceLen], reduceLen);
-        inQueue.EnQue(srcLocal);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        // 拷贝一整行
+        AscendC::DataCopy(xLocal, xGm[r * inner], inner);
+        inQueueX.EnQue<DTYPE_X>(xLocal);
     }
 
-    __aicore__ inline void Compute(uint32_t /*r*/)
+    __aicore__ inline void Compute(uint32_t r)
     {
-        AscendC::LocalTensor<srcType> srcLocal = inQueue.DeQue<srcType>();
-        AscendC::LocalTensor<srcType> workLocal = tmpQueue.AllocTensor<srcType>(); // workLocal required by ReduceMax
-        AscendC::LocalTensor<dstType> dstLocal = outQueue.AllocTensor<dstType>();  // store one max value
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Y> workLocal = workQueue.AllocTensor<DTYPE_Y>();
 
-        // Use ReduceMax over the first 'reduceLen' elements of the row (contiguous)
-        // Reference: CANN Ascend C API Reference 4.1.8.1 ReduceMax (first n elements)
-        AscendC::ReduceMax<dstType>(dstLocal, srcLocal, workLocal, static_cast<int32_t>(reduceLen), false);
+        // 对一行做ReduceMax，输出一个标量
+        AscendC::ReduceMax<DTYPE_Y>(yLocal, xLocal, workLocal, inner, true);
 
-        outQueue.EnQue<dstType>(dstLocal);
-        inQueue.FreeTensor(srcLocal);
-        tmpQueue.FreeTensor(workLocal);
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+        workQueue.FreeTensor(workLocal);
     }
 
     __aicore__ inline void CopyOut(uint32_t r)
     {
-        AscendC::LocalTensor<dstType> dstLocal = outQueue.DeQue<dstType>();
-        AscendC::DataCopy(yGm[r], dstLocal, 1);
-        outQueue.FreeTensor(dstLocal);
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        // 写出该行的最大值（标量）
+        AscendC::DataCopy(yGm[r], yLocal, 1);
+        outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueue;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpQueue;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, IN_Q_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, OUT_Q_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECOUT, WORK_Q_NUM> workQueue;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
 
-    AscendC::GlobalTensor<srcType> xGm;
-    AscendC::GlobalTensor<dstType> yGm;
-
-    uint32_t outerRows;
-    uint32_t reduceLen;
-    uint32_t rowsPerBlock;
+    uint32_t inner;
+    uint32_t tileRows;
     uint32_t rowsThisBlock;
-    uint32_t tmpBytes;
+    uint32_t startRow;
 };
 
-extern "C" __global__ __aicore__ void max_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tilingData, tiling);
+extern "C" __global__ __aicore__ void max_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
     KernelMaxReduceLastDim op;
-    op.Init(x, y, tilingData.outerRows, tilingData.reduceLen, tilingData.rowsPerBlock, tilingData.tmpBufferSize);
+    op.Init(x, y, tiling_data.totalOuter, tiling_data.inner, tiling_data.tileRows);
     op.Process();
 }
 """
+
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor max_reduction_over_a_dimension_custom_impl_npu(const at::Tensor& self) {
-    at::Tensor input = self;
-    TORCH_CHECK(input.scalar_type() == at::kHalf, "MaxReductionOverADimensionCustom expects float16 input.");
-    // Output has one fewer dimension (last axis reduced)
-    std::vector<int64_t> out_sizes(input.sizes().begin(), input.sizes().end());
-    out_sizes.pop_back();
-    at::Tensor result = at::empty(out_sizes, input.options());
-    EXEC_NPU_CMD(aclnnMaxReductionOverADimensionCustom, input, result);
+at::Tensor max_reduction_over_a_dimension_custom_impl_npu(const at::Tensor& x, int64_t dim) {
+    // 仅支持沿最后一维进行约简
+    TORCH_CHECK(dim == x.dim() - 1 || dim == -1, \"Only reduction along the last dimension is supported by this custom kernel\");
+
+    // 构造输出形状：去掉最后一维
+    std::vector<int64_t> sizes = x.sizes().vec();
+    if (dim < 0) dim += x.dim();
+    sizes.erase(sizes.begin() + dim);
+
+    at::Tensor result = at::empty(sizes, x.options());
+
+    // 调用自定义算子
+    EXEC_NPU_CMD(aclnnMaxReductionOverADimensionCustom, x, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("max_reduction_over_a_dimension_custom", &max_reduction_over_a_dimension_custom_impl_npu);
+    m.impl(\"max_reduction_over_a_dimension_custom\", &max_reduction_over_a_dimension_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("max_reduction_over_a_dimension_custom", &max_reduction_over_a_dimension_custom_impl_npu, "ReduceMax over last dim");
+    m.def(\"max_reduction_over_a_dimension_custom\", &max_reduction_over_a_dimension_custom_impl_npu, \"max reduce over a dimension (last)\");
 }
 """
+
 model_src='''
 import torch
 import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    Max reduction over an arbitrary dimension using a custom AscendC kernel
-    that reduces over the last axis. We permute input if needed.
-    """
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Kernel supports float16 and reduces over the last dimension.
-        # Move target dimension to last by permutation when necessary.
-        dim = self.dim
-        ndim = x.dim()
-        if dim < 0:
-            dim += ndim
-        assert 0 <= dim < ndim, "Invalid reduction dimension"
-
-        x = x.to(torch.float16)
-        if dim != ndim - 1:
-            order = list(range(ndim))
-            # move dim to the end while keeping relative order of other axes
-            order = [i for i in range(ndim) if i != dim] + [dim]
-            x = x.permute(order).contiguous()
-
-        # Call custom op: reduce over last dimension
-        y = custom_ops_lib.max_reduction_over_a_dimension_custom(x)
-        return y
+        return custom_ops_lib.max_reduction_over_a_dimension_custom(x, self.dim)
 '''

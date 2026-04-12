@@ -1,0 +1,306 @@
+project_json_src='''
+[
+    {
+        "op": "VanillaRnnCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "h",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "wx",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "wh",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "pre_h",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(VanillaRnnCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, input_size);
+  TILING_DATA_FIELD_DEF(uint32_t, hidden_size);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(VanillaRnnCustom, VanillaRnnCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "vanilla_rnn_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    VanillaRnnCustomTilingData tiling;
+
+    const auto *xShape = context->GetInputShape(0);
+    const auto *hShape = context->GetInputShape(1);
+
+    const int64_t B = xShape->GetOriginShape().GetDim(0);
+    const int64_t I = xShape->GetOriginShape().GetDim(1);
+    const int64_t H = hShape->GetOriginShape().GetDim(1);
+
+    tiling.set_batch(static_cast<uint32_t>(B));
+    tiling.set_input_size(static_cast<uint32_t>(I));
+    tiling.set_hidden_size(static_cast<uint32_t>(H));
+
+    // 设置并行block数（可根据实际硬件调优）
+    context->SetBlockDim(8);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 本算子不需要额外workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0); // (B, I)
+    const gert::Shape* h_shape = context->GetInputShape(1); // (B, H)
+
+    gert::Shape* pre_h_shape = context->GetOutputShape(0);  // (B, H)
+    // 输出 pre_h 与 h 的形状一致
+    pre_h_shape->SetOriginShape({x_shape->GetOriginShape().GetDim(0), h_shape->GetOriginShape().GetDim(1)});
+    pre_h_shape->SetStorageShape(pre_h_shape->GetOriginShape());
+
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // 与输入数据类型对齐
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class VanillaRnnCustom : public OpDef {
+public:
+    explicit VanillaRnnCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("h")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("wx")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("wh")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("pre_h")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(VanillaRnnCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+
+// 朴素实现：pre_h = x @ wx^T + h @ wh^T + b
+// 形状约定：
+// x:  [B, I]
+// h:  [B, H]
+// wx: [H, I]  （Linear权重是[H, I]，这里需要转置做 @ wx^T）
+// wh: [H, H]
+// b:  [H]
+// pre_h: [B, H]
+struct VanillaRnnTilingData {
+    uint32_t batch;
+    uint32_t input_size;
+    uint32_t hidden_size;
+};
+
+extern "C" __global__ __aicore__ void vanilla_rnn_custom(GM_ADDR x_gm,
+                                                          GM_ADDR h_gm,
+                                                          GM_ADDR wx_gm,
+                                                          GM_ADDR wh_gm,
+                                                          GM_ADDR b_gm,
+                                                          GM_ADDR pre_h_gm,
+                                                          GM_ADDR workspace,
+                                                          GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+
+    const uint32_t B = tilingData.batch;
+    const uint32_t I = tilingData.input_size;
+    const uint32_t H = tilingData.hidden_size;
+
+    __gm__ const DTYPE* x = reinterpret_cast<__gm__ const DTYPE*>(x_gm);
+    __gm__ const DTYPE* h = reinterpret_cast<__gm__ const DTYPE*>(h_gm);
+    __gm__ const DTYPE* wx = reinterpret_cast<__gm__ const DTYPE*>(wx_gm);
+    __gm__ const DTYPE* wh = reinterpret_cast<__gm__ const DTYPE*>(wh_gm);
+    __gm__ const DTYPE* b  = reinterpret_cast<__gm__ const DTYPE*>(b_gm);
+    __gm__ DTYPE* pre_h    = reinterpret_cast<__gm__ DTYPE*>(pre_h_gm);
+
+    // 简单按batch行划分到block
+    const uint32_t block_num = AscendC::GetBlockNum();
+    const uint32_t block_idx = AscendC::GetBlockIdx();
+    const uint32_t rows_per_block = (B + block_num - 1) / block_num;
+    const uint32_t row_begin = block_idx * rows_per_block;
+    const uint32_t row_end = row_begin + rows_per_block > B ? B : (row_begin + rows_per_block);
+
+    for (uint32_t b_idx = row_begin; b_idx < row_end; ++b_idx) {
+        const __gm__ DTYPE* x_row = x + static_cast<uint64_t>(b_idx) * I;
+        const __gm__ DTYPE* h_row = h + static_cast<uint64_t>(b_idx) * H;
+        __gm__ DTYPE* pre_h_row = pre_h + static_cast<uint64_t>(b_idx) * H;
+
+        for (uint32_t j = 0; j < H; ++j) {
+            // acc = bias[j]
+            DTYPE acc = b[j];
+
+            // x @ wx^T -> sum_k x[k] * wx[j, k]
+            const __gm__ DTYPE* wx_row = wx + static_cast<uint64_t>(j) * I;
+            for (uint32_t k = 0; k < I; ++k) {
+                acc += x_row[k] * wx_row[k];
+            }
+
+            // h @ wh^T -> sum_k h[k] * wh[j, k]
+            const __gm__ DTYPE* wh_row = wh + static_cast<uint64_t>(j) * H;
+            for (uint32_t k = 0; k < H; ++k) {
+                acc += h_row[k] * wh_row[k];
+            }
+
+            pre_h_row[j] = acc;
+        }
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor vanilla_rnn_custom_impl_npu(const at::Tensor& x,
+                                       const at::Tensor& h,
+                                       const at::Tensor& wx,
+                                       const at::Tensor& wh,
+                                       const at::Tensor& b) {
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [B, I]");
+    TORCH_CHECK(h.dim() == 2, "h must be 2D [B, H]");
+    TORCH_CHECK(wx.dim() == 2, "wx must be 2D [H, I]");
+    TORCH_CHECK(wh.dim() == 2, "wh must be 2D [H, H]");
+    TORCH_CHECK(b.dim() == 1,  "b must be 1D [H]");
+
+    at::Tensor pre_h = at::empty({x.size(0), h.size(1)}, x.options());
+    EXEC_NPU_CMD(aclnnVanillaRnnCustom, x, h, wx, wh, b, pre_h);
+    return pre_h;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("vanilla_rnn_custom", &vanilla_rnn_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("vanilla_rnn_custom", &vanilla_rnn_custom_impl_npu, "compute pre-activation hidden for Vanilla RNN");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, output_size: int):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+
+        # 与原模型保持一致
+        self.hidden = torch.randn((batch_size, hidden_size))
+        self.i2h = torch.nn.Linear(input_size + hidden_size, hidden_size, bias=True)
+        self.h2o = torch.nn.Linear(hidden_size, output_size, bias=True)
+        self.tanh = torch.nn.Tanh()
+
+    def forward(self, x: torch.Tensor, initial_hidden=None) -> torch.Tensor:
+        if initial_hidden is not None:
+            self.hidden.copy_(initial_hidden)
+        self.hidden = self.hidden.to(x.device, dtype=x.dtype)
+
+        # 将 i2h 的权重拆分为 wx (H, I) 与 wh (H, H)，避免在核函数中做拼接
+        wx = self.i2h.weight[:, :self.input_size].contiguous()
+        wh = self.i2h.weight[:, self.input_size:].contiguous()
+        b  = self.i2h.bias.contiguous()
+
+        # 自定义AscendC核：计算 pre_h = x @ wx^T + hidden @ wh^T + b
+        pre_h = custom_ops_lib.vanilla_rnn_custom(x, self.hidden, wx, wh, b)
+
+        # 激活与输出层仍用高层算子（也可继续自定义优化）
+        self.hidden = self.tanh(pre_h)
+        output = self.h2o(self.hidden)
+        return output
+'''

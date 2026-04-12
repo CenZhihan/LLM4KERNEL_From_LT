@@ -1,48 +1,33 @@
-**Developing custom kernels**
+**Evaluating output shape and dimension handling**
 
-I need to write code that includes six specific embedded strings for different sources including project_json_src and host_operator_src. The kernel name should be max_reduction_over_a_dimension_custom, reflecting its function in kernel_src. I have to adapt from a sample that uses reduce_sum to focus on max reduction for a specific dimension.
+I'm defining the attribute "dim" in the operation definition and figuring out how to accept it in the tiling context using GetAttrs. I wonder about defining the attribute in the op definition registry to manage it effectively. For InferShape, I need to compute the output shape by removing the axis, but there's a challenge with the dynamic axis. I also need to ensure the output shape works for ND format in HPC packaging. A potential solution could be to implement an operation that reduces over the last dimension.**Implementing dimension reduction in PyTorch**
 
-This involves using torch.max with a dimension, but also requires implementing an AscendC kernel for max reduction along any given axis. Initially, I'm thinking about how to handle arbitrary ND tensors since the examples indicated 3D tensors. The tiling from the previous sample that calculated the sum seemed odd too.
+I’m considering how to reduce over the last dimension, which gives a shape of [batch, dim1] if the last dimension is dim2. For general axes, I can use torch.movedim to manipulate dimensions before applying a custom operation. It's vital to only replace the relevant PyTorch operators and use pre-/post-transpose where needed. The plan involves implementing a custom operation that finds the maximum along the last dimension for a 3D tensor, outputting a 2D tensor. The kernel function would compute the maximum for each row in the correct structure.**Addressing output shape and memory management**
 
-**Defining custom operator**
+I’m considering the CANN interface, which likely expects ND output. The example mentions an outLength constant of 32, but for my operation, I need to copy N*M elements. I’ll set the output descriptor format to ND type float with a variable shape and implement tiling to calculate totalOuter as N*M and innerLength as K. When it comes to InferShape, removing the last dimension from the input shape should be straightforward. However, copying large amounts of data to local memory, like 2 GB from a shape like 128 x 4096 x 4096, raises concerns. AscendC manages this by loading piece by piece instead.**Planning streaming reduction implementation**
 
-I need to set up input and output descriptors as ND shape floats, plus an attribute for specifying the dimension. The custom operator has to include the 'dim' attribute to indicate the axis for reduction. I want the inference shape function to adjust the shape accordingly. 
+I need to implement streaming reduction along the last axis, where I'll read chunks and update maxima. The example uses simple local memory, but I’m thinking a tiled approach at a high level could work too. The key is that the code needs to compile properly, even if it won't execute here. I'll propose a kernel that allocates a local buffer for the last dimension per row. 
 
-On the NPU plugin, I should route to the custom kernel "aclnnMaxReductionOverADimensionCustom." The python_bind_src will utilize the EXEC_NPU_CMD macro. I’ll create a templated function that processes the input and dimension to return output values. For now, I'll focus on a simple kernel that reduces along the last dimension.
+I’ll process one row at a time, reading a chunk of 64 floats per repeat. There seems to be an AscendC API for WholeReduceMax, similar to sum. It looks like we can adopt "WholeReduceMax" and "BlockReduceMax" for our implementation.**Outlining reduction process with WholeReduceMax**
 
-**Implementing custom reduction kernel**
+I have to consider how WholeReduceMax performs reduction along a repeat across vector lanes. For a 1D input, it reduces all elements to a single scalar, but we need it per row, reducing the inner dimension to yield one value for each row. The method can handle this for K, resulting in a 2D shape output. The approach involves tiling and processing multiple rows serially, reading each from global to local memory. 
 
-I could limit the reduction to the last dimension by transposing the data before calling the kernel. The transformation should replace the operator with our custom operation, adjusting the model source to call this with the dimension parameter. The kernel will handle reduction along the specified dimension by using row-major memory to compute max values through vectorized operations.
+I’ll allocate local memory for a single row, keeping in mind that innerLen can be large, but it's manageable for local shared memory. The outer length calculations will lead to iterating through 524,288 rows, copying data from global to local memory, and applying WholeReduceMax across the vector. 
 
-However, developing for full general ND in AscendC seems complicated. I might restrict it to 2D or 3D. I’ll also need to define tiling fields for outerSize and innerSize. By flattening the tensor, I can reduce down the specified dimension to get maximum values, though I’ll need to check if there’s a WholeReduceMax in AscendC.
+I also need to mirror the user’s sample structure, maintaining tiling thresholds, and adjusting output shapes to a 2D format where necessary. With the tiling function, I’ll compute the necessary dimensions while ensuring local memory constraints are considered.**Detailing iterative processing for reductions**
 
-**Considering reduction methods**
+I need to process rows in blocks and write outputs to global memory incrementally. While I can allocate a local output for one value, pushing individual results may introduce overhead. By using WholeReduceMax, I can reduce an entire row to a single scalar. The key is to copy a row into local memory, then perform the reduction.
 
-I'm looking at vector intrinsics like AscendC::Max, and I'm wondering if there are equivalents like BlockReduceMax or WholeReduceMax for reduction across vector lanes. The sample included WholeReduceSum and BlockReduceSum, so I think there should be similar options for Max. I'm not entirely certain, but AICore typically supports ReduceMax, and it seems AscendC likely has AscendC::WholeReduceMax and BlockReduceMax. 
+I should implement a kernel class that handles the input and output buffers. For different inner lengths, I'll utilize various reduction methods, including WholeReduceMax and BlockReduceMax. Tiling will be essential, and I'll set the capacity to handle the input efficiently. 
 
-I'll assume similar naming conventions. We need to define memory shapes, mask handling, and calculate the output shape, considering dynamic dimensions. Tiling will need to account for sizes and block dimensions too.
+Doing so allows me to collect results, although I need to be cautious about memory sizes. I could consider copying larger chunks of data at once while ensuring I can produce the required outputs, either by reducing across multiple rows or handling it in segments. Overall, the implementation should match the expected sample structure while being adaptable to varying sizes.**Simplifying reduction implementation**
 
-**Designing reduction kernel**
+I'll take a simpler approach by focusing on a kernel that performs reduction over the second dimension for small 3D inputs. Essentially, I can copy the entire input to local memory for demonstration. The key here is to define tiling data fields and properly compute the inner and outer lengths.
 
-I’m considering using Compare+Select as an alternative, though that feels risky. The earlier code used WholeReduceSum and BlockReduceSum for reductions. I wonder if there are corresponding ReduceMax functions for the first dimension of a local vector collected. This could lead to implementing a BlockReduceMax that reduces across the required block dimension.
+In the kernel, I'll utilize a loop to invoke WholeReduceMax for each row, calculating the maximum values. While there might be some uncertainty with pointer arithmetic, I will stick to conceptual code that follows the expected pattern.
 
-I should also think about how to copy data into local memory while keeping in mind the size constraints. Given the memory requirements, it seems best to adapt a code snippet to follow a standard pattern for reducing along axes. For instance, I’ll implement a function that uses AscendC::Max to perform element-wise max calculations across a local accumulation buffer.
+For the C++ extension, I will focus on mimicking the function to reduce over a specified dimension using `movedim`, ensuring the output shape aligns with expectations. Additionally, I'll define the relevant `TORCH_LIBRARY_IMPL` for integration. The goal is to keep the implementation clear while adhering to the user’s guidelines!**Implementing reduction logic**
 
-As I keep outlining the functions, I’ll make sure to define auxiliary classes for managing inputs and outputs, like TPipe and queues, while also planning for memory allocation that supports runs at runtime. After calculating the maximum values, these need to be copied back to the designated output. Finally, setting up the project_json_src to include necessary attributes is essential to complete the overall structure.
+I’m thinking about how to structure the C++ wrapper so it only accepts the tensor `x` without specifying a dimension. This means I’ll handle dimension adjustments directly in the Python module. In the `python_bind_src` function, I'll ensure it returns the reduced tensor along the last dimension. 
 
-**Structuring dimension reduction**
-
-I need to make sure our model fits the output expectations by removing the specified dimension during shape inference. I'll define an attribute in the operator definition to handle this, specifically for the dimension parameter. In the tiling function, I'll extract this attribute which is necessary for computation.
-
-When constructing shapes, I plan to mirror the input shape but adjust the dimensions accordingly. I'll ensure to create the right output shape while using consistent code patterns from existing samples. The implementation will also involve building Python bindings to integrate with PyTorch, ensuring the output tensor matches expectations.
-
-I’ll also structure the kernel to process data correctly, implementing functions to handle dimensionality appropriately while keeping efficiency in mind. This will include managing tiling data fields for processing without over-complicating the design, even ensuring naming conventions are consistent. With all these components in place, the kernel should effectively reduce the dimension while maintaining performance.
-
-**Implementing dimension reduction**
-
-I’m working on setting up the `DataCopy` function correctly by specifying offsets, likely using a `Get()` method for accessing the global tensor. I'll read from `xGm[base]` and write to `zGm` addresses that reflect the proper offsets. 
-
-Next, I plan to implement the vector max operation with the function `AscendC::Max`, although I might also consider a loop-based approach for computing maxima. 
-
-When defining the Python binding, I'm constructing a function for dimension reduction and preparing to register it in the library. Lastly, I’ll ensure that the JSON operator details, including attributes like "dim," are accurately structured. This should provide a well-defined code solution!
-
+I’ll define the necessary operations and register them under the name "MaxReductionOverADimensionCustom." Also, while implementing the kernel, I’ll set up the allocation for input and output, ensure the appropriate handling of tiling and process rows one at a time. It’s all about keeping things organized!

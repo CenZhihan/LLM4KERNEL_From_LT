@@ -50,8 +50,7 @@ BEGIN_TILING_DATA_DEF(ConvTranspose3dLeakyReluMultiplyLeakyReluMaxCustomTilingDa
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
-REGISTER_TILING_DATA_CLASS(ConvTranspose3dLeakyReluMultiplyLeakyReluMaxCustom,
-                           ConvTranspose3dLeakyReluMultiplyLeakyReluMaxCustomTilingData)
+REGISTER_TILING_DATA_CLASS(ConvTranspose3dLeakyReluMultiplyLeakyReluMaxCustom, ConvTranspose3dLeakyReluMultiplyLeakyReluMaxCustomTilingData)
 }
 """
 
@@ -62,11 +61,10 @@ host_operator_src="""
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
 const uint32_t TILE_NUM = 8;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ConvTranspose3dLeakyReluMultiplyLeakyReluMaxCustomTilingData tiling;
-    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
@@ -82,11 +80,13 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
-    gert::Shape* z_shape = context->GetOutputShape(0);
-    *z_shape = *x_shape;
+    const gert::Shape* m_shape = context->GetInputShape(1);
+    // 简单校验：multiplier可广播或已扩展为与x相同形状，此处直接设输出为x的形状
+    (void)m_shape;
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -117,6 +117,7 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
@@ -128,48 +129,33 @@ OP_ADD(ConvTranspose3dLeakyReluMultiplyLeakyReluMaxCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom_tiling_data.h"
 
-// 本自定义算子在设备端完成：LeakyReLU -> 按元素乘 multiplier -> 再次 LeakyReLU
-// 前后的 ConvTranspose3d 与 MaxPool3d 由模型在 PyTorch 侧完成。
-// 参考：AscendC API LeakyRelu（4.1.3.7）、两输入模板（4.1.2.9）、TPipe 用法（4.3.1.x）
-
-constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor数量
-constexpr float NEGATIVE_SLOPE = 0.2f; // 固定的LeakyReLU负斜率
+// 融合算子：对输入x执行 LeakyReLU(0.2) -> 与multiplier逐元素相乘 -> 再次LeakyReLU(0.2)
+// 注意：此自定义核不包含ConvTranspose3d与MaxPool3d，它们在模型中由PyTorch完成。
+// multiplier需在调用侧扩展为与x同形状以进行逐元素相乘。
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor个数
 
 class KernelFused {
 public:
     __aicore__ inline KernelFused() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR m, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR multiplier, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
     {
-        this->totalLength = totalLength;
-        this->blockLength = (totalLength + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
-        this->startOffset = this->blockLength * AscendC::GetBlockIdx();
-        if (this->startOffset + this->blockLength > totalLength) {
-            this->blockLength = totalLength > this->startOffset ? (totalLength - this->startOffset) : 0;
-        }
+        this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
-        // 简单按tileNum*BUFFER_NUM切分
-        uint32_t denom = tileNum * BUFFER_NUM;
-        this->tileLength = (this->blockLength + denom - 1) / denom;
-        if (this->tileLength == 0) this->tileLength = this->blockLength;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x) + this->startOffset, this->blockLength);
-        mGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(m) + this->startOffset, this->blockLength);
-        zGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(z) + this->startOffset, this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        mGm.SetGlobalBuffer((__gm__ float *)multiplier + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ float *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(inQueueM, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpQueue, 2, this->tileLength * sizeof(float)); // 中间缓冲
         pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(float));
     }
-
     __aicore__ inline void Process()
     {
-        if (this->blockLength == 0) { return; }
-        uint32_t loopCount = (this->blockLength + this->tileLength - 1) / this->tileLength;
-        for (uint32_t i = 0; i < loopCount; ++i) {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
             CopyIn(i);
             Compute(i);
             CopyOut(i);
@@ -177,85 +163,57 @@ public:
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t progress)
+    __aicore__ inline void CopyIn(int32_t progress)
     {
-        uint32_t offset = progress * this->tileLength;
-        uint32_t len = AscendC::min(this->tileLength, this->blockLength - offset);
-
         AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
         AscendC::LocalTensor<float> mLocal = inQueueM.AllocTensor<float>();
-        AscendC::DataCopy(xLocal, xGm[offset], len);
-        AscendC::DataCopy(mLocal, mGm[offset], len);
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(mLocal, mGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
         inQueueM.EnQue(mLocal);
-        // 将本次真实长度记录在成员变量中（简单方式：保存到类成员）
-        curLens = len;
     }
-
-    __aicore__ inline void Compute(uint32_t /*progress*/)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        // 出队输入
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> mLocal = inQueueM.DeQue<float>();
-        // 分配中间与输出buffer
-        AscendC::LocalTensor<float> tmp1 = tmpQueue.AllocTensor<float>();
-        AscendC::LocalTensor<float> tmp2 = tmpQueue.AllocTensor<float>();
         AscendC::LocalTensor<float> zLocal = outQueueZ.AllocTensor<float>();
 
-        // 1) LeakyReLU(x) -> tmp1
-        AscendC::LeakyRelu(tmp1, xLocal, NEGATIVE_SLOPE, static_cast<int32_t>(curLens));
+        const float slope = 0.2f;
+        // 第一次LeakyReLU
+        AscendC::LeakyRelu(zLocal, xLocal, slope, this->tileLength);
+        // 逐元素乘以multiplier
+        AscendC::Mul(zLocal, zLocal, mLocal, this->tileLength);
+        // 第二次LeakyReLU
+        AscendC::LeakyRelu(zLocal, zLocal, slope, this->tileLength);
 
-        // 2) 按元素乘法: tmp1 * mLocal -> tmp2
-        // 采用两输入指令模板的调用方式
-        AscendC::Mul(tmp2, tmp1, mLocal, static_cast<int32_t>(curLens));
-
-        // 3) 再次LeakyReLU: tmp2 -> zLocal
-        AscendC::LeakyRelu(zLocal, tmp2, NEGATIVE_SLOPE, static_cast<int32_t>(curLens));
-
-        // 入队输出
         outQueueZ.EnQue<float>(zLocal);
-
-        // 释放本地张量
-        tmpQueue.FreeTensor(tmp2);
-        tmpQueue.FreeTensor(tmp1);
         inQueueX.FreeTensor(xLocal);
         inQueueM.FreeTensor(mLocal);
     }
-
-    __aicore__ inline void CopyOut(uint32_t progress)
+    __aicore__ inline void CopyOut(int32_t progress)
     {
-        uint32_t offset = progress * this->tileLength;
-        uint32_t len = AscendC::min(this->tileLength, this->blockLength - offset);
-
         AscendC::LocalTensor<float> zLocal = outQueueZ.DeQue<float>();
-        AscendC::DataCopy(zGm[offset], zLocal, len);
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
         outQueueZ.FreeTensor(zLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueM;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 2> tmpQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueM;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
-
     AscendC::GlobalTensor<float> xGm;
     AscendC::GlobalTensor<float> mGm;
     AscendC::GlobalTensor<float> zGm;
-
-    uint32_t totalLength = 0;
-    uint32_t blockLength = 0;
-    uint32_t startOffset = 0;
-    uint32_t tileNum = 0;
-    uint32_t tileLength = 0;
-    uint32_t curLens = 0;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom(
-    GM_ADDR x, GM_ADDR multiplier, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tilingData, tiling);
+extern "C" __global__ __aicore__ void conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom(GM_ADDR x, GM_ADDR multiplier, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
     KernelFused op;
-    op.Init(x, multiplier, z, tilingData.totalLength, tilingData.tileNum);
+    op.Init(x, multiplier, z, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -266,23 +224,18 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom_impl_npu(const at::Tensor& x,
-                                                                               const at::Tensor& multiplier_broadcast) {
-    // x 与 multiplier_broadcast 形状一致（已在Python侧进行广播展开到NCDHW）
+at::Tensor conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom_impl_npu(const at::Tensor& x, const at::Tensor& multiplier_expanded) {
     at::Tensor result = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnConvTranspose3dLeakyReluMultiplyLeakyReluMaxCustom, x, multiplier_broadcast, result);
+    EXEC_NPU_CMD(aclnnConvTranspose3dLeakyReluMultiplyLeakyReluMaxCustom, x, multiplier_expanded, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom",
-           &conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom_impl_npu);
+    m.impl("conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom", &conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom",
-          &conv_transpose3d_leaky_relu_multiply_leaky_rel u_max_custom_impl_npu,
-          "fused: LeakyReLU -> Multiply -> LeakyReLU");
+    m.def("conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom", &conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom_impl_npu, "LeakyRelu -> Mul -> LeakyRelu fused");
 }
 """
 
@@ -293,52 +246,24 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    将 LeakyReLU -> 逐通道乘 -> LeakyReLU 的链路用 AscendC 自定义算子替换；
-    ConvTranspose3d 与 MaxPool3d 仍采用原生模块，避免在设备端实现卷积与池化的复杂度。
+    使用自定义AscendC核函数将 LeakyReLU -> 逐元素乘法 -> LeakyReLU 融合，
+    ConvTranspose3d 与 MaxPool3d 仍由PyTorch执行。
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier_shape):
         super(ModelNew, self).__init__()
-        self.conv_transpose = torch.nn.ConvTranspose3d(
-            in_channels, out_channels, kernel_size,
-            stride=stride, padding=padding, output_padding=output_padding
-        )
-        # 与原模型一致的可学习系数 (C,1,1,1)
+        self.conv_transpose = torch.nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
         self.multiplier = torch.nn.Parameter(torch.randn(multiplier_shape))
         self.max_pool = torch.nn.MaxPool3d(kernel_size=2)
-
-        # 固定的 LeakyReLU 负斜率 0.2 在自定义算子中使用
-        self.negative_slope = 0.2
+        self.out_channels = out_channels
 
     def forward(self, x):
-        # 1) 反卷积
+        # 先由PyTorch执行反卷积
         x = self.conv_transpose(x)
-
-        # 2) 逐通道广播 multiplier 并展开到与 x 相同的 NCDHW 形状
-        # multiplier: (C,1,1,1) -> (1,C,1,1,1) -> expand_as(x)
-        mul_broadcast = self.multiplier.view(1, self.multiplier.shape[0], 1, 1, 1).expand_as(x)
-
-        # 3) 调用自定义AscendC算子完成 (LeakyReLU -> 乘 -> LeakyReLU)
-        x = custom_ops_lib.conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom(x, mul_broadcast)
-
-        # 4) MaxPool3d
+        # 将multiplier扩展到与x相同形状，便于在核函数中逐元素相乘
+        mul = self.multiplier.view(1, self.out_channels, 1, 1, 1).expand_as(x)
+        # 自定义核执行：LeakyReLU(0.2) -> 逐元素乘法 -> LeakyReLU(0.2)
+        x = custom_ops_lib.conv_transpose3d_leaky_relu_multiply_leaky_relu_max_custom(x, mul)
+        # 继续由PyTorch执行MaxPool3d
         x = self.max_pool(x)
         return x
-
-def get_inputs():
-    batch_size = 16
-    in_channels = 16
-    depth, height, width = 16, 32, 32
-    return [torch.rand(batch_size, in_channels, depth, height, width)]
-
-def get_init_inputs():
-    batch_size = 16
-    in_channels = 16
-    out_channels = 32
-    depth, height, width = 16, 32, 32
-    kernel_size = 3
-    stride = 2
-    padding = 1
-    output_padding = 1
-    multiplier_shape = (out_channels, 1, 1, 1)
-    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier_shape]
 '''

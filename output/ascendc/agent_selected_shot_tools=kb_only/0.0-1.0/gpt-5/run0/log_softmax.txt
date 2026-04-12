@@ -41,116 +41,77 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
-#include "register/op_def_registry.h"
 
 namespace optiling {
-
 BEGIN_TILING_DATA_DEF(LogSoftmaxCustomTilingData)
-TILING_DATA_FIELD_DEF(uint32_t, outter);
-TILING_DATA_FIELD_DEF(uint32_t, inner);
-TILING_DATA_FIELD_DEF(uint32_t, rowsPerBlock);
-TILING_DATA_FIELD_DEF(uint32_t, lastRowsPerBlock);
-TILING_DATA_FIELD_DEF(uint32_t, tmpSizePerRow);
-TILING_DATA_FIELD_DEF(optiling::LogSoftMaxTiling, logSoftmaxTilingData);
+TILING_DATA_FIELD_DEF(uint32_t, m);                  // outter: 非最后一维乘积
+TILING_DATA_FIELD_DEF(uint32_t, k);                  // inner: 最后一维长度
+TILING_DATA_FIELD_DEF(uint32_t, tmpSize);            // 最小临时空间
+TILING_DATA_FIELD_DEF(int32_t, dim);                 // 归约维度（必须为最后一维）
+TILING_DATA_FIELD_DEF_STRUCT(LogSoftMaxTiling, logSoftmaxTilingData); // LogSoftMax 的tiling信息
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(LogSoftmaxCustom, LogSoftmaxCustomTilingData)
-
-} // namespace optiling
+}
 """
 
 host_operator_src="""
-#include <vector>
-#include <numeric>
-#include <algorithm>
 #include "log_softmax_custom_tiling.h"
 #include "register/op_def_registry.h"
 
-namespace {
-inline int64_t NormalizeAxis(int64_t axis, int64_t rank) {
-    if (axis < 0) axis += rank;
-    if (axis < 0) axis = 0;
-    if (axis >= rank) axis = rank - 1;
-    return axis;
-}
-
-inline uint32_t Prod(const std::vector<int64_t> &dims, int64_t start, int64_t end) {
-    // product of dims in [start, end)
-    uint64_t p = 1;
-    for (int64_t i = start; i < end; ++i) {
-        p *= static_cast<uint64_t>(dims[i] > 0 ? dims[i] : 1);
-    }
-    return static_cast<uint32_t>(p);
-}
-} // namespace
-
 namespace optiling {
-const uint32_t MAX_BLOCKS = 48;
-const uint32_t DTYPE_SIZE_F32 = 4;
-
 static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
     LogSoftmaxCustomTilingData tiling;
 
     const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    const int64_t *dimAttr = attrs->GetAttrPointer<int64_t>(0); // dim
+    const int64_t *dimAttr = attrs->GetAttrPointer<int64_t>(0);
 
-    // Get input shape dims
-    const gert::Shape *in_shape = context->GetInputShape(0);
-    const auto &origin = in_shape->GetOriginShape();
-    std::vector<int64_t> dims = origin.GetDims();
-    if (dims.empty()) {
-        dims = {1};
+    // 获取输入形状
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const ge::Shape origin = x_shape->GetOriginShape();
+    const std::vector<int64_t> dims = origin.GetDims();
+    const int64_t rank = static_cast<int64_t>(dims.size());
+
+    int64_t dim = *dimAttr;
+    if (dim < 0) dim += rank;
+    // 计算 outter(inner 之外各轴乘积) 与 inner(目标维长度)
+    uint64_t outter_u64 = 1;
+    for (int64_t i = 0; i < rank; ++i) {
+        if (i == dim) continue;
+        outter_u64 *= static_cast<uint64_t>(dims[i]);
     }
-    int64_t rank = static_cast<int64_t>(dims.size());
-    int64_t axis = NormalizeAxis(*dimAttr, rank);
+    uint64_t inner_u64 = static_cast<uint64_t>(dims[dim]);
 
-    // Compute outter/inner according to axis
-    uint32_t outter = Prod(dims, 0, axis);
-    uint32_t inner = Prod(dims, axis, rank);
-    if (outter == 0) outter = 1;
-    if (inner == 0) inner = 1;
+    uint32_t outter = static_cast<uint32_t>(outter_u64);
+    uint32_t inner = static_cast<uint32_t>(inner_u64);
 
-    // Decide block dim and rows per block
-    uint32_t blockDim = std::min<uint32_t>(outter, MAX_BLOCKS);
-    if (blockDim == 0) blockDim = 1;
-    uint32_t rowsPerBlock = outter / blockDim;
-    if (rowsPerBlock == 0) {
-        rowsPerBlock = 1;
-        blockDim = std::min<uint32_t>(outter, MAX_BLOCKS);
-        if (blockDim == 0) blockDim = 1;
-    }
-    uint32_t lastRowsPerBlock = outter - rowsPerBlock * (blockDim - 1);
-    if (lastRowsPerBlock == 0) lastRowsPerBlock = rowsPerBlock;
+    // LogSoftMax高阶API按最后一维做归约，这里假设dim为最后一维使用
+    // 若dim不是最后一维，建议在图优化阶段调整轴顺序；此处仍按[m,k]传入tiling
+    std::vector<int64_t> shapeVec = {static_cast<int64_t>(outter), static_cast<int64_t>(inner)};
+    ge::Shape srcShape(shapeVec);
 
-    // Prepare LogSoftMax tiling for a single row [1, inner]
-    std::vector<int64_t> rowDims = {1, static_cast<int64_t>(inner)};
-    ge::Shape rowShape(rowDims);
-    const uint32_t tmpSizePerRow = AscendC::GetLogSoftMaxMaxTmpSize(rowShape, DTYPE_SIZE_F32, false);
+    // 选择最小临时空间以确保功能正确
+    const uint32_t tmpSize = AscendC::GetLogSoftMaxMinTmpSize(srcShape, sizeof(float), false);
+    // 获取LogSoftMax的tiling参数
+    AscendC::LogSoftMaxTilingFunc(srcShape, sizeof(float), tmpSize, tiling.logSoftmaxTilingData);
 
-    // Fill inner tiling for HLL API
-    optiling::LogSoftMaxTiling logTiling;
-    AscendC::LogSoftMaxTilingFunc(rowShape, DTYPE_SIZE_F32, tmpSizePerRow, logTiling);
+    tiling.set_m(outter);
+    tiling.set_k(inner);
+    tiling.set_tmpSize(tmpSize);
+    tiling.set_dim(static_cast<int32_t>(dim));
 
-    // Save tiling
-    tiling.set_outter(outter);
-    tiling.set_inner(inner);
-    tiling.set_rowsPerBlock(rowsPerBlock);
-    tiling.set_lastRowsPerBlock(lastRowsPerBlock);
-    tiling.set_tmpSizePerRow(tmpSizePerRow);
-    tiling.set_logSoftmaxTilingData(logTiling);
+    // 设置block数（可根据实际情况调整）
+    context->SetBlockDim(8);
 
-    context->SetBlockDim(blockDim);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // No GM workspace needed
-    size_t *workspaces = context->GetWorkspaceSizes(1);
-    workspaces[0] = 0;
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0; // 不需要GM侧workspace
 
     return ge::GRAPH_SUCCESS;
 }
-
 } // namespace optiling
 
 namespace ge {
@@ -185,8 +146,11 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
         this->Attr("dim").AttrType(OPTIONAL).Int(1);
+
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -196,47 +160,50 @@ OP_ADD(LogSoftmaxCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "log_softmax_custom_tiling_data.h"
-
-constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t BUFFER_NUM = 1; // 简化为单缓冲
 
 class KernelLogSoftmax {
 public:
     __aicore__ inline KernelLogSoftmax() {}
+
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t outter, uint32_t inner,
-                                uint32_t rowsPerBlock, uint32_t lastRowsPerBlock,
-                                uint32_t tmpSizePerRow,
-                                const optiling::LogSoftMaxTiling &logTiling) {
-        this->inner = inner;
-        this->outter = outter;
-        this->tmpSizePerRow = tmpSizePerRow;
-        this->logTiling = logTiling;
+                                uint32_t m, uint32_t k,
+                                uint32_t tmpSize,
+                                const optiling::LogSoftMaxTiling &tiling)
+    {
+        this->m = m;
+        this->k = k;
+        this->tmpSize = tmpSize;
+        this->tiling = tiling;
 
-        uint32_t blockIdx = AscendC::GetBlockIdx();
+        // 以行（M维）为单位在多核间划分
         uint32_t blockNum = AscendC::GetBlockNum();
-        this->rowsThisBlock = (blockIdx == blockNum - 1) ? lastRowsPerBlock : rowsPerBlock;
-        this->baseRow = blockIdx * rowsPerBlock;
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t rowsPerCore = (m + blockNum - 1) / blockNum;
+        this->startRow = rowsPerCore * blockIdx;
+        this->endRow = AscendC::Min(m, this->startRow + rowsPerCore);
+        this->rowsThisCore = (this->endRow > this->startRow) ? (this->endRow - this->startRow) : 0;
 
-        if (this->rowsThisBlock == 0) return;
+        // 设定当前核的GM起始地址
+        xGm.SetGlobalBuffer((__gm__ float*)x + static_cast<uint64_t>(this->startRow) * k,
+                            static_cast<uint64_t>(this->rowsThisCore) * k);
+        yGm.SetGlobalBuffer((__gm__ float*)y + static_cast<uint64_t>(this->startRow) * k,
+                            static_cast<uint64_t>(this->rowsThisCore) * k);
 
-        uint64_t elemOffset = static_cast<uint64_t>(this->baseRow) * this->inner;
-        xGm.SetGlobalBuffer((__gm__ float *)x + elemOffset, static_cast<uint64_t>(this->rowsThisBlock) * this->inner);
-        yGm.SetGlobalBuffer((__gm__ float *)y + elemOffset, static_cast<uint64_t>(this->rowsThisBlock) * this->inner);
-
-        // Each row length = inner
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->inner * sizeof(float));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->inner * sizeof(float));
-        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tmpSizePerRow);
-        pipe.InitBuffer(maxBuf, sizeof(float));
-        pipe.InitBuffer(sumBuf, sizeof(float));
+        // 初始化本地缓冲
+        // 每次处理一行（outter=1）
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, k * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, k * sizeof(float));
+        // 临时空间（由Host侧LogSoftMaxTilingFunc给出大小）
+        pipe.InitBuffer(tmpBuf, tmpSize);
+        // max / sum中间结果缓冲（大小按一行上限配置）
+        pipe.InitBuffer(maxBuf, k * sizeof(float));
+        pipe.InitBuffer(sumBuf, k * sizeof(float));
     }
 
-    __aicore__ inline void Process() {
-        if (this->rowsThisBlock == 0) return;
-
-        for (uint32_t r = 0; r < this->rowsThisBlock; ++r) {
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = 0; r < this->rowsThisCore; ++r) {
             CopyIn(r);
             Compute(r);
             CopyOut(r);
@@ -244,30 +211,35 @@ public:
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t r) {
+    __aicore__ inline void CopyIn(uint32_t rowIdx)
+    {
         AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        AscendC::DataCopy(xLocal, xGm[r * this->inner], this->inner);
+        // 从GM拷贝一行到本地
+        AscendC::DataCopy(xLocal, xGm[rowIdx * this->k], this->k);
         inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(uint32_t /*r*/) {
+    __aicore__ inline void Compute(uint32_t /*rowIdx*/)
+    {
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+
+        AscendC::LocalTensor<uint8_t> tmpLocal = tmpBuf.Get<uint8_t>();
         AscendC::LocalTensor<float> maxLocal = maxBuf.Get<float>();
         AscendC::LocalTensor<float> sumLocal = sumBuf.Get<float>();
-        AscendC::LocalTensor<uint8_t> tmpLocal = tmpQueue.AllocTensor<uint8_t>();
 
-        AscendC::SoftMaxShapeInfo shapeInfo = {1, this->inner, 1, this->inner};
-        AscendC::LogSoftMax<float, false>(yLocal, maxLocal, sumLocal, xLocal, tmpLocal, this->logTiling, shapeInfo);
+        AscendC::SoftMaxShapeInfo softmaxInfo = {1, this->k, 1, this->k};
+        // 调用高阶LogSoftMax API
+        AscendC::LogSoftMax<float, false>(yLocal, maxLocal, sumLocal, xLocal, tmpLocal, this->tiling, softmaxInfo);
 
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
-        tmpQueue.FreeTensor(tmpLocal);
     }
 
-    __aicore__ inline void CopyOut(uint32_t r) {
+    __aicore__ inline void CopyOut(uint32_t rowIdx)
+    {
         AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
-        AscendC::DataCopy(yGm[r * this->inner], yLocal, this->inner);
+        AscendC::DataCopy(yGm[rowIdx * this->k], yLocal, this->k);
         outQueueY.FreeTensor(yLocal);
     }
 
@@ -275,31 +247,29 @@ private:
     AscendC::TPipe pipe;
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuf;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> maxBuf;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> sumBuf;
+
     AscendC::GlobalTensor<float> xGm, yGm;
 
-    uint32_t inner;
-    uint32_t outter;
-    uint32_t baseRow;
-    uint32_t rowsThisBlock;
-    uint32_t tmpSizePerRow;
-    optiling::LogSoftMaxTiling logTiling;
+    uint32_t m;
+    uint32_t k;
+    uint32_t tmpSize;
+    uint32_t startRow;
+    uint32_t endRow;
+    uint32_t rowsThisCore;
+    optiling::LogSoftMaxTiling tiling;
 };
 
-extern "C" __global__ __aicore__ void log_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
-    (void)workspace;
-    GET_TILING_DATA(tiling_data, tiling);
-
+extern "C" __global__ __aicore__ void log_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
     KernelLogSoftmax op;
     op.Init(x, y,
-            tiling_data.outter(),
-            tiling_data.inner(),
-            tiling_data.rowsPerBlock(),
-            tiling_data.lastRowsPerBlock(),
-            tiling_data.tmpSizePerRow(),
-            tiling_data.logSoftmaxTilingData());
+            tilingData.m, tilingData.k,
+            tilingData.tmpSize,
+            tilingData.logSoftmaxTilingData);
     op.Process();
 }
 """
@@ -331,9 +301,6 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    Optimized model using custom AscendC LogSoftmax kernel.
-    """
     def __init__(self, dim: int = 1):
         super(ModelNew, self).__init__()
         self.dim = dim

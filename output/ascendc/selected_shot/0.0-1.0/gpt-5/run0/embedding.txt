@@ -1,0 +1,322 @@
+project_json_src='''
+[
+    {
+        "op": "EmbeddingCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "weight",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "indices",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "output",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(EmbeddingCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalIndices);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, embDim);
+  TILING_DATA_FIELD_DEF(uint32_t, vocabSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(EmbeddingCustom, EmbeddingCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "embedding_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    EmbeddingCustomTilingData tiling;
+
+    const gert::Shape* weightShape = context->GetInputShape(0);  // [vocab, dim]
+    const gert::Shape* indicesShape = context->GetInputShape(1); // [...],
+    uint32_t embDim = 1;
+    uint32_t vocab = 1;
+    if (weightShape->GetDimNum() >= 2) {
+        vocab = static_cast<uint32_t>(weightShape->GetDim(0));
+        embDim = static_cast<uint32_t>(weightShape->GetDim(weightShape->GetDimNum() - 1));
+    }
+    uint64_t totalIdx64 = 1;
+    for (size_t i = 0; i < indicesShape->GetDimNum(); ++i) {
+        totalIdx64 *= static_cast<uint64_t>(indicesShape->GetDim(i));
+    }
+    uint32_t totalIndices = static_cast<uint32_t>(totalIdx64);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalIndices(totalIndices);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_embDim(embDim);
+    tiling.set_vocabSize(vocab);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* weightShape = context->GetInputShape(0);
+    const gert::Shape* indicesShape = context->GetInputShape(1);
+    gert::Shape* outShape = context->GetOutputShape(0);
+
+    std::vector<int64_t> outDims;
+    outDims.reserve(indicesShape->GetDimNum() + 1);
+    for (size_t i = 0; i < indicesShape->GetDimNum(); ++i) {
+        outDims.push_back(indicesShape->GetDim(i));
+    }
+    int64_t embDim = 1;
+    if (weightShape->GetDimNum() >= 2) {
+        embDim = weightShape->GetDim(weightShape->GetDimNum() - 1);
+    }
+    outDims.push_back(embDim);
+    outShape->SetDimNum(outDims.size());
+    for (size_t i = 0; i < outDims.size(); ++i) {
+        outShape->SetDim(i, outDims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto weightDtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, weightDtype);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class EmbeddingCustom : public OpDef {
+public:
+    explicit EmbeddingCustom(const char* name) : OpDef(name)
+    {
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("indices")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("output")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(EmbeddingCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2; // buffer number for queues
+
+// x -> weight (float), y -> indices (int32), z -> output (float)
+class KernelEmbedding {
+public:
+    __aicore__ inline KernelEmbedding() {}
+
+    __aicore__ inline void Init(GM_ADDR weight, GM_ADDR indices, GM_ADDR output,
+                                uint32_t totalIndices, uint32_t tileNum,
+                                uint32_t embDim, uint32_t vocabSize)
+    {
+        this->totalIndices = totalIndices;
+        this->tileNum = tileNum;
+        this->embDim = embDim;
+        this->vocabSize = vocabSize;
+
+        // Compute block partition with remainder handling
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t base = totalIndices / blockNum;
+        uint32_t rem = totalIndices % blockNum;
+        this->blockStart = base * blockIdx + (blockIdx < rem ? blockIdx : rem);
+        this->blockCount = base + (blockIdx < rem ? 1 : 0);
+
+        // Basic tiling on indices count
+        uint32_t denom = (this->tileNum * BUFFER_NUM);
+        this->tileIdx = denom > 0 ? (this->blockCount / denom) : this->blockCount;
+        if (this->tileIdx == 0) {
+            this->tileIdx = 1;
+        }
+
+        // Set global buffers
+        // weight length in elements
+        wGm.SetGlobalBuffer((__gm__ DTYPE_X *)weight, (uint64_t)this->vocabSize * (uint64_t)this->embDim);
+        idxGm.SetGlobalBuffer((__gm__ DTYPE_Y *)indices + this->blockStart, this->blockCount);
+        outGm.SetGlobalBuffer((__gm__ DTYPE_Z *)output + ((uint64_t)this->blockStart * (uint64_t)this->embDim),
+                              (uint64_t)this->blockCount * (uint64_t)this->embDim);
+
+        // Init buffers: indices tile and one-row buffer for embedding vector
+        pipe.InitBuffer(inIdxQueue, BUFFER_NUM, this->tileIdx * sizeof(DTYPE_Y));
+        pipe.InitBuffer(rowQueue, BUFFER_NUM, this->embDim * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        uint32_t progressed = 0;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            if (progressed >= this->blockCount) { break; }
+            uint32_t curr = this->CalcCurrTile(progressed);
+            CopyIn(progressed, curr);
+            Compute(progressed, curr);
+            progressed += curr;
+        }
+    }
+
+private:
+    __aicore__ inline uint32_t CalcCurrTile(uint32_t progressed)
+    {
+        uint32_t remaining = this->blockCount - progressed;
+        return remaining < this->tileIdx ? remaining : this->tileIdx;
+    }
+
+    __aicore__ inline void CopyIn(uint32_t progressed, uint32_t curr)
+    {
+        AscendC::LocalTensor<DTYPE_Y> idxLocal = inIdxQueue.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(idxLocal, idxGm[progressed], curr);
+        inIdxQueue.EnQue(idxLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t progressed, uint32_t curr)
+    {
+        AscendC::LocalTensor<DTYPE_Y> idxLocal = inIdxQueue.DeQue<DTYPE_Y>();
+        for (uint32_t j = 0; j < curr; ++j) {
+            // Read one index value
+            int32_t idxVal = static_cast<int32_t>(idxLocal.GetValue(j));
+            // Bounds guard (optional)
+            if (idxVal < 0) { idxVal = 0; }
+            if ((uint32_t)idxVal >= this->vocabSize) { idxVal = (int32_t)(this->vocabSize - 1); }
+
+            // Copy one embedding row to local, then to output
+            AscendC::LocalTensor<DTYPE_Z> rowLocal = rowQueue.AllocTensor<DTYPE_Z>();
+            AscendC::DataCopy(rowLocal, wGm[(uint64_t)idxVal * (uint64_t)this->embDim], this->embDim);
+            AscendC::DataCopy(outGm[((uint64_t)progressed + (uint64_t)j) * (uint64_t)this->embDim], rowLocal, this->embDim);
+            rowQueue.FreeTensor(rowLocal);
+        }
+        inIdxQueue.FreeTensor(idxLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inIdxQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> rowQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> wGm;   // weight
+    AscendC::GlobalTensor<DTYPE_Y> idxGm; // indices
+    AscendC::GlobalTensor<DTYPE_Z> outGm; // output
+
+    uint32_t totalIndices;
+    uint32_t tileNum;
+    uint32_t embDim;
+    uint32_t vocabSize;
+
+    uint32_t blockStart;
+    uint32_t blockCount;
+    uint32_t tileIdx;
+};
+
+extern "C" __global__ __aicore__ void embedding_custom(GM_ADDR weight, GM_ADDR indices, GM_ADDR output, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelEmbedding op;
+    op.Init(weight, indices, output,
+            tiling_data.totalIndices, tiling_data.tileNum,
+            tiling_data.embDim, tiling_data.vocabSize);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor embedding_custom_impl_npu(const at::Tensor& weight, const at::Tensor& indices) {
+    std::vector<int64_t> out_sizes = indices.sizes().vec();
+    out_sizes.push_back(weight.size(-1));
+    at::Tensor result = at::empty(out_sizes, weight.options());
+    EXEC_NPU_CMD(aclnnEmbeddingCustom, weight, indices, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("embedding_custom", &embedding_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("embedding_custom", &embedding_custom_impl_npu, "embedding(weight, indices)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(100000, 768)
+
+    def forward(self, indices):
+        # Ensure indices are int32 for the custom kernel
+        idx = indices.to(torch.int32)
+        return custom_ops_lib.embedding_custom(self.embedding.weight, idx)
+'''

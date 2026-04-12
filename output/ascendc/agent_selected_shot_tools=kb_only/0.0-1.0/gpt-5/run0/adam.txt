@@ -1,0 +1,423 @@
+project_json_src='''
+[
+    {
+        "op": "AdamCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "param",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "grad",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "m",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "attr": [
+            { "name": "beta1", "type": "float" },
+            { "name": "beta2", "type": "float" },
+            { "name": "lr",    "type": "float" },
+            { "name": "eps",   "type": "float" },
+            { "name": "step",  "type": "int" }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include \"register/tilingdata_base.h\"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(AdamCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(float, beta1);
+  TILING_DATA_FIELD_DEF(float, beta2);
+  TILING_DATA_FIELD_DEF(float, lr);
+  TILING_DATA_FIELD_DEF(float, eps);
+  TILING_DATA_FIELD_DEF(float, invDenomM); // 1 / (1 - beta1^step)
+  TILING_DATA_FIELD_DEF(float, invDenomV); // 1 / (1 - beta2^step)
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(AdamCustom, AdamCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include <cmath>
+#include \"adam_custom_tiling.h\"
+#include \"register/op_def_registry.h\"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    AdamCustomTilingData tiling;
+
+    // 获取输入总长度
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+
+    // 读取算子属性
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    float beta1 = 0.9f;
+    float beta2 = 0.999f;
+    float lr = 1e-3f;
+    float eps = 1e-8f;
+    int64_t step = 1;
+    if (attrs != nullptr) {
+        if (attrs->GetAttrNum() >= 5) {
+            beta1 = *(attrs->GetAttrPointer<float>(0));
+            beta2 = *(attrs->GetAttrPointer<float>(1));
+            lr    = *(attrs->GetAttrPointer<float>(2));
+            eps   = *(attrs->GetAttrPointer<float>(3));
+            step  = *(attrs->GetAttrPointer<int64_t>(4));
+        }
+    }
+
+    // 计算偏置校正分母的倒数，传给kernel减少计算
+    float denomM = 1.0f - std::pow(beta1, static_cast<double>(step));
+    float denomV = 1.0f - std::pow(beta2, static_cast<double>(step));
+    float invDenomM = 1.0f / denomM;
+    float invDenomV = 1.0f / denomV;
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_beta1(beta1);
+    tiling.set_beta2(beta2);
+    tiling.set_lr(lr);
+    tiling.set_eps(eps);
+    tiling.set_invDenomM(invDenomM);
+    tiling.set_invDenomV(invDenomV);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    // 输出 shape 与 param 相同
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class AdamCustom : public OpDef {
+public:
+    explicit AdamCustom(const char* name) : OpDef(name)
+    {
+        this->Input(\"param\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"grad\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"m\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"v\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output(\"out\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // 推理
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        // AICore&tiling
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig(\"ascend910b\");
+
+        // 属性声明（供Runtime传参）
+        this->Attr(\"beta1\").SetType(ge::DT_FLOAT);
+        this->Attr(\"beta2\").SetType(ge::DT_FLOAT);
+        this->Attr(\"lr\").SetType(ge::DT_FLOAT);
+        this->Attr(\"eps\").SetType(ge::DT_FLOAT);
+        this->Attr(\"step\").SetType(ge::DT_INT64);
+    }
+};
+
+OP_ADD(AdamCustom);
+}
+"""
+
+kernel_src="""
+#include \"kernel_operator.h\"
+
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor个数
+
+class KernelAdam {
+public:
+    __aicore__ inline KernelAdam() {}
+    __aicore__ inline void Init(GM_ADDR param, GM_ADDR grad, GM_ADDR m, GM_ADDR v, GM_ADDR out,
+                                uint32_t totalLength, uint32_t tileNum,
+                                float beta1, float beta2, float lr, float eps, float invDenomM, float invDenomV)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        this->beta1 = beta1;
+        this->beta2 = beta2;
+        this->oneMinusBeta1 = 1.0f - beta1;
+        this->oneMinusBeta2 = 1.0f - beta2;
+        this->lr = lr;
+        this->eps = eps;
+        this->invDenomM = invDenomM;
+        this->invDenomV = invDenomV;
+
+        paramGm.SetGlobalBuffer((__gm__ float *)param + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        gradGm.SetGlobalBuffer((__gm__ float *)grad + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        mGm.SetGlobalBuffer((__gm__ float *)m + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        vGm.SetGlobalBuffer((__gm__ float *)v + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        outGm.SetGlobalBuffer((__gm__ float *)out + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueParam, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueGrad,  BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueM,     BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueV,     BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueOut,  BUFFER_NUM, this->tileLength * sizeof(float));
+        // 临时缓冲队列
+        pipe.InitBuffer(tmpQueue1,    BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpQueue2,    BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpQueue3,    BUFFER_NUM, this->tileLength * sizeof(float));
+    }
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<float> pLocal = inQueueParam.AllocTensor<float>();
+        AscendC::LocalTensor<float> gLocal = inQueueGrad.AllocTensor<float>();
+        AscendC::LocalTensor<float> mLocal = inQueueM.AllocTensor<float>();
+        AscendC::LocalTensor<float> vLocal = inQueueV.AllocTensor<float>();
+
+        AscendC::DataCopy(pLocal, paramGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(gLocal, gradGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(mLocal, mGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(vLocal, vGm[progress * this->tileLength], this->tileLength);
+
+        inQueueParam.EnQue(pLocal);
+        inQueueGrad.EnQue(gLocal);
+        inQueueM.EnQue(mLocal);
+        inQueueV.EnQue(vLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<float> pLocal = inQueueParam.DeQue<float>();
+        AscendC::LocalTensor<float> gLocal = inQueueGrad.DeQue<float>();
+        AscendC::LocalTensor<float> mLocal = inQueueM.DeQue<float>();
+        AscendC::LocalTensor<float> vLocal = inQueueV.DeQue<float>();
+        AscendC::LocalTensor<float> outLocal = outQueueOut.AllocTensor<float>();
+
+        // 临时缓冲
+        AscendC::LocalTensor<float> tmp1 = tmpQueue1.AllocTensor<float>();
+        AscendC::LocalTensor<float> tmp2 = tmpQueue2.AllocTensor<float>();
+        AscendC::LocalTensor<float> tmp3 = tmpQueue3.AllocTensor<float>();
+
+        // m_new = beta1 * m + (1 - beta1) * grad
+        AscendC::Muls(tmp1, mLocal, this->beta1, this->tileLength);              // tmp1 = beta1 * m
+        AscendC::Muls(tmp2, gLocal, this->oneMinusBeta1, this->tileLength);      // tmp2 = (1-beta1) * grad
+        AscendC::Add(tmp3, tmp1, tmp2, this->tileLength);                        // tmp3 = m_new
+
+        // v_new = beta2 * v + (1 - beta2) * grad^2
+        AscendC::Mul(tmp2, gLocal, gLocal, this->tileLength);                    // tmp2 = grad^2
+        AscendC::Muls(tmp1, vLocal, this->beta2, this->tileLength);              // tmp1 = beta2 * v
+        AscendC::Muls(tmp2, tmp2, this->oneMinusBeta2, this->tileLength);        // tmp2 = (1-beta2) * grad^2
+        AscendC::Add(vLocal, tmp1, tmp2, this->tileLength);                      // vLocal = v_new
+
+        // m_hat = m_new / (1 - beta1^step)  => tmp3 = m_hat
+        AscendC::Muls(tmp3, tmp3, this->invDenomM, this->tileLength);
+
+        // v_hat = v_new / (1 - beta2^step)  => vLocal = v_hat
+        AscendC::Muls(vLocal, vLocal, this->invDenomV, this->tileLength);
+
+        // denom = sqrt(v_hat) + eps  => tmp2 = denom
+        AscendC::Sqrt(tmp2, vLocal, this->tileLength);
+        AscendC::Adds(tmp2, tmp2, this->eps, this->tileLength);
+
+        // update = lr * (m_hat / denom)  => tmp1 = update
+        AscendC::Div(tmp1, tmp3, tmp2, this->tileLength);
+        AscendC::Muls(tmp1, tmp1, this->lr, this->tileLength);
+
+        // out = param - update
+        AscendC::Sub(outLocal, pLocal, tmp1, this->tileLength);
+
+        outQueueOut.EnQue<float>(outLocal);
+        inQueueParam.FreeTensor(pLocal);
+        inQueueGrad.FreeTensor(gLocal);
+        inQueueM.FreeTensor(mLocal);
+        inQueueV.FreeTensor(vLocal);
+        tmpQueue1.FreeTensor(tmp1);
+        tmpQueue2.FreeTensor(tmp2);
+        tmpQueue3.FreeTensor(tmp3);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<float> outLocal = outQueueOut.DeQue<float>();
+        AscendC::DataCopy(outGm[progress * this->tileLength], outLocal, this->tileLength);
+        outQueueOut.FreeTensor(outLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN,   BUFFER_NUM> inQueueParam, inQueueGrad, inQueueM, inQueueV;
+    AscendC::TQue<AscendC::TPosition::VECOUT,  BUFFER_NUM> outQueueOut;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue1, tmpQueue2, tmpQueue3;
+
+    AscendC::GlobalTensor<float> paramGm;
+    AscendC::GlobalTensor<float> gradGm;
+    AscendC::GlobalTensor<float> mGm;
+    AscendC::GlobalTensor<float> vGm;
+    AscendC::GlobalTensor<float> outGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+
+    float beta1, beta2;
+    float oneMinusBeta1, oneMinusBeta2;
+    float lr, eps;
+    float invDenomM, invDenomV;
+};
+
+extern \"C\" __global__ __aicore__ void adam_custom(GM_ADDR param, GM_ADDR grad, GM_ADDR m, GM_ADDR v, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelAdam op;
+    op.Init(param, grad, m, v, out,
+            tiling_data.totalLength, tiling_data.tileNum,
+            tiling_data.beta1, tiling_data.beta2, tiling_data.lr, tiling_data.eps,
+            tiling_data.invDenomM, tiling_data.invDenomV);
+    if (TILING_KEY_IS(1)) {
+        op.Process();
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include \"pytorch_npu_helper.hpp\"
+#include <torch/extension.h>
+
+at::Tensor adam_custom_impl_npu(const at::Tensor& param, const at::Tensor& grad,
+                                const at::Tensor& m, const at::Tensor& v,
+                                double lr, double beta1, double beta2, double eps, int64_t step) {
+    at::Tensor result = at::empty_like(param);
+    EXEC_NPU_CMD(aclnnAdamCustom, param, grad, m, v, static_cast<float>(beta1),
+                 static_cast<float>(beta2), static_cast<float>(lr), static_cast<float>(eps),
+                 step, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"adam_custom\", &adam_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"adam_custom\", &adam_custom_impl_npu, \"Adam fused update\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, beta1=0.9, beta2=0.999, lr=1e-3, eps=1e-8, step=1):
+        super().__init__()
+        self.beta1 = float(beta1)
+        self.beta2 = float(beta2)
+        self.lr = float(lr)
+        self.eps = float(eps)
+        self.step = int(step)
+
+    def forward(self, param, grad, m, v):
+        return custom_ops_lib.adam_custom(param, grad, m, v,
+                                          self.lr, self.beta1, self.beta2, self.eps, self.step)
+'''

@@ -1,0 +1,382 @@
+project_json_src='''
+[
+    {
+        "op": "Conv2dGroupNormTanhHardSwishResidualAddLogSumExpCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x_conv",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "x_norm",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv2dGroupNormTanhHardSwishResidualAddLogSumExpCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, hw);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv2dGroupNormTanhHardSwishResidualAddLogSumExpCustom, Conv2dGroupNormTanhHardSwishResidualAddLogSumExpCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv2d_group_norm_tanh_hard_swish_residual_add_log_sum_exp_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 1;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv2dGroupNormTanhHardSwishResidualAddLogSumExpCustomTilingData tiling;
+    auto *shape0 = context->GetInputShape(0); // x_conv
+    auto dims = shape0->GetOriginShape().GetDims();
+    if (dims.size() != 4) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t n = static_cast<uint32_t>(dims[0]);
+    uint32_t c = static_cast<uint32_t>(dims[1]);
+    uint32_t h = static_cast<uint32_t>(dims[2]);
+    uint32_t w = static_cast<uint32_t>(dims[3]);
+    uint32_t hw = h * w;
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_hw(hw);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0); // N,C,H,W
+    auto dims = x_shape->GetOriginShape().GetDims();
+    if (dims.size() != 4) {
+        return GRAPH_FAILED;
+    }
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    std::vector<int64_t> out_dims = {dims[0], 1, dims[2], dims[3]}; // reduce along C with keepdim
+    y_shape->SetDim(out_dims);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv2dGroupNormTanhHardSwishResidualAddLogSumExpCustom : public OpDef {
+public:
+    explicit Conv2dGroupNormTanhHardSwishResidualAddLogSumExpCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x_conv")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("x_norm")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv2dGroupNormTanhHardSwishResidualAddLogSumExpCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv2d_group_norm_tanh_hard_swish_residual_add_log_sum_exp_custom_tiling_data.h"
+
+// 本算子输入：x_conv（NCHW）、x_norm（NCHW）
+// 输出：在C维做LogSumExp后的张量（N,1,H,W）
+// 内部计算：res = x_conv + hardswish(tanh(x_norm))
+// y = logsumexp(res, axis=C, keepdim=True)
+
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor数
+
+class KernelConv2dGroupNormTanhHardSwishResidualAddLogSumExp {
+public:
+    __aicore__ inline KernelConv2dGroupNormTanhHardSwishResidualAddLogSumExp() {}
+
+    __aicore__ inline void Init(GM_ADDR xConv, GM_ADDR xNorm, GM_ADDR yOut,
+                                uint32_t n, uint32_t c, uint32_t h, uint32_t w,
+                                uint32_t hw, uint32_t tileNum)
+    {
+        // 简化：BLOCK_DIM=1，按每个batch内的H*W分块
+        this->N = n; this->C = c; this->H = h; this->W = w; this->HW = hw;
+        this->tileNum = tileNum;
+        this->tileLength = (this->HW / tileNum) / BUFFER_NUM;
+        if (this->tileLength == 0) { this->tileLength = this->HW; }
+
+        xConvGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(xConv), static_cast<uint32_t>(N*C*HW));
+        xNormGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(xNorm), static_cast<uint32_t>(N*C*HW));
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(yOut), static_cast<uint32_t>(N*HW)); // N*1*H*W
+
+        // 输入两个队列，输出一个队列，另配一个计算队列做中间缓冲
+        pipe.InitBuffer(inQueueConv, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueNorm, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpQue, BUFFER_NUM * 2, this->tileLength * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t nIdx = 0; nIdx < N; ++nIdx) {
+            // 对单个batch内的H*W按tile处理
+            uint32_t loopCount = (this->HW + this->tileLength - 1) / this->tileLength;
+            for (uint32_t tileIdx = 0; tileIdx < loopCount; ++tileIdx) {
+                uint32_t posStart = tileIdx * this->tileLength;
+                uint32_t curLen = AscendC::min(this->tileLength, this->HW - posStart);
+                ComputeTile(nIdx, posStart, curLen);
+            }
+        }
+    }
+
+private:
+    __aicore__ inline void ComputeTile(uint32_t nIdx, uint32_t posStart, uint32_t curLen)
+    {
+        // 分配局部buffer
+        AscendC::LocalTensor<float> maxLocal = tmpQue.AllocTensor<float>();
+        AscendC::LocalTensor<float> sumLocal = tmpQue.AllocTensor<float>();
+
+        // 1) 第一轮：计算每个位置在C上的最大值 maxLocal
+        bool firstCh = true;
+        for (uint32_t cIdx = 0; cIdx < C; ++cIdx) {
+            // 从GM取当前(n,c)在[posStart, posStart+curLen)的切片（连续）
+            AscendC::LocalTensor<float> convLocal = inQueueConv.AllocTensor<float>();
+            AscendC::LocalTensor<float> normLocal = inQueueNorm.AllocTensor<float>();
+            uint32_t base = (nIdx * C + cIdx) * HW + posStart;
+            AscendC::DataCopy(convLocal, xConvGm[base], curLen);
+            AscendC::DataCopy(normLocal, xNormGm[base], curLen);
+            inQueueConv.EnQue(convLocal);
+            inQueueNorm.EnQue(normLocal);
+
+            // 计算 tanh -> hardswish -> residual
+            AscendC::LocalTensor<float> convLocalD = inQueueConv.DeQue<float>();
+            AscendC::LocalTensor<float> normLocalD = inQueueNorm.DeQue<float>();
+            AscendC::LocalTensor<float> resLocal = outQueueY.AllocTensor<float>(); // 复用输出队列做中间计算
+
+            // tanh
+            AscendC::Tanh(resLocal, normLocalD, curLen);
+            // hardswish(x) = x * relu6(x + 3) / 6
+            AscendC::HardSwish(resLocal, resLocal, curLen);
+            // residual add
+            AscendC::Add(resLocal, resLocal, convLocalD, curLen);
+
+            // 更新max
+            if (firstCh) {
+                AscendC::DataCopy(maxLocal, resLocal, curLen);
+                firstCh = false;
+            } else {
+                AscendC::Maximum(maxLocal, maxLocal, resLocal, curLen);
+            }
+
+            outQueueY.EnQue(resLocal);
+            outQueueY.DeQue<float>(); // 释放resLocal
+            inQueueConv.FreeTensor(convLocalD);
+            inQueueNorm.FreeTensor(normLocalD);
+        }
+
+        // 2) 第二轮：sumLocal = sum(exp(res - maxLocal))
+        bool firstSum = true;
+        for (uint32_t cIdx = 0; cIdx < C; ++cIdx) {
+            AscendC::LocalTensor<float> convLocal = inQueueConv.AllocTensor<float>();
+            AscendC::LocalTensor<float> normLocal = inQueueNorm.AllocTensor<float>();
+            uint32_t base = (nIdx * C + cIdx) * HW + posStart;
+            AscendC::DataCopy(convLocal, xConvGm[base], curLen);
+            AscendC::DataCopy(normLocal, xNormGm[base], curLen);
+            inQueueConv.EnQue(convLocal);
+            inQueueNorm.EnQue(normLocal);
+
+            AscendC::LocalTensor<float> convLocalD = inQueueConv.DeQue<float>();
+            AscendC::LocalTensor<float> normLocalD = inQueueNorm.DeQue<float>();
+            AscendC::LocalTensor<float> resLocal = outQueueY.AllocTensor<float>();
+            AscendC::LocalTensor<float> tmpLocal = tmpQue.AllocTensor<float>();
+
+            // tanh -> hardswish -> residual
+            AscendC::Tanh(resLocal, normLocalD, curLen);
+            AscendC::HardSwish(resLocal, resLocal, curLen);
+            AscendC::Add(resLocal, resLocal, convLocalD, curLen);
+
+            // exp(res - maxLocal)
+            AscendC::Sub(tmpLocal, resLocal, maxLocal, curLen);
+            AscendC::Exp(tmpLocal, tmpLocal, curLen);
+
+            if (firstSum) {
+                AscendC::DataCopy(sumLocal, tmpLocal, curLen);
+                firstSum = false;
+            } else {
+                AscendC::Add(sumLocal, sumLocal, tmpLocal, curLen);
+            }
+
+            tmpQue.FreeTensor(tmpLocal);
+            outQueueY.EnQue(resLocal);
+            outQueueY.DeQue<float>(); // 释放resLocal
+            inQueueConv.FreeTensor(convLocalD);
+            inQueueNorm.FreeTensor(normLocalD);
+        }
+
+        // 3) y = log(sumLocal) + maxLocal
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        AscendC::Log(yLocal, sumLocal, curLen);
+        AscendC::Add(yLocal, yLocal, maxLocal, curLen);
+
+        // 写回 (N,1,H,W) 的对应位置
+        uint32_t outBase = nIdx * HW + posStart;
+        AscendC::DataCopy(yGm[outBase], yLocal, curLen);
+
+        // 释放
+        outQueueY.EnQue(yLocal);
+        outQueueY.DeQue<float>();
+        tmpQue.FreeTensor(sumLocal);
+        tmpQue.FreeTensor(maxLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueConv, inQueueNorm;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM * 2> tmpQue;
+
+    AscendC::GlobalTensor<float> xConvGm;
+    AscendC::GlobalTensor<float> xNormGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t N, C, H, W, HW;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void conv2d_group_norm_tanh_hard_swish_residual_add_log_sum_exp_custom(
+    GM_ADDR xConv, GM_ADDR xNorm, GM_ADDR yOut, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    KernelConv2dGroupNormTanhHardSwishResidualAddLogSumExp op;
+    op.Init(xConv, xNorm, yOut,
+            tilingData.n, tilingData.c, tilingData.h, tilingData.w,
+            tilingData.hw, tilingData.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv2d_group_norm_tanh_hard_swish_residual_add_log_sum_exp_custom_impl_npu(
+    const at::Tensor& x_conv,
+    const at::Tensor& x_norm) {
+    // x_conv, x_norm: [N,C,H,W]
+    TORCH_CHECK(x_conv.sizes() == x_norm.sizes(), "x_conv and x_norm must have same shape");
+    auto sizes = x_conv.sizes();
+    at::Tensor result = at::empty({sizes[0], 1, sizes[2], sizes[3]}, x_conv.options());
+    EXEC_NPU_CMD(aclnnConv2dGroupNormTanhHardSwishResidualAddLogSumExpCustom, x_conv, x_norm, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv2d_group_norm_tanh_hard_swish_residual_add_log_sum_exp_custom",
+           &conv2d_group_norm_tanh_hard_swish_residual_add_log_sum_exp_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv2d_group_norm_tanh_hard_swish_residual_add_log_sum_exp_custom",
+          &conv2d_group_norm_tanh_hard_swish_residual_add_log_sum_exp_custom_impl_npu,
+          "Fused: tanh -> hardswish -> residual add -> logsumexp(C)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Fused custom NPU op replaces: Tanh -> HardSwish -> Residual Add -> LogSumExp.
+    Conv2d and GroupNorm remain as native modules.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, eps=1e-5):
+        super(ModelNew, self).__init__()
+        self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.group_norm = torch.nn.GroupNorm(groups, out_channels, eps=eps)
+
+    def forward(self, x):
+        x_conv = self.conv(x)           # [N,C,H,W]
+        x_norm = self.group_norm(x_conv)
+        # Fused custom op expects x_conv and x_norm, outputs [N,1,H,W]
+        y = custom_ops_lib.conv2d_group_norm_tanh_hard_swish_residual_add_log_sum_exp_custom(x_conv, x_norm)
+        return y
+'''

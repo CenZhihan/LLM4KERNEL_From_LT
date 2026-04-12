@@ -1,0 +1,295 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulWithIrregularShapesCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "a",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "c",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "graph/op_desc.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "lib/matmul_tiling_intf.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulWithIrregularShapesCustomTilingData)
+  TILING_DATA_FIELD_DEF(optiling::TCubeTiling, tiling);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulWithIrregularShapesCustom, MatmulWithIrregularShapesCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "matmul_with_irregular_shapes_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "graph/utils/type_utils.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "lib/matmul_tiling_intf.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 获取输入形状
+    const gert::Shape* a_shape = context->GetInputShape(0);
+    const gert::Shape* b_shape = context->GetInputShape(1);
+    if (a_shape->GetOriginShape().GetDimNum() != 2 || b_shape->GetOriginShape().GetDimNum() != 2) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t M = static_cast<uint32_t>(a_shape->GetOriginShape().GetDim(0));
+    uint32_t K = static_cast<uint32_t>(a_shape->GetOriginShape().GetDim(1));
+    uint32_t N = static_cast<uint32_t>(b_shape->GetOriginShape().GetDim(1));
+
+    // 构建平台信息
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+
+    // 使用多核Matmul Tiling以获得更优blockDim
+    matmul_tiling::MultiCoreMatmulTiling tiler(ascendcPlatform);
+    tiler.SetDim(1);  // 可按需调整，GetTiling后会给出实际核数
+    tiler.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    tiler.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    // 输出也使用FP16以便端到端兼容
+    tiler.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    tiler.SetBias(false);
+    tiler.SetShape(M, N, K);
+    tiler.SetSingleShape(M, N, K);
+    tiler.SetOrgShape(M, N, K);
+    tiler.SetBufferSpace(-1, -1, -1); // 默认使用AI Core可用全部空间
+
+    optiling::TCubeTiling tilingData;
+    int ret = tiler.GetTiling(tilingData);
+    if (ret != 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 设置blockDim
+    context->SetBlockDim(tiler.GetCoreNum());
+
+    // 序列化tiling到缓冲区
+    MatmulWithIrregularShapesCustomTilingData td;
+    td.set_tiling(tilingData);
+    td.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(td.GetDataSize());
+
+    // 无需workspace
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* a_shape = context->GetInputShape(0);
+    const gert::Shape* b_shape = context->GetInputShape(1);
+    if (a_shape->GetOriginShape().GetDimNum() != 2 || b_shape->GetOriginShape().GetDimNum() != 2) {
+        return GRAPH_FAILED;
+    }
+    int64_t M = a_shape->GetOriginShape().GetDim(0);
+    int64_t N = b_shape->GetOriginShape().GetDim(1);
+    gert::Shape* c_shape = context->GetOutputShape(0);
+    gert::Shape out;
+    out.SetDimNum(2);
+    out.SetDim(0, M);
+    out.SetDim(1, N);
+    c_shape->SetOriginShape(out);
+    c_shape->SetStorageShape(out);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // 统一输出为FP16以匹配核实现
+    context->SetOutputDataType(0, ge::DT_FLOAT16);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MatmulWithIrregularShapesCustom : public OpDef {
+public:
+    explicit MatmulWithIrregularShapesCustom(const char* name) : OpDef(name)
+    {
+        this->Input("a")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("c")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulWithIrregularShapesCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+#define __NPU_TILING__
+#include "matmul_with_irregular_shapes_custom_tiling_data.h"
+
+using namespace matmul;
+
+extern "C" __global__ __aicore__ void matmul_with_irregular_shapes_custom(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+{
+    // 从GM拷贝TCubeTiling
+    TCubeTiling tiling;
+    auto tgm = (__gm__ uint32_t*)tilingGM;
+    auto tl = (uint32_t*)&tiling;
+    for (int i = 0; i < (int)(sizeof(TCubeTiling) / sizeof(uint32_t)); ++i, ++tgm, ++tl) {
+        *tl = *tgm;
+    }
+
+    // 定义Matmul类型：A/B/C均为FP16，NORMAL布局
+    typedef MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half, false, LayoutMode::NORMAL> aType;
+    typedef MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half, false, LayoutMode::NORMAL> bType;
+    typedef MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half, false, LayoutMode::NORMAL> cType;
+
+    using A_T = typename aType::T;
+    using B_T = typename bType::T;
+    using C_T = typename cType::T;
+
+    // 初始化GM全局Tensor及大小
+    AscendC::GlobalTensor<A_T> aGlobal;
+    AscendC::GlobalTensor<B_T> bGlobal;
+    AscendC::GlobalTensor<C_T> cGlobal;
+
+    int32_t sizeA = tiling.ALayoutInfoB * tiling.singleCoreM * tiling.singleCoreK * sizeof(A_T);
+    int32_t sizeB = tiling.BLayoutInfoB * tiling.singleCoreK * tiling.singleCoreN * sizeof(B_T);
+    int32_t sizeC = tiling.CLayoutInfoB * tiling.singleCoreM * tiling.singleCoreN * sizeof(C_T);
+
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(aGM), sizeA);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(bGM), sizeB);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(cGM), sizeC);
+
+    int offset_a = 0, offset_b = 0, offset_c = 0;
+
+    AscendC::GlobalTensor<A_T> gm_a;
+    gm_a.SetGlobalBuffer(const_cast<__gm__ A_T*>(aGlobal[offset_a].GetPhyAddr()),
+                         tiling.singleCoreM * tiling.singleCoreK);
+
+    AscendC::GlobalTensor<B_T> gm_b;
+    gm_b.SetGlobalBuffer(const_cast<__gm__ B_T*>(bGlobal[offset_b].GetPhyAddr()),
+                         tiling.singleCoreK * tiling.singleCoreN);
+
+    AscendC::GlobalTensor<C_T> gm_c;
+    gm_c.SetGlobalBuffer(const_cast<__gm__ C_T*>(cGlobal[offset_c].GetPhyAddr()),
+                         tiling.singleCoreM * tiling.singleCoreN);
+
+    // 创建并初始化Matmul实例
+    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+    matmul::Matmul<aType, bType, cType, void, MM_CFG> mm;
+    TPipe pipe;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
+    mm.Init(&tiling);
+
+    // 配置A/B/C张量及工作区
+    mm.SetTensorA(gm_a, 0); // 不转置
+    mm.SetTensorB(gm_b, 0); // 不转置
+    mm.SetWorkspace(workspaceGM, 0);
+
+    // 执行一次Batch（等价单次Matmul）
+    mm.IterateBatch(gm_c, 1, 1, false);
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static at::Tensor to_half_if_needed(const at::Tensor& t) {
+    if (t.scalar_type() == at::kHalf) return t;
+    return t.to(at::kHalf);
+}
+
+at::Tensor matmul_with_irregular_shapes_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    // 内部以FP16计算
+    at::Tensor A_h = to_half_if_needed(A);
+    at::Tensor B_h = to_half_if_needed(B);
+    auto out_shape = std::vector<int64_t>{A_h.size(-2), B_h.size(-1)};
+    at::Tensor C_h = at::empty(out_shape, A_h.options().dtype(at::kHalf));
+
+    EXEC_NPU_CMD(aclnnMatmulWithIrregularShapesCustom, A_h, B_h, C_h);
+
+    // 若原始为FP32则回转
+    if (A.scalar_type() == at::kFloat) {
+        return C_h.to(at::kFloat);
+    }
+    return C_h;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_with_irregular_shapes_custom", &matmul_with_irregular_shapes_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_with_irregular_shapes_custom", &matmul_with_irregular_shapes_custom_impl_npu, "Matmul (irregular shapes)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A, B):
+        return custom_ops_lib.matmul_with_irregular_shapes_custom(A, B)
+'''

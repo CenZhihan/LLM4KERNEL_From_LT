@@ -1,0 +1,375 @@
+project_json_src='''
+[
+    {
+        "op": "TripletMarginLossCustom",
+        "input_desc": [
+            {
+                "name": "anchor",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "positive",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "negative",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "margin",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(TripletMarginLossCustomTilingData)
+    TILING_DATA_FIELD_DEF(uint32_t, batch);
+    TILING_DATA_FIELD_DEF(uint32_t, feat);
+    TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+    TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+    TILING_DATA_FIELD_DEF(uint32_t, lasttileLength);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(TripletMarginLossCustom, TripletMarginLossCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "triplet_margin_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <string.h>
+
+namespace optiling {
+const uint32_t BLOCK_SIZE = 32; // bytes
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    TripletMarginLossCustomTilingData tiling;
+    auto *shape0 = context->GetInputShape(0);
+    if (shape0 == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    auto storageShape = shape0->GetStorageShape();
+    uint64_t totalLength = storageShape.GetShapeSize();
+
+    // 获取batch和feat，假设输入为[batch, feat]或可展平为(batch, feat)
+    uint64_t batch = 1;
+    // 尝试获取第0维作为batch
+    // 如果无法获取维度接口，可在此根据业务场景自定义，这里假定能获取第0维
+    // 安全起见，当获取失败时，batch=1，feat=totalLength
+    try {
+        batch = storageShape.GetDim(0);
+    } catch (...) {
+        batch = 1;
+    }
+    if (batch == 0) batch = 1;
+    uint64_t feat = totalLength / batch;
+
+    // 对齐到数据块
+    uint32_t sizeofdatatype = 4; // float
+    uint32_t ALIGN_NUM = BLOCK_SIZE / sizeofdatatype; // 每个32B块包含的float个数 -> 8
+    // 选择UB块数量，使得tileLength = ub_block_num * ALIGN_NUM
+    uint32_t ub_block_num = 512;  // 512*8=4096 float，约16KB一块，预留空间用于临时缓冲
+    if (ub_block_num % 2 != 0) {
+        ub_block_num = ub_block_num - 1;
+    }
+
+    // 将feat对齐到ALIGN_NUM
+    uint64_t featAligned = (feat % ALIGN_NUM == 0) ? feat : ((feat + ALIGN_NUM - 1) / ALIGN_NUM) * ALIGN_NUM;
+
+    uint32_t tileLength = ub_block_num * ALIGN_NUM; // 4096
+    if (featAligned < tileLength) {
+        // 小于一个tile，取一个较小且对齐的长度
+        uint64_t tiles = (featAligned + ALIGN_NUM - 1) / ALIGN_NUM;
+        if (tiles == 0) tiles = 1;
+        if (tiles % 2 != 0) tiles += 1; // 保持偶数对齐
+        tileLength = (uint32_t)(tiles * ALIGN_NUM);
+    }
+
+    uint32_t tileNum = (uint32_t)((featAligned + tileLength - 1) / tileLength);
+    uint32_t lasttileLength = (uint32_t)(featAligned - (uint64_t)(tileNum - 1) * tileLength);
+    if (tileNum == 0) {
+        tileNum = 1;
+        lasttileLength = (uint32_t)featAligned;
+    }
+
+    tiling.set_batch((uint32_t)batch);
+    tiling.set_feat((uint32_t)feat);
+    tiling.set_tileNum(tileNum);
+    tiling.set_tileLength(tileLength);
+    tiling.set_lasttileLength(lasttileLength);
+
+    auto block_dim = 1;
+    context->SetBlockDim(block_dim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class TripletMarginLossCustom : public OpDef {
+public:
+    explicit TripletMarginLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("anchor")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("positive")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("negative")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        // 将margin作为第四个标量输入
+        this->Input("margin")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(TripletMarginLossCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelTripletMarginLoss {
+public:
+    __aicore__ inline KernelTripletMarginLoss() {}
+    __aicore__ inline void Init(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR margin,
+                                GM_ADDR y,
+                                uint32_t batch, uint32_t feat,
+                                uint32_t tileNum, uint32_t tileLength, uint32_t lasttileLength) {
+        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
+
+        this->batch = batch;
+        this->feat = feat;
+        this->tileNum = tileNum;
+        this->tileLength = tileLength;
+        this->lasttileLength = lasttileLength;
+
+        aGm.SetGlobalBuffer((__gm__ float*)anchor, (uint64_t)batch * feat);
+        pGm.SetGlobalBuffer((__gm__ float*)positive, (uint64_t)batch * feat);
+        nGm.SetGlobalBuffer((__gm__ float*)negative, (uint64_t)batch * feat);
+        marginGm.SetGlobalBuffer((__gm__ float*)margin, 1);
+        yGm.SetGlobalBuffer((__gm__ float*)y, 32);
+
+        pipe.InitBuffer(inQueue, BUFFER_NUM, this->tileLength * 4 * sizeof(float)); // a,p,n + tmp
+        pipe.InitBuffer(calcBuf, 64); // 小型计算缓冲
+    }
+
+    __aicore__ inline void Process() {
+        float total_sum = 0.0f;
+        float margin_val = 0.0f;
+
+        // 读取margin标量
+        {
+            AscendC::LocalTensor<float> cLocal = calcBuf.AllocTensor<float>();
+            AscendC::DataCopy(cLocal, marginGm, 1);
+            margin_val = cLocal.GetValue(0);
+        }
+
+        // 每个样本计算：hinge = relu(||a-p||_2 - ||a-n||_2 + margin)
+        for (uint32_t b = 0; b < this->batch; ++b) {
+            float sum_ap = 0.0f;
+            float sum_an = 0.0f;
+
+            for (uint32_t t = 0; t < this->tileNum; ++t) {
+                uint32_t len = (t == this->tileNum - 1) ? this->lasttileLength : this->tileLength;
+
+                AscendC::LocalTensor<float> buf = inQueue.AllocTensor<float>();
+                AscendC::LocalTensor<float> aLocal = buf;
+                AscendC::LocalTensor<float> pLocal = buf[this->tileLength];
+                AscendC::LocalTensor<float> nLocal = buf[this->tileLength * 2];
+                AscendC::LocalTensor<float> tmpLocal = buf[this->tileLength * 3];
+
+                uint64_t baseOffset = (uint64_t)b * this->feat + (uint64_t)t * this->tileLength;
+
+                AscendC::DataCopy(aLocal, aGm[baseOffset], len);
+                AscendC::DataCopy(pLocal, pGm[baseOffset], len);
+                AscendC::DataCopy(nLocal, nGm[baseOffset], len);
+
+                // diff_ap = (a - p)^2
+                AscendC::Sub(tmpLocal, aLocal, pLocal, len);
+                AscendC::Mul(tmpLocal, tmpLocal, tmpLocal, len);
+                // ReduceSum到tmpLocal[0]，使用pLocal作为临时缓冲
+                AscendC::ReduceSum<float>(tmpLocal, tmpLocal, pLocal, len);
+                sum_ap += tmpLocal.GetValue(0);
+
+                // diff_an = (a - n)^2
+                AscendC::Sub(tmpLocal, aLocal, nLocal, len);
+                AscendC::Mul(tmpLocal, tmpLocal, tmpLocal, len);
+                // ReduceSum到tmpLocal[0]，使用nLocal作为临时缓冲
+                AscendC::ReduceSum<float>(tmpLocal, tmpLocal, nLocal, len);
+                sum_an += tmpLocal.GetValue(0);
+
+                inQueue.FreeTensor(buf);
+            }
+
+            // 计算 sqrt(sum_ap + eps) 和 sqrt(sum_an + eps) 以及 hinge
+            const float eps = 1e-6f;
+            AscendC::LocalTensor<float> calc = calcBuf.AllocTensor<float>();
+            AscendC::LocalTensor<float> c0 = calc;        // 存放dap
+            AscendC::LocalTensor<float> c1 = calc[1];     // 存放dan
+            AscendC::LocalTensor<float> c2 = calc[2];     // 临时margin张量
+            AscendC::LocalTensor<float> c3 = calc[3];     // 减法/加法临时
+
+            c0.SetValue(0, sum_ap + eps);
+            c1.SetValue(0, sum_an + eps);
+
+            // 开平方
+            AscendC::Sqrt(c0, c0, 1);
+            AscendC::Sqrt(c1, c1, 1);
+
+            // c3 = c0 - c1
+            AscendC::Sub(c3, c0, c1, 1);
+            // c2 = margin_val
+            c2.SetValue(0, margin_val);
+            // c3 = c3 + margin
+            AscendC::Add(c3, c3, c2, 1);
+            // ReLU以获得hinge
+            AscendC::Relu(c3, c3, 1);
+
+            total_sum += c3.GetValue(0);
+        }
+
+        // 取batch均值
+        AscendC::LocalTensor<float> outLocal = calcBuf.AllocTensor<float>();
+        AscendC::LocalTensor<float> denomLocal = calcBuf.AllocTensor<float>();
+        outLocal.SetValue(0, total_sum);
+        denomLocal.SetValue(0, (float)this->batch);
+        AscendC::Div(outLocal, outLocal, denomLocal, 1);
+
+        // 写回输出标量
+        yGm.SetValue(0, outLocal.GetValue(0));
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueue;
+    AscendC::TBuf<> calcBuf;
+
+    AscendC::GlobalTensor<float> aGm;
+    AscendC::GlobalTensor<float> pGm;
+    AscendC::GlobalTensor<float> nGm;
+    AscendC::GlobalTensor<float> marginGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t batch;
+    uint32_t feat;
+    uint32_t tileNum;
+    uint32_t tileLength;
+    uint32_t lasttileLength;
+};
+
+extern "C" __global__ __aicore__ void triplet_margin_loss_custom(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR margin, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelTripletMarginLoss op;
+    op.Init(anchor, positive, negative, margin, y,
+            tiling_data.batch, tiling_data.feat,
+            tiling_data.tileNum, tiling_data.tileLength, tiling_data.lasttileLength);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor triplet_margin_loss_impl_npu(const at::Tensor& anchor, const at::Tensor& positive, const at::Tensor& negative, const at::Tensor& margin) {
+    at::Tensor result = at::empty({}, anchor.options());
+    EXEC_NPU_CMD(aclnnTripletMarginLossCustom, anchor, positive, negative, margin, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("triplet_margin_loss_custom", &triplet_margin_loss_impl_npu);
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("triplet_margin_loss_custom", &triplet_margin_loss_impl_npu, "triplet margin loss");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, margin: float = 1.0):
+        super(ModelNew, self).__init__()
+        self.margin = float(margin)
+
+    def forward(self, anchor: torch.Tensor, positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
+        margin_tensor = torch.tensor([self.margin], dtype=anchor.dtype, device=anchor.device)
+        return custom_ops_lib.triplet_margin_loss_custom(anchor, positive, negative, margin_tensor)
+'''

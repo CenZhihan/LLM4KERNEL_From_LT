@@ -1,0 +1,359 @@
+project_json_src='''
+[
+    {
+        "op": "MseLossCustom",
+        "input_desc": [
+            {
+                "name": "predict",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "label",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MseLossCustomTilingData)
+    TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+    TILING_DATA_FIELD_DEF(uint32_t, blockLength);
+    TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+    TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+    TILING_DATA_FIELD_DEF(uint32_t, lasttileLength);
+    TILING_DATA_FIELD_DEF(uint32_t, sumTmpSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MseLossCustom, MseLossCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "mse_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+#include <algorithm>
+
+namespace optiling {
+const uint32_t BLOCK_SIZE = 32; // bytes
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MseLossCustomTilingData tiling;
+    // 输入元素总数（按存储形状）
+    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetStorageShape().GetShapeSize());
+    tiling.set_totalLength(totalLength);
+
+    // 当前使用float32
+    const uint32_t sizeofdatatype = 4;
+    const uint32_t ALIGN_NUM = BLOCK_SIZE / sizeofdatatype; // 对齐到32字节
+    uint32_t totalLengthAligned = (totalLength % ALIGN_NUM == 0)
+        ? totalLength
+        : ((totalLength + ALIGN_NUM - 1) / ALIGN_NUM) * ALIGN_NUM;
+
+    // 简单设置1个block
+    uint32_t block_dim = 1;
+    context->SetBlockDim(block_dim);
+
+    // 设定UB可容纳的对齐块数（经验值，可根据平台实际UB余量调整）
+    uint32_t ub_block_num = 1024;
+    if (ub_block_num % 2 != 0) {
+        ub_block_num -= 1;
+    }
+
+    uint32_t blockLength = totalLengthAligned / block_dim;
+    uint32_t tile_num = blockLength / ALIGN_NUM / ub_block_num;
+
+    uint32_t tileLength = 0;
+    uint32_t lasttileLength = 0;
+
+    if ((blockLength / ALIGN_NUM) % ub_block_num == 0 || tile_num == 0) {
+        if (tile_num == 0) {
+            tile_num = 1;
+        }
+        if (blockLength < ub_block_num * ALIGN_NUM) {
+            tileLength = ((blockLength / ALIGN_NUM) + 1) / 2 * 2 * ALIGN_NUM;
+            lasttileLength = tileLength;
+        } else {
+            tileLength = ub_block_num * ALIGN_NUM;
+            lasttileLength = tileLength;
+        }
+    } else {
+        tile_num = tile_num + 1;
+        tileLength = ub_block_num * ALIGN_NUM;
+        lasttileLength = blockLength - (tile_num - 1) * tileLength;
+    }
+
+    tiling.set_blockLength(blockLength);
+    tiling.set_tileNum(tile_num);
+    tiling.set_tileLength(tileLength);
+    tiling.set_lasttileLength(lasttileLength);
+
+    // 为Sum高阶API预留临时空间（采用框架分配方式），选择tile与最终归并两个阶段的n取较大者
+    uint32_t maxValue = 0, minValue = 0;
+    uint32_t maxValue2 = 0, minValue2 = 0;
+    AscendC::GetSumMaxMinTmpSize(tileLength, sizeofdatatype, false, maxValue, minValue);
+    // 最终阶段将tile_num个分块和再做一次Sum
+    uint32_t finalReduceN = std::max(1u, tile_num);
+    AscendC::GetSumMaxMinTmpSize(finalReduceN, sizeofdatatype, false, maxValue2, minValue2);
+    uint32_t sumTmpSize = std::max(minValue, minValue2);
+    tiling.set_sumTmpSize(sumTmpSize);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MseLossCustom : public OpDef {
+public:
+    explicit MseLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("predict")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("label")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MseLossCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelMseLoss {
+public:
+    __aicore__ inline KernelMseLoss() {}
+
+    __aicore__ inline void Init(GM_ADDR predict, GM_ADDR label, GM_ADDR y,
+                                uint32_t totalLength, uint32_t blockLength,
+                                uint32_t tileNum, uint32_t tileLength,
+                                uint32_t lasttileLength, uint32_t sumTmpSize) {
+        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
+
+        this->totalLength = totalLength;
+        this->blockLength = blockLength;
+        this->tileNum = tileNum;
+        this->tileLength = tileLength / BUFFER_NUM;
+        this->lasttileLength = lasttileLength;
+        this->sumTmpSize = sumTmpSize;
+
+        // GM指针设置（单block）
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(predict) + this->blockLength * AscendC::GetBlockIdx(),
+                            this->blockLength);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(label) + this->blockLength * AscendC::GetBlockIdx(),
+                            this->blockLength);
+        outGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y) + this->blockLength * AscendC::GetBlockIdx(), 1);
+
+        // 对齐后的inner
+        tileInner = AlignInner(this->tileLength);
+        reduceNum = (this->tileNum == 0) ? 1 : this->tileNum;
+        reduceInner = AlignInner(reduceNum);
+
+        // 缓冲区初始化
+        pipe.InitBuffer(inQueue, BUFFER_NUM, tileInner * 2 * sizeof(float));                // 两份输入
+        pipe.InitBuffer(sumWorkQueue, 1, this->sumTmpSize);                                 // Sum框架临时空间
+        pipe.InitBuffer(tmpScalarQueue, 1, AscendC::ONE_BLK_SIZE);                          // 标量对齐空间
+        pipe.InitBuffer(partialQueue, 1, reduceInner * sizeof(float));                      // 分块和数组
+    }
+
+    __aicore__ inline void Process() {
+        // 预分配分块和数组，并置零（对齐长度）
+        AscendC::LocalTensor<float> partialLocal = partialQueue.AllocTensor<float>();
+        AscendC::Duplicate<float>(partialLocal, 0.0f, reduceInner);
+
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            CopyIn(i);
+            Compute(i, partialLocal);
+        }
+
+        // 对分块和再次求和
+        AscendC::LocalTensor<uint8_t> workLocal = sumWorkQueue.AllocTensor<uint8_t>();
+        AscendC::LocalTensor<float> finalLocal = tmpScalarQueue.AllocTensor<float>();
+
+        AscendC::SumParams params2{1, static_cast<uint32_t>(reduceInner), static_cast<uint32_t>(reduceNum)};
+        AscendC::Sum<float>(finalLocal, partialLocal, params2);
+
+        // 求均值：除以总长度（使用Muls乘以倒数）
+        float inv_len = 1.0f / static_cast<float>(this->totalLength);
+        AscendC::Muls<float>(finalLocal, finalLocal, inv_len, 1);
+
+        // 写回GM
+        AscendC::DataCopy(outGm, finalLocal, 1);
+
+        // 释放本地tensor
+        tmpScalarQueue.FreeTensor(finalLocal);
+        sumWorkQueue.FreeTensor(workLocal);
+        partialQueue.FreeTensor(partialLocal);
+    }
+
+private:
+    __aicore__ inline uint32_t AlignInner(uint32_t n) const {
+        return (n * sizeof(float) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(float);
+    }
+
+    __aicore__ inline uint32_t CurrentTileLen(int32_t progress) const {
+        return (progress == static_cast<int32_t>(this->tileNum) - 1) ? this->lasttileLength : this->tileLength;
+    }
+
+    __aicore__ inline void CopyIn(int32_t progress) {
+        AscendC::LocalTensor<float> inLocal = inQueue.AllocTensor<float>();
+        uint32_t n = CurrentTileLen(progress);
+        uint32_t offset = (progress == static_cast<int32_t>(this->tileNum) - 1 && progress != 0)
+                        ? (progress - 1) * this->tileLength + this->lasttileLength
+                        : progress * this->tileLength;
+
+        AscendC::DataCopy(inLocal, xGm[offset], n);                         // 预测
+        AscendC::DataCopy(inLocal[tileInner], yGm[offset], n);              // 标签
+        inQueue.EnQue(inLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t progress, AscendC::LocalTensor<float> &partialLocal) {
+        AscendC::LocalTensor<float> inLocal = inQueue.DeQue<float>();
+        uint32_t n = CurrentTileLen(progress);
+
+        AscendC::LocalTensor<float> predLocal = inLocal;
+        AscendC::LocalTensor<float> labelLocal = inLocal[tileInner];
+        AscendC::LocalTensor<float> diffLocal = predLocal;                  // 复用predLocal空间
+
+        // diff = pred - label
+        AscendC::Sub<float>(diffLocal, predLocal, labelLocal, n);
+        // diff = diff * diff
+        AscendC::Mul<float>(diffLocal, diffLocal, diffLocal, n);
+
+        // 每个tile内做一次Sum，得到1个标量
+        AscendC::LocalTensor<uint8_t> workLocal = sumWorkQueue.AllocTensor<uint8_t>();
+        AscendC::LocalTensor<float> tileSumLocal = tmpScalarQueue.AllocTensor<float>();
+        AscendC::SumParams params{1, static_cast<uint32_t>(tileInner), n};
+        AscendC::Sum<float>(tileSumLocal, diffLocal, params);
+
+        // 写入分块和数组
+        partialLocal.SetValue(progress, tileSumLocal.GetValue(0));
+
+        // 释放
+        tmpScalarQueue.FreeTensor(tileSumLocal);
+        sumWorkQueue.FreeTensor(workLocal);
+        inQueue.FreeTensor(inLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> sumWorkQueue;     // 预留给Sum框架的临时空间
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpScalarQueue; // 标量对齐缓冲
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> partialQueue;   // 分块和数组
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+    AscendC::GlobalTensor<float> outGm;
+
+    uint32_t totalLength = 0;
+    uint32_t blockLength = 0;
+    uint32_t tileNum = 0;
+    uint32_t tileLength = 0;
+    uint32_t lasttileLength = 0;
+    uint32_t sumTmpSize = 0;
+
+    uint32_t tileInner = 0;
+    uint32_t reduceNum = 0;
+    uint32_t reduceInner = 0;
+};
+
+extern "C" __global__ __aicore__ void mse_loss_custom(GM_ADDR predict, GM_ADDR label, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMseLoss op;
+    op.Init(predict, label, y,
+            tiling_data.totalLength,
+            tiling_data.blockLength,
+            tiling_data.tileNum,
+            tiling_data.tileLength,
+            tiling_data.lasttileLength,
+            tiling_data.sumTmpSize);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor mse_loss_impl_npu(const at::Tensor& predict, const at::Tensor& label) {
+    at::Tensor result = at::empty({}, predict.options());
+    EXEC_NPU_CMD(aclnnMseLossCustom, predict, label, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("mse_loss_custom", &mse_loss_impl_npu);
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mse_loss_custom", &mse_loss_impl_npu, "mse loss");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.mse_loss_custom(predictions, targets)
+'''

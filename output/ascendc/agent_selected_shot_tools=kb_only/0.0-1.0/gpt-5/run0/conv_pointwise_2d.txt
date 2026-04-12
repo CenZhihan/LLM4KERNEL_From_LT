@@ -1,0 +1,350 @@
+project_json_src='''
+[
+    {
+        "op": "ConvPointwise2dCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x2d",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            },
+            {
+                "name": "weight_ktn",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y2d",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvPointwise2dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, tileM);
+  TILING_DATA_FIELD_DEF(uint32_t, tileN);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvPointwise2dCustom, ConvPointwise2dCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_pointwise_2d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static constexpr uint32_t BLOCKS = 8;
+static constexpr uint32_t DEFAULT_TILE_M = 64; // simple tiling along M
+static constexpr uint32_t DEFAULT_TILE_N = 64; // simple tiling along N
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvPointwise2dCustomTilingData tiling;
+    // x2d shape: [m, k]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1); // weight_ktn shape: [k, n]
+
+    if (x_shape == nullptr || w_shape == nullptr || x_shape->GetOriginShape().GetDimNum() != 2 || w_shape->GetOriginShape().GetDimNum() != 2) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint64_t m = x_shape->GetOriginShape().GetDim(0);
+    uint64_t k = x_shape->GetOriginShape().GetDim(1);
+    uint64_t k_w = w_shape->GetOriginShape().GetDim(0);
+    uint64_t n = w_shape->GetOriginShape().GetDim(1);
+    if (k != k_w) {
+        return ge::GRAPH_FAILED;
+    }
+
+    context->SetBlockDim(BLOCKS);
+    tiling.set_m(static_cast<uint32_t>(m));
+    tiling.set_k(static_cast<uint32_t>(k));
+    tiling.set_n(static_cast<uint32_t>(n));
+    tiling.set_tileM(DEFAULT_TILE_M);
+    tiling.set_tileN(DEFAULT_TILE_N);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0); // [m, k]
+    const gert::Shape* w_shape = context->GetInputShape(1); // [k, n]
+    if (x_shape == nullptr || w_shape == nullptr || x_shape->GetOriginShape().GetDimNum() != 2 || w_shape->GetOriginShape().GetDimNum() != 2) {
+        return GRAPH_FAILED;
+    }
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    uint64_t m = x_shape->GetOriginShape().GetDim(0);
+    uint64_t n = w_shape->GetOriginShape().GetDim(1);
+    gert::Shape out({static_cast<int64_t>(m), static_cast<int64_t>(n)});
+    *y_shape = out;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    // output is float32
+    context->SetOutputDataType(0, ge::DT_FLOAT);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvPointwise2dCustom : public OpDef {
+public:
+    explicit ConvPointwise2dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x2d")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight_ktn")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y2d")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvPointwise2dCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+// Simple tiled GEMM for pointwise conv (1x1): C[m, n] = A[m, k] * B[k, n]
+// A: half, B: half, C: float
+// Input x2d: [m, k] in row-major (after NHWC->(m,k) packing on host)
+// Input weight_ktn: [k, n] in row-major (after transpose on host)
+// Output y2d: [m, n] in row-major
+
+struct PWConvTiling {
+    uint32_t m;
+    uint32_t k;
+    uint32_t n;
+    uint32_t tileM;
+    uint32_t tileN;
+};
+
+class KernelPWConv1x1 {
+public:
+    __aicore__ inline KernelPWConv1x1() {}
+
+    __aicore__ inline void Init(GM_ADDR aGm, GM_ADDR bGm, GM_ADDR cGm, GM_ADDR tilingGm)
+    {
+        // Load tiling data
+        GET_TILING_DATA(tilingData, tilingGm);
+        this->m_ = tilingData.m;
+        this->k_ = tilingData.k;
+        this->n_ = tilingData.n;
+        this->tileM_ = tilingData.tileM;
+        this->tileN_ = tilingData.tileN;
+
+        aGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(aGm), (uint64_t)m_ * k_);
+        bGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(bGm), (uint64_t)k_ * n_);
+        cGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(cGm), (uint64_t)m_ * n_);
+
+        // Allocate buffers for one tile
+        // A tile: tileM x k; B tile: k x tileN; C tile: tileM x tileN
+        pipe_.InitBuffer(aQue_, 1, (uint64_t)tileM_ * k_ * sizeof(half));
+        pipe_.InitBuffer(bQue_, 1, (uint64_t)k_ * tileN_ * sizeof(half));
+        pipe_.InitBuffer(cQue_, 1, (uint64_t)tileM_ * tileN_ * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t mo = 0; mo < m_; mo += tileM_) {
+            uint32_t tm = AscendC::Min(tileM_, m_ - mo);
+            for (uint32_t no = 0; no < n_; no += tileN_) {
+                uint32_t tn = AscendC::Min(tileN_, n_ - no);
+                ComputeTile(mo, no, tm, tn);
+            }
+        }
+    }
+
+private:
+    __aicore__ inline void ComputeTile(uint32_t mo, uint32_t no, uint32_t tm, uint32_t tn)
+    {
+        // Copy A tile [tm, k] contiguous
+        AscendC::LocalTensor<half> aLocal = aQue_.AllocTensor<half>();
+        AscendC::DataCopy(aLocal, aGlobal_[static_cast<uint64_t>(mo) * k_], static_cast<uint64_t>(tm) * k_);
+
+        // Copy B tile [k, tn] row-by-row due to stride in global
+        AscendC::LocalTensor<half> bLocal = bQue_.AllocTensor<half>();
+        for (uint32_t i = 0; i < k_; ++i) {
+            AscendC::DataCopy(bLocal[i * tn], bGlobal_[static_cast<uint64_t>(i) * n_ + no], tn);
+        }
+
+        aQue_.EnQue(aLocal);
+        bQue_.EnQue(bLocal);
+
+        // GEMM on the tile: C_tile[tm, tn] = A_tile[tm, k] * B_tile[k, tn]
+        aLocal = aQue_.DeQue<half>();
+        bLocal = bQue_.DeQue<half>();
+        AscendC::LocalTensor<float> cLocal = cQue_.AllocTensor<float>();
+
+        AscendC::GemmTiling gtiling = AscendC::GetGemmTiling<half>(tm, k_, tn);
+        // overwrite dst, not accumulate
+        AscendC::Gemm(cLocal, aLocal, bLocal, tm, k_, tn, gtiling, false, 1);
+
+        cQue_.EnQue<float>(cLocal);
+        aQue_.FreeTensor(aLocal);
+        bQue_.FreeTensor(bLocal);
+
+        // Copy C tile back to GM row-by-row, as each row length is tn with stride n_
+        cLocal = cQue_.DeQue<float>();
+        for (uint32_t r = 0; r < tm; ++r) {
+            AscendC::DataCopy(cGlobal_[static_cast<uint64_t>(mo + r) * n_ + no], cLocal[r * tn], tn);
+        }
+        cQue_.FreeTensor(cLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> aQue_, bQue_;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> cQue_;
+
+    AscendC::GlobalTensor<half> aGlobal_;
+    AscendC::GlobalTensor<half> bGlobal_;
+    AscendC::GlobalTensor<float> cGlobal_;
+
+    uint32_t m_{0}, k_{0}, n_{0}, tileM_{0}, tileN_{0};
+};
+
+extern "C" __global__ __aicore__ void conv_pointwise_2d_custom(GM_ADDR x2d, GM_ADDR w_ktn, GM_ADDR y2d, GM_ADDR workspace, GM_ADDR tiling) {
+    KernelPWConv1x1 op;
+    op.Init(x2d, w_ktn, y2d, tiling);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline at::Tensor call_kernel(const at::Tensor& x2d_half, const at::Tensor& w_ktn_half, at::Tensor& y2d_float) {
+    EXEC_NPU_CMD(aclnnConvPointwise2dCustom, x2d_half, w_ktn_half, y2d_float);
+    return y2d_float;
+}
+
+at::Tensor conv_pointwise_2d_custom_impl_npu(const at::Tensor& x_nchw, const at::Tensor& weight_oihw, c10::optional<at::Tensor> bias_opt) {
+    TORCH_CHECK(x_nchw.dim() == 4, "x must be 4D NCHW");
+    TORCH_CHECK(weight_oihw.dim() == 4 && weight_oihw.size(2) == 1 && weight_oihw.size(3) == 1, "weight must be 1x1 Conv2d filter");
+    auto N = x_nchw.size(0);
+    auto C = x_nchw.size(1);
+    auto H = x_nchw.size(2);
+    auto W = x_nchw.size(3);
+    auto OC = weight_oihw.size(0);
+    auto IC = weight_oihw.size(1);
+    TORCH_CHECK(C == IC, "in_channels mismatch");
+
+    // Pack input to [m, k] with channels-last for contiguous rows
+    auto x_nhwc = x_nchw.permute({0, 2, 3, 1}).contiguous();
+    auto x2d = x_nhwc.view({N * H * W, C});
+    auto x2d_half = x2d.to(at::kHalf);
+
+    // Prepare weight to [k, n] = [inC, outC]
+    auto w2d = weight_oihw.view({OC, IC}).permute({1, 0}).contiguous();
+    auto w_ktn_half = w2d.to(at::kHalf);
+
+    // Output [m, n] float32
+    auto y2d = at::empty({N * H * W, OC}, x_nchw.options().dtype(at::kFloat));
+
+    call_kernel(x2d_half, w_ktn_half, y2d);
+
+    // Optional bias add on host
+    if (bias_opt.has_value() && bias_opt.value().defined()) {
+        auto bias = bias_opt.value().to(at::kFloat);
+        y2d.add_(bias); // broadcast add along last dim
+    }
+
+    auto y_nhwc = y2d.view({N, H, W, OC});
+    auto y_nchw = y_nhwc.permute({0, 3, 1, 2}).contiguous();
+    return y_nchw;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_pointwise_2d_custom", &conv_pointwise_2d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_pointwise_2d_custom", &conv_pointwise_2d_custom_impl_npu, "Pointwise Conv2d 1x1 via custom AscendC kernel");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized 1x1 pointwise Conv2d using custom AscendC kernel.
+    """
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.weight = torch.nn.Parameter(torch.empty(out_channels, in_channels, 1, 1))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+        torch.nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        if self.bias is not None:
+            fan_in = in_channels
+            bound = 1 / (fan_in ** 0.5)
+            torch.nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.conv_pointwise_2d_custom(x, self.weight, self.bias)
+'''

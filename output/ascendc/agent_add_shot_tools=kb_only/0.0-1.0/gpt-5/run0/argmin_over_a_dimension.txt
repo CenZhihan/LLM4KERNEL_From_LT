@@ -3,12 +3,6 @@ project_json_src='''
     {
         "op": "ArgminOverADimensionCustom",
         "language": "cpp",
-        "attr": [
-            {
-                "name": "dim",
-                "type": "int"
-            }
-        ],
         "input_desc": [
             {
                 "name": "x",
@@ -19,11 +13,21 @@ project_json_src='''
                 "type": [
                     "float"
                 ]
+            },
+            {
+                "name": "dim",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
             }
         ],
         "output_desc": [
             {
-                "name": "index",
+                "name": "idx",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -39,14 +43,26 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ArgminOverADimensionCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, outter);     // product of dims before 'dim'
-  TILING_DATA_FIELD_DEF(uint32_t, n);          // length along 'dim'
-  TILING_DATA_FIELD_DEF(uint32_t, inner);      // product of dims after 'dim'
-  TILING_DATA_FIELD_DEF(uint32_t, tileInner);  // tile size along 'inner'
-  TILING_DATA_FIELD_DEF(int32_t, dim);         // normalized dim
+  // 输入张量三维尺寸
+  TILING_DATA_FIELD_DEF(int32_t, d0);
+  TILING_DATA_FIELD_DEF(int32_t, d1);
+  TILING_DATA_FIELD_DEF(int32_t, d2);
+
+  // 仅支持按维度1（中间维度）取argmin的示例实现
+  TILING_DATA_FIELD_DEF(int32_t, axis);    // 固定为1
+
+  // TopK所需参数（k=1, isLargest=false, isInitIndex=false）
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(bool, islargest);
+  TILING_DATA_FIELD_DEF(bool, isinitindex);
+
+  // TopK Tiling（按行处理一行(outter=1)）
+  TILING_DATA_FIELD_DEF(uint32_t, tmpsize_axis1);
+  TILING_DATA_FIELD_DEF_STRUCT(TopkTiling, topkTilingAxis1);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ArgminOverADimensionCustom, ArgminOverADimensionCustomTilingData)
@@ -58,107 +74,118 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 #include "tiling/tiling_api.h"
 
-namespace {
-inline uint32_t ProdDims(const gert::StorageShape &shape, uint32_t start, uint32_t end) {
-    uint32_t p = 1;
-    for (uint32_t i = start; i < end; ++i) {
-        p *= static_cast<uint32_t>(shape.GetDim(i));
-    }
-    return p;
-}
-}
-
 namespace optiling {
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    ArgminOverADimensionCustomTilingData tiling;
-
-    const gert::StorageShape* x_shape = context->GetInputShape(0);
-    const auto &shape = x_shape->GetStorageShape();
-    uint32_t rank = static_cast<uint32_t>(shape.GetDimNum());
-
-    const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    int64_t dimAttr = 0;
-    if (attrs != nullptr && attrs->GetAttrNum() >= 1) {
-        dimAttr = *(attrs->GetAttrPointer<int64_t>(0));
+    // 读取输入形状，假设为三维 [d0, d1, d2]
+    const gert::Shape* inShape = context->GetInputShape(0);
+    if (inShape->GetOriginShape().GetDimNum() != 3) {
+        // 简化示例：仅支持3D输入
+        return ge::GRAPH_FAILED;
     }
-    // normalize dim
-    int32_t dim = static_cast<int32_t>(dimAttr < 0 ? (dimAttr + rank) : dimAttr);
-    if (dim < 0) dim = 0;
-    if (dim >= static_cast<int32_t>(rank)) dim = static_cast<int32_t>(rank) - 1;
+    int64_t d0 = inShape->GetOriginShape().GetDim(0);
+    int64_t d1 = inShape->GetOriginShape().GetDim(1);
+    int64_t d2 = inShape->GetOriginShape().GetDim(2);
 
-    uint32_t outter = (dim == 0) ? 1 : ProdDims(shape, 0, static_cast<uint32_t>(dim));
-    uint32_t n = static_cast<uint32_t>(shape.GetDim(dim));
-    uint32_t inner = (static_cast<uint32_t>(dim) + 1 >= rank) ? 1 : ProdDims(shape, static_cast<uint32_t>(dim) + 1, rank);
+    // 本示例固定按维度1执行argmin（与给定模型中的dim=1一致）
+    const int32_t axis = 1;
+    const uint32_t inner_axis1 = static_cast<uint32_t>(d1); // 被约简的维度长度
+    const uint32_t outter_per_call = 1; // TopK每次只处理1行
 
-    // simple tiling: process full inner in one tile (fits typical UB for float/int)
-    uint32_t tileInner = inner == 0 ? 1 : inner;
+    // TopK参数
+    const uint32_t k = 1;
+    const bool isLargest = false;       // argmin => isLargest=false
+    const bool isInitIndex = false;     // 索引由TopK自动生成
+    auto platformInfo = context->GetPlatformInfo();
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
 
-    // choose a reasonable block dim by outter
-    uint32_t blockDim = outter >= 8 ? 8 : (outter == 0 ? 1 : outter);
-    context->SetBlockDim(blockDim);
+    // 选择TopK模式：若inner为32可用NSMALL，否则NORMAL
+    AscendC::TopKMode mode_axis1 = (inner_axis1 == 32) ? AscendC::TopKMode::TOPK_NSMALL : AscendC::TopKMode::TOPK_NORMAL;
 
-    tiling.set_outter(outter);
-    tiling.set_n(n);
-    tiling.set_inner(inner);
-    tiling.set_tileInner(tileInner);
-    tiling.set_dim(dim);
+    // 计算TopK tiling（按行(outter=1)）
+    optiling::TopkTiling topkTilingAxis1;
+    bool ok = AscendC::TopKTilingFunc(ascendcPlatform,
+                                      inner_axis1,
+                                      outter_per_call,
+                                      k,
+                                      /*dataTypeSize=*/4, // float
+                                      isInitIndex,
+                                      mode_axis1,
+                                      isLargest,
+                                      topkTilingAxis1);
+    if (!ok) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 获取临时空间范围并采用最小值
+    uint32_t maxTmp = 0, minTmp = 0;
+    AscendC::GetTopKMaxMinTmpSize(ascendcPlatform,
+                                  inner_axis1,
+                                  outter_per_call,
+                                  /*isReuseSource=*/false,
+                                  isInitIndex,
+                                  mode_axis1,
+                                  isLargest,
+                                  /*dataTypeSize=*/4,
+                                  maxTmp,
+                                  minTmp);
+
+    // 设置BlockDim（示例）
+    context->SetBlockDim(8);
+
+    ArgminOverADimensionCustomTilingData tiling;
+    tiling.set_d0(static_cast<int32_t>(d0));
+    tiling.set_d1(static_cast<int32_t>(d1));
+    tiling.set_d2(static_cast<int32_t>(d2));
+
+    tiling.set_axis(axis);
+    tiling.set_k(k);
+    tiling.set_islargest(isLargest);
+    tiling.set_isinitindex(isInitIndex);
+
+    tiling.set_tmpsize_axis1(minTmp);
+    tiling.set_topkTilingAxis1(topkTilingAxis1);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+    currentWorkspace[0] = 0; // 本算子无需workspace
     return ge::GRAPH_SUCCESS;
 }
 }
 
+
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
+    // 形状推理：简化为仅支持按dim=1约简
     const gert::Shape* x_shape = context->GetInputShape(0);
-    const gert::RuntimeAttrs *attrs = context->GetAttrs();
-
-    int64_t dimAttr = 0;
-    if (attrs != nullptr && attrs->GetAttrNum() >= 1) {
-        dimAttr = *(attrs->GetAttrPointer<int64_t>(0));
+    if (x_shape->GetOriginShape().GetDimNum() != 3) {
+        return GRAPH_FAILED;
     }
-    int64_t rank = static_cast<int64_t>(x_shape->GetOriginShape().GetDimNum());
-    int64_t dim = dimAttr < 0 ? (dimAttr + rank) : dimAttr;
-    if (dim < 0) dim = 0;
-    if (dim >= rank) dim = rank - 1;
-
+    int64_t d0 = x_shape->GetOriginShape().GetDim(0);
+    int64_t d1 = x_shape->GetOriginShape().GetDim(1);
+    int64_t d2 = x_shape->GetOriginShape().GetDim(2);
+    (void)d1; // 约简掉
+    std::vector<int64_t> outDims = {d0, d2};
     gert::Shape* y_shape = context->GetOutputShape(0);
-
-    // output shape = input shape with dimension 'dim' removed
-    std::vector<int64_t> outDims;
-    outDims.reserve(static_cast<size_t>(rank > 0 ? rank - 1 : 0));
-    for (int64_t i = 0; i < rank; ++i) {
-        if (i == dim) continue;
-        outDims.push_back(x_shape->GetOriginShape().GetDim(i));
-    }
-    if (outDims.empty()) {
-        // if reduced to scalar, set it to [1]
-        outDims.push_back(1);
-    }
     y_shape->SetDimNum(outDims.size());
     for (size_t i = 0; i < outDims.size(); ++i) {
         y_shape->SetDim(i, outDims[i]);
     }
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    // indices output type int32
+    // 输出为int32索引
     context->SetOutputDataType(0, ge::DT_INT32);
     return ge::GRAPH_SUCCESS;
 }
 }
 
-namespace ops {
-OP_ATTR(dim);
 
+namespace ops {
 class ArgminOverADimensionCustom : public OpDef {
 public:
     explicit ArgminOverADimensionCustom(const char* name) : OpDef(name)
@@ -168,14 +195,16 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Output("index")
+        this->Input("dim")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Attr("dim");
+        this->Output("idx")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
@@ -189,128 +218,142 @@ OP_ADD(ArgminOverADimensionCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "argmin_over_a_dimension_custom_tiling_data.h"
 
-using DTYPE_X = float;
-using DTYPE_INDEX = int32_t;
+// 仅示例：按axis=1执行argmin（与给定模型一致），通过TopK(k=1, isLargest=false)获得最小值下标
+// 输入：x(float32, 3D)，dim(int32标量，未在kernel中使用，按tiling固定axis=1)
+// 输出：idx(int32, 2D [d0, d2])
 
-class KernelArgmin {
+class KernelArgminAxis1 {
 public:
-    __aicore__ inline KernelArgmin() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR index, uint32_t outter, uint32_t n, uint32_t inner, uint32_t tileInner)
+    __aicore__ inline KernelArgminAxis1() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR dim, GM_ADDR idx,
+                                int32_t d0, int32_t d1, int32_t d2,
+                                uint32_t k, bool isLargest, bool isInitIndex,
+                                uint32_t tmpsize_axis1, const AscendC::TopkTiling &topkTilingAxis1)
     {
-        this->outter = outter;
-        this->n = n;
-        this->inner = inner;
-        this->tileInner = (tileInner == 0) ? 1 : tileInner;
+        // 全局张量绑定
+        xGm.SetGlobalBuffer((__gm__ float*)x);
+        // dim输入在本示例中未在kernel中使用，按tiling固定axis=1
+        dimGm.SetGlobalBuffer((__gm__ int32_t*)dim);
+        idxGm.SetGlobalBuffer((__gm__ int32_t*)idx);
 
-        // split by outter on multi-cores
-        this->coreNum = AscendC::GetBlockNum();
-        this->coreIdx = AscendC::GetBlockIdx();
-        this->outterPerCore = (outter + coreNum - 1) / coreNum; // simple ceil split
-        this->outterStart = this->outterPerCore * coreIdx;
-        if (this->outterStart + this->outterPerCore > outter) {
-            this->outterPerCore = (outter > this->outterStart) ? (outter - this->outterStart) : 0;
-        }
+        this->D0 = d0;
+        this->D1 = d1;
+        this->D2 = d2;
 
-        // total elements in this core's slice for x: outterPerCore * n * inner
-        uint64_t xOffset = static_cast<uint64_t>(this->outterStart) * static_cast<uint64_t>(this->n) * static_cast<uint64_t>(this->inner);
-        uint64_t xSize   = static_cast<uint64_t>(this->outterPerCore) * static_cast<uint64_t>(this->n) * static_cast<uint64_t>(this->inner);
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + xOffset, xSize);
+        this->k = k; // =1
+        this->isLargest = isLargest;     // false
+        this->isInitIndex = isInitIndex; // false
 
-        // output indices shape [outter, inner]
-        uint64_t yOffset = static_cast<uint64_t>(this->outterStart) * static_cast<uint64_t>(this->inner);
-        uint64_t ySize   = static_cast<uint64_t>(this->outterPerCore) * static_cast<uint64_t>(this->inner);
-        indexGm.SetGlobalBuffer((__gm__ DTYPE_INDEX *)index + yOffset, ySize);
+        // TopK相关
+        this->topkTilingAxis1 = topkTilingAxis1;
+        this->tmpSizeAxis1 = tmpsize_axis1;
 
-        // allocate local buffers
-        pipe.InitBuffer(bufMinVal, 1, this->tileInner * sizeof(DTYPE_X));
-        pipe.InitBuffer(bufCurVal, 1, this->tileInner * sizeof(DTYPE_X));
-        pipe.InitBuffer(bufIdx,    1, this->tileInner * sizeof(DTYPE_INDEX));
-        pipe.InitBuffer(bufCurIdx, 1, this->tileInner * sizeof(DTYPE_INDEX));
+        // 每行长度(inner)与步长(step)（axis=1）
+        this->inner = D1;
+        this->step = D2;
+
+        // 每个block处理的行数（outer = d0*d2）
+        this->outer = static_cast<uint32_t>(D0) * static_cast<uint32_t>(D2);
+        this->rowsPerBlock = (outer + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
+        this->startRow = AscendC::GetBlockIdx() * rowsPerBlock;
+        this->endRow = AscendC::Min(startRow + rowsPerBlock, outer);
+
+        // UB缓冲：一行数据+TopK临时空间+结果缓冲
+        maxRowSizeBytes = static_cast<uint32_t>(inner) * sizeof(float);
+        pipe.InitBuffer(rowBufQ, 1, maxRowSizeBytes);
+        pipe.InitBuffer(tmpBufQ, 1, tmpSizeAxis1);         // TopK tmp
+        pipe.InitBuffer(idxBufQ, 1, k * sizeof(int32_t));  // TopK输出idx（k=1）
+        pipe.InitBuffer(valBufQ, 1, k * sizeof(float));    // TopK输出val（k=1），仅占位
+        pipe.InitBuffer(finBufQ, 1, sizeof(bool));         // finishLocal（未使用）
     }
 
     __aicore__ inline void Process()
     {
-        for (uint32_t b = 0; b < this->outterPerCore; ++b) {
-            uint64_t baseSlice = static_cast<uint64_t>(b) * static_cast<uint64_t>(this->n) * static_cast<uint64_t>(this->inner);
-            uint64_t outBase   = static_cast<uint64_t>(b) * static_cast<uint64_t>(this->inner);
+        for (uint32_t r = startRow; r < endRow; ++r) {
+            // 将全局的第r行（对应[b, j]，b=j//D2, j=j%D2）按axis=1收集到UB连续缓冲
+            // base = b*D1*D2 + 0*D2 + j_in_D2
+            uint32_t b = r / static_cast<uint32_t>(D2);
+            uint32_t j2 = r % static_cast<uint32_t>(D2);
+            uint64_t base = static_cast<uint64_t>(b) * static_cast<uint64_t>(D1) * static_cast<uint64_t>(D2)
+                            + static_cast<uint64_t>(j2);
 
-            // tile along inner dimension
-            for (uint32_t start = 0; start < this->inner; start += this->tileInner) {
-                uint32_t currLen = AscendC::Min(this->tileInner, this->inner - start);
-
-                // local tensors
-                AscendC::LocalTensor<DTYPE_X> minValLocal = bufMinVal.AllocTensor<DTYPE_X>();
-                AscendC::LocalTensor<DTYPE_X> curValLocal = bufCurVal.AllocTensor<DTYPE_X>();
-                AscendC::LocalTensor<DTYPE_INDEX> idxLocal = bufIdx.AllocTensor<DTYPE_INDEX>();
-                AscendC::LocalTensor<DTYPE_INDEX> curIdxLocal = bufCurIdx.AllocTensor<DTYPE_INDEX>();
-
-                // initialize min values from i=0 slice, indices = 0
-                AscendC::DataCopy(minValLocal, xGm[baseSlice + 0ull * this->inner + start], currLen);
-                DTYPE_INDEX zero = 0;
-                AscendC::Duplicate(idxLocal, zero, currLen);
-
-                // iterate i=1..n-1, keep argmin
-                for (uint32_t i = 1; i < this->n; ++i) {
-                    AscendC::DataCopy(curValLocal, xGm[baseSlice + static_cast<uint64_t>(i) * this->inner + start], currLen);
-
-                    // build current index vector
-                    DTYPE_INDEX currIdxScalar = static_cast<DTYPE_INDEX>(i);
-                    AscendC::Duplicate(curIdxLocal, currIdxScalar, currLen);
-
-                    // element-wise compare and select:
-                    // mask = (curVal < minVal)
-                    // minVal = mask ? curVal : minVal
-                    // idx     = mask ? currIdx : idx
-                    // Note: Compare/Select are AscendC vector APIs (see Ascend C API Reference: Compare/Select).
-                    // We set mask by the framework and use it inside Select.
-                    AscendC::SetMaskCount(currLen);
-                    auto cmpMask = AscendC::Compare(curValLocal, minValLocal, AscendC::CMPMODE_LT);
-                    AscendC::Select(minValLocal, curValLocal, minValLocal, cmpMask);
-                    AscendC::Select(idxLocal, curIdxLocal, idxLocal, cmpMask);
-                    AscendC::ResetMask();
-                }
-
-                // write indices to GM
-                AscendC::DataCopy(indexGm[outBase + start], idxLocal, currLen);
-
-                // free locals
-                bufMinVal.FreeTensor(minValLocal);
-                bufCurVal.FreeTensor(curValLocal);
-                bufIdx.FreeTensor(idxLocal);
-                bufCurIdx.FreeTensor(curIdxLocal);
+            // 分配本地缓冲
+            AscendC::LocalTensor<float> rowLocal = rowBufQ.AllocTensor<float>();
+            // 将该行的inner元素逐个拷入UB（步长为step=D2）
+            for (int32_t t = 0; t < D1; ++t) {
+                // 目标位置：rowLocal[t]，源：xGm[base + t*step]
+                AscendC::DataCopy(rowLocal[t], xGm[base + static_cast<uint64_t>(t) * static_cast<uint64_t>(step)], 1);
             }
+
+            // TopK(k=1, isLargest=false) -> argmin
+            AscendC::LocalTensor<uint8_t> tmpLocal = tmpBufQ.AllocTensor<uint8_t>();
+            AscendC::LocalTensor<float> dstValLocal = valBufQ.AllocTensor<float>();
+            AscendC::LocalTensor<int32_t> dstIndexLocal = idxBufQ.AllocTensor<int32_t>();
+            AscendC::LocalTensor<int32_t> srcIndexStub = idxBufQ.AllocTensor<int32_t>(); // 占位，不使用
+            AscendC::LocalTensor<bool> finishStub = finBufQ.AllocTensor<bool>();         // 占位，不使用
+
+            // 使用TopK NORMAL模式（tiling已按inner和outter=1生成）
+            AscendC::TopK<float, false, false, false, AscendC::TopKMode::TOPK_NORMAL>(
+                dstValLocal, dstIndexLocal, rowLocal, srcIndexStub, finishStub, tmpLocal,
+                static_cast<int32_t>(k), topkTilingAxis1, GetTopKInfo(), /*isLargest=*/false);
+
+            // 将idx写回全局（每行输出1个int32）
+            AscendC::DataCopy(idxGm[r], dstIndexLocal, k);
+
+            // 释放本地缓冲
+            idxBufQ.FreeTensor(dstIndexLocal);
+            valBufQ.FreeTensor(dstValLocal);
+            tmpBufQ.FreeTensor(tmpLocal);
+            finBufQ.FreeTensor(finishStub);
+            idxBufQ.FreeTensor(srcIndexStub);
+            rowBufQ.FreeTensor(rowLocal);
         }
     }
 
 private:
+    // TopKInfo 占位（默认构造）
+    __aicore__ inline AscendC::TopKInfo GetTopKInfo() {
+        AscendC::TopKInfo info;
+        return info;
+    }
+
+private:
     AscendC::TPipe pipe;
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_INDEX> indexGm;
 
-    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> bufMinVal;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> bufCurVal;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> bufIdx;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> bufCurIdx;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> rowBufQ;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> tmpBufQ;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> idxBufQ;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> valBufQ;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> finBufQ;
 
-    uint32_t outter;
-    uint32_t n;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<int32_t> dimGm; // 未使用
+    AscendC::GlobalTensor<int32_t> idxGm;
+
+    int32_t D0, D1, D2;
     uint32_t inner;
-    uint32_t tileInner;
+    uint32_t step;
+    uint32_t outer;
+    uint32_t rowsPerBlock, startRow, endRow;
+    uint32_t k;
+    bool isLargest;
+    bool isInitIndex;
 
-    uint32_t coreNum;
-    uint32_t coreIdx;
-    uint32_t outterPerCore;
-    uint32_t outterStart;
+    uint32_t maxRowSizeBytes;
+
+    AscendC::TopkTiling topkTilingAxis1;
+    uint32_t tmpSizeAxis1;
 };
 
-extern "C" __global__ __aicore__ void argmin_over_a_dimension_custom(GM_ADDR x, GM_ADDR index, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tiling_data, tiling);
-    KernelArgmin op;
-    op.Init(x, index, tiling_data.outter, tiling_data.n, tiling_data.inner, tiling_data.tileInner);
+extern "C" __global__ __aicore__ void argmin_over_a_dimension_custom(GM_ADDR x, GM_ADDR dim, GM_ADDR idx, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+    KernelArgminAxis1 op;
+    op.Init(x, dim, idx,
+            tilingData.d0, tilingData.d1, tilingData.d2,
+            tilingData.k, tilingData.islargest, tilingData.isinitindex,
+            tilingData.tmpsize_axis1, tilingData.topkTilingAxis1);
     op.Process();
 }
 """
@@ -321,40 +364,31 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-static inline int64_t normalize_dim(int64_t dim, int64_t rank) {
-    if (dim < 0) dim += rank;
-    if (dim < 0) dim = 0;
-    if (dim >= rank) dim = rank - 1;
-    return dim;
+static at::Tensor make_dim_tensor(int64_t dim, c10::Device device) {
+    auto opts = at::TensorOptions().dtype(at::kInt).device(at::kCPU);
+    at::Tensor dim_cpu = at::empty({1}, opts);
+    dim_cpu.fill_(dim);
+    // 在NPU执行时由调度器搬运，保持输入为标量张量
+    return dim_cpu;
 }
 
 at::Tensor argmin_over_a_dimension_custom_impl_npu(const at::Tensor& x, int64_t dim) {
-    TORCH_CHECK(x.dim() >= 1, \"input must have at least 1 dimension\");
-    int64_t rank = x.dim();
-    int64_t d = normalize_dim(dim, rank);
-
-    // build output shape: remove dimension d
-    std::vector<int64_t> outSizes;
-    outSizes.reserve(static_cast<size_t>(rank > 0 ? rank - 1 : 0));
-    for (int64_t i = 0; i < rank; ++i) {
-        if (i == d) continue;
-        outSizes.push_back(x.size(i));
-    }
-    if (outSizes.empty()) outSizes.push_back(1);
-
-    at::Tensor result = at::empty(outSizes, x.options().dtype(at::kInt));
-
-    // call custom operator runtime (attributes passed as scalars)
-    EXEC_NPU_CMD(aclnnArgminOverADimensionCustom, x, dim, result);
+    // 输出形状：按dim=1约简，仅示例（与模型保持一致）
+    TORCH_CHECK(x.dim() == 3, "Only 3D input is supported in this example.");
+    TORCH_CHECK(dim == 1, "This example kernel supports dim=1 only.");
+    auto out_sizes = std::vector<int64_t>{x.size(0), x.size(2)};
+    at::Tensor result = at::empty(out_sizes, x.options().dtype(at::kInt));
+    at::Tensor dim_tensor = make_dim_tensor(dim, x.device());
+    EXEC_NPU_CMD(aclnnArgminOverADimensionCustom, x, dim_tensor, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl(\"argmin_over_a_dimension_custom\", &argmin_over_a_dimension_custom_impl_npu);
+    m.impl("argmin_over_a_dimension_custom", &argmin_over_a_dimension_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def(\"argmin_over_a_dimension_custom\", &argmin_over_a_dimension_custom_impl_npu, \"argmin over a dimension\");
+    m.def("argmin_over_a_dimension_custom", &argmin_over_a_dimension_custom_impl_npu, "argmin over a dimension (dim=1)");
 }
 """
 
@@ -364,13 +398,11 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    Custom NPU kernel version of argmin along a specified dimension.
-    """
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 示例核实现按dim=1执行
         return custom_ops_lib.argmin_over_a_dimension_custom(x, self.dim)
 '''

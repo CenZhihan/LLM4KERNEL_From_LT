@@ -1,0 +1,325 @@
+project_json_src='''
+[
+    {
+        "op": "MaskedCumsumCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "mask",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MaskedCumsumCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, axisLen);
+  TILING_DATA_FIELD_DEF(uint32_t, outerNum);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MaskedCumsumCustom, MaskedCumsumCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "masked_cumsum_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MaskedCumsumCustomTilingData tiling;
+    // Assume cumsum along last dimension after potential permutation in Python binding
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    uint64_t ndim = in_shape->GetOriginShape().GetDimNum();
+    uint64_t totalLength = in_shape->GetOriginShape().GetShapeSize();
+    uint32_t axisLen = (ndim > 0) ? static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(ndim - 1)) : 1U;
+    uint32_t outerNum = (axisLen == 0) ? 0U : static_cast<uint32_t>(totalLength / axisLen);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(static_cast<uint32_t>(totalLength));
+    tiling.set_axisLen(axisLen);
+    tiling.set_outerNum(outerNum);
+    tiling.set_tileNum(1U); // process one full row per iteration
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    *z_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MaskedCumsumCustom : public OpDef {
+public:
+    explicit MaskedCumsumCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("mask")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MaskedCumsumCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 1; // one tensor per queue for simplicity
+
+class KernelMaskedCumsum {
+public:
+    __aicore__ inline KernelMaskedCumsum() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR m, GM_ADDR z,
+                                uint32_t totalLength, uint32_t axisLen, uint32_t outerNum, uint32_t tileNum) {
+        (void)totalLength;
+        this->axisLen = axisLen;
+        this->outerNum = outerNum;
+        this->tileNum = tileNum;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, totalLength);
+        mGm.SetGlobalBuffer((__gm__ DTYPE_Y *)m, totalLength);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z, totalLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->axisLen * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueM, BUFFER_NUM, this->axisLen * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->axisLen * sizeof(DTYPE_Z));
+
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blkIdx = AscendC::GetBlockIdx();
+        rowsPerBlock = outerNum / blockNum;
+        uint32_t remain = outerNum % blockNum;
+        // Distribute remaining rows to the first 'remain' blocks
+        startRow = blkIdx * rowsPerBlock + AscendC::Min(blkIdx, remain);
+        uint32_t myRows = rowsPerBlock + (blkIdx < remain ? 1U : 0U);
+        endRow = startRow + myRows;
+    }
+
+    __aicore__ inline void Process() {
+        for (uint32_t row = startRow; row < endRow; ++row) {
+            CopyInRow(row);
+            ComputeRow();
+            CopyOutRow(row);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyInRow(uint32_t row) {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> mLocal = inQueueM.AllocTensor<DTYPE_Y>();
+        uint32_t offset = row * axisLen;
+        AscendC::DataCopy(xLocal, xGm[offset], axisLen);
+        AscendC::DataCopy(mLocal, mGm[offset], axisLen);
+        inQueueX.EnQue(xLocal);
+        inQueueM.EnQue(mLocal);
+    }
+
+    __aicore__ inline void ComputeRow() {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> mLocal = inQueueM.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+
+        // masked cumsum along the last dimension for this row
+        // Assuming mask is 0.0 or 1.0 in the same dtype as input.
+        if (axisLen > 0) {
+            // First element
+            zLocal.SetValue(0, xLocal.GetValue(0) * mLocal.GetValue(0));
+            for (uint32_t i = 1; i < axisLen; ++i) {
+                DTYPE_Z val = static_cast<DTYPE_Z>(xLocal.GetValue(i) * mLocal.GetValue(i));
+                DTYPE_Z prev = zLocal.GetValue(i - 1);
+                zLocal.SetValue(i, prev + val);
+            }
+        }
+
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueM.FreeTensor(mLocal);
+    }
+
+    __aicore__ inline void CopyOutRow(uint32_t row) {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        uint32_t offset = row * axisLen;
+        AscendC::DataCopy(zGm[offset], zLocal, axisLen);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueM;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> mGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+
+    uint32_t axisLen;
+    uint32_t outerNum;
+    uint32_t tileNum;
+
+    uint32_t startRow;
+    uint32_t endRow;
+    uint32_t rowsPerBlock;
+};
+
+extern "C" __global__ __aicore__ void masked_cumsum_custom(GM_ADDR x, GM_ADDR mask, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMaskedCumsum op;
+    op.Init(x, mask, z, tiling_data.totalLength, tiling_data.axisLen, tiling_data.outerNum, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline std::vector<int64_t> make_perm_last(int64_t dim, int64_t ndims) {
+    std::vector<int64_t> perm(ndims);
+    int64_t idx = 0;
+    for (int64_t i = 0; i < ndims; ++i) {
+        if (i != dim) perm[idx++] = i;
+    }
+    perm[ndims - 1] = dim;
+    return perm;
+}
+
+static inline std::vector<int64_t> invert_perm(const std::vector<int64_t>& perm) {
+    std::vector<int64_t> inv(perm.size());
+    for (size_t i = 0; i < perm.size(); ++i) {
+        inv[perm[i]] = static_cast<int64_t>(i);
+    }
+    return inv;
+}
+
+at::Tensor masked_cumsum_custom_impl_npu(const at::Tensor& x, const at::Tensor& mask, int64_t dim) {
+    TORCH_CHECK(x.sizes() == mask.sizes(), "x and mask must have the same shape");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(mask.is_contiguous(), "mask must be contiguous");
+    int64_t nd = x.dim();
+    TORCH_CHECK(nd >= 1, "x must have at least 1 dimension");
+    if (dim < 0) dim += nd;
+    TORCH_CHECK(dim >= 0 && dim < nd, "dim out of range");
+
+    // Convert mask to same dtype as x (0.0/1.0)
+    at::Tensor mask_f = mask.to(x.scalar_type());
+
+    at::Tensor x_perm = x;
+    at::Tensor m_perm = mask_f;
+    bool need_perm = (dim != nd - 1);
+    std::vector<int64_t> perm, inv_perm;
+    if (need_perm) {
+        perm = make_perm_last(dim, nd);
+        inv_perm = invert_perm(perm);
+        x_perm = x_perm.permute(perm).contiguous();
+        m_perm = m_perm.permute(perm).contiguous();
+    }
+
+    at::Tensor out_perm = at::empty_like(x_perm);
+    EXEC_NPU_CMD(aclnnMaskedCumsumCustom, x_perm, m_perm, out_perm);
+
+    at::Tensor out = out_perm;
+    if (need_perm) {
+        out = out_perm.permute(inv_perm).contiguous();
+    }
+    return out;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("masked_cumsum_custom", &masked_cumsum_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("masked_cumsum_custom", &masked_cumsum_custom_impl_npu, "masked cumsum along a dimension");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x, mask):
+        return custom_ops_lib.masked_cumsum_custom(x, mask, self.dim)
+'''

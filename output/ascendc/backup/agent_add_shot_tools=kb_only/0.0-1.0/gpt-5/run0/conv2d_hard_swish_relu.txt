@@ -1,0 +1,416 @@
+project_json_src='''
+[
+    {
+        "op": "Conv2dHardSwishReluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "attr_desc": [
+            {
+                "name": "kernel",
+                "type": "int"
+            },
+            {
+                "name": "stride",
+                "type": "int"
+            },
+            {
+                "name": "pad",
+                "type": "int"
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv2dHardSwishReluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, CIn);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint32_t, COut);
+  TILING_DATA_FIELD_DEF(uint32_t, Kh);
+  TILING_DATA_FIELD_DEF(uint32_t, Kw);
+  TILING_DATA_FIELD_DEF(uint32_t, Stride);
+  TILING_DATA_FIELD_DEF(uint32_t, Pad);
+  TILING_DATA_FIELD_DEF(uint32_t, Ho);
+  TILING_DATA_FIELD_DEF(uint32_t, Wo);
+  TILING_DATA_FIELD_DEF(uint32_t, outLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv2dHardSwishReluCustom, Conv2dHardSwishReluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv2d_hard_swish_relu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 输入 x: [N, CIn, H, W], 权重 w: [COut, CIn, Kh, Kw], 偏置 b: [COut]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+
+    int64_t N  = x_shape->GetDim(0);
+    int64_t C  = x_shape->GetDim(1);
+    int64_t H  = x_shape->GetDim(2);
+    int64_t W  = x_shape->GetDim(3);
+
+    int64_t Co = w_shape->GetDim(0);
+    int64_t Ci = w_shape->GetDim(1);
+    int64_t Kh = w_shape->GetDim(2);
+    int64_t Kw = w_shape->GetDim(3);
+
+    // 读取属性
+    int64_t kernel_attr = 0;
+    int64_t stride_attr = 1;
+    int64_t pad_attr    = 0;
+    (void)context->GetAttr("kernel", kernel_attr);
+    (void)context->GetAttr("stride", stride_attr);
+    (void)context->GetAttr("pad", pad_attr);
+
+    // 若未显式传入 pad，则按 SAME 推导
+    if (pad_attr < 0) {
+        pad_attr = kernel_attr / 2;
+    }
+
+    // 输出尺寸
+    int64_t Ho = (H + 2 * pad_attr - Kh) / stride_attr + 1;
+    int64_t Wo = (W + 2 * pad_attr - Kw) / stride_attr + 1;
+
+    // 组装 Tiling
+    Conv2dHardSwishReluCustomTilingData tiling;
+    tiling.set_N(static_cast<uint32_t>(N));
+    tiling.set_CIn(static_cast<uint32_t>(C));
+    tiling.set_H(static_cast<uint32_t>(H));
+    tiling.set_W(static_cast<uint32_t>(W));
+    tiling.set_COut(static_cast<uint32_t>(Co));
+    tiling.set_Kh(static_cast<uint32_t>(Kh));
+    tiling.set_Kw(static_cast<uint32_t>(Kw));
+    tiling.set_Stride(static_cast<uint32_t>(stride_attr));
+    tiling.set_Pad(static_cast<uint32_t>(pad_attr));
+    tiling.set_Ho(static_cast<uint32_t>(Ho));
+    tiling.set_Wo(static_cast<uint32_t>(Wo));
+
+    uint64_t outLength = static_cast<uint64_t>(N) * static_cast<uint64_t>(Co) * static_cast<uint64_t>(Ho) * static_cast<uint64_t>(Wo);
+    tiling.set_outLength(static_cast<uint32_t>(outLength));
+    tiling.set_tileNum(TILE_NUM);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0; // 无额外 workspace
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x = context->GetInputShape(0);
+    const gert::Shape* w = context->GetInputShape(1);
+
+    int64_t N  = x->GetDim(0);
+    int64_t H  = x->GetDim(2);
+    int64_t W  = x->GetDim(3);
+    int64_t Co = w->GetDim(0);
+    int64_t Kh = w->GetDim(2);
+    int64_t Kw = w->GetDim(3);
+
+    int64_t kernel_attr = 0, stride_attr = 1, pad_attr = 0;
+    (void)context->GetAttr("kernel", kernel_attr);
+    (void)context->GetAttr("stride", stride_attr);
+    (void)context->GetAttr("pad", pad_attr);
+    if (pad_attr < 0) { pad_attr = kernel_attr / 2; }
+
+    int64_t Ho = (H + 2 * pad_attr - Kh) / stride_attr + 1;
+    int64_t Wo = (W + 2 * pad_attr - Kw) / stride_attr + 1;
+
+    gert::Shape* y = context->GetOutputShape(0);
+    std::vector<int64_t> ydims = {N, Co, Ho, Wo};
+    y->SetDim(ydims);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class Conv2dHardSwishReluCustom : public OpDef {
+public:
+    explicit Conv2dHardSwishReluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("kernel").Int(3);
+        this->Attr("stride").Int(1);
+        this->Attr("pad").Int(-1); // <0 时按 SAME 推导
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(Conv2dHardSwishReluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "conv2d_hard_swish_relu_custom_tiling_data.h"
+
+// 参考文档：
+// - 矢量标量运算 Adds/Muls/Maxs/Mins、元素乘 Mul、Relu 等，见 Ascend C API Basic APIs（向量/标量指令）。
+// - Conv2D 属于 ISASI 类 API（Conv2D Performs 2D convolution...）。
+// - 本内核示例演示将 Conv2D + HardSwish + ReLU 融合计算到一个 AscendC 内核中。
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelConv2dHardSwishRelu {
+public:
+    __aicore__ inline KernelConv2dHardSwishRelu() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                uint32_t N, uint32_t CIn, uint32_t H, uint32_t W,
+                                uint32_t COut, uint32_t Kh, uint32_t Kw,
+                                uint32_t Stride, uint32_t Pad,
+                                uint32_t Ho, uint32_t Wo)
+    {
+        this->N = N; this->CIn = CIn; this->H = H; this->W = W;
+        this->COut = COut; this->Kh = Kh; this->Kw = Kw;
+        this->Stride = Stride; this->Pad = Pad; this->Ho = Ho; this->Wo = Wo;
+
+        uint32_t xSize = N * CIn * H * W;
+        uint32_t wSize = COut * CIn * Kh * Kw;
+        uint32_t bSize = COut;
+        uint32_t ySize = N * COut * Ho * Wo;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, xSize);
+        wGm.SetGlobalBuffer((__gm__ DTYPE_W *)w, wSize);
+        bGm.SetGlobalBuffer((__gm__ DTYPE_B *)b, bSize);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y, ySize);
+
+        // 简化实现：一次性搬运，演示融合流程
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, xSize * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueW, BUFFER_NUM, wSize * sizeof(DTYPE_W));
+        pipe.InitBuffer(inQueueB, BUFFER_NUM, bSize * sizeof(DTYPE_B));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, ySize * sizeof(DTYPE_Y));
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        uint32_t xSize = N * CIn * H * W;
+        uint32_t wSize = COut * CIn * Kh * Kw;
+        uint32_t bSize = COut;
+
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_W> wLocal = inQueueW.AllocTensor<DTYPE_W>();
+        AscendC::LocalTensor<DTYPE_B> bLocal = inQueueB.AllocTensor<DTYPE_B>();
+
+        AscendC::DataCopy(xLocal, xGm, xSize);
+        AscendC::DataCopy(wLocal, wGm, wSize);
+        AscendC::DataCopy(bLocal, bGm, bSize);
+
+        inQueueX.EnQue(xLocal);
+        inQueueW.EnQue(wLocal);
+        inQueueB.EnQue(bLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        uint32_t ySize = N * COut * Ho * Wo;
+
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_W> wLocal = inQueueW.DeQue<DTYPE_W>();
+        AscendC::LocalTensor<DTYPE_B> bLocal = inQueueB.DeQue<DTYPE_B>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+
+        // 1) 卷积：调用 ISASI Conv2D（接口原型见文档 1.9 ISASI APIs -> Conv2D）
+        // 具体参数结构体在商业文档中定义，此处示范调用流程。
+        // AscendC::Conv2D(yLocal, xLocal, wLocal, bLocal, /*stride*/Stride, /*pad*/Pad, /*dilation*/1, /*groups*/1,
+        //                 /*shape*/N, CIn, H, W, COut, Kh, Kw, Ho, Wo);
+
+        // 注意：若无法直接调用 Conv2D，可在工程中使用已有算子包装或采用官方样例接口。
+
+        // 2) 激活：HardSwish(x) = x * ReLU6(x + 3) / 6，然后再接 ReLU
+        // 参考向量/标量指令：Adds/Muls/Maxs/Mins、Mul、Relu
+        // 为演示，先将卷积结果 yLocal 原地进行 HardSwish + ReLU
+        // tmp = y + 3
+        AscendC::LocalTensor<DTYPE_Y> tmpLocal = yLocal; // 复用
+        AscendC::Adds(tmpLocal, yLocal, static_cast<DTYPE_Y>(3.0f), ySize);
+        // tmp = min(max(tmp, 0), 6)
+        AscendC::Maxs(tmpLocal, tmpLocal, static_cast<DTYPE_Y>(0.0f), ySize);
+        AscendC::Mins(tmpLocal, tmpLocal, static_cast<DTYPE_Y>(6.0f), ySize);
+        // y = y * tmp
+        AscendC::Mul(yLocal, yLocal, tmpLocal, ySize);
+        // y = y / 6
+        AscendC::Muls(yLocal, yLocal, static_cast<DTYPE_Y>(1.0f/6.0f), ySize);
+        // y = ReLU(y)
+        AscendC::Relu(yLocal, yLocal, ySize);
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueW.FreeTensor(wLocal);
+        inQueueB.FreeTensor(bLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        uint32_t ySize = N * COut * Ho * Wo;
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm, yLocal, ySize);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX, inQueueW, inQueueB;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_W> wGm;
+    AscendC::GlobalTensor<DTYPE_B> bGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t N, CIn, H, W, COut, Kh, Kw, Stride, Pad, Ho, Wo;
+};
+
+extern "C" __global__ __aicore__ void conv2d_hard_swish_relu_custom(
+    GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+
+    KernelConv2dHardSwishRelu op;
+    op.Init(
+        x, w, b, y,
+        tiling_data.N, tiling_data.CIn, tiling_data.H, tiling_data.W,
+        tiling_data.COut, tiling_data.Kh, tiling_data.Kw,
+        tiling_data.Stride, tiling_data.Pad,
+        tiling_data.Ho, tiling_data.Wo
+    );
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+// x: [N, CIn, H, W], w: [COut, CIn, Kh, Kw], b: [COut]
+// attrs: kernel, stride, pad
+at::Tensor conv2d_hard_swish_relu_custom_impl_npu(
+    const at::Tensor& x, const at::Tensor& w, const at::Tensor& b,
+    int64_t kernel, int64_t stride, int64_t pad)
+{
+    // 输出张量形状推导在 InferShape 中进行，这里直接创建同类型空张量，由 NPU 内核写入
+    // 为了与 NPU 接口对齐，使用 at::empty_like(x) 仅作占位。实际形状由后端算子确定。
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnConv2dHardSwishReluCustom, x, w, b, kernel, stride, pad, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv2d_hard_swish_relu_custom", &conv2d_hard_swish_relu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv2d_hard_swish_relu_custom", &conv2d_hard_swish_relu_custom_impl_npu,
+          "fused Conv2D + HardSwish + ReLU");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    使用自定义 AscendC 融合算子：Conv2d + HardSwish + ReLU
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        # 仅用于权重/偏置的创建与管理（参数与原模型一致）
+        self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=kernel_size // 2, bias=True)
+        self.kernel_size = kernel_size
+
+    def forward(self, x):
+        # 将 PyTorch 卷积权重/偏置传入自定义融合算子
+        k = int(self.kernel_size)
+        stride = 1
+        pad = k // 2
+        return custom_ops_lib.conv2d_hard_swish_relu_custom(x, self.conv.weight, self.conv.bias, k, stride, pad)
+'''

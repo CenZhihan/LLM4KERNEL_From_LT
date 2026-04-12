@@ -1,0 +1,312 @@
+project_json_src='''
+[
+    {
+        "op": "CumsumExclusiveCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CumsumExclusiveCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, outter);
+  TILING_DATA_FIELD_DEF(uint32_t, inner);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(int32_t, dim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CumsumExclusiveCustom, CumsumExclusiveCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cumsum_exclusive_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t AlignTo32BytesElems(uint32_t n, uint32_t typeSize) {
+    uint32_t bytes = n * typeSize;
+    uint32_t aligned = (bytes + 32 - 1) / 32 * 32;
+    return aligned / typeSize;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CumsumExclusiveCustomTilingData tiling;
+
+    // Read attribute dim
+    const gert::RuntimeAttrs* attrs = context->GetAttrs();
+    int32_t dim = 1;
+    if (attrs != nullptr && attrs->GetAttrsNum() > 0) {
+        dim = *(attrs->GetAttrPointer<int32_t>(0));
+    }
+
+    // Infer outter/inner from input shape (assume 2-D, last-axis cumsum when dim == 1)
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    // Default to 2-D behavior
+    int64_t rank = origin.GetDimNum();
+    int64_t outter = 1;
+    int64_t n = 1;
+    if (rank == 1) {
+        // Treat as [1, N]
+        outter = 1;
+        n = origin.GetDim(0);
+        dim = 0; // only axis
+    } else {
+        // rank >= 2, only support along last axis or axis 1 for 2-D
+        int64_t last = rank - 1;
+        int64_t targetDim = dim;
+        if (targetDim < 0) targetDim += rank;
+        // Flatten to [outter, n] for CumSum API
+        n = origin.GetDim(last);
+        outter = 1;
+        for (int64_t i = 0; i < last; ++i) {
+            outter *= origin.GetDim(i);
+        }
+        // We only support cumsum along last axis in kernel (isLastAxis=true)
+        // Caller should pass dim == last for best performance.
+    }
+
+    // dtype size is 4 for float
+    uint32_t typeSize = 4;
+    uint32_t innerAligned = AlignTo32BytesElems(static_cast<uint32_t>(n), typeSize);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_outter(static_cast<uint32_t>(outter));
+    tiling.set_inner(innerAligned);
+    tiling.set_n(static_cast<uint32_t>(n));
+    tiling.set_dim(dim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CumsumExclusiveCustom : public OpDef {
+public:
+    explicit CumsumExclusiveCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("dim")
+            .AttrType(REQUIRED)
+            .Int(1);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(CumsumExclusiveCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "cumsum_exclusive_custom_tiling_data.h"
+
+// 使用高阶API CumSum（参考文档 5.1.29.1 CumSum），并按行进行exclusive移动。
+// 仅支持沿最后一维进行exclusive cumsum。
+
+template <typename T>
+class KernelCumsumExclusive {
+public:
+    __aicore__ inline KernelCumsumExclusive() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t outter, uint32_t inner, uint32_t n)
+    {
+        this->outter = outter;
+        this->inner = inner; // 已按32字节对齐
+        this->n = n;
+
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t bid = AscendC::GetBlockIdx();
+
+        uint32_t base = outter / blockNum;
+        uint32_t rem = outter % blockNum;
+        this->rows = base + (bid < rem ? 1 : 0);
+        uint32_t startRow = bid * base + (bid < rem ? bid : rem);
+
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(x) + startRow * inner, rows * inner);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(y) + startRow * inner, rows * inner);
+
+        pipe.InitBuffer(inQueueX, 1, inner * sizeof(T));
+        pipe.InitBuffer(outQueueY, 1, inner * sizeof(T));
+        pipe.InitBuffer(tmpCumsumQueue, 1, inner * sizeof(T));    // 存放包含当前元素的cumsum
+        pipe.InitBuffer(lastRowQueue, 1, inner * sizeof(T));      // CumSum API需要的lastRow缓冲
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = 0; r < rows; ++r) {
+            CopyIn(r);
+            Compute(r);
+            CopyOut(r);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<T> xLocal = inQueueX.AllocTensor<T>();
+        AscendC::DataCopy(xLocal, xGm[rowIdx * inner], inner);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t /*rowIdx*/)
+    {
+        AscendC::LocalTensor<T> xLocal = inQueueX.DeQue<T>();
+        AscendC::LocalTensor<T> cumsumLocal = tmpCumsumQueue.AllocTensor<T>();
+        AscendC::LocalTensor<T> lastRowLocal = lastRowQueue.AllocTensor<T>();
+        AscendC::LocalTensor<T> yLocal = outQueueY.AllocTensor<T>();
+
+        // 使用CumSum在最后一维上进行累加（inclusive）
+        static constexpr AscendC::CumSumConfig cfg{true, false, true};
+        const AscendC::CumSumInfo info{1, inner}; // 视为[1, inner]
+        AscendC::CumSum<T, cfg>(cumsumLocal, lastRowLocal, xLocal, info);
+
+        // exclusive: y[0] = 0, y[1:n] = inclusive[0:n-1]，其余对齐填充保持为0
+        T zero(0);
+        AscendC::Duplicate<T>(yLocal, zero, inner);
+        if (n > 1) {
+            AscendC::DataCopy(yLocal[1], cumsumLocal, n - 1);
+        }
+
+        outQueueY.EnQue<T>(yLocal);
+        tmpCumsumQueue.FreeTensor(cumsumLocal);
+        lastRowQueue.FreeTensor(lastRowLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<T> yLocal = outQueueY.DeQue<T>();
+        AscendC::DataCopy(yGm[rowIdx * inner], yLocal, inner);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpCumsumQueue;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> lastRowQueue;
+
+    AscendC::GlobalTensor<T> xGm;
+    AscendC::GlobalTensor<T> yGm;
+
+    uint32_t outter{0};
+    uint32_t inner{0};
+    uint32_t n{0};
+    uint32_t rows{0};
+};
+
+extern "C" __global__ __aicore__ void cumsum_exclusive_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCumsumExclusive<DTYPE_X> op;
+    op.Init(x, y, tiling_data.outter, tiling_data.inner, tiling_data.n);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cumsum_exclusive_custom_impl_npu(const at::Tensor& x, int64_t dim) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnCumsumExclusiveCustom, x, dim, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cumsum_exclusive_custom", &cumsum_exclusive_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cumsum_exclusive_custom", &cumsum_exclusive_custom_impl_npu, "exclusive cumsum");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return custom_ops_lib.cumsum_exclusive_custom(x, self.dim)
+'''

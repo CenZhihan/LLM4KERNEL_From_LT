@@ -1,0 +1,370 @@
+project_json_src='''
+[
+    {
+        "op": "ShufflenetCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "groups",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ShufflenetCustomTiling)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ShufflenetCustom, ShufflenetCustomTiling)
+}
+"""
+
+host_operator_src="""
+#include "shufflenet_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ShufflenetCustomTiling tiling;
+
+    auto *in_shape = context->GetInputShape(0);
+    auto origin_shape = in_shape->GetOriginShape();
+    uint32_t dim_num = origin_shape.GetDimNum();
+    if (dim_num != 4) {
+        return ge::GRAPH_FAILED;
+    }
+    // 假设按 NCHW
+    uint32_t n = static_cast<uint32_t>(origin_shape.GetDim(0));
+    uint32_t c = static_cast<uint32_t>(origin_shape.GetDim(1));
+    uint32_t h = static_cast<uint32_t>(origin_shape.GetDim(2));
+    uint32_t w = static_cast<uint32_t>(origin_shape.GetDim(3));
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_h(h);
+    tiling.set_w(w);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ShufflenetCustom : public OpDef {
+public:
+    explicit ShufflenetCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("groups")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ShufflenetCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t IN_QUEUE_NUM = 1;
+constexpr int32_t OUT_QUEUE_NUM = 1;
+
+using DTYPE = float;
+
+class KernelChannelShuffle {
+public:
+    __aicore__ inline KernelChannelShuffle() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR groups, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t h, uint32_t w)
+    {
+        this->N = n;
+        this->C = c;
+        this->H = h;
+        this->W = w;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE *)x, static_cast<uint64_t>(N) * C * H * W);
+        yGm.SetGlobalBuffer((__gm__ DTYPE *)y, static_cast<uint64_t>(N) * C * H * W);
+        groupsGm.SetGlobalBuffer((__gm__ int32_t *)groups, 1);
+
+        // 行拷贝缓冲区
+        pipe.InitBuffer(inQueueRow, IN_QUEUE_NUM, this->W * sizeof(DTYPE));
+        pipe.InitBuffer(outQueueRow, OUT_QUEUE_NUM, this->W * sizeof(DTYPE));
+
+        // groups标量缓冲
+        pipe.InitBuffer(scalarQueue, 1, sizeof(int32_t));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t groups = LoadGroupsScalar();
+        if (groups <= 0) {
+            return;
+        }
+        uint32_t G = static_cast<uint32_t>(groups);
+        uint32_t CpG = C / G; // channels per group
+
+        // 按batch划分到不同block
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t nPerBlock = (N + blockNum - 1) / blockNum;
+        uint32_t nStart = blockIdx * nPerBlock;
+        uint32_t nEnd = AscendC::Min(N, nStart + nPerBlock);
+        if (nStart >= N) {
+            return;
+        }
+
+        for (uint32_t n = nStart; n < nEnd; ++n) {
+            for (uint32_t p = 0; p < CpG; ++p) {
+                for (uint32_t g = 0; g < G; ++g) {
+                    uint32_t srcC = g * CpG + p;
+                    uint32_t dstC = p * G + g;
+                    for (uint32_t h = 0; h < H; ++h) {
+                        CopyRow(n, srcC, h);
+                        WriteRow(n, dstC, h);
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    __aicore__ inline int32_t LoadGroupsScalar()
+    {
+        AscendC::LocalTensor<int32_t> loc = scalarQueue.AllocTensor<int32_t>();
+        AscendC::DataCopy(loc, groupsGm, 1);
+        scalarQueue.EnQue(loc);
+        AscendC::LocalTensor<int32_t> loc2 = scalarQueue.DeQue<int32_t>();
+        int32_t g = *(reinterpret_cast<__ub__ int32_t*>(loc2.GetPhyAddr()));
+        scalarQueue.FreeTensor(loc2);
+        return g;
+    }
+
+    __aicore__ inline void CopyRow(uint32_t n, uint32_t c, uint32_t h)
+    {
+        AscendC::LocalTensor<DTYPE> rowLocal = inQueueRow.AllocTensor<DTYPE>();
+        uint64_t offset = ((((uint64_t)n) * C + c) * H + h) * W;
+        AscendC::DataCopy(rowLocal, xGm[offset], W);
+        inQueueRow.EnQue(rowLocal);
+    }
+
+    __aicore__ inline void WriteRow(uint32_t n, uint32_t c, uint32_t h)
+    {
+        AscendC::LocalTensor<DTYPE> rowLocal = inQueueRow.DeQue<DTYPE>();
+        AscendC::LocalTensor<DTYPE> outLocal = outQueueRow.AllocTensor<DTYPE>();
+        // 直接复用输入本地缓冲作为输出，避免额外计算
+        AscendC::DataCopy(outLocal, rowLocal, W);
+        outQueueRow.EnQue(outLocal);
+        inQueueRow.FreeTensor(rowLocal);
+
+        AscendC::LocalTensor<DTYPE> outRow = outQueueRow.DeQue<DTYPE>();
+        uint64_t dstOffset = ((((uint64_t)n) * C + c) * H + h) * W;
+        AscendC::DataCopy(yGm[dstOffset], outRow, W);
+        outQueueRow.FreeTensor(outRow);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, IN_QUEUE_NUM> inQueueRow;
+    AscendC::TQue<AscendC::TPosition::VECOUT, OUT_QUEUE_NUM> outQueueRow;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> scalarQueue;
+
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+    AscendC::GlobalTensor<int32_t> groupsGm;
+
+    uint32_t N, C, H, W;
+};
+
+extern "C" __global__ __aicore__ void shufflenet_custom(GM_ADDR x, GM_ADDR groups, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelChannelShuffle op;
+    op.Init(x, groups, y, tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor shufflenet_custom_impl_npu(const at::Tensor& x, int64_t groups) {
+    auto result = at::empty_like(x);
+    auto opts = x.options().dtype(at::kInt);
+    auto groups_tensor = at::empty({1}, opts);
+    groups_tensor.fill_(static_cast<int>(groups));
+    EXEC_NPU_CMD(aclnnShufflenetCustom, x, groups_tensor, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("shufflenet_custom", &shufflenet_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("shufflenet_custom", &shufflenet_custom_impl_npu, "ChannelShuffle");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_npu
+import custom_ops_lib
+
+class ChannelShuffleNew(nn.Module):
+    def __init__(self, groups):
+        super(ChannelShuffleNew, self).__init__()
+        self.groups = groups
+    def forward(self, x):
+        return custom_ops_lib.shufflenet_custom(x, self.groups)
+
+class ShuffleNetUnitNew(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        super(ShuffleNetUnitNew, self).__init__()
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1, groups=mid_channels, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        self.shuffle = ChannelShuffleNew(groups)
+
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.shuffle(out)
+        out = F.relu(self.bn3(self.conv3(out)))
+        out += self.shortcut(x)
+        return out
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000, groups=3, stages_repeats=[3, 7, 3], stages_out_channels=[24, 240, 480, 960]):
+        super(ModelNew, self).__init__()
+        self.conv1 = nn.Conv2d(3, stages_out_channels[0], kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(stages_out_channels[0])
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.stage2 = self._make_stage(stages_out_channels[0], stages_out_channels[1], stages_repeats[0], groups)
+        self.stage3 = self._make_stage(stages_out_channels[1], stages_out_channels[2], stages_repeats[1], groups)
+        self.stage4 = self._make_stage(stages_out_channels[2], stages_out_channels[3], stages_repeats[2], groups)
+        self.conv5 = nn.Conv2d(stages_out_channels[3], 1024, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn5 = nn.BatchNorm2d(1024)
+        self.fc = nn.Linear(1024, num_classes)
+
+    def _make_stage(self, in_channels, out_channels, repeats, groups):
+        layers = []
+        layers.append(ShuffleNetUnitNew(in_channels, out_channels, groups))
+        for _ in range(1, repeats):
+            layers.append(ShuffleNetUnitNew(out_channels, out_channels, groups))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = F.relu(self.bn5(self.conv5(x)))
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+'''

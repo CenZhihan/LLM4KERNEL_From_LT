@@ -65,16 +65,15 @@ const uint32_t TILE_NUM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     MambaReturnYCustomTilingData tiling;
-    // y_diag and y_off share the same shape: [b, c, l, h, p]
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -84,21 +83,7 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* in_shape = context->GetInputShape(0);
     gert::Shape* out_shape = context->GetOutputShape(0);
-
-    // Expect rank 5: [b, c, l, h, p], merge c and l => [b, c*l, h, p]
-    auto dims = in_shape->GetStorageShape().GetDims();
-    if (dims.size() == 5) {
-        int64_t b = dims[0];
-        int64_t c = dims[1];
-        int64_t l = dims[2];
-        int64_t h = dims[3];
-        int64_t p = dims[4];
-        std::vector<int64_t> odims = {b, c * l, h, p};
-        out_shape->SetDim(odims);
-    } else {
-        // Fallback to same total size if unexpected rank
-        *out_shape = *in_shape;
-    }
+    *out_shape = *in_shape;
     return GRAPH_SUCCESS;
 }
 
@@ -133,8 +118,7 @@ public:
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -145,27 +129,25 @@ OP_ADD(MambaReturnYCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "mamba_return_y_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的张量数量
 
 class KernelMambaReturnY {
 public:
     __aicore__ inline KernelMambaReturnY() {}
-    __aicore__ inline void Init(GM_ADDR y_diag, GM_ADDR y_off, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
+    __aicore__ inline void Init(GM_ADDR yDiag, GM_ADDR yOff, GM_ADDR yOut, uint32_t totalLength, uint32_t tileNum)
     {
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        yDiagGm.SetGlobalBuffer((__gm__ float *)y_diag + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yOffGm.SetGlobalBuffer((__gm__ float *)y_off + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yDiagGm.SetGlobalBuffer((__gm__ float *)yDiag + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yOffGm.SetGlobalBuffer((__gm__ float *)yOff + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yOutGm.SetGlobalBuffer((__gm__ float *)yOut + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
         pipe.InitBuffer(inQueueDiag, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(inQueueOff,  BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(outQueueY,   BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueOff , BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueue   , BUFFER_NUM, this->tileLength * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -183,50 +165,50 @@ private:
     {
         AscendC::LocalTensor<float> diagLocal = inQueueDiag.AllocTensor<float>();
         AscendC::LocalTensor<float> offLocal  = inQueueOff.AllocTensor<float>();
+
         AscendC::DataCopy(diagLocal, yDiagGm[progress * this->tileLength], this->tileLength);
-        AscendC::DataCopy(offLocal,  yOffGm[progress * this->tileLength],  this->tileLength);
+        AscendC::DataCopy(offLocal , yOffGm [progress * this->tileLength], this->tileLength);
+
         inQueueDiag.EnQue(diagLocal);
         inQueueOff.EnQue(offLocal);
     }
 
-    __aicore__ inline void Compute(int32_t progress)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
         AscendC::LocalTensor<float> diagLocal = inQueueDiag.DeQue<float>();
         AscendC::LocalTensor<float> offLocal  = inQueueOff.DeQue<float>();
-        AscendC::LocalTensor<float> yLocal    = outQueueY.AllocTensor<float>();
+        AscendC::LocalTensor<float> outLocal  = outQueue.AllocTensor<float>();
 
-        // Element-wise add: y = y_diag + y_off
-        AscendC::Add(yLocal, diagLocal, offLocal, this->tileLength);
+        AscendC::Add(outLocal, diagLocal, offLocal, this->tileLength);
 
-        outQueueY.EnQue<float>(yLocal);
+        outQueue.EnQue<float>(outLocal);
         inQueueDiag.FreeTensor(diagLocal);
         inQueueOff.FreeTensor(offLocal);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
-        outQueueY.FreeTensor(yLocal);
+        AscendC::LocalTensor<float> outLocal = outQueue.DeQue<float>();
+        AscendC::DataCopy(yOutGm[progress * this->tileLength], outLocal, this->tileLength);
+        outQueue.FreeTensor(outLocal);
     }
 
 private:
     AscendC::TPipe pipe;
     AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueDiag, inQueueOff;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
     AscendC::GlobalTensor<float> yDiagGm;
     AscendC::GlobalTensor<float> yOffGm;
-    AscendC::GlobalTensor<float> yGm;
+    AscendC::GlobalTensor<float> yOutGm;
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void mamba_return_y_custom(GM_ADDR y_diag, GM_ADDR y_off, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void mamba_return_y_custom(GM_ADDR yDiag, GM_ADDR yOff, GM_ADDR yOut, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelMambaReturnY op;
-    op.Init(y_diag, y_off, y, tiling_data.totalLength, tiling_data.tileNum);
+    op.Init(yDiag, yOff, yOut, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -238,9 +220,7 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor mamba_return_y_custom_impl_npu(const at::Tensor& y_diag, const at::Tensor& y_off) {
-    // Output shape merges dims 1 and 2: [b, c, l, h, p] -> [b, c*l, h, p]
-    // Let aclnn infer shape via host InferShape.
-    at::Tensor result = at::empty({0}, y_diag.options()); // framework will resize
+    at::Tensor result = at::empty_like(y_diag);
     EXEC_NPU_CMD(aclnnMambaReturnYCustom, y_diag, y_off, result);
     return result;
 }
@@ -250,7 +230,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("mamba_return_y_custom", &mamba_return_y_custom_impl_npu, "Y = rearrange(Y_diag + Y_off, 'b c l h p -> b (c l) h p')");
+    m.def("mamba_return_y_custom", &mamba_return_y_custom_impl_npu, "Mamba Return Y (sum of Y_diag and Y_off)");
 }
 """
 
@@ -259,9 +239,10 @@ import torch
 import torch_npu
 import custom_ops_lib
 from einops import rearrange
+import torch.nn as nn
 import torch.nn.functional as F
 
-class ModelNew(torch.nn.Module):
+class ModelNew(nn.Module):
     def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
         super(ModelNew, self).__init__()
         assert seq_length % block_len == 0, "Sequence length must be divisible by block length"
@@ -272,15 +253,15 @@ class ModelNew(torch.nn.Module):
         self.d_state = d_state
         self.block_len = block_len
 
-        self.A = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
-        self.B = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
-        self.C = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
 
     def segsum(self, x):
         T = x.size(-1)
         x_cumsum = torch.cumsum(x, dim=-1)
         x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
-        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=0)
+        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
         x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
         return x_segsum
 
@@ -293,17 +274,15 @@ class ModelNew(torch.nn.Module):
         A_blocks = rearrange(A_blocks, "b c l h -> b h c l")
         A_cumsum = torch.cumsum(A_blocks, dim=-1)
 
-        # 1. Compute diagonal block outputs
+        # 1. 计算对角块输出
         L = torch.exp(self.segsum(A_blocks))
-        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp",
-                              C_blocks, B_blocks, L, X_blocks)
+        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C_blocks, B_blocks, L, X_blocks)
 
-        # 2. Compute intra-chunk states
+        # 2. 计算块内状态
         decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
-        states = torch.einsum("bclhn,bhcl,bclhp->bchpn",
-                              B_blocks, decay_states, X_blocks)
+        states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B_blocks, decay_states, X_blocks)
 
-        # 3. Compute inter-chunk recurrence
+        # 3. 计算块间递推
         if initial_states is None:
             initial_states = torch.zeros_like(states[:, :1])
         states = torch.cat([initial_states, states], dim=1)
@@ -312,12 +291,14 @@ class ModelNew(torch.nn.Module):
         new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
         states = new_states[:, :-1]
 
-        # 4. Compute state-to-output conversion
+        # 4. 状态到输出的转换
         state_decay_out = torch.exp(A_cumsum)
-        Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp',
-                             C_blocks, states, state_decay_out)
+        Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', C_blocks, states, state_decay_out)
 
-        # Replace: Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
-        Y = custom_ops_lib.mamba_return_y_custom(Y_diag, Y_off)
+        # 使用自定义 AscendC 内核进行 Y = Y_diag + Y_off 的融合加法
+        Y_sum = custom_ops_lib.mamba_return_y_custom(Y_diag, Y_off)
+
+        # 还原形状
+        Y = rearrange(Y_sum, "b c l h p -> b (c l) h p")
         return Y
 '''

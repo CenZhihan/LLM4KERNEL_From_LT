@@ -81,13 +81,11 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
-    const gert::Shape* y_shape = context->GetInputShape(1);
-    // Assume shapes are identical in valid residual connections
-    (void)y_shape;
-    gert::Shape* z_shape = context->GetOutputShape(0);
-    *z_shape = *x_shape;
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -131,14 +129,15 @@ OP_ADD(ResnetBasicBlockCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "resnet_basic_block_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+// 说明：该自定义算子实现 out = Relu(x + y)
+// 利用Ascend C基础向量API AddRelu 进行逐元素融合计算
 
-class KernelAddRelu {
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的张量个数
+
+class KernelResnetBasicBlockCustom {
 public:
-    __aicore__ inline KernelAddRelu() {}
+    __aicore__ inline KernelResnetBasicBlockCustom() {}
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
     {
         this->blockLength = totalLength / AscendC::GetBlockNum();
@@ -148,10 +147,12 @@ public:
         xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
         pipe.InitBuffer(inQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
         pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
     }
+
     __aicore__ inline void Process()
     {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
@@ -172,17 +173,21 @@ private:
         inQueueX.EnQue(xLocal);
         inQueueY.EnQue(yLocal);
     }
+
     __aicore__ inline void Compute(int32_t /*progress*/)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
         AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.DeQue<DTYPE_Y>();
         AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
-        // Fused Add + ReLU
+
+        // 融合计算：z = Relu(x + y)
         AscendC::AddRelu(zLocal, xLocal, yLocal, this->tileLength);
+
         outQueueZ.EnQue<DTYPE_Z>(zLocal);
         inQueueX.FreeTensor(xLocal);
         inQueueY.FreeTensor(yLocal);
     }
+
     __aicore__ inline void CopyOut(int32_t progress)
     {
         AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
@@ -204,7 +209,7 @@ private:
 
 extern "C" __global__ __aicore__ void resnet_basic_block_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelAddRelu op;
+    KernelResnetBasicBlockCustom op;
     op.Init(x, y, z, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
@@ -216,9 +221,9 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor resnet_basic_block_custom_impl_npu(const at::Tensor& self, const at::Tensor& other) {
-    at::Tensor result = at::empty_like(self);
-    EXEC_NPU_CMD(aclnnResnetBasicBlockCustom, self, other, result);
+at::Tensor resnet_basic_block_custom_impl_npu(const at::Tensor& x, const at::Tensor& y) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnResnetBasicBlockCustom, x, y, result);
     return result;
 }
 
@@ -227,14 +232,15 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("resnet_basic_block_custom", &resnet_basic_block_custom_impl_npu, "residual add + relu");
+    m.def("resnet_basic_block_custom", &resnet_basic_block_custom_impl_npu, "relu(x + y)");
 }
 """
 
 model_src='''
 import torch
-import torch_npu
 import torch.nn as nn
+import torch.nn.functional as F
+import torch_npu
 import custom_ops_lib
 
 class ModelNew(nn.Module):
@@ -266,7 +272,8 @@ class ModelNew(nn.Module):
         if self.downsample is not None:
             identity = self.downsample(x)
 
-        # Fused residual addition + ReLU using custom AscendC op
+        # 融合残差加法与ReLU的自定义AscendC算子
         out = custom_ops_lib.resnet_basic_block_custom(out, identity)
+
         return out
 '''

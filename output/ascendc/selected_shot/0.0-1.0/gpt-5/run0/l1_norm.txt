@@ -27,6 +27,14 @@ project_json_src='''
             }
         ],
         "attr":[
+            {
+                "name":"epsilon",
+                "type": [
+                    "float"
+                ],
+                "default_value":0.0,
+                "param_type":"optional"
+            }
         ]
     }
 ]
@@ -44,6 +52,8 @@ BEGIN_TILING_DATA_DEF(L1NormCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, tileLoop);
   TILING_DATA_FIELD_DEF(uint32_t, tileLength);
   TILING_DATA_FIELD_DEF(uint32_t, loopCount);
+  TILING_DATA_FIELD_DEF(float, factor);
+  TILING_DATA_FIELD_DEF(float, eps);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(L1NormCustom, L1NormCustomTilingData)
@@ -61,19 +71,21 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
   L1NormCustomTilingData tiling;
   const gert::StorageShape* x_shape = context->GetInputShape(0);
   const gert::Shape shape = x_shape->GetStorageShape();
-  auto rowNum = static_cast<uint32_t>(shape.GetDim(0));
-  auto colNum = static_cast<uint32_t>(shape.GetDim(1));
+  auto rowNum = shape.GetDim(0);
+  auto colNum = shape.GetDim(1);
   auto coreRowNum = rowNum / BLOCK_DIM;
 
+  const float* epsilonAttr = context->GetAttrs()->GetAttrPointer<float>(0);
+  tiling.set_eps(*epsilonAttr);
   tiling.set_rowNum(coreRowNum);
   tiling.set_rowNumSp(coreRowNum + 1);
   tiling.set_rowLength(colNum);
   tiling.set_blockPivot(rowNum - coreRowNum * BLOCK_DIM);
-
   uint32_t tileLoop = 18;
   tiling.set_tileLoop(tileLoop);
   tiling.set_tileLength(tileLoop * colNum);
   tiling.set_loopCount(coreRowNum / tileLoop);
+  tiling.set_factor(1.0f / static_cast<float>(colNum));
 
   context->SetBlockDim(BLOCK_DIM);
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
@@ -108,6 +120,7 @@ class L1NormCustom : public OpDef {
         .DataType({ge::DT_FLOAT})
         .Format({ge::FORMAT_ND})
         .UnknownShapeFormat({ge::FORMAT_ND});
+    this->Attr("epsilon").AttrType(OPTIONAL).Float(0.0);
 
     this->SetInferShape(ge::InferShape);
 
@@ -136,7 +149,10 @@ class KernelL1Norm {
     tileLoop = tiling_data.tileLoop;
     tileLength = tiling_data.tileLength;
     loopCount = tiling_data.loopCount;
+    factor = tiling_data.factor;
+    eps = tiling_data.eps;
   }
+
   __aicore__ inline void Init(GM_ADDR x, GM_ADDR z, GM_ADDR tiling) {
     InitTiling(tiling);
 
@@ -165,6 +181,7 @@ class KernelL1Norm {
     pipe.InitBuffer(tmpBuffer2, 64 * sizeof(float));
     pipe.InitBuffer(onesBuffer, 64 * sizeof(float));
   }
+
   __aicore__ inline void Process() {
     for (int32_t i = 0; i < this->loopCount; i++) {
       CopyIn(i, this->tileLoop);
@@ -182,7 +199,7 @@ class KernelL1Norm {
   __aicore__ inline void CopyIn(int32_t progress, int32_t rowNum) {
     AscendC::LocalTensor<float> xLocal = queueX.AllocTensor<float>();
     AscendC::DataCopy(xLocal, xGm[progress * this->tileLength],
-             this->rowLength * rowNum);
+                      this->rowLength * rowNum);
     queueX.EnQue(xLocal);
   }
 
@@ -190,26 +207,33 @@ class KernelL1Norm {
     AscendC::LocalTensor<float> xLocal = queueX.DeQue<float>();
 
     AscendC::LocalTensor<float> tmpTensor1 = tmpBuffer1.Get<float>();
-    AscendC::LocalTensor<float> tmpTensor2 = tmpBuffer2.Get<float>();
+    AscendC::LocalTensor<float> tmpTensor2 = tmpBuffer2.Get<float>();  // size >= tileLoop
     AscendC::LocalTensor<float> onesLocal = onesBuffer.Get<float>();
     AscendC::LocalTensor<float> zLocal = queueZ.AllocTensor<float>();
+
     AscendC::Duplicate<float>(onesLocal, 1.0f, this->tileLoop);
 
-    // Compute per-row L1 mean inverse: inv_mean = rowLength / sum(abs(x))
-    for (uint32_t j = 0; j < rowNum; ++j) {
-      uint32_t buffIndex = j * this->rowLength;
-      AscendC::Abs(zLocal[buffIndex], xLocal[buffIndex], this->rowLength);
-      AscendC::ReduceSum<float>(tmpTensor2[j], zLocal[buffIndex], tmpTensor1,
-                       this->rowLength);
+    // Compute mean(abs(x)) per row
+    for (uint32_t j = 0; j < (uint32_t)rowNum; ++j) {
+      uint32_t offset = j * this->rowLength;
+      AscendC::Abs(zLocal[offset], xLocal[offset], this->rowLength);
     }
 
-    AscendC::Div(tmpTensor2, onesLocal, tmpTensor2, rowNum); // 1 / sum(abs(x))
-    AscendC::Muls(tmpTensor2, tmpTensor2, static_cast<float>(this->rowLength), rowNum); // rowLength / sum(abs(x))
+    for (uint32_t j = 0; j < (uint32_t)rowNum; ++j) {
+      uint32_t offset = j * this->rowLength;
+      AscendC::ReduceSum<float>(tmpTensor2[j], zLocal[offset], tmpTensor1, this->rowLength);
+    }
 
-    for (uint32_t j = 0; j < rowNum; ++j) {
-      uint32_t buffIndex = j * this->rowLength;
-      AscendC::Muls(zLocal[buffIndex], xLocal[buffIndex], tmpTensor2.GetValue(j),
-           this->rowLength);
+    AscendC::Muls(tmpTensor2, tmpTensor2, this->factor, rowNum);   // mean
+    if (this->eps != 0.0f) {
+      AscendC::Adds(tmpTensor2, tmpTensor2, this->eps, rowNum);
+    }
+    AscendC::Div(tmpTensor2, onesLocal, tmpTensor2, rowNum);  // reciprocal of mean
+
+    // Normalize: z = x * recip_mean
+    for (uint32_t j = 0; j < (uint32_t)rowNum; ++j) {
+      uint32_t offset = j * this->rowLength;
+      AscendC::Muls(zLocal[offset], xLocal[offset], tmpTensor2.GetValue(j), this->rowLength);
     }
 
     queueZ.EnQue<float>(zLocal);
@@ -218,10 +242,8 @@ class KernelL1Norm {
 
   __aicore__ inline void CopyOut(int32_t progress, int32_t rowNum) {
     AscendC::LocalTensor<float> zLocal = queueZ.DeQue<float>();
-
     AscendC::DataCopy(zGm[progress * this->tileLength], zLocal,
-             rowNum * this->rowLength);
-
+                      rowNum * this->rowLength);
     queueZ.FreeTensor(zLocal);
   }
 
@@ -242,6 +264,8 @@ class KernelL1Norm {
   uint32_t tileLoop = 8;
   uint32_t tileLength = 8 * 1024;
   uint32_t loopCount = 42;
+  float factor = 0.0009765625f;
+  float eps = 0.0f;
 };
 
 extern "C" __global__ __aicore__ void l1_norm_custom(
@@ -260,9 +284,9 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor l1_norm_impl_npu(const at::Tensor& x) {
+at::Tensor l1_norm_impl_npu(const at::Tensor& x, double epsilon) {
     at::Tensor result = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnL1NormCustom, x, result);
+    EXEC_NPU_CMD(aclnnL1NormCustom, x, epsilon, result);
     return result;
 }
 
@@ -280,6 +304,7 @@ import torch, torch_npu, custom_ops_lib
 class ModelNew(torch.nn.Module):
     def __init__(self):
         super(ModelNew, self).__init__()
+        self.epsilon = 0.0
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return custom_ops_lib.l1_norm_custom(x)
+        return custom_ops_lib.l1_norm_custom(x, self.epsilon)
 '''

@@ -38,6 +38,10 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(GemmSwishDivideClampTanhClampCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(float, swishBeta);
+  TILING_DATA_FIELD_DEF(float, divideScalar);
+  TILING_DATA_FIELD_DEF(float, clampMin);
+  TILING_DATA_FIELD_DEF(float, clampMax);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(GemmSwishDivideClampTanhClampCustom, GemmSwishDivideClampTanhClampCustomTilingData)
@@ -58,15 +62,19 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
 
     context->SetBlockDim(BLOCK_DIM);
+
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
+    tiling.set_swishBeta(1.0f);        // x * sigmoid(beta * x), beta=1
+    tiling.set_divideScalar(0.5f);     // divide by 2.0 -> multiply by 0.5
+    tiling.set_clampMin(-1.0f);
+    tiling.set_clampMax(1.0f);
 
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
-                        context->GetRawTilingData()->GetCapacity());
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+    currentWorkspace[0] = 0; // no extra workspace
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -74,12 +82,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    *y_shape = *x_shape;
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -98,7 +105,6 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -106,9 +112,7 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -119,27 +123,33 @@ OP_ADD(GemmSwishDivideClampTanhClampCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "gemm_swish_divide_clamp_tanh_clamp_custom_tiling_data.h"
 
+using DTYPE = float;
 constexpr int32_t BUFFER_NUM = 2;
 
-class KernelFused {
+class KernelGemmSwishDivideClampTanhClamp {
 public:
-    __aicore__ inline KernelFused() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
+    __aicore__ inline KernelGemmSwishDivideClampTanhClamp() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, float swishBeta, float divideScalar, float clampMin, float clampMax,
+                                uint32_t totalLength, uint32_t tileNum)
     {
         ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
         ASSERT(tileNum != 0 && "tile num can not be zero!");
-        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->tileLength = (this->blockLength / tileNum) / BUFFER_NUM;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Z*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ DTYPE*)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE));
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE));
+
+        this->swishBeta = swishBeta;
+        this->divideScalar = divideScalar;
+        this->clampMin = clampMin;
+        this->clampMax = clampMax;
     }
 
     __aicore__ inline void Process()
@@ -155,51 +165,66 @@ public:
 private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
     }
 
     __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.DeQue<DTYPE>();
+        AscendC::LocalTensor<DTYPE> yLocal = outQueueY.AllocTensor<DTYPE>();
 
-        // y = x * sigmoid(x)
-        AscendC::Sigmoid(yLocal, xLocal, this->tileLength);                 // y = sigmoid(x)
-        AscendC::Mul(yLocal, yLocal, xLocal, this->tileLength);             // y = y * x
+        // Swish: y = x * sigmoid(beta * x)
+        AscendC::Swish(yLocal, xLocal, this->tileLength, (DTYPE)swishBeta);
 
-        // y = y / 2.0
-        AscendC::Muls(yLocal, yLocal, (DTYPE_Z)0.5, this->tileLength);
+        // Divide by 2.0 -> multiply by 0.5 (divideScalar)
+        AscendC::Muls(yLocal, yLocal, (DTYPE)divideScalar, this->tileLength);
 
-        // clamp to [-1, 1]
-        AscendC::ClampMin(yLocal, yLocal, (DTYPE_Z)(-1.0), this->tileLength);
-        AscendC::ClampMax(yLocal, yLocal, (DTYPE_Z)(1.0), this->tileLength);
+        // Clamp to [clampMin, clampMax]
+        AscendC::Maxs(yLocal, yLocal, (DTYPE)clampMin, this->tileLength);
+        AscendC::Mins(yLocal, yLocal, (DTYPE)clampMax, this->tileLength);
 
-        // tanh
-        AscendC::Tanh(yLocal, yLocal, this->tileLength);
+        // Tanh using exp: tanh(a) = (exp(2a) - 1) / (exp(2a) + 1)
+        AscendC::LocalTensor<DTYPE> tmpLocal = tmpQueue.AllocTensor<DTYPE>();
+        AscendC::Muls(tmpLocal, yLocal, (DTYPE)2.0f, this->tileLength);      // tmp = 2a
+        AscendC::Exp(tmpLocal, tmpLocal, this->tileLength);                   // tmp = exp(2a)
 
-        // clamp to [-1, 1] again
-        AscendC::ClampMin(yLocal, yLocal, (DTYPE_Z)(-1.0), this->tileLength);
-        AscendC::ClampMax(yLocal, yLocal, (DTYPE_Z)(1.0), this->tileLength);
+        AscendC::Adds(yLocal, tmpLocal, (DTYPE)1.0f, this->tileLength);       // y = tmp + 1  (denominator)
+        AscendC::Adds(tmpLocal, tmpLocal, (DTYPE)(-1.0f), this->tileLength);  // tmp = tmp - 1 (numerator)
 
-        outQueueY.EnQue<DTYPE_Z>(yLocal);
+        AscendC::Div(yLocal, tmpLocal, yLocal, this->tileLength);             // y = numerator / denominator
+
+        // Final clamp to [-1, 1]
+        AscendC::Maxs(yLocal, yLocal, (DTYPE)clampMin, this->tileLength);
+        AscendC::Mins(yLocal, yLocal, (DTYPE)clampMax, this->tileLength);
+
+        outQueueY.EnQue<DTYPE>(yLocal);
         inQueueX.FreeTensor(xLocal);
+        tmpQueue.FreeTensor(tmpLocal);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE> yLocal = outQueueY.DeQue<DTYPE>();
         AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Z> yGm;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue;
+
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+
+    float swishBeta;
+    float divideScalar;
+    float clampMin;
+    float clampMax;
+
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
@@ -208,8 +233,11 @@ private:
 extern "C" __global__ __aicore__ void gemm_swish_divide_clamp_tanh_clamp_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tilingData, tiling);
-    KernelFused op;
-    op.Init(x, y, tilingData.totalLength, tilingData.tileNum);
+    KernelGemmSwishDivideClampTanhClamp op;
+    op.Init(x, y,
+            tilingData.swishBeta(), tilingData.divideScalar(),
+            tilingData.clampMin(), tilingData.clampMax(),
+            tilingData.totalLength(), tilingData.tileNum());
     op.Process();
 }
 """
@@ -221,9 +249,9 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor gemm_swish_divide_clamp_tanh_clamp_custom_impl_npu(const at::Tensor& input) {
-    at::Tensor result = at::empty_like(input);
-    EXEC_NPU_CMD(aclnnGemmSwishDivideClampTanhClampCustom, input, result);
-    return result;
+    at::Tensor output = at::empty_like(input);
+    EXEC_NPU_CMD(aclnnGemmSwishDivideClampTanhClampCustom, input, output);
+    return output;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -232,7 +260,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gemm_swish_divide_clamp_tanh_clamp_custom", &gemm_swish_divide_clamp_tanh_clamp_custom_impl_npu,
-          "Fused swish/divide/clamp/tanh/clamp");
+          "fused swish/divide/clamp/tanh/clamp");
 }
 """
 
@@ -242,15 +270,12 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    Optimized model: keep Linear on PyTorch, fuse swish/divide/clamp/tanh/clamp into a custom AscendC op.
-    """
     def __init__(self, in_features, out_features, bias=True):
-        super(ModelNew, self).__init__()
+        super().__init__()
         self.gemm = torch.nn.Linear(in_features, out_features, bias=bias)
 
     def forward(self, x):
-        x = self.gemm(x)
-        x = custom_ops_lib.gemm_swish_divide_clamp_tanh_clamp_custom(x)
-        return x
+        y = self.gemm(x)
+        y = custom_ops_lib.gemm_swish_divide_clamp_tanh_clamp_custom(y)
+        return y
 '''

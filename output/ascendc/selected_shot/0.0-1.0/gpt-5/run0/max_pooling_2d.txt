@@ -1,0 +1,357 @@
+project_json_src='''
+[
+    {
+        "op": "MaxPooling2dCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MaxPooling2dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, out_h);
+  TILING_DATA_FIELD_DEF(uint32_t, out_w);
+  TILING_DATA_FIELD_DEF(uint32_t, kernel_h);
+  TILING_DATA_FIELD_DEF(uint32_t, kernel_w);
+  TILING_DATA_FIELD_DEF(uint32_t, stride_h);
+  TILING_DATA_FIELD_DEF(uint32_t, stride_w);
+  TILING_DATA_FIELD_DEF(uint32_t, pad_t);
+  TILING_DATA_FIELD_DEF(uint32_t, pad_b);
+  TILING_DATA_FIELD_DEF(uint32_t, pad_l);
+  TILING_DATA_FIELD_DEF(uint32_t, pad_r);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MaxPooling2dCustom, MaxPooling2dCustomTilingData)
+}
+"""
+host_operator_src="""
+#include "max_pooling_2d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline int64_t div_floor(int64_t a, int64_t b) {
+    return a / b;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MaxPooling2dCustomTilingData tiling;
+
+    const auto* shape = context->GetInputShape(0);
+    auto origin = shape->GetOriginShape();
+
+    uint64_t N = origin.GetDimNum() > 0 ? origin.GetDim(0) : 1;
+    uint64_t C = origin.GetDimNum() > 1 ? origin.GetDim(1) : 1;
+    uint64_t H = origin.GetDimNum() > 2 ? origin.GetDim(2) : 1;
+    uint64_t W = origin.GetDimNum() > 3 ? origin.GetDim(3) : 1;
+
+    int64_t kH = 1, kW = 1, sH = 1, sW = 1, pT = 0, pB = 0, pL = 0, pR = 0;
+
+    // Try to read attributes; fall back to common names
+    (void)context->GetIntAttr("kernel_h", kH);
+    (void)context->GetIntAttr("kernel_w", kW);
+    // symmetric fallback
+    int64_t kSz = 1;
+    if (!context->GetIntAttr("kernel_h", kH) && context->GetIntAttr("kernel_size", kSz)) {
+        kH = kSz; kW = kSz;
+    }
+    (void)context->GetIntAttr("stride_h", sH);
+    (void)context->GetIntAttr("stride_w", sW);
+    int64_t sSz = 1;
+    if (!context->GetIntAttr("stride_h", sH) && context->GetIntAttr("stride", sSz)) {
+        sH = sSz; sW = sSz;
+    }
+    (void)context->GetIntAttr("pad_t", pT);
+    (void)context->GetIntAttr("pad_b", pB);
+    (void)context->GetIntAttr("pad_l", pL);
+    (void)context->GetIntAttr("pad_r", pR);
+    int64_t pSz = 0;
+    if (!context->GetIntAttr("pad_t", pT) && context->GetIntAttr("padding", pSz)) {
+        pT = pB = pL = pR = pSz;
+    }
+
+    int64_t outH = div_floor((static_cast<int64_t>(H) + pT + pB - kH), sH) + 1;
+    int64_t outW = div_floor((static_cast<int64_t>(W) + pL + pR - kW), sW) + 1;
+    if (outH < 0) outH = 0;
+    if (outW < 0) outW = 0;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(static_cast<uint32_t>(N));
+    tiling.set_c(static_cast<uint32_t>(C));
+    tiling.set_h(static_cast<uint32_t>(H));
+    tiling.set_w(static_cast<uint32_t>(W));
+    tiling.set_out_h(static_cast<uint32_t>(outH));
+    tiling.set_out_w(static_cast<uint32_t>(outW));
+    tiling.set_kernel_h(static_cast<uint32_t>(kH));
+    tiling.set_kernel_w(static_cast<uint32_t>(kW));
+    tiling.set_stride_h(static_cast<uint32_t>(sH));
+    tiling.set_stride_w(static_cast<uint32_t>(sW));
+    tiling.set_pad_t(static_cast<uint32_t>(pT));
+    tiling.set_pad_b(static_cast<uint32_t>(pB));
+    tiling.set_pad_l(static_cast<uint32_t>(pL));
+    tiling.set_pad_r(static_cast<uint32_t>(pR));
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    int64_t N = origin.GetDimNum() > 0 ? origin.GetDim(0) : 1;
+    int64_t C = origin.GetDimNum() > 1 ? origin.GetDim(1) : 1;
+    int64_t H = origin.GetDimNum() > 2 ? origin.GetDim(2) : 1;
+    int64_t W = origin.GetDimNum() > 3 ? origin.GetDim(3) : 1;
+
+    int64_t kH = 1, kW = 1, sH = 1, sW = 1, pT = 0, pB = 0, pL = 0, pR = 0;
+    (void)context->GetIntAttr("kernel_h", kH);
+    (void)context->GetIntAttr("kernel_w", kW);
+    int64_t kSz = 1;
+    if (!context->GetIntAttr("kernel_h", kH) && context->GetIntAttr("kernel_size", kSz)) {
+        kH = kSz; kW = kSz;
+    }
+    (void)context->GetIntAttr("stride_h", sH);
+    (void)context->GetIntAttr("stride_w", sW);
+    int64_t sSz = 1;
+    if (!context->GetIntAttr("stride_h", sH) && context->GetIntAttr("stride", sSz)) {
+        sH = sSz; sW = sSz;
+    }
+    (void)context->GetIntAttr("pad_t", pT);
+    (void)context->GetIntAttr("pad_b", pB);
+    (void)context->GetIntAttr("pad_l", pL);
+    (void)context->GetIntAttr("pad_r", pR);
+    int64_t pSz = 0;
+    if (!context->GetIntAttr("pad_t", pT) && context->GetIntAttr("padding", pSz)) {
+        pT = pB = pL = pR = pSz;
+    }
+
+    int64_t outH = (H + pT + pB - kH) / sH + 1;
+    int64_t outW = (W + pL + pR - kW) / sW + 1;
+    if (outH < 0) outH = 0;
+    if (outW < 0) outW = 0;
+
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    out_shape->SetDimNum(4);
+    out_shape->SetDim(0, N);
+    out_shape->SetDim(1, C);
+    out_shape->SetDim(2, outH);
+    out_shape->SetDim(3, outW);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MaxPooling2dCustom : public OpDef {
+public:
+    explicit MaxPooling2dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // Optional: attributes (kernel/stride/padding) can be supplied by frontend
+        // and consumed in tiling/infer functions.
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MaxPooling2dCustom);
+}
+"""
+kernel_src="""
+#include "kernel_operator.h"
+#include <limits>
+
+extern \"C\" __global__ __aicore__ void max_pooling_2d_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+
+    const uint32_t N = tiling_data.n;
+    const uint32_t C = tiling_data.c;
+    const uint32_t H = tiling_data.h;
+    const uint32_t W = tiling_data.w;
+    const uint32_t outH = tiling_data.out_h;
+    const uint32_t outW = tiling_data.out_w;
+
+    const uint32_t kH = tiling_data.kernel_h;
+    const uint32_t kW = tiling_data.kernel_w;
+    const uint32_t sH = tiling_data.stride_h;
+    const uint32_t sW = tiling_data.stride_w;
+    const uint32_t pT = tiling_data.pad_t;
+    const uint32_t pB = tiling_data.pad_b;
+    const uint32_t pL = tiling_data.pad_l;
+    const uint32_t pR = tiling_data.pad_r;
+
+    __gm__ const DTYPE_X* x_ptr = reinterpret_cast<__gm__ const DTYPE_X*>(x);
+    __gm__ DTYPE_Y* y_ptr = reinterpret_cast<__gm__ DTYPE_Y*>(y);
+
+    uint32_t blockNum = AscendC::GetBlockNum();
+    uint32_t blockIdx = AscendC::GetBlockIdx();
+
+    uint64_t totalNC = static_cast<uint64_t>(N) * static_cast<uint64_t>(C);
+    uint64_t ncPerBlock = (totalNC + blockNum - 1) / blockNum;
+    uint64_t ncStart = blockIdx * ncPerBlock;
+    uint64_t ncEnd = ncStart + ncPerBlock;
+    if (ncEnd > totalNC) ncEnd = totalNC;
+
+    for (uint64_t nc = ncStart; nc < ncEnd; ++nc) {
+        uint32_t n = static_cast<uint32_t>(nc / C);
+        uint32_t c = static_cast<uint32_t>(nc % C);
+
+        uint64_t inBatchOffset = (static_cast<uint64_t>(n) * C + c) * H * W;
+        uint64_t outBatchOffset = (static_cast<uint64_t>(n) * C + c) * outH * outW;
+
+        for (uint32_t oh = 0; oh < outH; ++oh) {
+            int64_t h_start = static_cast<int64_t>(oh) * static_cast<int64_t>(sH) - static_cast<int64_t>(pT);
+            int64_t h_end = h_start + static_cast<int64_t>(kH);
+            if (h_start < 0) h_start = 0;
+            if (h_end > static_cast<int64_t>(H)) h_end = static_cast<int64_t>(H);
+
+            for (uint32_t ow = 0; ow < outW; ++ow) {
+                int64_t w_start = static_cast<int64_t>(ow) * static_cast<int64_t>(sW) - static_cast<int64_t>(pL);
+                int64_t w_end = w_start + static_cast<int64_t>(kW);
+                if (w_start < 0) w_start = 0;
+                if (w_end > static_cast<int64_t>(W)) w_end = static_cast<int64_t>(W);
+
+                // Initialize max value to very small number
+                float maxVal = -std::numeric_limits<float>::infinity();
+
+                for (int64_t ih = h_start; ih < h_end; ++ih) {
+                    uint64_t rowBase = inBatchOffset + static_cast<uint64_t>(ih) * W;
+                    for (int64_t iw = w_start; iw < w_end; ++iw) {
+                        float val = static_cast<float>(x_ptr[rowBase + static_cast<uint64_t>(iw)]);
+                        if (val > maxVal) {
+                            maxVal = val;
+                        }
+                    }
+                }
+
+                uint64_t outIndex = outBatchOffset + static_cast<uint64_t>(oh) * outW + static_cast<uint64_t>(ow);
+                y_ptr[outIndex] = static_cast<DTYPE_Y>(maxVal);
+            }
+        }
+    }
+}
+"""
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline int64_t compute_out_dim(int64_t in, int64_t k, int64_t s, int64_t p0, int64_t p1) {
+    return (in + p0 + p1 - k) / s + 1;
+}
+
+at::Tensor max_pooling_2d_custom_impl_npu(const at::Tensor& x,
+                                          int64_t kernel_h,
+                                          int64_t kernel_w,
+                                          int64_t stride_h,
+                                          int64_t stride_w,
+                                          int64_t pad_t,
+                                          int64_t pad_l,
+                                          int64_t pad_b,
+                                          int64_t pad_r) {
+    TORCH_CHECK(x.dim() == 4, "Input must be 4D NCHW");
+    auto N = x.size(0);
+    auto C = x.size(1);
+    auto H = x.size(2);
+    auto W = x.size(3);
+    int64_t outH = compute_out_dim(H, kernel_h, stride_h, pad_t, pad_b);
+    int64_t outW = compute_out_dim(W, kernel_w, stride_w, pad_l, pad_r);
+    TORCH_CHECK(outH >= 0 && outW >= 0, "Invalid output shape computed for max pooling");
+    at::Tensor result = at::empty({N, C, outH, outW}, x.options());
+    EXEC_NPU_CMD(aclnnMaxPooling2dCustom, x, kernel_h, kernel_w, stride_h, stride_w, pad_t, pad_l, pad_b, pad_r, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("max_pooling_2d_custom", &max_pooling_2d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("max_pooling_2d_custom", &max_pooling_2d_custom_impl_npu, "MaxPooling2D Custom");
+}
+"""
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model that performs Max Pooling 2D using a custom AscendC kernel.
+    """
+    def __init__(self, kernel_size: int, stride: int, padding: int):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        k = self.kernel_size
+        s = self.stride
+        p = self.padding
+        # Pass symmetric params for H/W and T/L/B/R
+        return custom_ops_lib.max_pooling_2d_custom(x, k, k, s, s, p, p, p, p)
+'''

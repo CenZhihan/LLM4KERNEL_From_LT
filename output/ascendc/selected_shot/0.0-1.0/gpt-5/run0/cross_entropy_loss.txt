@@ -45,8 +45,11 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(CrossEntropyLossCustomTilingData)
-    TILING_DATA_FIELD_DEF(uint32_t, rows);
-    TILING_DATA_FIELD_DEF(uint32_t, cols);
+    TILING_DATA_FIELD_DEF(uint32_t, batchSize);
+    TILING_DATA_FIELD_DEF(uint32_t, numClasses);
+    TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+    TILING_DATA_FIELD_DEF(uint32_t, tileBatch);
+    TILING_DATA_FIELD_DEF(uint32_t, lastTileBatch);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(CrossEntropyLossCustom, CrossEntropyLossCustomTilingData)
@@ -63,19 +66,26 @@ namespace optiling {
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     CrossEntropyLossCustomTilingData tiling;
+    auto inShape = context->GetInputShape(0)->GetStorageShape();
+    // Expect 2D logits: [batch, numClasses]
+    uint32_t dim0 = static_cast<uint32_t>(inShape.GetDim(0));
+    uint32_t dim1 = static_cast<uint32_t>(inShape.GetDim(1));
 
-    // Input 0: logits with shape [N, C]
-    // Input 1: target with shape [N]
-    uint64_t totalLengthLogits = context->GetInputShape(0)->GetStorageShape().GetShapeSize();
-    uint64_t totalLengthTarget = context->GetInputShape(1)->GetStorageShape().GetShapeSize();
+    uint32_t batchSize = dim0;
+    uint32_t numClasses = dim1;
 
-    uint32_t rows = static_cast<uint32_t>(totalLengthTarget);
-    uint32_t cols = static_cast<uint32_t>(totalLengthLogits / (rows == 0 ? 1 : rows));
+    // Simple 1-row tiles to keep UB usage predictable
+    uint32_t tileBatch = 1;
+    uint32_t tileNum = batchSize;
+    uint32_t lastTileBatch = 1;
 
-    tiling.set_rows(rows);
-    tiling.set_cols(cols);
+    tiling.set_batchSize(batchSize);
+    tiling.set_numClasses(numClasses);
+    tiling.set_tileNum(tileNum);
+    tiling.set_tileBatch(tileBatch);
+    tiling.set_lastTileBatch(lastTileBatch);
 
-    // Use single block by default
+    // single block
     context->SetBlockDim(1);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
@@ -126,102 +136,119 @@ constexpr int32_t BUFFER_NUM = 1;
 class KernelCrossEntropyLoss {
 public:
     __aicore__ inline KernelCrossEntropyLoss() {}
-
     __aicore__ inline void Init(GM_ADDR logits, GM_ADDR target, GM_ADDR y,
-                                uint32_t rows, uint32_t cols) {
+                                uint32_t batchSize, uint32_t numClasses,
+                                uint32_t tileNum, uint32_t tileBatch, uint32_t lastTileBatch) {
         ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
-        this->rows = rows;
-        this->cols = cols;
 
-        logitsGm.SetGlobalBuffer((__gm__ float*)logits, static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols));
-        targetGm.SetGlobalBuffer((__gm__ int32_t*)target, rows);
+        this->batchSize = batchSize;
+        this->numClasses = numClasses;
+        this->tileNum = tileNum;
+        this->tileBatch = tileBatch;
+        this->lastTileBatch = lastTileBatch;
+
+        logitsGm.SetGlobalBuffer((__gm__ float*)logits, (uint32_t)(batchSize * numClasses));
+        targetGm.SetGlobalBuffer((__gm__ int32_t*)target, batchSize);
         outGm.SetGlobalBuffer((__gm__ float*)y, 32);
 
-        pipe.InitBuffer(inQueueIN, BUFFER_NUM, this->cols * sizeof(float));
-        pipe.InitBuffer(tempBuf, this->cols * sizeof(float));
+        uint32_t reduce_align = (this->tileNum + 31) / 32 * 32;
+        pipe.InitBuffer(inQueue, BUFFER_NUM, this->numClasses * sizeof(float));
+        pipe.InitBuffer(tmpVecBuf, this->numClasses * sizeof(float));
+        pipe.InitBuffer(redWsVecBuf, this->numClasses * sizeof(float));
+        pipe.InitBuffer(lossBuf, reduce_align * sizeof(float));
+        pipe.InitBuffer(globalRedWsBuf, reduce_align * sizeof(float));
+        pipe.InitBuffer(labelBuf, sizeof(int32_t));
     }
 
     __aicore__ inline void Process() {
-        float lossSum = 0.0f;
-
-        for (uint32_t i = 0; i < rows; ++i) {
-            CopyInRow(i);
-            lossSum += ComputeRow(i);
+        AscendC::LocalTensor<float> lossLocal = lossBuf.Get<float>();
+        // Accumulate per-row loss into lossLocal[progress]
+        int32_t loopCount = this->tileNum;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            CopyIn(i);
+            Compute(i, lossLocal);
         }
+        // Reduce sum over all rows
+        AscendC::LocalTensor<float> redWs = globalRedWsBuf.Get<float>();
+        uint32_t reduce_align = (this->tileNum + 31) / 32 * 32;
+        AscendC::Duplicate(redWs, (float)0, reduce_align);
+        AscendC::ReduceSum<float>(lossLocal, lossLocal, redWs, this->tileNum);
 
-        AscendC::LocalTensor<float> tmp = tempBuf.Get<float>();
-        AscendC::LocalTensor<float> denom = inQueueIN.AllocTensor<float>();
+        // Mean over batch
+        AscendC::LocalTensor<float> denom = inQueue.AllocTensor<float>();
+        AscendC::Duplicate(denom, static_cast<float>(this->batchSize), 1);
+        AscendC::Div(lossLocal, lossLocal, denom, 1);
 
-        tmp.SetValue(0, lossSum);
-        AscendC::Duplicate(denom, static_cast<float>(rows), 1);
-        AscendC::Div(tmp, tmp, denom, 1);
-
-        outGm.SetValue(0, tmp.GetValue(0));
-        inQueueIN.FreeTensor(denom);
+        outGm.SetValue(0, lossLocal.GetValue(0));
+        inQueue.FreeTensor(denom);
     }
 
 private:
-    __aicore__ inline void CopyInRow(uint32_t rowIdx) {
-        AscendC::LocalTensor<float> rowLocal = inQueueIN.AllocTensor<float>();
-        uint64_t offset = static_cast<uint64_t>(rowIdx) * static_cast<uint64_t>(cols);
-        AscendC::DataCopy(rowLocal[0], logitsGm[offset], cols);
-        inQueueIN.EnQue(rowLocal);
+    __aicore__ inline void CopyIn(int32_t rowIdx) {
+        AscendC::LocalTensor<float> rowLocal = inQueue.AllocTensor<float>();
+        uint32_t offset = (uint32_t)rowIdx * this->numClasses;
+        AscendC::DataCopy(rowLocal[0], logitsGm[offset], this->numClasses);
+        inQueue.EnQue(rowLocal);
     }
 
-    __aicore__ inline float ComputeRow(uint32_t rowIdx) {
-        AscendC::LocalTensor<float> rowLocal = inQueueIN.DeQue<float>();
-        AscendC::LocalTensor<float> tmp = tempBuf.Get<float>();
+    __aicore__ inline void Compute(int32_t rowIdx, AscendC::LocalTensor<float>& lossLocal) {
+        AscendC::LocalTensor<float> row = inQueue.DeQue<float>();
+        AscendC::LocalTensor<float> tmp = tmpVecBuf.Get<float>();
+        AscendC::LocalTensor<float> redWs = redWsVecBuf.Get<float>();
 
-        uint32_t tgt = static_cast<uint32_t>(targetGm.GetValue(rowIdx));
-        // Read target logit before modifying rowLocal
-        float target_val = rowLocal.GetValue(static_cast<int32_t>(tgt));
+        // Copy row to tmp for ReduceMax
+        AscendC::DataCopy(tmp, row, this->numClasses);
+        // Reduce max over classes for numeric stability
+        AscendC::ReduceMax<float>(tmp, tmp, redWs, this->numClasses);
+        float maxVal = tmp.GetValue(0);
+        // Shift by max
+        AscendC::Duplicate(redWs, maxVal, this->numClasses);
+        AscendC::Sub(row, row, redWs, this->numClasses);
 
-        // Compute max for numerical stability
-        float maxv = rowLocal.GetValue(0);
-        for (uint32_t j = 1; j < cols; ++j) {
-            float v = rowLocal.GetValue(static_cast<int32_t>(j));
-            maxv = v > maxv ? v : maxv;
-        }
+        // Load target index
+        AscendC::LocalTensor<int32_t> labelLocal = labelBuf.Get<int32_t>();
+        AscendC::DataCopy(labelLocal, targetGm[rowIdx], 1);
+        int32_t tgtIdx = labelLocal.GetValue(0);
+        // Get shifted logit for target class
+        float tgtShifted = row.GetValue(tgtIdx);
 
-        // rowLocal = rowLocal - maxv
-        AscendC::Duplicate(tmp, maxv, cols);
-        AscendC::Sub(rowLocal, rowLocal, tmp, cols);
+        // Compute logsumexp
+        AscendC::Exp(row, row, this->numClasses);
+        AscendC::ReduceSum<float>(row, row, redWs, this->numClasses);
+        AscendC::Log(row, row, 1); // row[0] = log(sum(exp(shifted)))
 
-        // exp(rowLocal)
-        AscendC::Exp(rowLocal, rowLocal, cols);
+        float l = row.GetValue(0) - tgtShifted;
+        lossLocal.SetValue(rowIdx, l);
 
-        // sumexp = sum(exp)
-        AscendC::ReduceSum<float>(rowLocal, rowLocal, tmp, cols);
-        float sumexp = rowLocal.GetValue(0);
-
-        // logsumexp = log(sumexp) + maxv
-        tmp.SetValue(0, sumexp);
-        AscendC::Log(tmp, tmp, 1);
-        float logsumexp = tmp.GetValue(0) + maxv;
-
-        float loss = logsumexp - target_val;
-
-        inQueueIN.FreeTensor(rowLocal);
-        return loss;
+        inQueue.FreeTensor(row);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueIN;
-    AscendC::TBuf<> tempBuf;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueue;
+    AscendC::TBuf<> tmpVecBuf;
+    AscendC::TBuf<> redWsVecBuf;
+    AscendC::TBuf<> lossBuf;
+    AscendC::TBuf<> globalRedWsBuf;
+    AscendC::TBuf<> labelBuf;
 
     AscendC::GlobalTensor<float> logitsGm;
     AscendC::GlobalTensor<int32_t> targetGm;
     AscendC::GlobalTensor<float> outGm;
 
-    uint32_t rows;
-    uint32_t cols;
+    uint32_t batchSize;
+    uint32_t numClasses;
+    uint32_t tileNum;
+    uint32_t tileBatch;
+    uint32_t lastTileBatch;
 };
 
 extern "C" __global__ __aicore__ void cross_entropy_loss_custom(GM_ADDR logits, GM_ADDR target, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelCrossEntropyLoss op;
-    op.Init(logits, target, y, tiling_data.rows, tiling_data.cols);
+    op.Init(logits, target, y,
+            tiling_data.batchSize, tiling_data.numClasses,
+            tiling_data.tileNum, tiling_data.tileBatch, tiling_data.lastTileBatch);
     op.Process();
 }
 """
@@ -233,10 +260,8 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor cross_entropy_loss_impl_npu(const at::Tensor& logits, const at::Tensor& target) {
-    at::Tensor logits_f = logits.contiguous();
-    at::Tensor target_i32 = target.to(at::kInt).contiguous();
     at::Tensor result = at::empty({}, logits.options());
-    EXEC_NPU_CMD(aclnnCrossEntropyLossCustom, logits_f, target_i32, result);
+    EXEC_NPU_CMD(aclnnCrossEntropyLossCustom, logits, target, result);
     return result;
 }
 

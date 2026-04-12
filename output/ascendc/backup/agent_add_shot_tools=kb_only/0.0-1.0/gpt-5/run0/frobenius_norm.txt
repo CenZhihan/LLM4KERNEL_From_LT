@@ -1,0 +1,302 @@
+project_json_src='''
+[
+    {
+        "op": "FrobeniusNormCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(FrobeniusNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(FrobeniusNormCustom, FrobeniusNormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "frobenius_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 1;     // 归一化需要全局规约，这里设置为单block，简化实现
+const uint32_t TILE_NUM  = 8;     // 分片个数
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    FrobeniusNormCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // workspace: 存放每个tile的局部平方和，长度 = TILE_NUM * BUFFER_NUM
+    size_t* workspaces = context->GetWorkspaceSizes(1);
+    const uint32_t BUFFER_NUM = 2;
+    workspaces[0] = static_cast<size_t>(TILE_NUM * BUFFER_NUM * sizeof(float));
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto dt = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dt);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class FrobeniusNormCustom : public OpDef {
+public:
+    explicit FrobeniusNormCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape)
+            .SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(FrobeniusNormCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "frobenius_norm_custom_tiling_data.h"
+
+// 参考文档：
+// - BlockReduce/ReduceSum 用于向量规约 (CANN Ascend C API Reference 4 Basic APIs 4.1.8/4.1.*)
+// - 标量参数传入/分片示例参考 BinaryScalar 样例 (5.?) 与示例代码结构
+// 本Kernel流程：
+// 1) 第一遍遍历所有tile，计算每个tile的sum(x^2)，保存到workspace（GM）
+// 2) 规约workspace中的tile部分和，得到全局sum(x^2)，计算inv_norm=1/sqrt(sum(x^2)+eps)
+// 3) 第二遍遍历所有tile，y = x * inv_norm
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelFroNorm {
+public:
+    __aicore__ inline KernelFroNorm() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, uint32_t totalLength, uint32_t tileNum)
+    {
+        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        ASSERT(tileNum != 0 && "tile num can not be zero!");
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->loopCount = this->tileNum * BUFFER_NUM;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        // workspace 用于存放每个tile的平方和（float）
+        sumTilesGm.SetGlobalBuffer((__gm__ DTYPE_X*)workspace, this->loopCount);
+
+        // 队列初始化
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+
+        // 用于ReduceSum的中间缓冲（按文档ReduceSum需要额外tmp空间）
+        // 这里给出一个保守的缓冲大小
+        pipe.InitBuffer(workQueue, 1, 256 * sizeof(DTYPE_X));
+        pipe.InitBuffer(reduceOutQueue, 1, 16 * sizeof(DTYPE_X)); // ReduceSum输出16个元素的向量（参考示例）
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Pass 1: 逐tile计算平方和 -> 写入GM workspace
+        for (int32_t i = 0; i < this->loopCount; ++i) {
+            Pass1_TileSquareSum(i);
+        }
+
+        // 规约workspace得到全局 sum(x^2)
+        DTYPE_X invNorm = ComputeInvNormFromWorkspace();
+
+        // Pass 2: 逐tile缩放输出
+        for (int32_t i = 0; i < this->loopCount; ++i) {
+            Pass2_ScaleOut(i, invNorm);
+        }
+    }
+
+private:
+    __aicore__ inline void Pass1_TileSquareSum(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+
+        xLocal = inQueueX.DeQue<DTYPE_X>();
+
+        // tmp buffer for ReduceSum
+        AscendC::LocalTensor<DTYPE_X> tmpLocal = workQueue.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> redLocal = reduceOutQueue.AllocTensor<DTYPE_X>();
+
+        // element-wise square: use Mul
+        // 先在redLocal中拷贝xLocal，再就地平方，减少额外缓冲
+        AscendC::DataCopy(redLocal, xLocal, this->tileLength);
+        AscendC::Mul(redLocal, redLocal, redLocal, this->tileLength);
+
+        // 对平方结果规约求和
+        AscendC::ReduceSum<DTYPE_X>(redLocal, redLocal, tmpLocal, this->tileLength);
+        // 将规约结果的第一个元素写回GM workspace（每个tile写一个标量）
+        AscendC::DataCopy(sumTilesGm[progress], redLocal, 1);
+
+        reduceOutQueue.FreeTensor(redLocal);
+        workQueue.FreeTensor(tmpLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline DTYPE_X ComputeInvNormFromWorkspace()
+    {
+        // 将workspace中所有tile的部分和拷贝到本地
+        AscendC::LocalTensor<DTYPE_X> partLocal = reduceOutQueue.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(partLocal, sumTilesGm, this->loopCount);
+
+        // 规约得到全局sum
+        AscendC::LocalTensor<DTYPE_X> tmpLocal = workQueue.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> sumLocal = reduceOutQueue.AllocTensor<DTYPE_X>();
+        AscendC::ReduceSum<DTYPE_X>(sumLocal, partLocal, tmpLocal, this->loopCount);
+
+        // 从sumLocal读第一个元素作为标量（示意）
+        DTYPE_X sumVal = ((DTYPE_X*)sumLocal.GetPhyAddr())[0];
+
+        // inv_norm = 1 / sqrt(sum(x^2) + eps)
+        const DTYPE_X eps = (DTYPE_X)1e-12f;
+        DTYPE_X invNorm = (DTYPE_X)(1.0f / sqrtf((float)(sumVal + eps)));
+
+        reduceOutQueue.FreeTensor(sumLocal);
+        workQueue.FreeTensor(tmpLocal);
+        reduceOutQueue.FreeTensor(partLocal);
+        return invNorm;
+    }
+
+    __aicore__ inline void Pass2_ScaleOut(int32_t progress, DTYPE_X invNorm)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+
+        xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+
+        // y = x * invNorm
+        AscendC::Muls(yLocal, xLocal, (DTYPE_X)invNorm, this->tileLength);
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+
+        yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> workQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> reduceOutQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<DTYPE_X> sumTilesGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+    uint32_t loopCount;
+};
+
+extern "C" __global__ __aicore__ void frobenius_norm_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    KernelFroNorm op;
+    op.Init(x, y, workspace, tilingData.totalLength, tilingData.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor frobenius_norm_custom_impl_npu(const at::Tensor& x) {
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnFrobeniusNormCustom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("frobenius_norm_custom", &frobenius_norm_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("frobenius_norm_custom", &frobenius_norm_custom_impl_npu, "Frobenius norm normalization");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.frobenius_norm_custom(x)
+'''

@@ -3,12 +3,6 @@ project_json_src='''
     {
         "op": "TripletMarginLossCustom",
         "language": "cpp",
-        "attr": [
-            {
-                "name": "margin",
-                "type": "float"
-            }
-        ],
         "input_desc": [
             {
                 "name": "anchor",
@@ -62,8 +56,9 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(TripletMarginLossCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, bLength);
-  TILING_DATA_FIELD_DEF(uint32_t, hLength);
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, tileInner);
   TILING_DATA_FIELD_DEF(float, margin);
 END_TILING_DATA_DEF;
 
@@ -76,37 +71,26 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 获取输入shape: [B, H]
-    const ge::Shape& shape = context->GetInputShape(0)->GetOriginShape();
-    std::vector<int64_t> dims = shape.GetDims();
-    uint32_t bLength = 1;
-    uint32_t hLength = 1;
-    if (dims.size() == 1) {
-        bLength = dims[0];
-        hLength = 1;
-    } else if (dims.size() >= 2) {
-        bLength = dims[0];
-        hLength = 1;
-        for (size_t i = 1; i < dims.size(); ++i) {
-            hLength *= dims[i];
-        }
-    }
-
-    // 读取margin属性（若框架未传入，则用1.0f）
-    float margin = 1.0f;
-    if (context->GetAttrs() != nullptr) {
-        (void)context->GetAttrs()->GetFloat("margin", margin);
-    }
-
-    // 单block执行，便于在核内完成全局归约
-    context->SetBlockDim(1);
-
     TripletMarginLossCustomTilingData tiling;
-    tiling.set_bLength(bLength);
-    tiling.set_hLength(hLength);
-    tiling.set_margin(margin);
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    // 假设输入为二维 [N, D]
+    uint32_t rows = static_cast<uint32_t>(origin.GetDim(0));
+    uint32_t cols = static_cast<uint32_t>(origin.GetDim(1));
+
+    // 设置每次沿特征维处理的元素数，保证与ReduceSum使用一致
+    const uint32_t TILE_INNER = 128;
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+    tiling.set_tileInner(TILE_INNER);
+    // margin 在此示例固定为 1.0，如需可扩展为属性
+    tiling.set_margin(1.0f);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
@@ -114,6 +98,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     // 无workspace
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
+
+    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -121,10 +107,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // TripletMarginLoss默认reduction='mean'，输出标量
-    gert::Shape* out_shape = context->GetOutputShape(0);
-    out_shape->SetDimNum(1);
-    out_shape->SetDim(0, 1);
+    // 输出设为与输入0同shape由框架实际张量控制（Python侧会分配 [rows] 的输出）
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
@@ -161,152 +147,155 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        // 属性：margin
-        this->Attr("margin").Float(1.0);
-
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(TripletMarginLossCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "triplet_margin_loss_custom_tiling_data.h"
-
-// 参考文档示例：使用ReduceSum与GetAccVal获取和（4.1.8.12 GetAccVal）
-// 以及DataCopy/Sub/Mul等基础算子用法
-// 为避免跨block归约问题，BlockDim在host侧固定为1
+#include <cmath>
 
 constexpr int32_t BUFFER_NUM = 1;
-
-using DTYPE = float;
 
 class KernelTripletMarginLoss {
 public:
     __aicore__ inline KernelTripletMarginLoss() {}
 
     __aicore__ inline void Init(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR loss,
-                                uint32_t bLength, uint32_t hLength, float margin) {
-        this->bLength = bLength;
-        this->hLength = hLength;
+                                uint32_t rows, uint32_t cols, uint32_t tileInner, float margin)
+    {
+        this->rows = rows;
+        this->cols = cols;
+        this->tileInner = tileInner;
         this->margin = margin;
 
-        anchorGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(anchor), bLength * hLength);
-        positiveGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(positive), bLength * hLength);
-        negativeGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(negative), bLength * hLength);
-        lossGm = reinterpret_cast<__gm__ DTYPE *>(loss);
-
-        // 三个输入行缓冲 + 临时计算缓冲 + ReduceSum工作缓冲 + 一个dummy dst
-        pipe.InitBuffer(inQueueA, BUFFER_NUM, hLength * sizeof(DTYPE));
-        pipe.InitBuffer(inQueueP, BUFFER_NUM, hLength * sizeof(DTYPE));
-        pipe.InitBuffer(inQueueN, BUFFER_NUM, hLength * sizeof(DTYPE));
-        pipe.InitBuffer(calcQueue1, BUFFER_NUM, hLength * sizeof(DTYPE));
-        pipe.InitBuffer(calcQueue2, BUFFER_NUM, hLength * sizeof(DTYPE));
-        pipe.InitBuffer(workQueue, BUFFER_NUM, hLength * sizeof(DTYPE));
-        pipe.InitBuffer(dstQueue, BUFFER_NUM, hLength * sizeof(DTYPE)); // 占位
-    }
-
-    __aicore__ inline void Process() {
-        float sumLoss = 0.0f;
-
-        for (uint32_t i = 0; i < bLength; ++i) {
-            CopyInRow(i);
-            sumLoss += ComputeRow();
-            FreeRow();
+        // 按block划分样本行
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->rowsPerBlock = this->rows / blockNum;
+        this->rowStart = this->rowsPerBlock * blockIdx;
+        if (blockIdx == blockNum - 1) {
+            this->rowsThisBlock = this->rows - this->rowStart;
+        } else {
+            this->rowsThisBlock = this->rowsPerBlock;
         }
 
-        float meanLoss = sumLoss / static_cast<float>(bLength);
+        // 设置GM指针偏移
+        aGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(anchor) + static_cast<size_t>(rowStart) * cols,
+                            static_cast<size_t>(rowsThisBlock) * cols);
+        pGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(positive) + static_cast<size_t>(rowStart) * cols,
+                            static_cast<size_t>(rowsThisBlock) * cols);
+        nGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(negative) + static_cast<size_t>(rowStart) * cols,
+                            static_cast<size_t>(rowsThisBlock) * cols);
+        lossGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(loss) + rowStart, rowsThisBlock);
 
-        // 写回标量到GM（直接写GM指针）
-        lossGm[0] = meanLoss;
+        // 初始化本地缓冲
+        pipe.InitBuffer(inQueueA, BUFFER_NUM, this->tileInner * sizeof(float));
+        pipe.InitBuffer(inQueueP, BUFFER_NUM, this->tileInner * sizeof(float));
+        pipe.InitBuffer(inQueueN, BUFFER_NUM, this->tileInner * sizeof(float));
+        pipe.InitBuffer(tmpQueueVec, BUFFER_NUM, this->tileInner * sizeof(float)); // 中间向量
+        pipe.InitBuffer(tmpQueueWork, BUFFER_NUM, this->tileInner * sizeof(float)); // ReduceSum工作区（示例按tile分配）
+        pipe.InitBuffer(outQueueLoss, BUFFER_NUM, sizeof(float));
     }
 
-private:
-    __aicore__ inline void CopyInRow(uint32_t rowIndex) {
-        AscendC::LocalTensor<DTYPE> aLocal = inQueueA.AllocTensor<DTYPE>();
-        AscendC::LocalTensor<DTYPE> pLocal = inQueueP.AllocTensor<DTYPE>();
-        AscendC::LocalTensor<DTYPE> nLocal = inQueueN.AllocTensor<DTYPE>();
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = 0; r < rowsThisBlock; ++r) {
+            float sumAP = 0.0f;
+            float sumAN = 0.0f;
 
-        uint32_t offset = rowIndex * hLength;
-        AscendC::DataCopy(aLocal, anchorGm[offset], hLength);
-        AscendC::DataCopy(pLocal, positiveGm[offset], hLength);
-        AscendC::DataCopy(nLocal, negativeGm[offset], hLength);
+            for (uint32_t c = 0; c < cols; c += tileInner) {
+                // 读取一段tileInner（假设cols能整除tileInner）
+                AscendC::LocalTensor<float> aLocal = inQueueA.AllocTensor<float>();
+                AscendC::LocalTensor<float> pLocal = inQueueP.AllocTensor<float>();
+                AscendC::LocalTensor<float> nLocal = inQueueN.AllocTensor<float>();
+                AscendC::DataCopy(aLocal, aGm[r * cols + c], tileInner);
+                AscendC::DataCopy(pLocal, pGm[r * cols + c], tileInner);
+                AscendC::DataCopy(nLocal, nGm[r * cols + c], tileInner);
+                inQueueA.EnQue(aLocal);
+                inQueueP.EnQue(pLocal);
+                inQueueN.EnQue(nLocal);
 
-        inQueueA.EnQue(aLocal);
-        inQueueP.EnQue(pLocal);
-        inQueueN.EnQue(nLocal);
-    }
+                // (a - p)^2
+                AscendC::LocalTensor<float> aLoc = inQueueA.DeQue<float>();
+                AscendC::LocalTensor<float> pLoc = inQueueP.DeQue<float>();
+                AscendC::LocalTensor<float> nLoc = inQueueN.DeQue<float>();
+                AscendC::LocalTensor<float> tmpVec = tmpQueueVec.AllocTensor<float>();
+                AscendC::LocalTensor<float> workBuf = tmpQueueWork.AllocTensor<float>();
 
-    __aicore__ inline float ComputeRow() {
-        AscendC::LocalTensor<DTYPE> aLocal = inQueueA.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> pLocal = inQueueP.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> nLocal = inQueueN.DeQue<DTYPE>();
+                AscendC::Sub(tmpVec, aLoc, pLoc, tileInner);
+                AscendC::Mul(tmpVec, tmpVec, tmpVec, tileInner);
+                AscendC::ReduceSum(tmpVec, tmpVec, workBuf, tileInner);
+                float partAP = AscendC::GetAccVal<float>();
+                sumAP += partAP;
 
-        AscendC::LocalTensor<DTYPE> tmp1 = calcQueue1.AllocTensor<DTYPE>();
-        AscendC::LocalTensor<DTYPE> tmp2 = calcQueue2.AllocTensor<DTYPE>();
-        AscendC::LocalTensor<DTYPE> work = workQueue.AllocTensor<DTYPE>();
-        AscendC::LocalTensor<DTYPE> dstDummy = dstQueue.AllocTensor<DTYPE>();
+                // (a - n)^2
+                AscendC::Sub(tmpVec, aLoc, nLoc, tileInner);
+                AscendC::Mul(tmpVec, tmpVec, tmpVec, tileInner);
+                AscendC::ReduceSum(tmpVec, tmpVec, workBuf, tileInner);
+                float partAN = AscendC::GetAccVal<float>();
+                sumAN += partAN;
 
-        // dist_pos^2
-        AscendC::Sub(tmp1, aLocal, pLocal, hLength);
-        AscendC::Mul(tmp2, tmp1, tmp1, hLength);
-        AscendC::ReduceSum(dstDummy, tmp2, work, hLength);
-        float dpos2 = AscendC::GetAccVal<float>();
+                tmpQueueVec.FreeTensor(tmpVec);
+                tmpQueueWork.FreeTensor(workBuf);
+                inQueueA.FreeTensor(aLoc);
+                inQueueP.FreeTensor(pLoc);
+                inQueueN.FreeTensor(nLoc);
+            }
 
-        // dist_neg^2
-        AscendC::Sub(tmp1, aLocal, nLocal, hLength);
-        AscendC::Mul(tmp2, tmp1, tmp1, hLength);
-        AscendC::ReduceSum(dstDummy, tmp2, work, hLength);
-        float dneg2 = AscendC::GetAccVal<float>();
+            float distAP = sqrtf(sumAP);
+            float distAN = sqrtf(sumAN);
+            float l = distAP - distAN + margin;
+            if (l < 0.0f) l = 0.0f;
 
-        // L2距离（sqrt）
-        float dpos = sqrtf(dpos2);
-        float dneg = sqrtf(dneg2);
-
-        float hinge = dpos - dneg + margin;
-        if (hinge < 0.0f) hinge = 0.0f;
-
-        // 释放本行资源
-        return hinge;
-    }
-
-    __aicore__ inline void FreeRow() {
-        AscendC::LocalTensor<DTYPE> aLocal = inQueueA.DeQue<DTYPE>(); // 实际不会进入，这里只为占位
+            // 写回每个样本的loss到GM
+            AscendC::LocalTensor<float> lossLocal = outQueueLoss.AllocTensor<float>();
+            AscendC::Duplicate(lossLocal, l, 1);
+            outQueueLoss.EnQue<float>(lossLocal);
+            AscendC::LocalTensor<float> lossOut = outQueueLoss.DeQue<float>();
+            AscendC::DataCopy(lossGm[r], lossOut, 1);
+            outQueueLoss.FreeTensor(lossOut);
+        }
     }
 
 private:
     AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueA;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueP;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueN;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueueVec;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueueWork;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueLoss;
 
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM>  inQueueA;
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM>  inQueueP;
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM>  inQueueN;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> calcQueue1;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> calcQueue2;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> workQueue;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> dstQueue;
+    AscendC::GlobalTensor<float> aGm;
+    AscendC::GlobalTensor<float> pGm;
+    AscendC::GlobalTensor<float> nGm;
+    AscendC::GlobalTensor<float> lossGm;
 
-    AscendC::GlobalTensor<DTYPE> anchorGm;
-    AscendC::GlobalTensor<DTYPE> positiveGm;
-    AscendC::GlobalTensor<DTYPE> negativeGm;
-    __gm__ DTYPE* lossGm = nullptr;
-
-    uint32_t bLength;
-    uint32_t hLength;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t tileInner;
     float margin;
+
+    uint32_t rowsPerBlock;
+    uint32_t rowStart;
+    uint32_t rowsThisBlock;
 };
 
-extern "C" __global__ __aicore__ void triplet_margin_loss_custom(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative,
-                                                                 GM_ADDR loss, GM_ADDR tiling) {
-    GET_TILING_DATA(tilingData, tiling);
+extern "C" __global__ __aicore__ void triplet_margin_loss_custom(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR loss, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
     KernelTripletMarginLoss op;
     op.Init(anchor, positive, negative, loss,
-            tilingData.bLength, tilingData.hLength, tilingData.margin);
-    op.Process();
+            tiling_data.rows, tiling_data.cols, tiling_data.tileInner, tiling_data.margin);
+    if (TILING_KEY_IS(1)) {
+        op.Process();
+    }
 }
 """
 
@@ -318,12 +307,13 @@ python_bind_src="""
 
 at::Tensor triplet_margin_loss_custom_impl_npu(const at::Tensor& anchor,
                                                const at::Tensor& positive,
-                                               const at::Tensor& negative,
-                                               double margin) {
-    auto out_options = anchor.options();
-    at::Tensor result = at::empty({1}, out_options);
-    EXEC_NPU_CMD(aclnnTripletMarginLossCustom, anchor, positive, negative, result, (float)margin);
-    return result;
+                                               const at::Tensor& negative) {
+    // 输出每个样本的loss，形状为 [N]
+    auto opts = anchor.options();
+    at::Tensor per_sample = at::empty({anchor.size(0)}, opts);
+    EXEC_NPU_CMD(aclnnTripletMarginLossCustom, anchor, positive, negative, per_sample);
+    // 返回mean作为标量loss
+    return per_sample.mean();
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -331,7 +321,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("triplet_margin_loss_custom", &triplet_margin_loss_custom_impl_npu, "TripletMarginLossCustom(anchor, positive, negative, margin)");
+    m.def("triplet_margin_loss_custom", &triplet_margin_loss_custom_impl_npu, "Triplet Margin Loss (mean)");
 }
 """
 
@@ -341,11 +331,10 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    def __init__(self, margin=1.0):
+    def __init__(self, margin=1.0) -> None:
         super().__init__()
-        self.margin = float(margin)
+        self.margin = margin  # 当前实现内部固定为1.0，如需可扩展为属性传递
 
     def forward(self, anchor, positive, negative):
-        # 返回标量张量（shape=[1]）
-        return custom_ops_lib.triplet_margin_loss_custom(anchor, positive, negative, self.margin)
+        return custom_ops_lib.triplet_margin_loss_custom(anchor, positive, negative)
 '''

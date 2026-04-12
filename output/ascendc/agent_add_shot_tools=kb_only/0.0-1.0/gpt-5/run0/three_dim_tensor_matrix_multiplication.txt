@@ -45,9 +45,13 @@ host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
-// 这里定义一个占位的TilingData类型，实际采用TCubeTiling原始拷贝传递
 BEGIN_TILING_DATA_DEF(ThreeDimTensorMatrixMultiplicationCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, reserved);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, M);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, L);
+  TILING_DATA_FIELD_DEF(uint32_t, batchA);  // how many A batches to compute per IterateBatch
+  TILING_DATA_FIELD_DEF(uint32_t, batchB);  // B batches per IterateBatch (fixed 1 here)
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ThreeDimTensorMatrixMultiplicationCustom, ThreeDimTensorMatrixMultiplicationCustomTilingData)
@@ -55,69 +59,58 @@ REGISTER_TILING_DATA_CLASS(ThreeDimTensorMatrixMultiplicationCustom, ThreeDimTen
 """
 
 host_operator_src="""
-#include <cstring>
+#include "three_dim_tensor_matrix_multiplication_custom_tiling.h"
 #include "register/op_def_registry.h"
 
-// 参考文档使用的Matmul Tiling接口
-#include "matmul_tiling.h"
-#include "platform_ascendc.h"
+namespace {
+inline uint32_t SafeCastDim(int64_t v) { return static_cast<uint32_t>(v); }
+}
 
 namespace optiling {
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 获取输入形状
-    const auto *shapeA = context->GetInputShape(0);
-    const auto *shapeB = context->GetInputShape(1);
-    const auto &oriA = shapeA->GetOriginShape();
-    const auto &oriB = shapeB->GetOriginShape();
+    // Input0: A [N, M, K], Input1: B [K, L]
+    const auto* aShape = context->GetInputShape(0);
+    const auto* bShape = context->GetInputShape(1);
+    const auto& aOrigin = aShape->GetOriginShape();
+    const auto& bOrigin = bShape->GetOriginShape();
 
-    // 预期 A: (N, M, K), B: (K, L)
-    int32_t N = static_cast<int32_t>(oriA.GetDim(0));
-    int32_t M = static_cast<int32_t>(oriA.GetDim(1));
-    int32_t K = static_cast<int32_t>(oriA.GetDim(2));
-    int32_t L = static_cast<int32_t>(oriB.GetDim(1));
-
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
-
-    // 数据类型均为 float (DT_FLOAT)
-    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    // 本算子无bias
-    tiling.SetBias(false);
-
-    // 单次Matmul的M/N/K
-    tiling.SetShape(M, L, K);
-    // 原始完整形状 (M, N, Ka, Kb)，此处Ka=Kb=K
-    tiling.SetOrgShape(M, L, K);
-
-    // NORMAL布局下设置batch信息：A有N个batch，B按1个batch广播
-    tiling.SetBatchInfoForNormal(N, 1, M, L, K);
-
-    // 默认占用全部可用buffer空间
-    tiling.SetBufferSpace(-1, -1, -1);
-
-    optiling::TCubeTiling tilingData;
-    int ret = tiling.GetTiling(tilingData);
-    if (ret == -1) {
+    // Read dims
+    uint32_t dimA = static_cast<uint32_t>(aOrigin.GetDimNum());
+    uint32_t dimB = static_cast<uint32_t>(bOrigin.GetDimNum());
+    if (dimA != 3 || dimB != 2) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t N = SafeCastDim(aOrigin.GetDim(0));
+    uint32_t M = SafeCastDim(aOrigin.GetDim(1));
+    uint32_t K = SafeCastDim(aOrigin.GetDim(2));
+    uint32_t Kb = SafeCastDim(bOrigin.GetDim(0));
+    uint32_t L = SafeCastDim(bOrigin.GetDim(1));
+    if (K != Kb) {
         return ge::GRAPH_FAILED;
     }
 
-    // 设置blockDim
-    int32_t core_num = tiling.GetCoreNum();
-    if (core_num <= 0) { core_num = 1; }
-    context->SetBlockDim(static_cast<uint32_t>(core_num));
+    // Decide block dim and batch config
+    // We run matmul with NORMAL layout and batch on A's first dimension (N).
+    // Keep a conservative block dim for portability.
+    const uint32_t BLOCK_DIM = 1;
+    context->SetBlockDim(BLOCK_DIM);
 
-    // 将TCubeTiling二进制拷贝到框架原始tiling buffer
-    auto *raw = context->GetRawTilingData();
-    std::memcpy(raw->GetData(), &tilingData, sizeof(optiling::TCubeTiling));
-    raw->SetDataSize(sizeof(optiling::TCubeTiling));
+    ThreeDimTensorMatrixMultiplicationCustomTilingData tiling;
+    tiling.set_N(N);
+    tiling.set_M(M);
+    tiling.set_K(K);
+    tiling.set_L(L);
+    tiling.set_batchA(N);   // compute all A batches at once
+    tiling.set_batchB(1);   // B has no batching
 
-    // workspace为0
-    size_t *ws_sizes = context->GetWorkspaceSizes(1);
-    ws_sizes[0] = 0;
+    // Save tiling
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // No workspace required
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
 
     return ge::GRAPH_SUCCESS;
 }
@@ -128,15 +121,20 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* a_shape = context->GetInputShape(0);
     const gert::Shape* b_shape = context->GetInputShape(1);
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    // 期望输出为 (N, M, L)
-    *y_shape = *a_shape;
-    if (a_shape->GetDimNum() == 3 && b_shape->GetDimNum() == 2) {
-        y_shape->SetDim(2, b_shape->GetDim(1));
+    const auto& aO = a_shape->GetOriginShape();
+    const auto& bO = b_shape->GetOriginShape();
+    if (aO.GetDimNum() != 3 || bO.GetDimNum() != 2) {
+        return GRAPH_FAILED;
     }
+    gert::Shape* out = context->GetOutputShape(0);
+    gert::SmallVector dims;
+    dims.push_back(aO.GetDim(0)); // N
+    dims.push_back(aO.GetDim(1)); // M
+    dims.push_back(bO.GetDim(1)); // L
+    out->GetOriginShape().SetDim(dims);
+    out->SetUnknownRank(false);
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -167,6 +165,7 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
@@ -179,75 +178,89 @@ OP_ADD(ThreeDimTensorMatrixMultiplicationCustom);
 kernel_src="""
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
+#include "register/tilingdata_base.h"
 
-// 使用TCubeTiling作为host侧下发的tiling结构
-extern "C" __global__  __aicore__ void three_dim_tensor_matrix_multiplication_custom(GM_ADDR aGM, GM_ADDR bGM,
-                                                                                      GM_ADDR cGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+using A_T = float;
+using B_T = float;
+using C_T = float;
+using BiasT = float;
+
+extern \"C\" __global__ __aicore__ void three_dim_tensor_matrix_multiplication_custom(GM_ADDR aGM, GM_ADDR bGM,
+                                                                                      GM_ADDR cGM, GM_ADDR workspaceGM,
+                                                                                      GM_ADDR tilingGM)
 {
-    // 从GM中反序列化TCubeTiling
+    // Read host tiling data (N, M, K, L, batchA, batchB)
+    GET_TILING_DATA(tiling_data, tilingGM);
+    const uint32_t N = tiling_data.N;
+    const uint32_t M = tiling_data.M;
+    const uint32_t K = tiling_data.K;
+    const uint32_t L = tiling_data.L;
+    const uint32_t batchA = tiling_data.batchA; // expected N
+    const uint32_t batchB = tiling_data.batchB; // expected 1
+
+    // Define Matmul types in NORMAL layout
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL> bType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, BiasT> biasType;
+
+    // Prepare TCubeTiling
     TCubeTiling tiling;
-    auto tempTilingGM = (__gm__ uint32_t*)tilingGM;
-    auto tempTiling = (uint32_t*)&tiling;
-    for (int i = 0; i < (int)(sizeof(TCubeTiling) / sizeof(int32_t)); ++i, ++tempTilingGM, ++tempTiling) {
-        *tempTiling = *tempTilingGM;
-    }
-
-    // GM张量初始化
-    using A_T = float;
-    using B_T = float;
-    using C_T = float;
-
-    AscendC::GlobalTensor<A_T> aGlobal;
-    AscendC::GlobalTensor<B_T> bGlobal;
-    AscendC::GlobalTensor<C_T> cGlobal;
-
-    int32_t sizeA = tiling.ALayoutInfoB * tiling.singleCoreM * tiling.singleCoreK * sizeof(A_T);
-    int32_t sizeB = tiling.BLayoutInfoB * tiling.singleCoreK * tiling.singleCoreN * sizeof(B_T);
-    int32_t sizeC = tiling.CLayoutInfoB * tiling.singleCoreM * tiling.singleCoreN * sizeof(C_T);
-
-    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(aGM), sizeA);
-    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(bGM), sizeB);
-    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(cGM), sizeC);
-
-    // 共享资源配置（参考文档示例）
+    // Set NORMAL layout core sizes
+    tiling.singleCoreM = M;
+    tiling.singleCoreK = K;
+    tiling.singleCoreN = L;
+    // Set batch info: batch over N
+    tiling.ALayoutInfoB = N;  // number of A batches
+    tiling.BLayoutInfoB = 1;  // B has no batches
+    tiling.CLayoutInfoB = N;  // output batches
+    // No bias
+    tiling.isBias = 0;
+    // Share buffer config (typical)
     tiling.shareMode = 0;
     tiling.shareL1Size = 512 * 1024;
     tiling.shareL0CSize = 128 * 1024;
     tiling.shareUbSize = 0;
 
-    // 构造Matmul类型，NORMAL布局
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, false, LayoutMode::NORMAL> bType;
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T> biasType;
+    // Wrap GM buffers
+    AscendC::GlobalTensor<A_T> aGlobal;
+    AscendC::GlobalTensor<B_T> bGlobal;
+    AscendC::GlobalTensor<C_T> cGlobal;
+    const int32_t sizeA = static_cast<int32_t>(N) * static_cast<int32_t>(M) * static_cast<int32_t>(K) * sizeof(A_T);
+    const int32_t sizeB = static_cast<int32_t>(K) * static_cast<int32_t>(L) * sizeof(B_T);
+    const int32_t sizeC = static_cast<int32_t>(N) * static_cast<int32_t>(M) * static_cast<int32_t>(L) * sizeof(C_T);
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(aGM), sizeA);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(bGM), sizeB);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(cGM), sizeC);
 
-    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
-    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm;
-
-    TPipe pipe;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
-    mm.Init(&tiling);
-
-    // 绑定张量
+    int offset_a = 0, offset_b = 0, offset_c = 0;
     AscendC::GlobalTensor<A_T> gm_a;
-    gm_a.SetGlobalBuffer(const_cast<__gm__ A_T*>(aGlobal[0].GetPhyAddr()), tiling.singleCoreM * tiling.singleCoreK);
-
+    gm_a.SetGlobalBuffer(const_cast<__gm__ A_T*>(aGlobal[offset_a].GetPhyAddr()),
+                         static_cast<int32_t>(M) * static_cast<int32_t>(K));
     AscendC::GlobalTensor<B_T> gm_b;
-    gm_b.SetGlobalBuffer(const_cast<__gm__ B_T*>(bGlobal[0].GetPhyAddr()), tiling.singleCoreK * tiling.singleCoreN);
-
+    gm_b.SetGlobalBuffer(const_cast<__gm__ B_T*>(bGlobal[offset_b].GetPhyAddr()),
+                         static_cast<int32_t>(K) * static_cast<int32_t>(L));
     AscendC::GlobalTensor<C_T> gm_c;
-    gm_c.SetGlobalBuffer(const_cast<__gm__ C_T*>(cGlobal[0].GetPhyAddr()), tiling.singleCoreM * tiling.singleCoreN);
+    gm_c.SetGlobalBuffer(const_cast<__gm__ C_T*>(cGlobal[offset_c].GetPhyAddr()),
+                         static_cast<int32_t>(M) * static_cast<int32_t>(L));
 
-    mm.SetTensorA(gm_a, false);
-    mm.SetTensorB(gm_b, false);
-    mm.SetWorkspace(workspaceGM, 0);
+    // Create Matmul instance with NORMAL layout
+    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm1;
+    AscendC::TPipe pipe;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm1);
 
-    // 从tiling读取batch信息
-    uint32_t batchA = static_cast<uint32_t>(tiling.ALayoutInfoB);
-    uint32_t batchB = static_cast<uint32_t>(tiling.BLayoutInfoB);
+    // Init and bind tensors
+    mm1.Init(&tiling);
+    const uint32_t isTransposeAIn = 0;
+    const uint32_t isTransposeBIn = 0;
+    mm1.SetTensorA(gm_a, isTransposeAIn);
+    mm1.SetTensorB(gm_b, isTransposeBIn);
+    mm1.SetWorkspace(workspaceGM, 0);
 
-    // 执行多batch矩阵乘
-    mm.IterateBatch(gm_c, batchA, batchB, false);
+    // Execute multi-batch Matmul: compute C of shape [N, M, L]
+    // batchA: number of A batches per call (N), batchB: 1
+    mm1.IterateBatch(gm_c, batchA, batchB, false);
 }
 """
 
@@ -258,17 +271,23 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor three_dim_tensor_matrix_multiplication_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
-    at::Tensor C = at::empty({A.size(0), A.size(1), B.size(1)}, A.options());
+    // A: [N, M, K], B: [K, L], output C: [N, M, L]
+    at::IntArrayRef aSizes = A.sizes();
+    TORCH_CHECK(aSizes.size() == 3, \"A must be 3D\");
+    auto N = aSizes[0];
+    auto M = aSizes[1];
+    auto L = B.size(1);
+    at::Tensor C = at::empty({N, M, L}, A.options());
     EXEC_NPU_CMD(aclnnThreeDimTensorMatrixMultiplicationCustom, A, B, C);
     return C;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("three_dim_tensor_matrix_multiplication_custom", &three_dim_tensor_matrix_multiplication_custom_impl_npu);
+    m.impl(\"three_dim_tensor_matrix_multiplication_custom\", &three_dim_tensor_matrix_multiplication_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("three_dim_tensor_matrix_multiplication_custom", &three_dim_tensor_matrix_multiplication_custom_impl_npu, "3D tensor-matrix matmul");
+    m.def(\"three_dim_tensor_matrix_multiplication_custom\", &three_dim_tensor_matrix_multiplication_custom_impl_npu, \"3D tensor-matrix multiplication\");
 }
 """
 
@@ -279,7 +298,7 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     def __init__(self):
-        super(ModelNew, self).__init__()
+        super().__init__()
 
     def forward(self, A, B):
         return custom_ops_lib.three_dim_tensor_matrix_multiplication_custom(A, B)

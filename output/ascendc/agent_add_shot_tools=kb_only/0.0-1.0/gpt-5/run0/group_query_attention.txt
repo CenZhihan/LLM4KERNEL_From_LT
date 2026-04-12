@@ -7,28 +7,54 @@ project_json_src='''
             {
                 "name": "q",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             },
             {
                 "name": "k",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             },
             {
                 "name": "v",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "scale",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ],
         "output_desc": [
             {
-                "name": "o",
+                "name": "y",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ]
     }
@@ -40,17 +66,10 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(GroupQueryAttentionCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, B);
-  TILING_DATA_FIELD_DEF(uint32_t, Lq);
-  TILING_DATA_FIELD_DEF(uint32_t, Lk);
-  TILING_DATA_FIELD_DEF(uint32_t, H);
-  TILING_DATA_FIELD_DEF(uint32_t, Hkv);
-  TILING_DATA_FIELD_DEF(uint32_t, Dh);
-  TILING_DATA_FIELD_DEF(uint32_t, groupSize);
-  TILING_DATA_FIELD_DEF(float, scale);
-  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
-  TILING_DATA_FIELD_DEF(uint64_t, scoreWorkspacePerBlock);
-  TILING_DATA_FIELD_DEF(uint64_t, softmaxTmpWorkspacePerBlock);
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, seqlen);
+  TILING_DATA_FIELD_DEF(uint32_t, num_heads);
+  TILING_DATA_FIELD_DEF(uint32_t, head_dim);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(GroupQueryAttentionCustom, GroupQueryAttentionCustomTilingData)
@@ -60,117 +79,45 @@ REGISTER_TILING_DATA_CLASS(GroupQueryAttentionCustom, GroupQueryAttentionCustomT
 host_operator_src="""
 #include "group_query_attention_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/op_tiling.h"
-#include "graph/utils/type_utils.h"
-
-// Softmax tiling helpers from CANN (see CANN Ascend C API Reference: SoftMax/SimpleSoftMax Tiling)
-#include "register/tilingdata_base.h"
-#include "graph/tensor.h"
-
-namespace {
-inline uint32_t GetU32(const gert::Shape* s, int idx) {
-    return static_cast<uint32_t>(s->GetOriginShape().GetDim(idx));
-}
-}
+#include <algorithm>
 
 namespace optiling {
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // Input shapes:
-    // q: [B, Lq, H, Dh]
-    // k: [B, Lk, Hkv, Dh]
-    // v: [B, Lk, Hkv, Dh]
-    const gert::Shape* qShape = context->GetInputShape(0);
-    const gert::Shape* kShape = context->GetInputShape(1);
-    const gert::Shape* vShape = context->GetInputShape(2);
-    if (qShape == nullptr || kShape == nullptr || vShape == nullptr) {
+    GroupQueryAttentionCustomTilingData tiling;
+    const gert::Shape* q_shape = context->GetInputShape(0); // [B, L, H, Dh]
+    if (q_shape->GetDimNum() != 4) {
         return ge::GRAPH_FAILED;
     }
+    uint32_t B = static_cast<uint32_t>(q_shape->GetDim(0));
+    uint32_t L = static_cast<uint32_t>(q_shape->GetDim(1));
+    uint32_t H = static_cast<uint32_t>(q_shape->GetDim(2));
+    uint32_t Dh = static_cast<uint32_t>(q_shape->GetDim(3));
 
-    if (qShape->GetOriginShape().GetDimNum() != 4 ||
-        kShape->GetOriginShape().GetDimNum() != 4 ||
-        vShape->GetOriginShape().GetDimNum() != 4) {
-        return ge::GRAPH_FAILED;
-    }
+    tiling.set_batch(B);
+    tiling.set_seqlen(L);
+    tiling.set_num_heads(H);
+    tiling.set_head_dim(Dh);
 
-    uint32_t B = GetU32(qShape, 0);
-    uint32_t Lq = GetU32(qShape, 1);
-    uint32_t H = GetU32(qShape, 2);
-    uint32_t Dh = GetU32(qShape, 3);
-
-    uint32_t Bk = GetU32(kShape, 0);
-    uint32_t Lk = GetU32(kShape, 1);
-    uint32_t Hkv = GetU32(kShape, 2);
-    uint32_t Dhk = GetU32(kShape, 3);
-    if (B != Bk || Dh != Dhk) {
-        return ge::GRAPH_FAILED;
-    }
-
-    // group size inferred from heads
-    if (H == 0 || Hkv == 0 || (H % Hkv) != 0) {
-        return ge::GRAPH_FAILED;
-    }
-    uint32_t groupSize = H / Hkv;
-    float scale = 1.0f / std::sqrt(static_cast<float>(Dh));
-
-    // Set block dim: map each (B,H) to a block, clamp by a small factor
-    // You can tune this per platform. Here we keep small default.
-    uint32_t blockDim = B * H;
-    if (blockDim == 0) blockDim = 1;
-    // Typical small value to avoid over-parallelization
-    if (blockDim > 32) blockDim = 32;
+    uint32_t totalHeads = B * H;
+    uint32_t blockDim = std::min<uint32_t>(totalHeads, 32);
     context->SetBlockDim(blockDim);
 
-    // Workspace estimation:
-    // - Score matrix per block (for one (b,h) pair): Lq * Lk * sizeof(float)
-    // - Softmax temp buffer: use SoftMax tiling helper to get max temp size for a single Lq x Lk softmax along last axis
-    //   According to doc (GetSoftMaxMaxTmpSize/GetSoftMaxMinTmpSize), dataTypeSize for fp32 = 4, reuseSource=false
-    uint64_t scoreWs = static_cast<uint64_t>(Lq) * static_cast<uint64_t>(Lk) * sizeof(float);
-
-    // Softmax tmp size (host-side helper)
-    ge::Shape softmaxSrcShape({static_cast<int64_t>(Lq), static_cast<int64_t>(Lk)});
-    // These APIs are documented in CANN Ascend C API Reference: SoftMax/SimpleSoftMax Tiling
-    uint32_t softmaxTmpMax = GetSoftMaxMaxTmpSize(softmaxSrcShape, /*dataTypeSize=*/4, /*isReuseSource=*/false);
-
-    GroupQueryAttentionCustomTilingData tiling;
-    tiling.set_B(B);
-    tiling.set_Lq(Lq);
-    tiling.set_Lk(Lk);
-    tiling.set_H(H);
-    tiling.set_Hkv(Hkv);
-    tiling.set_Dh(Dh);
-    tiling.set_groupSize(groupSize);
-    tiling.set_scale(scale);
-    tiling.set_blockDim(blockDim);
-    tiling.set_scoreWorkspacePerBlock(scoreWs);
-    tiling.set_softmaxTmpWorkspacePerBlock(softmaxTmpMax);
-
-    // Save tiling
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // Workspace layout:
-    // For each running block, we allocate 1 score buffer and 1 softmax tmp buffer.
-    // Runtime will provide one contiguous workspace. We request a single piece large enough for worst case:
-    size_t* ws = context->GetWorkspaceSizes(1);
-    ws[0] = static_cast<size_t>(scoreWs + softmaxTmpMax);
-
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
-
-} // namespace optiling
-
+}
 
 namespace ge {
-
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // Output shape: same 4D as Q: [B, Lq, H, Dh]
     const gert::Shape* q_shape = context->GetInputShape(0);
-    gert::Shape* o_shape = context->GetOutputShape(0);
-    if (q_shape == nullptr || o_shape == nullptr) return GRAPH_FAILED;
-    *o_shape = *q_shape;
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *q_shape; // output [B, L, H, Dh]
     return GRAPH_SUCCESS;
 }
 
@@ -180,9 +127,7 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
     context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
-
-} // namespace ge
-
+}
 
 namespace ops {
 class GroupQueryAttentionCustom : public OpDef {
@@ -204,7 +149,12 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("o")
+        this->Input("scale")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -212,8 +162,7 @@ public:
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -224,231 +173,179 @@ OP_ADD(GroupQueryAttentionCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "group_query_attention_custom_tiling_data.h"
-#include "lib/matmul_intf.h"
+#include <cmath>
 
-// 使用文档中的 Matmul IterateBatch/IterateNBatch 与 SimpleSoftMax 相关范式（参考 CANN Ascend C API Reference）
+struct GQATiling {
+    uint32_t batch;
+    uint32_t seqlen;
+    uint32_t num_heads;
+    uint32_t head_dim;
+};
 
-using Q_T = float;
-using K_T = float;
-using V_T = float;
-using O_T = float;
-constexpr int32_t BUFFER_NUM = 1;
-
-class KernelGQA {
+class KernelGroupQueryAttention {
 public:
-    __aicore__ inline KernelGQA() {}
+    __aicore__ inline KernelGroupQueryAttention() {}
 
-    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o,
-                                GM_ADDR workspace, const optiling::GroupQueryAttentionCustomTilingData &t)
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR scale, GM_ADDR y, const GQATiling &t)
     {
-        B = t.get_B();
-        Lq = t.get_Lq();
-        Lk = t.get_Lk();
-        H = t.get_H();
-        Hkv = t.get_Hkv();
-        Dh = t.get_Dh();
-        groupSize = t.get_groupSize();
-        scale = t.get_scale();
-
-        // 将 (b, hq) 维度映射到 block，block 内只处理一个 (b,hq)
-        // blockIdx 映射:
-        //  headGlobalIdx = blockIdx % H
-        //  batchIdx      = blockIdx / H
-        uint32_t blockIdx = AscendC::GetBlockIdx();
-        headIdx = blockIdx % H;
-        batchIdx = blockIdx / H;
-        if (batchIdx >= B) {
-            // 额外的 block 不参与计算
-            valid = false;
-            return;
-        }
-        valid = true;
-
-        // GM 视图（按 [B, L, H or Hkv, Dh] 连续）
-        qGm.SetGlobalBuffer((__gm__ Q_T*)q, (uint32_t)(B * Lq * H * Dh));
-        kGm.SetGlobalBuffer((__gm__ K_T*)k, (uint32_t)(B * Lk * Hkv * Dh));
-        vGm.SetGlobalBuffer((__gm__ V_T*)v, (uint32_t)(B * Lk * Hkv * Dh));
-        oGm.SetGlobalBuffer((__gm__ O_T*)o, (uint32_t)(B * Lq * H * Dh));
-
-        // 工作空间布局: [scores(Lq*Lk)*sizeof(float)] + [softmax_tmp]
-        uint64_t scoreWsBytes = t.get_scoreWorkspacePerBlock();
-        uint64_t softmaxTmpBytes = t.get_softmaxTmpWorkspacePerBlock();
-        scoresGm.SetGlobalBuffer((__gm__ float*)workspace, (uint32_t)(scoreWsBytes / sizeof(float)));
-        softmaxTmpGm = (GM_ADDR)((uint8_t*)workspace + scoreWsBytes);
-        softmaxTmpBytes_ = softmaxTmpBytes;
-
-        // 管线本地缓存
-        pipe.InitBuffer(qTileQ, BUFFER_NUM, Dh * sizeof(Q_T));
-        pipe.InitBuffer(kTileQ, BUFFER_NUM, Dh * sizeof(K_T));
-        pipe.InitBuffer(vTileQ, BUFFER_NUM, Dh * sizeof(V_T));
-        pipe.InitBuffer(oTileQ, BUFFER_NUM, Dh * sizeof(O_T));
+        qGm = reinterpret_cast<__gm__ float*>(q);
+        kGm = reinterpret_cast<__gm__ float*>(k);
+        vGm = reinterpret_cast<__gm__ float*>(v);
+        yGm = reinterpret_cast<__gm__ float*>(y);
+        scaleGm = reinterpret_cast<__gm__ float*>(scale);
+        tiling = t;
+        headsPerBatch = tiling.num_heads;
+        totalHeads = tiling.batch * tiling.num_heads;
+        strideRow = tiling.num_heads * tiling.head_dim; // elements between adjacent rows for a fixed head
+        strideHeadBase = tiling.head_dim;              // contiguous over head_dim
+        scaleVal = *scaleGm;
     }
 
     __aicore__ inline void Process()
     {
-        if (!valid) return;
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
 
-        // 选择对应的 kv head
-        uint32_t kvIdx = headIdx / groupSize;
-
-        // 基于文档 5.2.1.24 IterateBatch/NBatch，构造 NORMAL 布局的两次 Matmul:
-        // 1) scores = Q[b, :, hq, :] @ K[b, :, kv, :]^T  -> [Lq, Lk]
-        // 2) out    = softmax(scores) @ V[b, :, kv, :]   -> [Lq, Dh]
-        // 下面为简化实现示意：将 Q/K/V 的单头视图映射为 GM 子张量，然后用 AscendC::Matmul 执行。
-        ComputeQK();
-        SoftmaxScores();
-        ComputeAV();
+        for (uint32_t headIdx = blockIdx; headIdx < totalHeads; headIdx += blockNum) {
+            uint32_t b = headIdx / headsPerBatch;
+            uint32_t h = headIdx % headsPerBatch;
+            ComputeOneHead(b, h);
+        }
     }
 
 private:
-    __aicore__ inline __gm__ Q_T* GetQPtr(uint32_t b, uint32_t hq, uint32_t l = 0, uint32_t d = 0)
+    __aicore__ inline void LoadRow(__gm__ float* basePtr, uint32_t rowIndex, float* dst)
     {
-        // base = (((b * Lq + 0) * H + hq) * Dh + 0)
-        uint64_t base = (((uint64_t)b * Lq) * H + hq) * Dh;
-        return reinterpret_cast<__gm__ Q_T*>(qGm.GetPhyAddr()) + base + (uint64_t)l * (uint64_t)(H * Dh) + d;
+        // basePtr points to tensor start [B, L, H, Dh]; rowIndex is sequence index l; head fixed
+        __gm__ float* rowPtr = basePtr + rowIndex * strideRow + currentHeadOffset;
+        for (uint32_t d = 0; d < tiling.head_dim; ++d) {
+            dst[d] = rowPtr[d];
+        }
     }
 
-    __aicore__ inline __gm__ K_T* GetKPtr(uint32_t b, uint32_t hk, uint32_t l = 0, uint32_t d = 0)
+    __aicore__ inline void StoreRow(__gm__ float* basePtr, uint32_t rowIndex, const float* src)
     {
-        uint64_t base = (((uint64_t)b * Lk) * Hkv + hk) * Dh;
-        return reinterpret_cast<__gm__ K_T*>(kGm.GetPhyAddr()) + base + (uint64_t)l * (uint64_t)(Hkv * Dh) + d;
+        __gm__ float* rowPtr = basePtr + rowIndex * strideRow + currentHeadOffset;
+        for (uint32_t d = 0; d < tiling.head_dim; ++d) {
+            rowPtr[d] = src[d];
+        }
     }
 
-    __aicore__ inline __gm__ V_T* GetVPtr(uint32_t b, uint32_t hk, uint32_t l = 0, uint32_t d = 0)
+    __aicore__ inline float DotScaled(const float* qa, uint32_t keyRowIdx)
     {
-        uint64_t base = (((uint64_t)b * Lk) * Hkv + hk) * Dh;
-        return reinterpret_cast<__gm__ V_T*>(vGm.GetPhyAddr()) + base + (uint64_t)l * (uint64_t)(Hkv * Dh) + d;
+        float acc = 0.f;
+        __gm__ float* kRowPtr = kGmBase + keyRowIdx * strideRow;
+        for (uint32_t d = 0; d < tiling.head_dim; ++d) {
+            acc += qa[d] * kRowPtr[d];
+        }
+        return acc * scaleVal;
     }
 
-    __aicore__ inline __gm__ O_T* GetOPtr(uint32_t b, uint32_t hq, uint32_t l = 0, uint32_t d = 0)
+    __aicore__ inline void AccumulateOut(float weight, uint32_t keyRowIdx, float* outAcc)
     {
-        uint64_t base = (((uint64_t)b * Lq) * H + hq) * Dh;
-        return reinterpret_cast<__gm__ O_T*>(oGm.GetPhyAddr()) + base + (uint64_t)l * (uint64_t)(H * Dh) + d;
+        __gm__ float* vRowPtr = vGmBase + keyRowIdx * strideRow;
+        for (uint32_t d = 0; d < tiling.head_dim; ++d) {
+            outAcc[d] += weight * vRowPtr[d];
+        }
     }
 
-    __aicore__ inline void ComputeQK()
+    __aicore__ inline void ComputeOneHead(uint32_t b, uint32_t h)
     {
-        // 将 scores 写入 scoresGm，排列为 [Lq, Lk]
-        // 这里演示按行计算：逐行读取 q(lq, :)，与整段 k(: , :) 做点积生成 scores 行
-        for (uint32_t lqi = 0; lqi < Lq; ++lqi) {
-            // load q row
-            AscendC::LocalTensor<Q_T> qLocal = qTileQ.AllocTensor<Q_T>();
-            AscendC::DataCopy(qLocal, GetQPtr(batchIdx, headIdx, lqi, 0), Dh);
-            qTileQ.EnQue(qLocal);
+        // compute base offsets for the given (b,h)
+        // offset (b, l=0, h, d=0)
+        uint64_t headBaseIndex = (static_cast<uint64_t>(b) * tiling.seqlen * tiling.num_heads + h) * tiling.head_dim;
+        currentHeadOffset = h * tiling.head_dim; // within a row
+        qGmBase = qGm + headBaseIndex - h * tiling.head_dim; // set row 0 base at (b,0,0,0), we'll add l*strideRow + h*Dh
+        kGmBase = kGm + headBaseIndex - h * tiling.head_dim;
+        vGmBase = vGm + headBaseIndex - h * tiling.head_dim;
+        yGmBase = yGm + headBaseIndex - h * tiling.head_dim;
 
-            // 计算一行 scores
-            AscendC::LocalTensor<Q_T> qRow = qTileQ.DeQue<Q_T>();
+        // local buffers with conservative upper bounds
+        const uint32_t MAX_DH = 256;
+        __ubuf__ float qVec[MAX_DH];
+        __ubuf__ float outVec[MAX_DH];
 
-            // 临时输出到 scoresGm 的对应行
-            for (uint32_t lkj = 0; lkj < Lk; ++lkj) {
-                AscendC::LocalTensor<K_T> kLocal = kTileQ.AllocTensor<K_T>();
-                AscendC::DataCopy(kLocal, GetKPtr(batchIdx, /*hk=*/(headIdx / groupSize), lkj, 0), Dh);
+        uint32_t Dh = tiling.head_dim;
+        // process each query row
+        for (uint32_t l = 0; l < tiling.seqlen; ++l) {
+            // load q[l]
+            LoadRow(qGm, l, qVec);
 
-                // dot(qRow, kLocal)
-                float acc = 0.0f;
-                // 简单标量规约（示意）。如需高性能，应使用向量化与 Matmul 接口（参考文档 5.2.1.24）。
+            // first pass: find max score over all keys
+            float maxScore = -1e30f;
+            for (uint32_t m = 0; m < tiling.seqlen; ++m) {
+                float s = 0.f;
+                __gm__ float* kRowPtr = kGmBase + m * strideRow;
                 for (uint32_t d = 0; d < Dh; ++d) {
-                    acc += static_cast<float>(qRow.GetValue(d)) * static_cast<float>(kLocal.GetValue(d));
+                    s += qVec[d] * kRowPtr[d];
                 }
-                acc *= scale;
-
-                // 写入 scores 到 GM: scores[lqi, lkj]
-                scoresGm.SetValue(lqi * Lk + lkj, acc);
-
-                kTileQ.FreeTensor(kLocal);
+                s = s * scaleVal;
+                if (s > maxScore) maxScore = s;
             }
 
-            qTileQ.FreeTensor(qRow);
-        }
-    }
-
-    __aicore__ inline void SoftmaxScores()
-    {
-        // 沿最后一维 Lk 做 softmax，输入/输出均为 scoresGm
-        // 参考文档 5.3.1.9 SoftMax/SimpleSoftMax Tiling 的注意事项，简化实现为逐行归一化
-        for (uint32_t lqi = 0; lqi < Lq; ++lqi) {
-            // 求 max
-            float maxv = -3.4e38f;
-            for (uint32_t lkj = 0; lkj < Lk; ++lkj) {
-                float v = scoresGm.GetValue(lqi * Lk + lkj);
-                if (v > maxv) maxv = v;
-            }
-            // exp 并求和
-            float sumv = 0.f;
-            for (uint32_t lkj = 0; lkj < Lk; ++lkj) {
-                float v = scoresGm.GetValue(lqi * Lk + lkj);
-                float ev = AscendC::Exp(v - maxv);
-                scoresGm.SetValue(lqi * Lk + lkj, ev);
-                sumv += ev;
-            }
-            // 归一化
-            float inv = 1.0f / sumv;
-            for (uint32_t lkj = 0; lkj < Lk; ++lkj) {
-                float ev = scoresGm.GetValue(lqi * Lk + lkj);
-                scoresGm.SetValue(lqi * Lk + lkj, ev * inv);
-            }
-        }
-    }
-
-    __aicore__ inline void ComputeAV()
-    {
-        // out[lq, dh] = sum_{lk} scores[lq, lk] * V[lk, dh]
-        for (uint32_t lqi = 0; lqi < Lq; ++lqi) {
-            AscendC::LocalTensor<O_T> outLocal = oTileQ.AllocTensor<O_T>();
-            // init 0
+            // second pass: accumulate numerator and denominator
             for (uint32_t d = 0; d < Dh; ++d) {
-                outLocal.SetValue(d, (O_T)0);
+                outVec[d] = 0.f;
             }
+            float denom = 0.f;
 
-            for (uint32_t lkj = 0; lkj < Lk; ++lkj) {
-                float w = scoresGm.GetValue(lqi * Lk + lkj);
-                AscendC::LocalTensor<V_T> vLocal = vTileQ.AllocTensor<V_T>();
-                AscendC::DataCopy(vLocal, GetVPtr(batchIdx, /*hk=*/(headIdx / groupSize), lkj, 0), Dh);
-                // out += w * v
+            for (uint32_t m = 0; m < tiling.seqlen; ++m) {
+                float s = 0.f;
+                __gm__ float* kRowPtr2 = kGmBase + m * strideRow;
                 for (uint32_t d = 0; d < Dh; ++d) {
-                    float prev = static_cast<float>(outLocal.GetValue(d));
-                    float vv = static_cast<float>(vLocal.GetValue(d));
-                    outLocal.SetValue(d, (O_T)(prev + w * vv));
+                    s += qVec[d] * kRowPtr2[d];
                 }
-                vTileQ.FreeTensor(vLocal);
+                s = s * scaleVal;
+                float w = expf(s - maxScore);
+                denom += w;
+
+                __gm__ float* vRowPtr = vGmBase + m * strideRow;
+                for (uint32_t d = 0; d < Dh; ++d) {
+                    outVec[d] += w * vRowPtr[d];
+                }
             }
 
-            // 写回 GM
-            AscendC::DataCopy(GetOPtr(batchIdx, headIdx, lqi, 0), outLocal, Dh);
-            oTileQ.FreeTensor(outLocal);
+            float invDen = 1.0f / denom;
+            for (uint32_t d = 0; d < Dh; ++d) {
+                outVec[d] *= invDen;
+            }
+
+            // store y[l]
+            StoreRow(yGm, l, outVec);
         }
     }
 
 private:
-    AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> qTileQ, kTileQ, vTileQ;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> oTileQ;
+    __gm__ float* qGm {nullptr};
+    __gm__ float* kGm {nullptr};
+    __gm__ float* vGm {nullptr};
+    __gm__ float* yGm {nullptr};
+    __gm__ float* scaleGm {nullptr};
 
-    AscendC::GlobalTensor<Q_T> qGm;
-    AscendC::GlobalTensor<K_T> kGm;
-    AscendC::GlobalTensor<V_T> vGm;
-    AscendC::GlobalTensor<O_T> oGm;
+    __gm__ float* qGmBase {nullptr};
+    __gm__ float* kGmBase {nullptr};
+    __gm__ float* vGmBase {nullptr};
+    __gm__ float* yGmBase {nullptr};
 
-    // scores buffer in GM workspace (size Lq*Lk)
-    AscendC::GlobalTensor<float> scoresGm;
-    GM_ADDR softmaxTmpGm {nullptr};
-    uint64_t softmaxTmpBytes_ {0};
-
-    uint32_t B{0}, Lq{0}, Lk{0}, H{0}, Hkv{0}, Dh{0}, groupSize{1};
-    float scale{1.f};
-    uint32_t headIdx{0}, batchIdx{0};
-    bool valid{true};
+    GQATiling tiling;
+    uint32_t headsPerBatch {0};
+    uint32_t totalHeads {0};
+    uint32_t strideRow {0};       // H*Dh
+    uint32_t strideHeadBase {0};  // Dh
+    uint32_t currentHeadOffset {0};
+    float scaleVal {1.f};
 };
 
+extern "C" __global__ __aicore__ void group_query_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR scale, GM_ADDR y, GM_ADDR workspace, GM_ADDR tilingGM) {
+    GET_TILING_DATA(tiling_data, tilingGM);
+    GQATiling t;
+    t.batch = tiling_data.batch();
+    t.seqlen = tiling_data.seqlen();
+    t.num_heads = tiling_data.num_heads();
+    t.head_dim = tiling_data.head_dim();
 
-extern "C" __global__ __aicore__ void group_query_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v,
-                                                                   GM_ADDR o, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tiling_data, tiling);
-    KernelGQA op;
-    op.Init(q, k, v, o, workspace, tiling_data);
+    KernelGroupQueryAttention op;
+    op.Init(q, k, v, scale, y, t);
     op.Process();
 }
 """
@@ -461,13 +358,13 @@ python_bind_src="""
 
 at::Tensor group_query_attention_custom_impl_npu(const at::Tensor& q,
                                                  const at::Tensor& k,
-                                                 const at::Tensor& v) {
-    TORCH_CHECK(q.dim() == 4, "q must be [B, L, H, Dh]");
-    TORCH_CHECK(k.dim() == 4 && v.dim() == 4, "k, v must be [B, L, Hkv, Dh]");
-    TORCH_CHECK(q.scalar_type() == at::kFloat, "dtype must be float32");
-    auto o = at::empty_like(q);
-    EXEC_NPU_CMD(aclnnGroupQueryAttentionCustom, q, k, v, o);
-    return o;
+                                                 const at::Tensor& v,
+                                                 const at::Tensor& scale) {
+    TORCH_CHECK(q.sizes() == k.sizes(), "q and k must have the same shape [B, L, H, Dh]");
+    TORCH_CHECK(q.sizes() == v.sizes(), "q and v must have the same shape [B, L, H, Dh]");
+    at::Tensor y = at::empty_like(q);
+    EXEC_NPU_CMD(aclnnGroupQueryAttentionCustom, q, k, v, scale, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -482,21 +379,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 model_src='''
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 import torch_npu
 import custom_ops_lib
 
 class ModelNew(nn.Module):
-    """
-    使用自定义 AscendC 内核 group_query_attention_custom 融合实现 GQA 的核心注意力计算：
-    输入给内核的张量为:
-      - Q: [B, L, H, Dh]
-      - K: [B, L, Hkv, Dh]
-      - V: [B, L, Hkv, Dh]
-    内核内部完成分组映射、QK^T/Softmax/AV 三步，并输出:
-      - O: [B, L, H, Dh]
-    其余线性层保留为 PyTorch 模块。
-    """
     def __init__(self, d_model=1024, num_heads=16, num_kv_heads=4):
         super().__init__()
         assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
@@ -514,14 +402,17 @@ class ModelNew(nn.Module):
         H, H_kv = self.num_heads, self.num_kv_heads
         head_dim = D // H
 
-        # 生成 Q/K/V，并用 4D 视图匹配自定义内核的输入
         Q = self.q_proj(x).view(B, L, H, head_dim).contiguous()
         K = self.k_proj(x).view(B, L, H_kv, head_dim).contiguous()
         V = self.v_proj(x).view(B, L, H_kv, head_dim).contiguous()
 
-        # 调用自定义算子（融合 GQA 注意力核心）
-        O = custom_ops_lib.group_query_attention_custom(Q, K, V)  # [B, L, H, Dh]
+        if self.group_size > 1:
+            K = K.repeat_interleave(self.group_size, dim=2).contiguous()
+            V = V.repeat_interleave(self.group_size, dim=2).contiguous()
 
-        out = O.reshape(B, L, D)
-        return self.out_proj(out)
+        scale = torch.tensor([1.0 / math.sqrt(head_dim)], dtype=Q.dtype, device=Q.device)
+        # fused attention: [B, L, H, Dh] = f(Q, K, V, scale)
+        Y = custom_ops_lib.group_query_attention_custom(Q, K, V, scale)
+        Y = Y.reshape(B, L, D)
+        return self.out_proj(Y)
 '''

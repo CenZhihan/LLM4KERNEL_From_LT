@@ -1,0 +1,407 @@
+project_json_src='''
+[
+    {
+        "op": "ConvStandard3dSquareInputSquareKernelCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvStandard3dSquareInputSquareKernelCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cin);
+  TILING_DATA_FIELD_DEF(uint32_t, cout);
+  TILING_DATA_FIELD_DEF(uint32_t, d);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, out_d);
+  TILING_DATA_FIELD_DEF(uint32_t, out_h);
+  TILING_DATA_FIELD_DEF(uint32_t, out_w);
+  TILING_DATA_FIELD_DEF(uint64_t, totalWork);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvStandard3dSquareInputSquareKernelCustom, ConvStandard3dSquareInputSquareKernelCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_standard_3d_square_input_square_kernel_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline int64_t GetDimSafe(const gert::Shape* s, size_t i) {
+    if (s == nullptr) return 0;
+    auto os = s->GetOriginShape();
+    if (i >= os.GetDimNum()) return 0;
+    return static_cast<int64_t>(os.GetDim(i));
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvStandard3dSquareInputSquareKernelCustomTilingData tiling;
+
+    // Input 0: x, shape [N, C_in, D, H, W]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    // Input 1: w, shape [C_out, C_in, K, K, K]
+    const gert::Shape* w_shape = context->GetInputShape(1);
+
+    uint32_t N   = static_cast<uint32_t>(GetDimSafe(x_shape, 0));
+    uint32_t Cin = static_cast<uint32_t>(GetDimSafe(x_shape, 1));
+    uint32_t D   = static_cast<uint32_t>(GetDimSafe(x_shape, 2));
+    uint32_t H   = static_cast<uint32_t>(GetDimSafe(x_shape, 3));
+    uint32_t W   = static_cast<uint32_t>(GetDimSafe(x_shape, 4));
+
+    uint32_t Cout = static_cast<uint32_t>(GetDimSafe(w_shape, 0));
+    uint32_t K    = static_cast<uint32_t>(GetDimSafe(w_shape, 2)); // square kernel
+
+    // Defaults: stride=1, padding=0, dilation=1
+    uint32_t OutD = (D >= K) ? (D - K + 1) : 0;
+    uint32_t OutH = (H >= K) ? (H - K + 1) : 0;
+    uint32_t OutW = (W >= K) ? (W - K + 1) : 0;
+
+    tiling.set_n(N);
+    tiling.set_cin(Cin);
+    tiling.set_cout(Cout);
+    tiling.set_d(D);
+    tiling.set_h(H);
+    tiling.set_w(W);
+    tiling.set_k(K);
+    tiling.set_out_d(OutD);
+    tiling.set_out_h(OutH);
+    tiling.set_out_w(OutW);
+
+    uint64_t totalWork = static_cast<uint64_t>(N) * Cout * OutD * OutH * OutW;
+    tiling.set_totalWork(totalWork);
+    tiling.set_tileNum(TILE_NUM);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x = context->GetInputShape(0);
+    const gert::Shape* w = context->GetInputShape(1);
+
+    auto xN = GetDimSafe(x, 0);
+    auto xC = GetDimSafe(x, 1);
+    auto xD = GetDimSafe(x, 2);
+    auto xH = GetDimSafe(x, 3);
+    auto xW = GetDimSafe(x, 4);
+
+    auto wCout = GetDimSafe(w, 0);
+    auto k = GetDimSafe(w, 2);
+
+    int64_t outD = (xD >= k) ? (xD - k + 1) : 0;
+    int64_t outH = (xH >= k) ? (xH - k + 1) : 0;
+    int64_t outW = (xW >= k) ? (xW - k + 1) : 0;
+
+    gert::Shape* y = context->GetOutputShape(0);
+    y->SetDimNum(5);
+    y->SetDim(0, xN);
+    y->SetDim(1, wCout);
+    y->SetDim(2, outD);
+    y->SetDim(3, outH);
+    y->SetDim(4, outW);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvStandard3dSquareInputSquareKernelCustom : public OpDef {
+public:
+    explicit ConvStandard3dSquareInputSquareKernelCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvStandard3dSquareInputSquareKernelCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2; // number of buffers for output queue
+
+// A very simple tiling: split the flat output work evenly by block
+class KernelConv3D {
+public:
+    __aicore__ inline KernelConv3D() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                uint32_t n, uint32_t cin, uint32_t cout,
+                                uint32_t d, uint32_t h, uint32_t wi,
+                                uint32_t k, uint32_t out_d, uint32_t out_h, uint32_t out_w,
+                                uint64_t totalWork, uint32_t tileNum) {
+        this->N = n;
+        this->Cin = cin;
+        this->Cout = cout;
+        this->D = d;
+        this->H = h;
+        this->W = wi;
+        this->K = k;
+        this->OutD = out_d;
+        this->OutH = out_h;
+        this->OutW = out_w;
+        this->tileNum = tileNum;
+
+        // Work partition
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint64_t base = (totalWork / blockNum) * AscendC::GetBlockIdx();
+        uint64_t len  = (totalWork / blockNum);
+
+        // Set GM buffers; x and w are shared across blocks; y is offset by base
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, (uint64_t)N * Cin * D * H * W);
+        wGm.SetGlobalBuffer((__gm__ DTYPE_Y *)w, (uint64_t)Cout * Cin * K * K * K);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y + base, len);
+
+        // Tile length
+        this->blockWork = len;
+        this->tileLen = (uint32_t)((len / tileNum) > 0 ? (len / tileNum) : len);
+
+        // Queues: only output is queued; intermediate buffers are computed on-the-fly
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLen * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process() {
+        // Simple loop over tiles
+        uint32_t loops = (this->blockWork + this->tileLen - 1) / this->tileLen;
+        for (uint32_t t = 0; t < loops; ++t) {
+            uint32_t curLen = (t == loops - 1) ? (uint32_t)(this->blockWork - (uint64_t)t * this->tileLen) : this->tileLen;
+            ComputeTile(t, curLen);
+        }
+    }
+
+private:
+    __aicore__ inline void ComputeTile(uint32_t tileIdx, uint32_t curLen) {
+        // Allocate local output buffer
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
+        // Initialize local buffer to zero
+        for (uint32_t i = 0; i < curLen; ++i) {
+            yLocal.SetValue(i, (DTYPE_Z)0.f);
+        }
+
+        // For each element in the tile, compute the convolution result
+        uint64_t globalStart = (uint64_t)tileIdx * this->tileLen;
+        for (uint32_t i = 0; i < curLen; ++i) {
+            uint64_t outIndexLinear = globalStart + i;
+
+            // map linear index to (n, co, od, oh, ow)
+            uint32_t ow = (uint32_t)(outIndexLinear % OutW);
+            uint64_t tmp1 = outIndexLinear / OutW;
+            uint32_t oh = (uint32_t)(tmp1 % OutH);
+            uint64_t tmp2 = tmp1 / OutH;
+            uint32_t od = (uint32_t)(tmp2 % OutD);
+            uint64_t tmp3 = tmp2 / OutD;
+            uint32_t co = (uint32_t)(tmp3 % Cout);
+            uint32_t n  = (uint32_t)(tmp3 / Cout);
+
+            float acc = 0.0f;
+
+            // Accumulate over input channels and kernel window
+            for (uint32_t ci = 0; ci < Cin; ++ci) {
+                for (uint32_t kd = 0; kd < K; ++kd) {
+                    for (uint32_t kh = 0; kh < K; ++kh) {
+                        for (uint32_t kw = 0; kw < K; ++kw) {
+                            // input indices (stride=1, padding=0)
+                            uint32_t id = od + kd;
+                            uint32_t ih = oh + kh;
+                            uint32_t iw = ow + kw;
+
+                            // compute flat indices
+                            uint64_t xIdx = (((uint64_t)n * Cin + ci) * D + id) * H * W + (uint64_t)ih * W + iw;
+                            uint64_t wIdx = (((uint64_t)co * Cin + ci) * K + kd) * K * K + (uint64_t)kh * K + kw;
+
+                            // Load scalar from GM into registers via a 1-element local buffer
+                            AscendC::LocalTensor<DTYPE_X> xScalar;
+                            AscendC::LocalTensor<DTYPE_Y> wScalar;
+                            xScalar.SetSize(1);
+                            wScalar.SetSize(1);
+                            AscendC::DataCopy(xScalar, xGm[xIdx], 1);
+                            AscendC::DataCopy(wScalar, wGm[wIdx], 1);
+                            float xv = static_cast<float>(xScalar.GetValue(0));
+                            float wv = static_cast<float>(wScalar.GetValue(0));
+                            acc += xv * wv;
+                        }
+                    }
+                }
+            }
+            yLocal.SetValue(i, (DTYPE_Z)acc);
+        }
+
+        outQueueY.EnQue(yLocal);
+        // Write back to GM
+        AscendC::LocalTensor<DTYPE_Z> yLocalOut = outQueueY.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[(uint64_t)tileIdx * this->tileLen], yLocalOut, curLen);
+        outQueueY.FreeTensor(yLocalOut);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> wGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    uint32_t N, Cin, Cout;
+    uint32_t D, H, W;
+    uint32_t K;
+    uint32_t OutD, OutH, OutW;
+    uint32_t tileNum;
+    uint64_t blockWork;
+    uint32_t tileLen;
+};
+
+extern "C" __global__ __aicore__ void conv_standard_3d_square_input_square_kernel_custom(GM_ADDR x, GM_ADDR w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv3D op;
+    op.Init(x, w, y,
+            tiling_data.n, tiling_data.cin, tiling_data.cout,
+            tiling_data.d, tiling_data.h, tiling_data.w,
+            tiling_data.k, tiling_data.out_d, tiling_data.out_h, tiling_data.out_w,
+            tiling_data.totalWork, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_standard_3d_square_input_square_kernel_custom_impl_npu(const at::Tensor& x, const at::Tensor& w) {
+    // Infer output shape on host side similarly to PyTorch's conv3d defaults (stride=1, padding=0, dilation=1, groups=1)
+    TORCH_CHECK(x.dim() == 5, "x should be 5D NCDHW");
+    TORCH_CHECK(w.dim() == 5, "w should be 5D [Cout, Cin, K, K, K]");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "Only float tensors are supported");
+    TORCH_CHECK(w.scalar_type() == at::kFloat, "Only float tensors are supported");
+    int64_t N = x.size(0);
+    int64_t Cin = x.size(1);
+    int64_t D = x.size(2);
+    int64_t H = x.size(3);
+    int64_t W = x.size(4);
+    int64_t Cout = w.size(0);
+    int64_t K = w.size(2);
+
+    TORCH_CHECK(w.size(1) == Cin, "Weight Cin must equal input Cin");
+    TORCH_CHECK(w.size(2) == w.size(3) && w.size(3) == w.size(4), "Kernel must be cubic KxKxK");
+
+    int64_t OutD = std::max<int64_t>(D - K + 1, 0);
+    int64_t OutH = std::max<int64_t>(H - K + 1, 0);
+    int64_t OutW = std::max<int64_t>(W - K + 1, 0);
+
+    at::Tensor y = at::empty({N, Cout, OutD, OutH, OutW}, x.options());
+    EXEC_NPU_CMD(aclnnConvStandard3dSquareInputSquareKernelCustom, x, w, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_standard_3d_square_input_square_kernel_custom", &conv_standard_3d_square_input_square_kernel_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_standard_3d_square_input_square_kernel_custom", &conv_standard_3d_square_input_square_kernel_custom_impl_npu, "3D Conv (square input, square kernel, stride=1, padding=0)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Custom 3D convolution using AscendC kernel: ConvStandard3dSquareInputSquareKernelCustom
+    Supports square kernel with stride=1, padding=0, dilation=1, groups=1, bias=False.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1, bias: bool = False):
+        super().__init__()
+        assert stride == 1 and padding == 0 and dilation == 1 and groups == 1 and bias is False, "This custom op currently supports stride=1, padding=0, dilation=1, groups=1, bias=False"
+        k = kernel_size
+        self.weight = torch.nn.Parameter(torch.empty(out_channels, in_channels, k, k, k))
+        torch.nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.conv_standard_3d_square_input_square_kernel_custom(x, self.weight)
+'''

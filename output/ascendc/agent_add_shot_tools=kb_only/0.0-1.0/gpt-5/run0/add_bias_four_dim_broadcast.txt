@@ -27,7 +27,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "y",
+                "name": "z",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -50,46 +50,43 @@ BEGIN_TILING_DATA_DEF(AddBiasFourDimBroadcastCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, c);
   TILING_DATA_FIELD_DEF(uint32_t, h);
   TILING_DATA_FIELD_DEF(uint32_t, w);
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(AddBiasFourDimBroadcastCustom, AddBiasFourDimBroadcastCustomTilingData)
 }
+
 """
 
 host_operator_src="""
 #include "add_bias_four_dim_broadcast_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     AddBiasFourDimBroadcastCustomTilingData tiling;
 
-    const gert::StorageShape *x_shape = context->GetInputShape(0);
-    auto dims = x_shape->GetOriginShape().GetDims();
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    auto origin = x_shape->GetOriginShape();
 
-    if (dims.size() != 4) {
-        return ge::GRAPH_FAILED;
-    }
-    uint32_t n = static_cast<uint32_t>(dims[0]);
-    uint32_t c = static_cast<uint32_t>(dims[1]);
-    uint32_t h = static_cast<uint32_t>(dims[2]);
-    uint32_t w = static_cast<uint32_t>(dims[3]);
-
-    uint32_t totalLength = n * c * h * w;
+    // 期望输入为 [N, C, H, W]
+    uint32_t n = static_cast<uint32_t>(origin.GetDim(0));
+    uint32_t c = static_cast<uint32_t>(origin.GetDim(1));
+    uint32_t h = static_cast<uint32_t>(origin.GetDim(2));
+    uint32_t w = static_cast<uint32_t>(origin.GetDim(3));
 
     context->SetBlockDim(BLOCK_DIM);
+
     tiling.set_n(n);
     tiling.set_c(c);
     tiling.set_h(h);
     tiling.set_w(w);
-    tiling.set_totalLength(totalLength);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -127,7 +124,7 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("y")
+        this->Output("z")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -138,22 +135,21 @@ public:
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(AddBiasFourDimBroadcastCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "add_bias_four_dim_broadcast_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t BUFFER_NUM = 1; // 每次处理一个 [H*W] 通道平面
 
 class KernelAddBias4DBroadcast {
 public:
     __aicore__ inline KernelAddBias4DBroadcast() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR y,
-                                uint32_t n, uint32_t c, uint32_t h, uint32_t w, uint32_t totalLength)
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR z, uint32_t n, uint32_t c, uint32_t h, uint32_t w)
     {
         this->n = n;
         this->c = c;
@@ -161,98 +157,92 @@ public:
         this->w = w;
         this->hw = h * w;
 
-        uint32_t blockNum = AscendC::GetBlockNum();
-        uint32_t blockIdx = AscendC::GetBlockIdx();
+        // 为避免跨通道，按 (N*C) 的片段划分到不同 block
+        uint32_t totalNc = n * c;
+        uint32_t startNc = (totalNc * AscendC::GetBlockIdx()) / AscendC::GetBlockNum();
+        uint32_t endNc   = (totalNc * (AscendC::GetBlockIdx() + 1)) / AscendC::GetBlockNum();
+        this->startNc = startNc;
+        this->ncCount = endNc - startNc;
 
-        uint32_t groupsTotal = n * c;                  // number of (n,c) groups
-        this->groupsPerBlock = groupsTotal / blockNum; // assume divisible as set by host
-        this->tileLength = this->hw;                   // process one (H*W) plane per iteration
-        this->loopCount = this->groupsPerBlock;
+        // 设置GM指针，长度以元素计
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + startNc * this->hw, this->ncCount * this->hw);
+        biasGm.SetGlobalBuffer((__gm__ DTYPE_Y *)bias, c);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + startNc * this->hw, this->ncCount * this->hw);
 
-        // set GM buffers start at block offset
-        uint32_t blockStartElem = (blockIdx * this->groupsPerBlock) * this->tileLength;
-        xGm.SetGlobalBuffer((__gm__ float *)x + blockStartElem, this->groupsPerBlock * this->tileLength);
-        yGm.SetGlobalBuffer((__gm__ float *)y + blockStartElem, this->groupsPerBlock * this->tileLength);
-        biasGm.SetGlobalBuffer((__gm__ float *)bias, this->c);
-
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+        // 初始化本地队列缓冲
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->hw * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->hw * sizeof(DTYPE_Z));
+        pipe.InitBuffer(biasQueue, BUFFER_NUM, sizeof(DTYPE_Y));
     }
 
     __aicore__ inline void Process()
     {
-        for (uint32_t i = 0; i < this->loopCount * BUFFER_NUM; i++) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
+        for (uint32_t idx = 0; idx < this->ncCount; ++idx) {
+            CopyIn(idx);
+            Compute(idx);
+            CopyOut(idx);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t progress)
+    __aicore__ inline void CopyIn(uint32_t idx)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        // 复制一个通道平面 [H*W] 的数据
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[idx * this->hw], this->hw);
+
+        // 复制该通道的bias标量
+        uint32_t cIdx = (this->startNc + idx) % this->c;
+        AscendC::LocalTensor<DTYPE_Y> biasLocal = biasQueue.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(biasLocal, biasGm[cIdx], 1);
+
         inQueueX.EnQue(xLocal);
+        biasQueue.EnQue(biasLocal);
     }
 
-    __aicore__ inline void Compute(uint32_t progress)
+    __aicore__ inline void Compute(uint32_t idx)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
-        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> biasLocal = biasQueue.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
 
-        // compute channel index for this (H*W) tile
-        uint32_t blockIdx = AscendC::GetBlockIdx();
-        uint32_t groupIdxGlobal = blockIdx * this->groupsPerBlock + progress; // [0, n*c)
-        uint32_t cIdx = groupIdxGlobal % this->c;
+        // 从本地Tensor取出标量值
+        DTYPE_Y biasVal = biasLocal.GetValue(0);
 
-        // load bias scalar
-        // copy one element from GM to a local temp scalar buffer
-        AscendC::LocalTensor<float> tmpBiasLocal = tmpBuf.Get<float>(AscendC::ROUND_UP_DIV(1, AscendC::ONE_BLK_SIZE) * AscendC::ONE_BLK_SIZE);
-        AscendC::DataCopy(tmpBiasLocal, biasGm[cIdx], 1);
-        float biasScalar = tmpBiasLocal.GetValue(0);
+        // 对该通道平面执行向量 + 标量
+        AscendC::Adds(zLocal, xLocal, biasVal, static_cast<int32_t>(this->hw));
 
-        // y = x + biasScalar (broadcast over H*W)
-        AscendC::Adds(yLocal, xLocal, biasScalar, this->tileLength);
-
-        outQueueY.EnQue<float>(yLocal);
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
         inQueueX.FreeTensor(xLocal);
+        biasQueue.FreeTensor(biasLocal);
     }
 
-    __aicore__ inline void CopyOut(uint32_t progress)
+    __aicore__ inline void CopyOut(uint32_t idx)
     {
-        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
-        outQueueY.FreeTensor(yLocal);
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(zGm[idx * this->hw], zLocal, this->hw);
+        outQueueZ.FreeTensor(zLocal);
     }
 
 private:
     AscendC::TPipe pipe;
     AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> tmpBuf;
-    AscendC::GlobalTensor<float> xGm;
-    AscendC::GlobalTensor<float> yGm;
-    AscendC::GlobalTensor<float> biasGm;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> biasQueue;
 
-    uint32_t n;
-    uint32_t c;
-    uint32_t h;
-    uint32_t w;
-    uint32_t hw;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> biasGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
 
-    uint32_t groupsPerBlock;
-    uint32_t tileLength;
-    uint32_t loopCount;
+    uint32_t n, c, h, w, hw;
+    uint32_t startNc;
+    uint32_t ncCount;
 };
 
-extern "C" __global__ __aicore__ void add_bias_four_dim_broadcast_custom(GM_ADDR x, GM_ADDR bias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void add_bias_four_dim_broadcast_custom(GM_ADDR x, GM_ADDR bias, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelAddBias4DBroadcast op;
-    op.Init(x, bias, y,
-            tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w,
-            tiling_data.totalLength);
+    op.Init(x, bias, z, tiling_data.n, tiling_data.c, tiling_data.h, tiling_data.w);
     op.Process();
 }
 """
@@ -264,9 +254,9 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor add_bias_four_dim_broadcast_custom_impl_npu(const at::Tensor& x, const at::Tensor& bias) {
-    at::Tensor y = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnAddBiasFourDimBroadcastCustom, x, bias, y);
-    return y;
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnAddBiasFourDimBroadcastCustom, x, bias, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -274,7 +264,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("add_bias_four_dim_broadcast_custom", &add_bias_four_dim_broadcast_custom_impl_npu, "x + bias[1,C,1,1]");
+    m.def("add_bias_four_dim_broadcast_custom", &add_bias_four_dim_broadcast_custom_impl_npu, "x + bias.view(1, -1, 1, 1)");
 }
 """
 

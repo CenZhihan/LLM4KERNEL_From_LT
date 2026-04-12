@@ -7,54 +7,32 @@ project_json_src='''
             {
                 "name": "x",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
                 "name": "bias",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "attr_desc": [
+            {
+                "name": "const_val",
+                "type": "float"
             },
             {
-                "name": "const_tensor",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "scale_tensor",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "name": "scale_val",
+                "type": "float"
             }
         ],
         "output_desc": [
             {
-                "name": "z",
+                "name": "y",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ]
     }
@@ -68,6 +46,8 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(Conv2dMinAddMultiplyCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(float, constVal);
+  TILING_DATA_FIELD_DEF(float, scaleVal);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(Conv2dMinAddMultiplyCustom, Conv2dMinAddMultiplyCustomTilingData)
@@ -81,15 +61,34 @@ host_operator_src="""
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
 const uint32_t TILE_NUM = 8;
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     Conv2dMinAddMultiplyCustomTilingData tiling;
+
+    // 输入0为x，按ND展平后的总元素个数
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+
+    // 从属性中读取标量参数（常量与缩放因子）
+    // 具体属性获取接口以实际环境为准
+    float constVal = 0.0f;
+    float scaleVal = 1.0f;
+    if (context->GetAttrs() != nullptr) {
+        auto attrs = context->GetAttrs();
+        attrs->GetFloat("const_val", constVal);
+        attrs->GetFloat("scale_val", scaleVal);
+    }
+
     context->SetBlockDim(BLOCK_DIM);
+
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
+    tiling.set_constVal(constVal);
+    tiling.set_scaleVal(scaleVal);
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -99,16 +98,17 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    gert::Shape* out_shape = context->GetOutputShape(0);
-    *out_shape = *in_shape;
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
-    return ge::GRAPH_SUCCESS;
+    return GRAPH_SUCCESS;
 }
 }
 
@@ -122,31 +122,25 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Input("bias")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("const_tensor")
+
+        this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("scale_tensor")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("z")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // 声明属性（常量与缩放因子）
+        this->Attr("const_val").SetFloat(0.0);
+        this->Attr("scale_val").SetFloat(1.0);
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -157,114 +151,129 @@ OP_ADD(Conv2dMinAddMultiplyCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv2d_min_add_multiply_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+using DTYPE_X = float;
+using DTYPE_BIAS = float;
+using DTYPE_Y = float;
+
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的双缓冲
 
 class KernelConv2dMinAddMultiply {
 public:
     __aicore__ inline KernelConv2dMinAddMultiply() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR const_t, GM_ADDR scale_t, GM_ADDR z,
-                                uint32_t totalLength, uint32_t tileNum)
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileNum,
+                                float constVal, float scaleVal)
     {
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->constVal = constVal;
+        this->scaleVal = scaleVal;
 
-        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        biasGm.SetGlobalBuffer((__gm__ float *)bias + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        constGm.SetGlobalBuffer((__gm__ float *)const_t + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        scaleGm.SetGlobalBuffer((__gm__ float *)scale_t + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        zGm.SetGlobalBuffer((__gm__ float *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        biasGm.SetGlobalBuffer((__gm__ DTYPE_BIAS *)bias + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(inQueueBias, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(inQueueConst, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(inQueueScale, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueB, BUFFER_NUM, this->tileLength * sizeof(DTYPE_BIAS));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(tmpQueueConst, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpQueueScale, BUFFER_NUM, this->tileLength * sizeof(float));
     }
+
     __aicore__ inline void Process()
     {
+        // 循环按tile处理，处理不足tileLength的尾块
         int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; i++) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
+        for (int32_t i = 0; i < loopCount; ++i) {
+            uint32_t offset = i * this->tileLength;
+            if (offset >= this->blockLength) {
+                break;
+            }
+            uint32_t curLen = this->tileLength;
+            if (offset + curLen > this->blockLength) {
+                curLen = this->blockLength - offset;
+            }
+            CopyIn(i, offset, curLen);
+            Compute(i, curLen);
+            CopyOut(i, offset, curLen);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress)
+    __aicore__ inline void CopyIn(int32_t progress, uint32_t offset, uint32_t len)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        AscendC::LocalTensor<float> biasLocal = inQueueBias.AllocTensor<float>();
-        AscendC::LocalTensor<float> constLocal = inQueueConst.AllocTensor<float>();
-        AscendC::LocalTensor<float> scaleLocal = inQueueScale.AllocTensor<float>();
-
-        AscendC::DataCopy(xLocal,    xGm[progress * this->tileLength],    this->tileLength);
-        AscendC::DataCopy(biasLocal, biasGm[progress * this->tileLength], this->tileLength);
-        AscendC::DataCopy(constLocal,constGm[progress * this->tileLength],this->tileLength);
-        AscendC::DataCopy(scaleLocal,scaleGm[progress * this->tileLength],this->tileLength);
-
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_BIAS> bLocal = inQueueB.AllocTensor<DTYPE_BIAS>();
+        AscendC::DataCopy(xLocal, xGm[offset], len);
+        AscendC::DataCopy(bLocal, biasGm[offset], len);
         inQueueX.EnQue(xLocal);
-        inQueueBias.EnQue(biasLocal);
-        inQueueConst.EnQue(constLocal);
-        inQueueScale.EnQue(scaleLocal);
+        inQueueB.EnQue(bLocal);
+
+        // 准备常量与缩放因子向量
+        AscendC::LocalTensor<float> constLocal = tmpQueueConst.AllocTensor<float>();
+        AscendC::LocalTensor<float> scaleLocal = tmpQueueScale.AllocTensor<float>();
+        AscendC::Duplicate(constLocal, this->constVal, len);
+        AscendC::Duplicate(scaleLocal, this->scaleVal, len);
+        tmpQueueConst.EnQue(constLocal);
+        tmpQueueScale.EnQue(scaleLocal);
     }
-    __aicore__ inline void Compute(int32_t /*progress*/)
+
+    __aicore__ inline void Compute(int32_t progress, uint32_t len)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
-        AscendC::LocalTensor<float> biasLocal = inQueueBias.DeQue<float>();
-        AscendC::LocalTensor<float> constLocal = inQueueConst.DeQue<float>();
-        AscendC::LocalTensor<float> scaleLocal = inQueueScale.DeQue<float>();
-        AscendC::LocalTensor<float> zLocal = outQueueZ.AllocTensor<float>();
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_BIAS> bLocal = inQueueB.DeQue<DTYPE_BIAS>();
+        AscendC::LocalTensor<float> constLocal = tmpQueueConst.DeQue<float>();
+        AscendC::LocalTensor<float> scaleLocal = tmpQueueScale.DeQue<float>();
 
-        // z = min(x, const) + bias
-        AscendC::Min(zLocal, xLocal, constLocal, this->tileLength);
-        AscendC::Add(zLocal, zLocal, biasLocal, this->tileLength);
-        // z = z * scale
-        AscendC::Mul(zLocal, zLocal, scaleLocal, this->tileLength);
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
 
-        outQueueZ.EnQue<float>(zLocal);
+        // y = min(x, const) + bias
+        AscendC::Min(yLocal, xLocal, constLocal, len);
+        AscendC::Add(yLocal, yLocal, bLocal, len);
+        // y = y * scale
+        AscendC::Mul(yLocal, yLocal, scaleLocal, len);
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+
         inQueueX.FreeTensor(xLocal);
-        inQueueBias.FreeTensor(biasLocal);
-        inQueueConst.FreeTensor(constLocal);
-        inQueueScale.FreeTensor(scaleLocal);
+        inQueueB.FreeTensor(bLocal);
+        tmpQueueConst.FreeTensor(constLocal);
+        tmpQueueScale.FreeTensor(scaleLocal);
     }
-    __aicore__ inline void CopyOut(int32_t progress)
+
+    __aicore__ inline void CopyOut(int32_t progress, uint32_t offset, uint32_t len)
     {
-        AscendC::LocalTensor<float> zLocal = outQueueZ.DeQue<float>();
-        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
-        outQueueZ.FreeTensor(zLocal);
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[offset], yLocal, len);
+        outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX, inQueueBias, inQueueConst, inQueueScale;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueB;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueueConst, tmpQueueScale;
 
-    AscendC::GlobalTensor<float> xGm;
-    AscendC::GlobalTensor<float> biasGm;
-    AscendC::GlobalTensor<float> constGm;
-    AscendC::GlobalTensor<float> scaleGm;
-    AscendC::GlobalTensor<float> zGm;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_BIAS> biasGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
 
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
+
+    float constVal;
+    float scaleVal;
 };
 
-extern "C" __global__ __aicore__ void conv2d_min_add_multiply_custom(GM_ADDR x,
-                                                                      GM_ADDR bias,
-                                                                      GM_ADDR const_tensor,
-                                                                      GM_ADDR scale_tensor,
-                                                                      GM_ADDR z,
-                                                                      GM_ADDR workspace,
-                                                                      GM_ADDR tiling) {
+extern "C" __global__ __aicore__ void conv2d_min_add_multiply_custom(GM_ADDR x, GM_ADDR bias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
     GET_TILING_DATA(tiling_data, tiling);
     KernelConv2dMinAddMultiply op;
-    op.Init(x, bias, const_tensor, scale_tensor, z, tiling_data.totalLength, tiling_data.tileNum);
+    op.Init(x, bias, y, tiling_data.totalLength, tiling_data.tileNum, tiling_data.constVal, tiling_data.scaleVal);
     op.Process();
 }
 """
@@ -276,11 +285,12 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor conv2d_min_add_multiply_custom_impl_npu(const at::Tensor& x,
-                                                   const at::Tensor& bias,
-                                                   const at::Tensor& const_tensor,
-                                                   const at::Tensor& scale_tensor) {
+                                                   const at::Tensor& bias_expanded,
+                                                   double const_val,
+                                                   double scale_val) {
     at::Tensor result = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnConv2dMinAddMultiplyCustom, x, bias, const_tensor, scale_tensor, result);
+    // 通过EXEC_NPU_CMD将标量作为属性传入
+    EXEC_NPU_CMD(aclnnConv2dMinAddMultiplyCustom, x, bias_expanded, const_val, scale_val, result);
     return result;
 }
 
@@ -289,7 +299,8 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv2d_min_add_multiply_custom", &conv2d_min_add_multiply_custom_impl_npu, "min+add*multiply fused");
+    m.def("conv2d_min_add_multiply_custom", &conv2d_min_add_multiply_custom_impl_npu,
+          "y = min(x, const) + bias_expanded; y = y * scale");
 }
 """
 
@@ -299,19 +310,19 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
+    """
+    替换了卷积后的min+add+broadcast+mul为AscendC自定义核
+    """
     def __init__(self, in_channels, out_channels, kernel_size, constant_value, bias_shape, scaling_factor):
         super(ModelNew, self).__init__()
         self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size)
-        self.constant_value = constant_value
+        self.constant_value = float(constant_value)
         self.bias = torch.nn.Parameter(torch.randn(bias_shape))
-        self.scaling_factor = scaling_factor
+        self.scaling_factor = float(scaling_factor)
 
     def forward(self, x):
         x = self.conv(x)
-        # 预先在 PyTorch 侧进行广播，传给自定义算子做逐元素融合计算
-        bias_broadcast = self.bias.expand_as(x)
-        const_tensor = torch.full_like(x, self.constant_value)
-        scale_tensor = torch.full_like(x, self.scaling_factor)
-        x = custom_ops_lib.conv2d_min_add_multiply_custom(x, bias_broadcast, const_tensor, scale_tensor)
-        return x
+        # 将bias广播至与x相同形状，并保持连续以便核函数高效访问
+        b = self.bias.view(1, self.bias.shape[0], 1, 1).expand_as(x).contiguous()
+        return custom_ops_lib.conv2d_min_add_multiply_custom(x, b, self.constant_value, self.scaling_factor)
 '''

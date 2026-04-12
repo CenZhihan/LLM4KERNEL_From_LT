@@ -37,7 +37,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "out",
+                "name": "z",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -75,28 +75,35 @@ namespace optiling {
 const uint32_t BLOCK_DIM = 8;
 const uint32_t TILE_NUM = 8;
 
-// 这里设置默认的 RMSProp 超参，和给定模型默认值保持一致
-constexpr float kDefaultLr = 1e-3f;
-constexpr float kDefaultAlpha = 0.99f;
-constexpr float kDefaultEps = 1e-8f;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     RmspropCustomTilingData tiling;
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
-
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-    tiling.set_lr(kDefaultLr);
-    tiling.set_alpha(kDefaultAlpha);
-    tiling.set_eps(kDefaultEps);
+
+    // 获取算子属性（lr、alpha、eps），并写入tiling数据
+    // 注意：以下属性获取接口为常见用法示例，实际项目中请根据SDK提供的API获取属性。
+    float lr = 1e-3f;
+    float alpha = 0.99f;
+    float eps = 1e-8f;
+    auto lrAttr = context->GetOpAttr(\"lr\");
+    if (lrAttr != nullptr) { lr = lrAttr->GetFloat(); }
+    auto alphaAttr = context->GetOpAttr(\"alpha\");
+    if (alphaAttr != nullptr) { alpha = alphaAttr->GetFloat(); }
+    auto epsAttr = context->GetOpAttr(\"eps\");
+    if (epsAttr != nullptr) { eps = epsAttr->GetFloat(); }
+
+    tiling.set_lr(lr);
+    tiling.set_alpha(alpha);
+    tiling.set_eps(eps);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
+    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -104,11 +111,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* in_shape = context->GetInputShape(0);
+    const gert::Shape* param_shape = context->GetInputShape(0);
     gert::Shape* out_shape = context->GetOutputShape(0);
-    *out_shape = *in_shape;
+    *out_shape = *param_shape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -137,37 +145,37 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Output("out")
+        this->Output("z")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        // 定义算子属性（学习率、衰减系数、数值稳定项）
+        this->Attr("lr");
+        this->Attr("alpha");
+        this->Attr("eps");
 
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
-
 OP_ADD(RmspropCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "rmsprop_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // 每个队列双缓冲
+constexpr int32_t BUFFER_NUM = 2;
 
 class KernelRmsprop {
 public:
     __aicore__ inline KernelRmsprop() {}
-    __aicore__ inline void Init(GM_ADDR param, GM_ADDR grad, GM_ADDR v, GM_ADDR out,
-                                uint32_t totalLength, uint32_t tileNum, float lr, float alpha, float eps)
+    __aicore__ inline void Init(GM_ADDR param, GM_ADDR grad, GM_ADDR v, GM_ADDR z,
+                                float lr, float alpha, float eps,
+                                uint32_t totalLength, uint32_t tileNum)
     {
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
@@ -177,20 +185,19 @@ public:
         this->alpha = alpha;
         this->eps = eps;
 
-        paramGm.SetGlobalBuffer((__gm__ float *)param + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        gradGm.SetGlobalBuffer((__gm__ float *)grad + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        vGm.SetGlobalBuffer((__gm__ float *)v + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        outGm.SetGlobalBuffer((__gm__ float *)out + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        paramGm.SetGlobalBuffer((__gm__ float*)param + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        gradGm.SetGlobalBuffer((__gm__ float*)grad + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        vGm.SetGlobalBuffer((__gm__ float*)v + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ float*)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
         pipe.InitBuffer(inQueueParam, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(inQueueGrad,  BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(inQueueV,     BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(outQueueOut,  BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueGrad, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueV, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(float));
 
-        // 中间计算需要的临时缓冲：grad^2、v_new、denom
-        pipe.InitBuffer(tmpQue1, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpQue2, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpQue3, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpQueue1, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpQueue2, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpQueue3, BUFFER_NUM, this->tileLength * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -207,114 +214,119 @@ private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
         AscendC::LocalTensor<float> paramLocal = inQueueParam.AllocTensor<float>();
-        AscendC::LocalTensor<float> gradLocal  = inQueueGrad.AllocTensor<float>();
-        AscendC::LocalTensor<float> vLocal     = inQueueV.AllocTensor<float>();
-
+        AscendC::LocalTensor<float> gradLocal = inQueueGrad.AllocTensor<float>();
+        AscendC::LocalTensor<float> vLocal = inQueueV.AllocTensor<float>();
         AscendC::DataCopy(paramLocal, paramGm[progress * this->tileLength], this->tileLength);
-        AscendC::DataCopy(gradLocal,  gradGm[progress * this->tileLength],  this->tileLength);
-        AscendC::DataCopy(vLocal,     vGm[progress * this->tileLength],     this->tileLength);
-
+        AscendC::DataCopy(gradLocal, gradGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(vLocal, vGm[progress * this->tileLength], this->tileLength);
         inQueueParam.EnQue(paramLocal);
         inQueueGrad.EnQue(gradLocal);
         inQueueV.EnQue(vLocal);
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/)
+    __aicore__ inline void Compute(int32_t progress)
     {
         AscendC::LocalTensor<float> paramLocal = inQueueParam.DeQue<float>();
-        AscendC::LocalTensor<float> gradLocal  = inQueueGrad.DeQue<float>();
-        AscendC::LocalTensor<float> vLocal     = inQueueV.DeQue<float>();
+        AscendC::LocalTensor<float> gradLocal = inQueueGrad.DeQue<float>();
+        AscendC::LocalTensor<float> vLocal = inQueueV.DeQue<float>();
+        AscendC::LocalTensor<float> zLocal = outQueueZ.AllocTensor<float>();
 
-        AscendC::LocalTensor<float> grad2Local = tmpQue1.AllocTensor<float>();
-        AscendC::LocalTensor<float> vnewLocal  = tmpQue2.AllocTensor<float>();
-        AscendC::LocalTensor<float> denomLocal = tmpQue3.AllocTensor<float>();
-        AscendC::LocalTensor<float> outLocal   = outQueueOut.AllocTensor<float>();
+        AscendC::LocalTensor<float> t1 = tmpQueue1.AllocTensor<float>(); // g^2 or v_new
+        AscendC::LocalTensor<float> t2 = tmpQueue2.AllocTensor<float>(); // alpha*v or sqrt(v_new)+eps
+        AscendC::LocalTensor<float> t3 = tmpQueue3.AllocTensor<float>(); // (1-alpha)*g^2 or lr * (g/denom)
 
-        // grad2 = grad * grad
-        AscendC::Mul(grad2Local, gradLocal, gradLocal, this->tileLength);
-
-        // v_new = alpha * v + (1 - alpha) * grad2
-        AscendC::Muls(vnewLocal, vLocal, this->alpha, this->tileLength);                  // alpha * v
-        AscendC::Muls(denomLocal, grad2Local, (1.0f - this->alpha), this->tileLength);    // (1-alpha) * grad2
-        AscendC::Add(vnewLocal, vnewLocal, denomLocal, this->tileLength);                 // vnew = ...
-
+        // g^2
+        AscendC::Mul(t1, gradLocal, gradLocal, this->tileLength);
+        // alpha * v
+        AscendC::Muls(t2, vLocal, this->alpha, this->tileLength);
+        // (1 - alpha) * g^2
+        float one_minus_alpha = 1.0f - this->alpha;
+        AscendC::Muls(t3, t1, one_minus_alpha, this->tileLength);
+        // v_new = alpha*v + (1-alpha)*g^2 -> reuse t1
+        AscendC::Add(t1, t2, t3, this->tileLength);
+        // sqrt(v_new)
+        AscendC::Sqrt(t2, t1, this->tileLength);
         // denom = sqrt(v_new) + eps
-        AscendC::Sqrt(denomLocal, vnewLocal, this->tileLength);
-        AscendC::Adds(denomLocal, denomLocal, this->eps, this->tileLength);
+        AscendC::Adds(t2, t2, this->eps, this->tileLength);
+        // g / denom
+        AscendC::Div(t3, gradLocal, t2, this->tileLength);
+        // lr * (g / denom)
+        AscendC::Muls(t3, t3, this->lr, this->tileLength);
+        // param - lr * g / denom
+        AscendC::Sub(zLocal, paramLocal, t3, this->tileLength);
 
-        // update = lr * grad / denom
-        AscendC::Div(outLocal, gradLocal, denomLocal, this->tileLength);
-        AscendC::Muls(outLocal, outLocal, this->lr, this->tileLength);
-
-        // out = param - update
-        AscendC::Sub(outLocal, paramLocal, outLocal, this->tileLength);
-
-        outQueueOut.EnQue<float>(outLocal);
-
-        // 释放队列中的局部张量
+        outQueueZ.EnQue<float>(zLocal);
         inQueueParam.FreeTensor(paramLocal);
         inQueueGrad.FreeTensor(gradLocal);
         inQueueV.FreeTensor(vLocal);
-        tmpQue1.FreeTensor(grad2Local);
-        tmpQue2.FreeTensor(vnewLocal);
-        tmpQue3.FreeTensor(denomLocal);
+        tmpQueue1.FreeTensor(t1);
+        tmpQueue2.FreeTensor(t2);
+        tmpQueue3.FreeTensor(t3);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<float> outLocal = outQueueOut.DeQue<float>();
-        AscendC::DataCopy(outGm[progress * this->tileLength], outLocal, this->tileLength);
-        outQueueOut.FreeTensor(outLocal);
+        AscendC::LocalTensor<float> zLocal = outQueueZ.DeQue<float>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueParam, inQueueGrad, inQueueV;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueOut;
-    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQue1, tmpQue2, tmpQue3;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueParam;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueGrad;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueV;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue1;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue2;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue3;
 
     AscendC::GlobalTensor<float> paramGm;
     AscendC::GlobalTensor<float> gradGm;
     AscendC::GlobalTensor<float> vGm;
-    AscendC::GlobalTensor<float> outGm;
-
-    uint32_t blockLength;
-    uint32_t tileNum;
-    uint32_t tileLength;
+    AscendC::GlobalTensor<float> zGm;
 
     float lr;
     float alpha;
     float eps;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void rmsprop_custom(GM_ADDR param, GM_ADDR grad, GM_ADDR v, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling) {
-    GET_TILING_DATA(tiling_data, tiling);
+extern "C" __global__ __aicore__ void rmsprop_custom(GM_ADDR param, GM_ADDR grad, GM_ADDR v, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
     KernelRmsprop op;
-    op.Init(param, grad, v, out,
-            tiling_data.totalLength, tiling_data.tileNum,
-            tiling_data.lr, tiling_data.alpha, tiling_data.eps);
-    op.Process();
+    op.Init(param, grad, v, z, tilingData.lr, tilingData.alpha, tilingData.eps, tilingData.totalLength, tilingData.tileNum);
+    if (TILING_KEY_IS(1)) {
+        op.Process();
+    } else {
+        op.Process();
+    }
 }
 """
 
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
-#include "pytorch_npu_helper.hpp"
+#include \"pytorch_npu_helper.hpp\"
 #include <torch/extension.h>
 
-at::Tensor rmsprop_custom_impl_npu(const at::Tensor& param, const at::Tensor& grad, const at::Tensor& v) {
+at::Tensor rmsprop_custom_impl_npu(const at::Tensor& param, const at::Tensor& grad, const at::Tensor& v,
+                                   double lr, double alpha, double eps) {
     at::Tensor result = at::empty_like(param);
-    EXEC_NPU_CMD(aclnnRmspropCustom, param, grad, v, result);
+    EXEC_NPU_CMD(aclnnRmspropCustom, param, grad, v, lr, alpha, eps, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("rmsprop_custom", &rmsprop_custom_impl_npu);
+    m.impl(\"rmsprop_custom\", &rmsprop_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("rmsprop_custom", &rmsprop_custom_impl_npu, "RMSProp update");
+    m.def(\"rmsprop_custom\", &rmsprop_custom_impl_npu, \"RMSProp update\");
 }
 """
 
@@ -326,15 +338,10 @@ import custom_ops_lib
 class ModelNew(torch.nn.Module):
     def __init__(self, lr=1e-3, alpha=0.99, eps=1e-8):
         super().__init__()
-        # 内核当前使用默认超参（lr/alpha/eps），与该初始化参数保持一致
         self.lr = lr
         self.alpha = alpha
         self.eps = eps
 
     def forward(self, param, grad, v):
-        # 使用自定义AscendC算子完成：
-        # v_new = alpha * v + (1 - alpha) * grad^2
-        # param_new = param - lr * grad / (sqrt(v_new) + eps)
-        # 当前接口返回更新后的param
-        return custom_ops_lib.rmsprop_custom(param, grad, v)
+        return custom_ops_lib.rmsprop_custom(param, grad, v, float(self.lr), float(self.alpha), float(self.eps))
 '''

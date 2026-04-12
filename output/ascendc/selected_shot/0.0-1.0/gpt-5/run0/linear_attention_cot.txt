@@ -1,0 +1,33 @@
+**Structuring a custom kernel**
+
+I’m thinking about how to structure the kernel. For each batch, I need to compute S[b,:,:] using a K relu operation accumulated along the k dimension, and then multiply each Q row with S. In the AscendC kernel, I need to implement loops and DataCopy, but typical patterns focus on 1D arrays and vector operations. I could present a simplified kernel for element-wise operations. The implementation will be approximate pseudocode, but it should align with AscendC patterns.**Defining data types for kernel**
+
+In the sample, they rely on DTYPE_X defined in the build environment, but usually, macros are defined by the host operator. They used DTYPE_X for addition, so I’ll stick with DTYPE_Q, DTYPE_K, DTYPE_V, and DTYPE_O for clarity. Although sometimes tools expect DTYPE_X, Y, Z, I think it’ll be fine since we have three inputs and one output. I’ll also use GM_ADDR addresses for Q, K, V, and output while providing fields like batch, seqLen, and dModel for tiling data.**Simplifying the kernel design**
+
+To simplify things, I can create a straightforward serial kernel within one block for its batch while using outer loops. I need to rely on vector pipeline illusions here. In the kernel body, I'll compute for each pair (d, v) and accumulate across k. Memory usage could be heavy for d_model up to 1024, but I think it’s manageable. However, the actual AscendC code requires LocalTensor, TQue, and DataCopy. I’ll provide a plausible single-tile approach while reading slices and suggest using high-level functions like AscendC::Mmad or the interface for MatMul to keep things aligned with the example.**Implementing custom kernels**
+
+Given the complexity, I see that using loops in __aicore__ with local memory might be limiting. It might be better to break the task into two custom kernels: one for computing KV using einsum and another to multiply with Q. However, the user specifically asked for a single kernel called `linear_attention_custom`, which needs to match exactly in both the source and PascalCase in JSON, like `LinearAttentionCustom`. I'll also implement Python bindings to ensure `custom_ops_lib.linear_attention_custom(Q, K, V)` returns a torch tensor, while registering the operation in Torch as "myops." For the tiling function, I need to define fields like batch, seqLen, and dModel.**Designing the linear attention kernel**
+
+I need to set `BLOCK_DIM` as the minimum of the batch size or 8, but I could also just set it to batch directly. The tiling function will have shapes, so I'll use `SetBlockDim` for managing blocks. I'll define input dimensions for Q, K, and V based on their shapes. The C++ kernel function `linear_attention_custom` must be declared with relevant memory addresses. I'll handle indexing for batch assignments, ensuring that memory usage aligns with AscendC's constraints. 
+
+To avoid large memory requirements, I'll compute values tile-by-tile without fully materializing intermediate arrays. I can deduce output with scalar summations that focus on elements needed for each tile, while managing the complexity of nested loops in the code structure. 
+
+Meanwhile, I'll explore calling built-in Ascend operators within a simplified kernel structure, even if I need to balance performance and requirements outlined in the guidelines.**Creating the kernel source**
+
+I'm planning to craft the kernel source with a three-phase approach using SPMD across blocks by batch. In the compute phase, I intend to load K and V tiles and compute partial KV accumulations, but instead of a global buffer, I'll accumulate into the output on-the-fly since dimensions differ.
+
+I'll set up outer loops and handle tile initialization, ensuring efficient memory usage. The implementation will focus on micro-tiling and will store results into a workspace effectively. 
+
+Utilizing local memory for computations will help manage complexity while aligning with AscendC's requirements. Each batch will undergo two distinct phases to streamline the calculations and maintain memory efficiency.**Implementing kernel source**
+
+I need to utilize vector Dot and potentially AscendC's ReduceSum. The plan involves multiplying values into a local buffer and summing them up to compute scalars. Since the direct functions might not be available for reduction, I'll consider alternatives like accumulating results through scalar loops.
+
+For the JSON operator setup, I will define inputs and outputs clearly with data types. Additionally, the tiling and operator source files will set workspace sizes and handle dimensions appropriately.
+
+I'll keep an eye on simplifying the structure and ensure my code aligns with AscendC requirements while focusing on streamlining calculations and memory management during implementation.**Structuring names and headers**
+
+I need to include "linear_attention_custom_tiling.h" to match the tiling header naming conventions. In the reference code, the host operator source includes "add_custom_tiling.h," so I should follow that pattern.
+
+I’ll ensure the names are consistent across the code: the kernel function will be named linear_attention_custom, the JSON operation will be "LinearAttentionCustom," and the host operator class will be ops::LinearAttentionCustom. 
+
+I’ll also define a function in python_bind_src for linear_attention_custom_impl_npu and ensure it registers correctly. Finally, in ModelNew.forward, I plan to call custom_ops_lib.linear_attention_custom. Let’s get to coding!

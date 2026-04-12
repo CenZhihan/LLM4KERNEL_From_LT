@@ -1,0 +1,305 @@
+project_json_src='''
+[
+    {
+        "op": "CrossEntropyLossCustom",
+        "input_desc": [
+            {
+                "name": "predict",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "label",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32",
+                    "int64"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CrossEntropyLossCustomTilingData)
+    TILING_DATA_FIELD_DEF(uint32_t, rows);
+    TILING_DATA_FIELD_DEF(uint32_t, cols);
+    TILING_DATA_FIELD_DEF(uint32_t, tmpSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CrossEntropyLossCustom, CrossEntropyLossCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cross_entropy_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <string.h>
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CrossEntropyLossCustomTilingData tiling;
+
+    auto inShape = context->GetInputShape(0);
+    uint32_t rows = 1;
+    uint32_t cols = 1;
+    if (inShape != nullptr) {
+        auto storage = inShape->GetStorageShape();
+        if (storage.GetDimNum() >= 2) {
+            rows = static_cast<uint32_t>(storage.GetDim(0));
+            cols = static_cast<uint32_t>(storage.GetDim(1));
+        } else if (storage.GetDimNum() == 1) {
+            rows = static_cast<uint32_t>(storage.GetDim(0));
+            cols = 1;
+        }
+    }
+
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+
+    // 预留一定的UB临时空间给Exp等高阶API使用（示例设置为64KB）
+    uint32_t tmpSize = 64 * 1024;
+    tiling.set_tmpSize(tmpSize);
+
+    // 单核执行
+    context->SetBlockDim(1);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CrossEntropyLossCustom : public OpDef {
+public:
+    explicit CrossEntropyLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("predict")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("label")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32, ge::DT_INT64})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CrossEntropyLossCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include <cstdint>
+#include <cfloat>
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelCrossEntropyLoss {
+public:
+    __aicore__ inline KernelCrossEntropyLoss() {}
+
+    __aicore__ inline void Init(GM_ADDR predict, GM_ADDR label, GM_ADDR y,
+                                uint32_t rows, uint32_t cols, uint32_t tmpSize) {
+        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
+
+        this->rows = rows;
+        this->cols = cols;
+        this->tmpSize = tmpSize;
+
+        logitsGm.SetGlobalBuffer((__gm__ float*)predict, rows * cols);
+        // 标签按int32读取（若实际为int64，需在上层做dtype转换）
+        labelsGm.SetGlobalBuffer((__gm__ int32_t*)label, rows);
+        outGm.SetGlobalBuffer((__gm__ float*)y, 32); // 输出标量
+
+        // 行缓冲：一行logits
+        pipe.InitBuffer(inQueueRow, BUFFER_NUM, this->cols * sizeof(float));
+        // work buffer用于ReduceSum的临时空间（按cols大小分配，满足对齐要求）
+        pipe.InitBuffer(workQueue, BUFFER_NUM, this->cols * sizeof(float));
+        // exp/log等中间变量临时空间
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tmpSize);
+        // 累积loss缓冲
+        pipe.InitBuffer(accQueue, 1, 32);
+        // 单元素缓冲存标签和标量运算
+        pipe.InitBuffer(scalarQueue, 1, 64);
+    }
+
+    __aicore__ inline void Process() {
+        // 累加器初始化为0
+        AscendC::LocalTensor<float> lossAccum = accQueue.AllocTensor<float>();
+        AscendC::Duplicate(lossAccum, 0.0f, 1);
+
+        for (uint32_t i = 0; i < rows; ++i) {
+            ComputeOneRow(i, lossAccum);
+        }
+
+        // 求平均
+        AscendC::LocalTensor<float> denom = scalarQueue.AllocTensor<float>();
+        denom.SetValue(0, static_cast<float>(rows));
+        AscendC::Div(lossAccum, lossAccum, denom, 1);
+
+        // 写回输出
+        outGm.SetValue(0, lossAccum.GetValue(0));
+
+        scalarQueue.FreeTensor(denom);
+        accQueue.FreeTensor(lossAccum);
+    }
+
+private:
+    __aicore__ inline void ComputeOneRow(uint32_t rowIdx, AscendC::LocalTensor<float>& lossAccum) {
+        // 1. 拷贝该行logits到UB
+        AscendC::LocalTensor<float> rowLocal = inQueueRow.AllocTensor<float>();
+        AscendC::DataCopy(rowLocal, logitsGm[rowIdx * cols], cols);
+        inQueueRow.EnQue(rowLocal);
+
+        // 2. 计算该行最大值（标量循环）
+        float maxVal = -FLT_MAX;
+        for (uint32_t j = 0; j < cols; ++j) {
+            float v = rowLocal.GetValue(j);
+            maxVal = (v > maxVal) ? v : maxVal;
+        }
+
+        // 3. 计算exp(logits - max)向量
+        AscendC::LocalTensor<float> workLocal = workQueue.AllocTensor<float>();
+        AscendC::Duplicate(workLocal, maxVal, cols);
+        // rowLocal = rowLocal - max
+        AscendC::Sub(rowLocal, rowLocal, workLocal, cols);
+
+        AscendC::LocalTensor<uint8_t> sharedTmp = tmpQueue.AllocTensor<uint8_t>();
+        // 在整行上做exp（采用泰勒展开阶数15示例）
+        AscendC::Exp<float, 15, false>(rowLocal, rowLocal, sharedTmp, cols);
+
+        // 4. reduce sum 得到sum_exp
+        // 将exp结果reduce到rowLocal[0]
+        AscendC::ReduceSum<float>(rowLocal, rowLocal, workLocal, cols);
+        float sumExp = rowLocal.GetValue(0);
+
+        // 5. 读取对应label的logit（x_j）
+        AscendC::LocalTensor<int32_t> labelLocal = scalarQueue.AllocTensor<int32_t>();
+        AscendC::DataCopy(labelLocal, labelsGm[rowIdx], 1);
+        int32_t targetIdx = labelLocal.GetValue(0);
+        if (targetIdx < 0) { targetIdx = 0; }
+        if ((uint32_t)targetIdx >= cols) { targetIdx = (int32_t)(cols - 1); }
+        // 由于rowLocal当前是exp(logits - max)，需要x_j原值，需从GM再次读取该单点
+        float xj = logitsGm.GetValue(rowIdx * cols + (uint32_t)targetIdx);
+
+        // 6. 计算logsumexp = max + log(sumExp)
+        AscendC::LocalTensor<float> sumLocal = scalarQueue.AllocTensor<float>();
+        sumLocal.SetValue(0, sumExp);
+        // 对单元素做log（示例使用Log接口）
+        AscendC::Log(sumLocal, sumLocal, 1);
+        float logsumexp = maxVal + sumLocal.GetValue(0);
+
+        // 7. 累加loss：loss_i = logsumexp - xj
+        float loss_i = logsumexp - xj;
+        float accum = lossAccum.GetValue(0);
+        lossAccum.SetValue(0, accum + loss_i);
+
+        // 释放本次申请的本地tensor
+        scalarQueue.FreeTensor(sumLocal);
+        scalarQueue.FreeTensor(labelLocal);
+        tmpQueue.FreeTensor(sharedTmp);
+        workQueue.FreeTensor(workLocal);
+        inQueueRow.FreeTensor(rowLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueRow;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> workQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> accQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> scalarQueue;
+
+    AscendC::GlobalTensor<float> logitsGm;
+    AscendC::GlobalTensor<int32_t> labelsGm;
+    AscendC::GlobalTensor<float> outGm;
+
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t tmpSize;
+};
+
+extern "C" __global__ __aicore__ void cross_entropy_loss_custom(GM_ADDR predict, GM_ADDR label, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCrossEntropyLoss op;
+    op.Init(predict, label, y, tiling_data.rows, tiling_data.cols, tiling_data.tmpSize);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cross_entropy_loss_impl_npu(const at::Tensor& predict, const at::Tensor& label) {
+    // 输出标量
+    at::Tensor result = at::empty({}, predict.options());
+    EXEC_NPU_CMD(aclnnCrossEntropyLossCustom, predict, label, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cross_entropy_loss_custom", &cross_entropy_loss_impl_npu);
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cross_entropy_loss_custom", &cross_entropy_loss_impl_npu, "cross entropy loss");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.cross_entropy_loss_custom(predictions, targets)
+'''

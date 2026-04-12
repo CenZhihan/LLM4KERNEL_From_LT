@@ -7,44 +7,28 @@ project_json_src='''
             {
                 "name": "assignment",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
                 "name": "x",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
                 "name": "clusters2",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ],
         "output_desc": [
             {
                 "name": "vlad",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ]
     }
@@ -55,22 +39,11 @@ host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
-
-// 该自定义算子在内核中实现 NetVLAD 的核心部分：
-// - 去除 ghost clusters（仅保留前K列）
-// - 计算 a_sum = sum(assignment, dim=1)
-// - vlad_accum = sum_i (assignment[i]^T @ x[i]) 以外积累加实现
-// - 输出 vlad = vlad_accum^T - a, 形状为 [B, D, K]
-// 参考：
-// - Sum 高阶API对齐要求与用法（Ascend C API Reference 5.1.29.x/5.1.31 More Examples/5.1.20/5.1.21）
-// 此处不在主机侧做复杂tiling，仅传递必要的维度信息
-
 BEGIN_TILING_DATA_DEF(NetVladWithGhostClustersCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, B);
-  TILING_DATA_FIELD_DEF(uint32_t, N);
-  TILING_DATA_FIELD_DEF(uint32_t, D);
-  TILING_DATA_FIELD_DEF(uint32_t, K);
-  TILING_DATA_FIELD_DEF(uint32_t, KTotal); // K + G
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, numFeatures);
+  TILING_DATA_FIELD_DEF(uint32_t, featureSize);
+  TILING_DATA_FIELD_DEF(uint32_t, numClusters);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(NetVladWithGhostClustersCustom, NetVladWithGhostClustersCustomTilingData)
@@ -80,44 +53,31 @@ REGISTER_TILING_DATA_CLASS(NetVladWithGhostClustersCustom, NetVladWithGhostClust
 host_operator_src="""
 #include "net_vlad_with_ghost_clusters_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
-static const uint32_t BLOCK_DIM = 8;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 输入0: assignment [B, N, K+G]
-    // 输入1: x          [B, N, D]
-    // 输入2: clusters2  [1, D, K]
-    const gert::Shape* assignmentShape = context->GetInputShape(0);
-    const gert::Shape* xShape          = context->GetInputShape(1);
-    const gert::Shape* clusters2Shape  = context->GetInputShape(2);
-
-    // 解析维度
-    // assignment: [B, N, KTotal]
-    uint32_t B = static_cast<uint32_t>(assignmentShape->GetDim(0));
-    uint32_t N = static_cast<uint32_t>(assignmentShape->GetDim(1));
-    uint32_t KTotal = static_cast<uint32_t>(assignmentShape->GetDim(2));
-
-    // x: [B, N, D]
-    uint32_t D = static_cast<uint32_t>(xShape->GetDim(2));
-
-    // clusters2: [1, D, K]
-    uint32_t K = static_cast<uint32_t>(clusters2Shape->GetDim(2));
-
     NetVladWithGhostClustersCustomTilingData tiling;
-    tiling.set_B(B);
-    tiling.set_N(N);
-    tiling.set_D(D);
-    tiling.set_K(K);
-    tiling.set_KTotal(KTotal);
 
-    context->SetBlockDim(BLOCK_DIM);
+    // 输入0: assignment (B, N, K)
+    const auto& asg_shape = context->GetInputShape(0)->GetOriginShape();
+    const auto& x_shape   = context->GetInputShape(1)->GetOriginShape();
+    const auto& c2_shape  = context->GetInputShape(2)->GetOriginShape();
+
+    uint32_t B = (asg_shape.GetDimNum() > 0) ? asg_shape.GetDim(0) : 1;
+    uint32_t N = (asg_shape.GetDimNum() > 1) ? asg_shape.GetDim(1) : 1;
+    uint32_t K = (asg_shape.GetDimNum() > 2) ? asg_shape.GetDim(2) : 1;
+    uint32_t D = (x_shape.GetDimNum() > 2) ? x_shape.GetDim(2) : 1;
+
+    context->SetBlockDim(B);
+    tiling.set_batch(B);
+    tiling.set_numFeatures(N);
+    tiling.set_featureSize(D);
+    tiling.set_numClusters(K);
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // 无需workspace
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -127,25 +87,24 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 输出 vlad: [B, D, K]
-    const gert::Shape* assignmentShape = context->GetInputShape(0); // [B, N, K+G]
-    const gert::Shape* xShape = context->GetInputShape(1);          // [B, N, D]
-    const gert::Shape* clusters2Shape = context->GetInputShape(2);  // [1, D, K]
+    // 输出 vlad: (B, D, K)
+    const gert::Shape* asg_shape = context->GetInputShape(0);
+    const gert::Shape* x_shape   = context->GetInputShape(1);
 
-    int64_t B = assignmentShape->GetDim(0);
-    int64_t D = xShape->GetDim(2);
-    int64_t K = clusters2Shape->GetDim(2);
+    gert::Shape* y_shape = context->GetOutputShape(0);
 
-    gert::Shape* yShape = context->GetOutputShape(0);
-    yShape->SetDimNum(3);
-    yShape->SetDim(0, B);
-    yShape->SetDim(1, D);
-    yShape->SetDim(2, K);
+    std::vector<int64_t> out_dims(3);
+    out_dims[0] = asg_shape->GetDim(0); // B
+    out_dims[1] = x_shape->GetDim(2);   // D
+    out_dims[2] = asg_shape->GetDim(2); // K
+    y_shape->SetDimNum(3);
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        y_shape->SetDim(i, out_dims[i]);
+    }
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    // 输出dtype与输入保持一致（float32）
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
@@ -162,11 +121,13 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Input("x")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Input("clusters2")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -180,200 +141,77 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
-        // 请根据实际昇腾AI处理器型号填写
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
-
 OP_ADD(NetVladWithGhostClustersCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "net_vlad_with_ghost_clusters_custom_tiling_data.h"
 
-// 本内核实现 NetVLAD 的核心计算：
-// 输入：
-//   assignment: [B, N, KTotal]，已softmax，KTotal = K + G，内核仅取前K列
-//   x         : [B, N, D]
-//   clusters2 : [1, D, K]
-// 输出：
-//   vlad      : [B, D, K]，对应 vlad = (assignment^T @ x)^T - a，a = sum_N(assignment) * clusters2
-// 说明：
-// - 为了简洁与稳定，我们采用逐行/逐列分块+向量操作组合实现：
-//   vlad_accum[K, D] = sum_{n=0..N-1} outer(assignment[n, :K], x[n, :D])
-//   a_sum[K] = sum_{n=0..N-1} assignment[n, :K]
-//   a[D, K]  = clusters2[D, K] .* a_sum[None, K]
-//   最终输出转置为 [D, K] 并减去a。
-// - 参考文档：
-//   * 高阶API示例（Sum/More Examples）展示了队列、UB缓冲与LocalTensor用法。
-//   * 本实现主要用到DataCopy、Add、Muls、Duplicate等常用向量API（见LayerNorm/More Examples中的使用风格）。
+using namespace AscendC;
 
-constexpr int32_t IN_Q_DEPTH  = 1;
-constexpr int32_t OUT_Q_DEPTH = 1;
-constexpr int32_t CALC_Q_DEPTH = 1;
-
-class KernelNetVladWithGhostClusters {
-public:
-    __aicore__ inline KernelNetVladWithGhostClusters() {}
-
-    __aicore__ inline void Init(GM_ADDR assignment, GM_ADDR x, GM_ADDR clusters2, GM_ADDR vlad,
-                                uint32_t B, uint32_t N, uint32_t D, uint32_t K, uint32_t KTotal)
-    {
-        this->B = B;
-        this->N = N;
-        this->D = D;
-        this->K = K;
-        this->KTotal = KTotal;
-
-        assignmentGm.SetGlobalBuffer((__gm__ DTYPE_X *)assignment, static_cast<uint64_t>(B) * N * KTotal);
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, static_cast<uint64_t>(B) * N * D);
-        clusters2Gm.SetGlobalBuffer((__gm__ DTYPE_X *)clusters2, static_cast<uint64_t>(D) * K);
-        vladGm.SetGlobalBuffer((__gm__ DTYPE_X *)vlad, static_cast<uint64_t>(B) * D * K);
-
-        // 初始化队列与UB缓存
-        pipe.InitBuffer(inAssRowQ, IN_Q_DEPTH, K * sizeof(DTYPE_X));
-        pipe.InitBuffer(inXRowQ, IN_Q_DEPTH, D * sizeof(DTYPE_X));
-        pipe.InitBuffer(inC2Q, IN_Q_DEPTH, D * K * sizeof(DTYPE_X));
-        pipe.InitBuffer(outZRowQ, OUT_Q_DEPTH, K * sizeof(DTYPE_X));
-        pipe.InitBuffer(calcQ, CALC_Q_DEPTH,
-                        (K * D + K + D) * sizeof(DTYPE_X)); // vladAcc(K*D) + aSum(K) + temp(D)
-    }
-
-    __aicore__ inline void Process()
-    {
-        // 预取 clusters2 到UB
-        AscendC::LocalTensor<DTYPE_X> clusters2Local = inC2Q.AllocTensor<DTYPE_X>();
-        AscendC::DataCopy(clusters2Local, clusters2Gm, static_cast<uint64_t>(D) * K);
-        inC2Q.EnQue(clusters2Local);
-
-        // 分批处理每个batch
-        for (uint32_t b = 0; b < B; ++b) {
-            ComputeOneBatch(b);
-        }
-
-        // 释放
-        clusters2Local = inC2Q.DeQue<DTYPE_X>();
-        inC2Q.FreeTensor(clusters2Local);
-    }
-
-private:
-    __aicore__ inline void ComputeOneBatch(uint32_t b)
-    {
-        // 分配计算缓冲
-        AscendC::LocalTensor<DTYPE_X> vladAcc = calcQ.AllocTensor<DTYPE_X>();        // 大小 K*D
-        AscendC::LocalTensor<DTYPE_X> aSum    = calcQ.Get<DTYPE_X>(K * D);           // 大小 K
-        AscendC::LocalTensor<DTYPE_X> tempD   = calcQ.Get<DTYPE_X>(K * D + K);       // 大小 D
-
-        // 初始化 vladAcc = 0, aSum = 0
-        DTYPE_X zero(0);
-        AscendC::Duplicate<DTYPE_X>(vladAcc, zero, static_cast<uint64_t>(K) * D);
-        AscendC::Duplicate<DTYPE_X>(aSum, zero, K);
-
-        // 外层循环：沿N累加
-        for (uint32_t n = 0; n < N; ++n) {
-            // 读取 assignment[b, n, :K] 一行（前K列）
-            AscendC::LocalTensor<DTYPE_X> aRow = inAssRowQ.AllocTensor<DTYPE_X>();
-            {
-                // GM起始下标
-                uint64_t assOff = static_cast<uint64_t>(b) * N * KTotal + static_cast<uint64_t>(n) * KTotal;
-                AscendC::DataCopy(aRow, assignmentGm[assOff], K);
-            }
-            inAssRowQ.EnQue(aRow);
-
-            // 读取 x[b, n, :D] 一行
-            AscendC::LocalTensor<DTYPE_X> xRow = inXRowQ.AllocTensor<DTYPE_X>();
-            {
-                uint64_t xOff = static_cast<uint64_t>(b) * N * D + static_cast<uint64_t>(n) * D;
-                AscendC::DataCopy(xRow, xGm[xOff], D);
-            }
-            inXRowQ.EnQue(xRow);
-
-            // a_sum 累积： aSum += aRow
-            aRow = inAssRowQ.DeQue<DTYPE_X>();
-            AscendC::Add(aSum, aSum, aRow, K);  // 向量加
-            inAssRowQ.FreeTensor(aRow);
-
-            // vlad_accum 累积：对于每个k，vladAcc[k, :] += aRow[k] * xRow[:]
-            xRow = inXRowQ.DeQue<DTYPE_X>();
-            for (uint32_t k = 0; k < K; ++k) {
-                // tempD[:] = xRow[:] * aRow[k]
-                // 为了获得 aRow[k]，复用一个小的读取：再次拉取该行（或在上面缓存）。此处简化起见再次读取。
-                AscendC::LocalTensor<DTYPE_X> aRow2 = inAssRowQ.AllocTensor<DTYPE_X>();
-                {
-                    uint64_t assOff = static_cast<uint64_t>(b) * N * KTotal + static_cast<uint64_t>(n) * KTotal;
-                    AscendC::DataCopy(aRow2, assignmentGm[assOff], K);
-                }
-                // 标量
-                DTYPE_X scalar = aRow2.GetValue(k);
-                inAssRowQ.FreeTensor(aRow2);
-
-                AscendC::Muls<DTYPE_X>(tempD, xRow, scalar, D);
-
-                // vladAcc[k, :] += tempD[:]
-                AscendC::Add(vladAcc[k * D], vladAcc[k * D], tempD, D);
-            }
-            inXRowQ.FreeTensor(xRow);
-        }
-
-        // clusters2 本地缓存
-        AscendC::LocalTensor<DTYPE_X> clusters2Local = inC2Q.DeQue<DTYPE_X>();
-        inC2Q.EnQue(clusters2Local); // 复用
-
-        // 输出：按d行写出 [D, K]，并做减法：vlad[d, k] = vladAcc[k, d] - clusters2[d, k] * aSum[k]
-        for (uint32_t d = 0; d < D; ++d) {
-            AscendC::LocalTensor<DTYPE_X> outRow = outZRowQ.AllocTensor<DTYPE_X>();
-            for (uint32_t k = 0; k < K; ++k) {
-                DTYPE_X valV = vladAcc[k * D + d];
-                DTYPE_X c2   = clusters2Local[d + k * D];
-                DTYPE_X as   = aSum[k];
-                outRow.SetValue(k, valV - c2 * as);
-            }
-            outZRowQ.EnQue(outRow);
-            outRow = outZRowQ.DeQue<DTYPE_X>();
-            uint64_t zOff = static_cast<uint64_t>(b) * D * K + static_cast<uint64_t>(d) * K;
-            AscendC::DataCopy(vladGm[zOff], outRow, K);
-            outZRowQ.FreeTensor(outRow);
-        }
-
-        // 释放计算缓冲
-        calcQ.FreeTensor(vladAcc);
-    }
-
-private:
-    AscendC::TPipe pipe;
-
-    AscendC::TQue<AscendC::TPosition::VECIN,  IN_Q_DEPTH>  inAssRowQ;
-    AscendC::TQue<AscendC::TPosition::VECIN,  IN_Q_DEPTH>  inXRowQ;
-    AscendC::TQue<AscendC::TPosition::VECIN,  IN_Q_DEPTH>  inC2Q;
-    AscendC::TQue<AscendC::TPosition::VECOUT, OUT_Q_DEPTH> outZRowQ;
-    AscendC::TQue<AscendC::TPosition::VECCALC, CALC_Q_DEPTH> calcQ;
-
-    AscendC::GlobalTensor<DTYPE_X> assignmentGm;
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_X> clusters2Gm;
-    AscendC::GlobalTensor<DTYPE_X> vladGm;
-
-    uint32_t B, N, D, K, KTotal;
-};
-
-extern "C" __global__ __aicore__ void net_vlad_with_ghost_clusters_custom(GM_ADDR assignment,
-                                                                          GM_ADDR x,
-                                                                          GM_ADDR clusters2,
-                                                                          GM_ADDR vlad,
-                                                                          GM_ADDR workspace,
-                                                                          GM_ADDR tiling)
+extern "C" __global__ __aicore__ void net_vlad_with_ghost_clusters_custom(
+    GM_ADDR assignment,  // B x N x K
+    GM_ADDR x,           // B x N x D
+    GM_ADDR clusters2,   // 1 x D x K
+    GM_ADDR vlad,        // B x D x K
+    GM_ADDR workspace,
+    GM_ADDR tiling)
 {
-    GET_TILING_DATA(tilingData, tiling);
-    KernelNetVladWithGhostClusters op;
-    op.Init(assignment, x, clusters2, vlad,
-            tilingData.B(), tilingData.N(), tilingData.D(), tilingData.K(), tilingData.KTotal());
-    op.Process();
+    GET_TILING_DATA(tiling_data, tiling);
+    const uint32_t B = tiling_data.batch();
+    const uint32_t N = tiling_data.numFeatures();
+    const uint32_t D = tiling_data.featureSize();
+    const uint32_t K = tiling_data.numClusters();
+
+    const uint32_t blockIdx = GetBlockIdx();
+    if (blockIdx >= B) {
+        return;
+    }
+
+    __gm__ float* asgGm = (__gm__ float*)assignment + (uint64_t)blockIdx * (uint64_t)N * (uint64_t)K;
+    __gm__ float* xGm   = (__gm__ float*)x         + (uint64_t)blockIdx * (uint64_t)N * (uint64_t)D;
+    __gm__ float* c2Gm  = (__gm__ float*)clusters2; // length D*K
+    __gm__ float* outGm = (__gm__ float*)vlad      + (uint64_t)blockIdx * (uint64_t)D * (uint64_t)K;
+
+    // 1) 初始化 out = 0 (shape D x K，按列主序 d*K + k)
+    for (uint32_t dk = 0; dk < D * K; ++dk) {
+        outGm[dk] = 0.0f;
+    }
+
+    // 2) 计算 vlad_pre = x^T @ assignment = sum_n x[n,:]^T * assignment[n,:]
+    // 即对每个样本 n，执行 rank-1 外积累加：out[d,k] += x[n,d] * assignment[n,k]
+    for (uint32_t n = 0; n < N; ++n) {
+        const uint64_t x_row_base   = (uint64_t)n * (uint64_t)D;
+        const uint64_t asg_row_base = (uint64_t)n * (uint64_t)K;
+
+        for (uint32_t k = 0; k < K; ++k) {
+            float a = asgGm[asg_row_base + k];
+            // 累加到列 k
+            uint64_t out_col_base = (uint64_t)k; // out[d*K + k]
+            for (uint32_t d = 0; d < D; ++d) {
+                float xv = xGm[x_row_base + d];
+                outGm[(uint64_t)d * (uint64_t)K + out_col_base] += (xv * a);
+            }
+        }
+    }
+
+    // 3) 计算 a_sum = sum_n assignment[:, :, k]，并执行 out -= a_sum * clusters2
+    // clusters2: [1, D, K]，按 [D, K] 展开
+    for (uint32_t k = 0; k < K; ++k) {
+        float a_sum = 0.0f;
+        for (uint32_t n = 0; n < N; ++n) {
+            a_sum += asgGm[(uint64_t)n * (uint64_t)K + k];
+        }
+        for (uint32_t d = 0; d < D; ++d) {
+            float c2 = c2Gm[(uint64_t)d * (uint64_t)K + k];
+            outGm[(uint64_t)d * (uint64_t)K + k] -= (a_sum * c2);
+        }
+    }
 }
 """
 
@@ -383,21 +221,22 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-// Python绑定：输入 (assignment[B,N,K+G], x[B,N,D], clusters2[1,D,K]) -> 输出 vlad[B,D,K]
 at::Tensor net_vlad_with_ghost_clusters_custom_impl_npu(const at::Tensor& assignment,
                                                         const at::Tensor& x,
                                                         const at::Tensor& clusters2) {
+    // assignment: (B, N, K), x: (B, N, D), clusters2: (1, D, K)
+    TORCH_CHECK(assignment.scalar_type() == at::kFloat, "assignment must be float32");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be float32");
+    TORCH_CHECK(clusters2.scalar_type() == at::kFloat, "clusters2 must be float32");
+
     auto B = assignment.size(0);
     auto N = assignment.size(1);
-    auto KTotal = assignment.size(2);
+    auto K = assignment.size(2);
     auto D = x.size(2);
-    auto K = clusters2.size(2);
 
-    // 输出 [B, D, K]
-    at::Tensor result = at::empty({B, D, K}, assignment.options());
-
-    EXEC_NPU_CMD(aclnnNetVladWithGhostClustersCustom, assignment, x, clusters2, result);
-    return result;
+    at::Tensor vlad = at::empty({B, D, K}, assignment.options());
+    EXEC_NPU_CMD(aclnnNetVladWithGhostClustersCustom, assignment, x, clusters2, vlad);
+    return vlad;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -405,20 +244,21 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("net_vlad_with_ghost_clusters_custom",
-          &net_vlad_with_ghost_clusters_custom_impl_npu,
-          "NetVLAD core with ghost clusters removal (assignment, x, clusters2) -> vlad");
+    m.def("net_vlad_with_ghost_clusters_custom", &net_vlad_with_ghost_clusters_custom_impl_npu, "NetVLAD core accumulation");
 }
 """
 
 model_src='''
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import torch as th
+import torch_npu
 import custom_ops_lib
 
-class ModelNew(torch.nn.Module):
+class ModelNew(nn.Module):
     def __init__(self, cluster_size, feature_size, ghost_clusters):
-        super().__init__()
+        super(ModelNew, self).__init__()
         self.feature_size = feature_size
         self.cluster_size = cluster_size
         self.ghost_clusters = ghost_clusters
@@ -427,30 +267,29 @@ class ModelNew(torch.nn.Module):
         init_sc = (1 / math.sqrt(feature_size))
         clusters = cluster_size + ghost_clusters
 
-        # 与原始模型保持一致
-        self.clusters = torch.nn.Parameter(init_sc * torch.randn(feature_size, clusters))
-        self.batch_norm = torch.nn.BatchNorm1d(clusters)
-        self.clusters2 = torch.nn.Parameter(init_sc * torch.randn(1, feature_size, cluster_size))
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
         self.out_dim = self.cluster_size * feature_size
 
     def forward(self, x, mask=None):
-        # x: [B, N, D]
+        # x: B x N x D
         B, N, D = x.shape
-        # 1) 计算 assignment（含BN与Softmax）
-        assignment = torch.matmul(x.view(-1, self.feature_size), self.clusters)         # [B*N, K+G]
-        assignment = self.batch_norm(assignment)                                        # BN1d通道数=K+G
-        assignment = F.softmax(assignment, dim=1)                                       # [B*N, K+G]
-        assignment = assignment.view(B, N, -1)                                          # [B, N, K+G]
+        x2d = x.reshape(-1, self.feature_size)  # BN x D
+        assignment = th.matmul(x2d, self.clusters)               # BN x (K+G)
+        assignment = self.batch_norm(assignment)                  # BN x (K+G)
+        assignment = F.softmax(assignment, dim=1)                 # BN x (K+G)
+        assignment = assignment[:, :self.cluster_size]            # BN x K
+        assignment = assignment.view(B, N, self.cluster_size)     # B x N x K
 
-        # 2) 使用自定义AscendC内核计算NetVLAD核心：去ghost、累积、减去a
-        #    输出 vlad: [B, D, K]
-        vlad = custom_ops_lib.net_vlad_with_ghost_clusters_custom(assignment, x, self.clusters2)
+        # 自定义算子：核心NetVLAD累积（完成 assignment^T@x 并减去 a_sum*clusters2）
+        vlad = custom_ops_lib.net_vlad_with_ghost_clusters_custom(assignment, x, self.clusters2)  # B x D x K
 
-        # 3) L2内归一化（沿D轴）
+        # L2 intra norm
         vlad = F.normalize(vlad, dim=1)
 
-        # 4) 拉平 + L2归一化
-        vlad = vlad.reshape(B, self.cluster_size * self.feature_size)  # [B, D*K]
+        # flattening + L2 norm
+        vlad = vlad.reshape(B, self.cluster_size * self.feature_size)  # B x DK
         vlad = F.normalize(vlad, dim=1)
         return vlad
 '''

@@ -38,7 +38,7 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(TanhCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(uint32_t, tmpBufferSize);
+  TILING_DATA_FIELD_DEF(uint32_t, bufferSize);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(TanhCustom, TanhCustomTilingData)
@@ -48,7 +48,6 @@ REGISTER_TILING_DATA_CLASS(TanhCustom, TanhCustomTilingData)
 host_operator_src="""
 #include "tanh_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
@@ -58,47 +57,26 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     TanhCustomTilingData tiling;
 
-    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
-
-    // Build a 1D shape for tmp buffer estimation
-    std::vector<int64_t> dims = {static_cast<int64_t>(totalLength)};
-    ge::Shape shape(dims);
-
-    // Detect dtype size
-    auto dt = context->GetInputTensor(0)->GetDataType();
-    uint32_t typeSize = 4; // default float
-    if (dt == ge::DT_FLOAT16) {
-        typeSize = 2;
-    } else if (dt == ge::DT_FLOAT) {
-        typeSize = 4;
-    }
-
+    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+    // 计算 Tanh 临时缓冲区大小（选择最小值以保证正确性和更好地适配 UB）
     uint32_t maxValue = 0;
     uint32_t minValue = 0;
-    AscendC::GetTanhMaxMinTmpSize(shape, typeSize, false, maxValue, minValue);
-
-    // Query remaining UB and choose tmp buffer within [minValue, maxValue]
-    auto platformInfo = context->GetPlatformInfo();
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
-    uint64_t tailSize = 0; // remaining space of UB
-    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, tailSize);
-
-    uint32_t tmpSize = 0;
-    if (tailSize >= minValue) {
-        tmpSize = tailSize >= maxValue ? maxValue : static_cast<uint32_t>(tailSize);
-    } else {
-        // Fallback to minValue to ensure correctness (framework may further schedule memory)
-        tmpSize = minValue;
-    }
+    // 输入为 float，类型大小 4 字节，且不复用源数据
+    AscendC::GetTanhMaxMinTmpSize(context->GetInputShape(0)->GetOriginShape(), 4, false, maxValue, minValue);
+    uint32_t bufferSize = minValue;
 
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-    tiling.set_tmpBufferSize(tmpSize);
+    tiling.set_bufferSize(bufferSize);
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 无需额外 GM workspace
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
+
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -106,9 +84,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    *y_shape = *x_shape;
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
     return GRAPH_SUCCESS;
 }
 
@@ -130,6 +108,7 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -138,8 +117,7 @@ public:
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -150,81 +128,98 @@ OP_ADD(TanhCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "tanh_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+constexpr int32_t BUFFER_NUM = 2; // 每个队列分配的本地张量个数
 
 class KernelTanh {
 public:
     __aicore__ inline KernelTanh() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum, uint32_t tmpBufferSize)
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum, uint32_t bufferSize)
     {
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
-        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
-        this->tmpSize = tmpBufferSize;
+        this->tileLength = this->blockLength / (tileNum * BUFFER_NUM);
+        this->tmpBufferSize = bufferSize;
 
         xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
+        // 初始化输入/输出队列缓冲
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
-        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tmpSize);
+
+        // 初始化临时缓冲区（用于 Tanh 复杂计算的中间变量）
+        pipe.InitBuffer(tmpQue, 1, this->tmpBufferSize);
+        sharedTmpBuffer = tmpQue.AllocTensor<uint8_t>();
     }
+
     __aicore__ inline void Process()
     {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
         for (int32_t i = 0; i < loopCount; i++) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
+            uint32_t curCopy = GetCurCount(i);
+            if (curCopy == 0) { break; }
+            CopyIn(i, curCopy);
+            Compute(i, curCopy);
+            CopyOut(i, curCopy);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress)
+    __aicore__ inline uint32_t GetCurCount(int32_t progress)
+    {
+        uint32_t start = progress * this->tileLength;
+        if (start >= this->blockLength) return 0;
+        uint32_t remain = this->blockLength - start;
+        return remain > this->tileLength ? this->tileLength : remain;
+    }
+
+    __aicore__ inline void CopyIn(int32_t progress, uint32_t count)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], count);
         inQueueX.EnQue(xLocal);
     }
-    __aicore__ inline void Compute(int32_t progress)
+
+    __aicore__ inline void Compute(int32_t /*progress*/, uint32_t count)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
         AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
-        AscendC::LocalTensor<uint8_t> sharedTmpBuffer = tmpQueue.AllocTensor<uint8_t>();
-
-        AscendC::Tanh<DTYPE_Y, false>(yLocal, xLocal, sharedTmpBuffer, this->tileLength);
-
+        // 使用带共享临时缓冲的 Tanh 变体
+        AscendC::Tanh(yLocal, xLocal, sharedTmpBuffer, count);
         outQueueY.EnQue<DTYPE_Y>(yLocal);
         inQueueX.FreeTensor(xLocal);
-        tmpQueue.FreeTensor(sharedTmpBuffer);
     }
-    __aicore__ inline void CopyOut(int32_t progress)
+
+    __aicore__ inline void CopyOut(int32_t progress, uint32_t count)
     {
         AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, count);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM>  inQueueX;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1>         tmpQue;
+
     AscendC::GlobalTensor<DTYPE_X> xGm;
     AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    AscendC::LocalTensor<uint8_t> sharedTmpBuffer;
+
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
-    uint32_t tmpSize;
+    uint32_t tmpBufferSize;
 };
 
 extern "C" __global__ __aicore__ void tanh_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelTanh op;
-    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum, tiling_data.tmpBufferSize);
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum, tiling_data.bufferSize);
     op.Process();
 }
 """
@@ -256,7 +251,7 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

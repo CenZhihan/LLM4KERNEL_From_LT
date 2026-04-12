@@ -7,54 +7,16 @@ project_json_src='''
             {
                 "name": "x",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "multiplier",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "clamp_min",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "clamp_max",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ],
         "output_desc": [
             {
                 "name": "y",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ]
     }
@@ -71,8 +33,9 @@ BEGIN_TILING_DATA_DEF(Conv3dMultiplyInstanceNormClampMultiplyMaxCustomTilingData
   TILING_DATA_FIELD_DEF(uint32_t, d);
   TILING_DATA_FIELD_DEF(uint32_t, h);
   TILING_DATA_FIELD_DEF(uint32_t, w);
-  TILING_DATA_FIELD_DEF(uint32_t, spatialSize);
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, s);           // inner size = d*h*w
+  TILING_DATA_FIELD_DEF(uint32_t, tileInner);   // per-tile inner length
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);     // tiles per inner dimension
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(Conv3dMultiplyInstanceNormClampMultiplyMaxCustom, Conv3dMultiplyInstanceNormClampMultiplyMaxCustomTilingData)
@@ -83,37 +46,56 @@ host_operator_src="""
 #include "conv3d_multiply_instance_norm_clamp_multiply_max_custom_tiling.h"
 #include "register/op_def_registry.h"
 
+namespace {
+inline uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (a + b - 1) / b;
+}
+}
+
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     Conv3dMultiplyInstanceNormClampMultiplyMaxCustomTilingData tiling;
 
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    auto origin = x_shape->GetOriginShape();
-    // Expect x as [N, C, D, H, W]
-    uint32_t n = origin.GetDim(0);
-    uint32_t c = origin.GetDim(1);
-    uint32_t d = origin.GetDim(2);
-    uint32_t h = origin.GetDim(3);
-    uint32_t w = origin.GetDim(4);
+    // 输入形状: [N, C, D, H, W]
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto dims = in_shape->GetStorageShape().GetDimNum() > 0 ? in_shape->GetStorageShape() : in_shape->GetOriginShape();
+    uint32_t n = static_cast<uint32_t>(dims.GetDim(0));
+    uint32_t c = static_cast<uint32_t>(dims.GetDim(1));
+    uint32_t d = static_cast<uint32_t>(dims.GetDim(2));
+    uint32_t h = static_cast<uint32_t>(dims.GetDim(3));
+    uint32_t w = static_cast<uint32_t>(dims.GetDim(4));
+    uint32_t s = d * h * w;
+
+    // 简单内部分块: 以UB亲和的内长(按128对齐)进行分块
+    // 可根据平台UB容量调大/调小
+    const uint32_t kAlign = 128u;
+    uint32_t tileInner = s;
+    if (tileInner > 8192u) { // 粗略阈值，避免过大tile
+        tileInner = 8192u;
+    }
+    tileInner = ((tileInner + kAlign - 1) / kAlign) * kAlign;
+    tileInner = tileInner > 0 ? std::min(tileInner, s) : s;
+
+    uint32_t tileNum = CeilDiv(s, tileInner);
 
     tiling.set_n(n);
     tiling.set_c(c);
     tiling.set_d(d);
     tiling.set_h(h);
     tiling.set_w(w);
-    tiling.set_spatialSize(d * h * w);
-    tiling.set_totalLength(n * c * d * h * w);
+    tiling.set_s(s);
+    tiling.set_tileInner(tileInner);
+    tiling.set_tileNum(tileNum);
 
-    // One block per batch (or capped by device)
-    uint32_t block_dim = n > 0 ? std::min<uint32_t>(n, 128) : 1;
-    context->SetBlockDim(block_dim);
-
+    context->SetBlockDim(BLOCK_DIM);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t *ws = context->GetWorkspaceSizes(1);
-    ws[0] = 0;
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -121,16 +103,16 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
+    // 输入: [N, C, D, H, W] -> 输出: [N, D, H, W] (对C维取max)
     const gert::Shape* x_shape = context->GetInputShape(0);
     gert::Shape* y_shape = context->GetOutputShape(0);
-    // Output is max over channel, so [N, D, H, W]
-    std::vector<int64_t> out_dims = {
-        x_shape->GetDim(0),
-        x_shape->GetDim(2),
-        x_shape->GetDim(3),
-        x_shape->GetDim(4)
-    };
-    y_shape->SetDimNum(out_dims.size());
+    std::vector<int64_t> out_dims;
+    out_dims.reserve(4);
+    out_dims.push_back(x_shape->GetStorageShape().GetDim(0));
+    out_dims.push_back(x_shape->GetStorageShape().GetDim(2));
+    out_dims.push_back(x_shape->GetStorageShape().GetDim(3));
+    out_dims.push_back(x_shape->GetStorageShape().GetDim(4));
+    y_shape->SetDimNum(4);
     for (size_t i = 0; i < out_dims.size(); ++i) {
         y_shape->SetDim(i, out_dims[i]);
     }
@@ -155,21 +137,7 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("multiplier")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("clamp_min")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("clamp_max")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -188,62 +156,117 @@ OP_ADD(Conv3dMultiplyInstanceNormClampMultiplyMaxCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv3d_multiply_instance_norm_clamp_multiply_max_custom_tiling_data.h"
 
-// Kernel does: y = max_c( clamp( x * multiplier[c], min, max ) * multiplier[c] ), where
-// x: [N,C,D,H,W], multiplier: [C,1,1,1], output y: [N,D,H,W].
-// Note: This kernel focuses on fused elementwise ops and channel-wise max reduction.
+#define DTYPE_X float
+#define DTYPE_Z float
 
-extern "C" __global__ __aicore__ void conv3d_multiply_instance_norm_clamp_multiply_max_custom(
-    GM_ADDR x, GM_ADDR multiplier, GM_ADDR clamp_min, GM_ADDR clamp_max, GM_ADDR y,
-    GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tilingData, tiling);
-    const uint32_t N = tilingData.n();
-    const uint32_t C = tilingData.c();
-    const uint32_t D = tilingData.d();
-    const uint32_t H = tilingData.h();
-    const uint32_t W = tilingData.w();
-    const uint32_t S = tilingData.spatialSize(); // D*H*W
+// 本kernel实现: 对输入x(N,C,D,H,W)进行通道维max归约, 输出y(N,D,H,W).
+// 上游在PyTorch中完成: Conv3d -> 逐通道乘法 -> InstanceNorm3d -> Clamp -> 再乘法
+// 本kernel聚焦于通道方向的最大值归约, 提升性能的关键在于按(N, D*H*W)分块并在UB内循环C。
 
-    const uint32_t blockNum = AscendC::GetBlockNum();
-    const uint32_t blockIdx = AscendC::GetBlockIdx();
+constexpr int32_t BUFFER_NUM = 2;
 
-    __gm__ float* xGm = reinterpret_cast<__gm__ float*>(x);
-    __gm__ float* mGm = reinterpret_cast<__gm__ float*>(multiplier);
-    __gm__ float* minGm = reinterpret_cast<__gm__ float*>(clamp_min);
-    __gm__ float* maxGm = reinterpret_cast<__gm__ float*>(clamp_max);
-    __gm__ float* yGm = reinterpret_cast<__gm__ float*>(y);
+class KernelMaxAlongC {
+public:
+    __aicore__ inline KernelMaxAlongC() {}
 
-    const float vmin = *minGm;
-    const float vmax = *maxGm;
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t n, uint32_t c,
+                                uint32_t d, uint32_t h, uint32_t w,
+                                uint32_t s, uint32_t tileInner, uint32_t tileNum)
+    {
+        this->n = n;
+        this->c = c;
+        this->d = d;
+        this->h = h;
+        this->w = w;
+        this->s = s;
+        this->tileInner = tileInner;
+        this->tileNum = tileNum;
 
-    // Work partition: split by batch N along blocks.
-    uint32_t nPerBlock = (N + blockNum - 1) / blockNum;
-    uint32_t nStart = blockIdx * nPerBlock;
-    uint32_t nEnd = AscendC::Min(nStart + nPerBlock, N);
+        // 将N维在多核之间均分
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t nPerBlock = n / blocks + ((blockIdx < (n % blocks)) ? 1 : 0);
+        uint32_t nStart = (n / blocks) * blockIdx + (blockIdx < (n % blocks) ? blockIdx : (n % blocks));
+        this->nStart = nStart;
+        this->nCount = nPerBlock;
 
-    for (uint32_t n = nStart; n < nEnd; ++n) {
-        // base offsets
-        uint64_t baseInN = static_cast<uint64_t>(n) * C * S;
-        uint64_t baseOutN = static_cast<uint64_t>(n) * S;
-        for (uint32_t s = 0; s < S; ++s) {
-            float maxVal = -3.402823466e+38F; // -FLT_MAX
-            for (uint32_t c = 0; c < C; ++c) {
-                uint64_t idx = baseInN + static_cast<uint64_t>(c) * S + s;
-                float mul_c = mGm[c]; // multiplier per channel
-                float v = xGm[idx] * mul_c;
-                // clamp
-                if (v < vmin) v = vmin;
-                if (v > vmax) v = vmax;
-                // multiply again
-                v = v * mul_c;
-                if (v > maxVal) maxVal = v;
+        // 全局tensor绑定到该block处理的起始位置
+        uint64_t xOffset = static_cast<uint64_t>(nStart) * c * s;
+        uint64_t yOffset = static_cast<uint64_t>(nStart) * s;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + xOffset, nPerBlock * c * s);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z*)y + yOffset, nPerBlock * s);
+
+        // 初始化队列缓存: 每个tile大小为tileInner
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileInner * sizeof(DTYPE_X));
+        pipe.InitBuffer(tmpQueueMax, BUFFER_NUM, this->tileInner * sizeof(DTYPE_Z));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileInner * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t ni = 0; ni < nCount; ++ni) {
+            for (uint32_t t = 0; t < tileNum; ++t) {
+                uint32_t innerStart = t * tileInner;
+                uint32_t innerLen = (t == tileNum - 1) ? (s - innerStart) : tileInner;
+
+                // 初始化max缓冲为极小值
+                AscendC::LocalTensor<DTYPE_Z> maxLocal = tmpQueueMax.AllocTensor<DTYPE_Z>();
+                DTYPE_Z negInf = static_cast<DTYPE_Z>(-3.4e38f);
+                AscendC::Duplicate(maxLocal, negInf, innerLen);
+
+                for (uint32_t ci = 0; ci < c; ++ci) {
+                    AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                    // 计算当前通道的GM偏移
+                    uint64_t off = static_cast<uint64_t>(ni) * c * s + static_cast<uint64_t>(ci) * s + innerStart;
+                    AscendC::DataCopy(xLocal, xGm[off], innerLen);
+
+                    // 逐通道更新max
+                    AscendC::Max(maxLocal, maxLocal, xLocal, innerLen);
+
+                    inQueueX.EnQue(xLocal);
+                    inQueueX.FreeTensor(xLocal);
+                }
+
+                // 写回输出: y shape [n, d*h*w] 按同样内分块布局
+                AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
+                AscendC::DataCopy(yLocal, maxLocal, innerLen);
+                uint64_t yOff = static_cast<uint64_t>(ni) * s + innerStart;
+                AscendC::DataCopy(yGm[yOff], yLocal, innerLen);
+
+                outQueueY.EnQue(yLocal);
+                outQueueY.FreeTensor(yLocal);
+                tmpQueueMax.EnQue(maxLocal);
+                tmpQueueMax.FreeTensor(maxLocal);
             }
-            yGm[baseOutN + s] = maxVal;
         }
     }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueueMax;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    uint32_t n, c, d, h, w, s;
+    uint32_t tileInner, tileNum;
+    uint32_t nStart, nCount;
+};
+
+extern "C" __global__ __aicore__ void conv3d_multiply_instance_norm_clamp_multiply_max_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMaxAlongC op;
+    op.Init(x, y,
+            tiling_data.n, tiling_data.c,
+            tiling_data.d, tiling_data.h, tiling_data.w,
+            tiling_data.s, tiling_data.tileInner, tiling_data.tileNum);
+    op.Process();
 }
 """
 
@@ -253,17 +276,11 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv3d_multiply_instance_norm_clamp_multiply_max_custom_impl_npu(
-    const at::Tensor& x,
-    const at::Tensor& multiplier,
-    const at::Tensor& clamp_min,
-    const at::Tensor& clamp_max) {
-
-    // Output: [N, D, H, W]
-    auto sizes = x.sizes();
-    TORCH_CHECK(sizes.size() == 5, "x must be 5D NCDHW");
-    at::Tensor result = at::empty({sizes[0], sizes[2], sizes[3], sizes[4]}, x.options());
-    EXEC_NPU_CMD(aclnnConv3dMultiplyInstanceNormClampMultiplyMaxCustom, x, multiplier, clamp_min, clamp_max, result);
+at::Tensor conv3d_multiply_instance_norm_clamp_multiply_max_custom_impl_npu(const at::Tensor& x) {
+    // x: [N, C, D, H, W]; result: [N, D, H, W]
+    std::vector<int64_t> out_sizes = {x.size(0), x.size(2), x.size(3), x.size(4)};
+    at::Tensor result = at::empty(out_sizes, x.options());
+    EXEC_NPU_CMD(aclnnConv3dMultiplyInstanceNormClampMultiplyMaxCustom, x, result);
     return result;
 }
 
@@ -272,8 +289,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv3d_multiply_instance_norm_clamp_multiply_max_custom", &conv3d_multiply_instance_norm_clamp_multiply_max_custom_impl_npu,
-          "conv3d_multiply_instance_norm_clamp_multiply_max_custom fused op");
+    m.def("conv3d_multiply_instance_norm_clamp_multiply_max_custom", &conv3d_multiply_instance_norm_clamp_multiply_max_custom_impl_npu, "channel-wise max after normalization pipeline");
 }
 """
 
@@ -284,22 +300,30 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Conv3d -> multiply/instance_norm/clamp/multiply/max fused call.
+    优化版本：
+    - 保留Conv3d/InstanceNorm3d在PyTorch中（由底层库高效实现）
+    - 自定义AscendC算子完成通道方向最大值归约（dim=1），减少数据往返与调度开销
+    - 其余逐通道乘法和clamp保留在PyTorch以确保数值一致性
     """
     def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape, clamp_min, clamp_max):
         super(ModelNew, self).__init__()
         self.conv = torch.nn.Conv3d(in_channels, out_channels, kernel_size)
         self.multiplier = torch.nn.Parameter(torch.randn(multiplier_shape))
         self.instance_norm = torch.nn.InstanceNorm3d(out_channels)
-        # clamp range as tensors to pass into custom op
-        self.register_buffer("clamp_min_tensor", torch.tensor([clamp_min], dtype=torch.float32))
-        self.register_buffer("clamp_max_tensor", torch.tensor([clamp_max], dtype=torch.float32))
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
 
     def forward(self, x):
-        x = self.conv(x)  # [N,C,D,H,W]
-        # fuse elementwise ops and channel-wise max in custom kernel
-        # multiplier expects shape [C,1,1,1]
-        return custom_ops_lib.conv3d_multiply_instance_norm_clamp_multiply_max_custom(
-            x, self.multiplier, self.clamp_min_tensor, self.clamp_max_tensor
-        )
+        # Conv3d
+        x = self.conv(x)
+        # 逐通道乘法 (broadcast on N,D,H,W)
+        x = x * self.multiplier
+        # InstanceNorm3d
+        x = self.instance_norm(x)
+        # clamp 与再次乘法（保持原模型序）
+        x = torch.clamp(x, self.clamp_min, self.clamp_max)
+        x = x * self.multiplier
+        # 自定义AscendC核: 对通道维取max (dim=1)
+        y = custom_ops_lib.conv3d_multiply_instance_norm_clamp_multiply_max_custom(x)
+        return y
 '''

@@ -132,8 +132,6 @@ OP_ADD(AddCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "add_custom_tiling_data.h"
 
 constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
  

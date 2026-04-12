@@ -48,51 +48,48 @@ project_json_src='''
         ],
         "attr":[
             {
+                "name":"num_groups",
+                "type": [
+                    "int"
+                ],
+                "param_type":"required"
+            },
+            {
                 "name":"epsilon",
                 "type": [
                     "float"
                 ],
                 "default_value":0.00001,
                 "param_type":"optional"
-            },
-            {
-                "name":"num_groups",
-                "type": [
-                    "int"
-                ],
-                "param_type":"required"
             }
         ]
     }
 ]
 '''
-
 host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(GroupNormCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, rowNum);
-  TILING_DATA_FIELD_DEF(uint32_t, rowNumSp);
-  TILING_DATA_FIELD_DEF(uint32_t, rowLength);
-  TILING_DATA_FIELD_DEF(uint32_t, blockPivot);
-  TILING_DATA_FIELD_DEF(uint32_t, tileLoop);
-  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
-  TILING_DATA_FIELD_DEF(uint32_t, loopCount);
-  TILING_DATA_FIELD_DEF(uint32_t, groups);
-  TILING_DATA_FIELD_DEF(uint32_t, channels);
-  TILING_DATA_FIELD_DEF(uint32_t, channelsPerGroup);
-  TILING_DATA_FIELD_DEF(uint32_t, hw);
-  TILING_DATA_FIELD_DEF(uint32_t, chunkLen);
-  TILING_DATA_FIELD_DEF(float, factor);
-  TILING_DATA_FIELD_DEF(float, mfactor);
-  TILING_DATA_FIELD_DEF(float, eps);
+  TILING_DATA_FIELD_DEF(uint32_t, rowNum);          // base rows per core (before pivot)
+  TILING_DATA_FIELD_DEF(uint32_t, rowNumSp);        // rows per core for pivot blocks
+  TILING_DATA_FIELD_DEF(uint32_t, rowLength);       // elements per row = channelsPerGroup * innerSize
+  TILING_DATA_FIELD_DEF(uint32_t, blockPivot);      // pivot for uneven rows across blocks
+  TILING_DATA_FIELD_DEF(uint32_t, tileLoop);        // rows processed per tile
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);      // elements per tile = tileLoop * rowLength
+  TILING_DATA_FIELD_DEF(uint32_t, loopCount);       // number of full tiles
+  TILING_DATA_FIELD_DEF(float, factor);             // 1.0f / rowLength
+  TILING_DATA_FIELD_DEF(float, mfactor);            // -1.0f / rowLength
+  TILING_DATA_FIELD_DEF(float, eps);                // epsilon
+  TILING_DATA_FIELD_DEF(uint32_t, numGroups);       // number of groups
+  TILING_DATA_FIELD_DEF(uint32_t, channelsPerGroup);// C / G
+  TILING_DATA_FIELD_DEF(uint32_t, innerSize);       // product of spatial dims
+  TILING_DATA_FIELD_DEF(uint32_t, channelCount);    // total C
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(GroupNormCustom, GroupNormCustomTilingData)
 }
 """
-
 host_operator_src="""
 #include "group_norm_custom_tiling.h"
 #include "register/op_def_registry.h"
@@ -102,59 +99,58 @@ const uint32_t BLOCK_DIM = 48;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context) {
   GroupNormCustomTilingData tiling;
+
+  // Input shape
   const gert::StorageShape* x_shape = context->GetInputShape(0);
   const gert::Shape shape = x_shape->GetStorageShape();
-  int64_t dimNum = shape.GetDimNum();
+  uint32_t dimNum = shape.GetDimNum();
   if (dimNum < 2) {
     return ge::GRAPH_FAILED;
   }
-  uint32_t N = static_cast<uint32_t>(shape.GetDim(0));
-  uint32_t C = static_cast<uint32_t>(shape.GetDim(1));
-  uint32_t HW = 1;
-  for (int64_t i = 2; i < dimNum; ++i) {
-    HW *= static_cast<uint32_t>(shape.GetDim(i));
+  uint64_t N = static_cast<uint64_t>(shape.GetDim(0));
+  uint64_t C = static_cast<uint64_t>(shape.GetDim(1));
+  uint64_t inner = 1;
+  for (uint32_t i = 2; i < dimNum; ++i) {
+    inner *= static_cast<uint64_t>(shape.GetDim(i));
   }
 
-  const float* epsilonAttr = context->GetAttrs()->GetAttrPointer<float>(0);
-  const int64_t* groupsAttr = context->GetAttrs()->GetAttrPointer<int64_t>(1);
-  uint32_t G = static_cast<uint32_t>(*groupsAttr);
-  if (G == 0 || (C % G) != 0) {
+  // Attributes
+  const int32_t* numGroupsAttr = context->GetAttrs()->GetAttrPointer<int32_t>(0); // index 0: num_groups
+  const float* epsilonAttr = context->GetAttrs()->GetAttrPointer<float>(1);        // index 1: epsilon
+
+  uint32_t G = static_cast<uint32_t>(*numGroupsAttr);
+  if (G == 0) {
     return ge::GRAPH_FAILED;
   }
-  uint32_t CpG = C / G;
+  uint32_t channelsPerGroup = static_cast<uint32_t>(C / G);
+  uint64_t rowsTotal = N * G;
+  uint64_t rowLength = channelsPerGroup * inner;
 
-  uint32_t rowLength = CpG * HW;
-  uint32_t totalRows = N * G;
-
-  uint32_t blockDim = BLOCK_DIM;
-  if (totalRows < blockDim) {
-    blockDim = totalRows == 0 ? 1 : totalRows;
-  }
-  uint32_t coreRowNum = (blockDim == 0) ? 0 : (totalRows / blockDim);
-  uint32_t pivot = totalRows - coreRowNum * blockDim;
+  // Distribute rows across blocks
+  uint32_t coreRowNum = static_cast<uint32_t>(rowsTotal / BLOCK_DIM);
+  uint32_t blockPivot = static_cast<uint32_t>(rowsTotal - static_cast<uint64_t>(coreRowNum) * BLOCK_DIM);
 
   tiling.set_eps(*epsilonAttr);
   tiling.set_rowNum(coreRowNum);
   tiling.set_rowNumSp(coreRowNum + 1);
-  tiling.set_rowLength(rowLength);
-  tiling.set_blockPivot(pivot);
-  uint32_t tileLoop = 1;
+  tiling.set_rowLength(static_cast<uint32_t>(rowLength));
+  tiling.set_blockPivot(blockPivot);
+
+  uint32_t tileLoop = 8; // rows per tile
   tiling.set_tileLoop(tileLoop);
-  tiling.set_tileLength(tileLoop * rowLength);
+  tiling.set_tileLength(static_cast<uint32_t>(tileLoop * rowLength));
   tiling.set_loopCount(coreRowNum / tileLoop);
 
-  tiling.set_groups(G);
-  tiling.set_channels(C);
-  tiling.set_channelsPerGroup(CpG);
-  tiling.set_hw(HW);
+  float factor = 1.0f / static_cast<float>(rowLength);
+  tiling.set_factor(factor);
+  tiling.set_mfactor(-factor);
 
-  uint32_t chunkLen = 4096; // inner GM<->UB chunk in elements
-  tiling.set_chunkLen(chunkLen);
+  tiling.set_numGroups(G);
+  tiling.set_channelsPerGroup(channelsPerGroup);
+  tiling.set_innerSize(static_cast<uint32_t>(inner));
+  tiling.set_channelCount(static_cast<uint32_t>(C));
 
-  tiling.set_factor(1.0f / static_cast<float>(rowLength));
-  tiling.set_mfactor(-1.0f / static_cast<float>(rowLength));
-
-  context->SetBlockDim(blockDim);
+  context->SetBlockDim(BLOCK_DIM);
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                       context->GetRawTilingData()->GetCapacity());
   context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
@@ -197,8 +193,9 @@ class GroupNormCustom : public OpDef {
         .DataType({ge::DT_FLOAT})
         .Format({ge::FORMAT_ND})
         .UnknownShapeFormat({ge::FORMAT_ND});
-    this->Attr("epsilon").AttrType(OPTIONAL).Float(1e-05);
+
     this->Attr("num_groups").AttrType(REQUIRED).Int(1);
+    this->Attr("epsilon").AttrType(OPTIONAL).Float(1e-05);
 
     this->SetInferShape(ge::InferShape);
 
@@ -210,7 +207,6 @@ class GroupNormCustom : public OpDef {
 OP_ADD(GroupNormCustom);
 }
 """
-
 kernel_src="""
 #include "kernel_operator.h"
 constexpr int32_t BUFFER_NUM = 1;
@@ -220,6 +216,7 @@ class KernelGroupNorm {
   __aicore__ inline KernelGroupNorm() {}
   __aicore__ inline void InitTiling(GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
+    rowNumCore = tiling_data.rowNum;
     rowNum = tiling_data.rowNum;
     rowNumSp = tiling_data.rowNumSp;
     rowLength = tiling_data.rowLength;
@@ -227,140 +224,164 @@ class KernelGroupNorm {
     tileLoop = tiling_data.tileLoop;
     tileLength = tiling_data.tileLength;
     loopCount = tiling_data.loopCount;
-    groups = tiling_data.groups;
-    channels = tiling_data.channels;
-    channelsPerGroup = tiling_data.channelsPerGroup;
-    hw = tiling_data.hw;
-    chunkLen = tiling_data.chunkLen;
     factor = tiling_data.factor;
     mfactor = tiling_data.mfactor;
     eps = tiling_data.eps;
+    numGroups = tiling_data.numGroups;
+    channelsPerGroup = tiling_data.channelsPerGroup;
+    innerSize = tiling_data.innerSize;
+    channelCount = tiling_data.channelCount;
   }
-
   __aicore__ inline void Init(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR z,
                               GM_ADDR tiling) {
     InitTiling(tiling);
 
-    this->leftRow = this->rowNum % this->tileLoop;
-    if (AscendC::GetBlockIdx() < this->blockPivot) {
-      this->rowNum = this->rowNumSp;
-      this->leftRow += 1;
+    leftRow = rowNum % tileLoop;
+    if (AscendC::GetBlockIdx() < blockPivot) {
+      rowNum = rowNumSp;
+      leftRow += 1;
     }
 
-    this->blockLength = this->rowNum * this->rowLength;
+    blockLength = rowNum * rowLength;
 
-    uint32_t offset = 0;
-    if (AscendC::GetBlockIdx() < this->blockPivot) {
-      offset = this->blockLength * AscendC::GetBlockIdx();
+    // Compute start row index for this block
+    uint32_t blockStartRow = 0;
+    if (AscendC::GetBlockIdx() < blockPivot) {
+      blockStartRow = AscendC::GetBlockIdx() * rowNumSp;
     } else {
-      offset = this->blockLength * AscendC::GetBlockIdx() +
-               this->rowLength * this->blockPivot;
+      blockStartRow = blockPivot * rowNumSp + (AscendC::GetBlockIdx() - blockPivot) * rowNumCore;
     }
-    baseRowIndex = offset / this->rowLength;
+    this->baseRowIndex = blockStartRow;
 
-    xGm.SetGlobalBuffer((__gm__ float *)x + offset, this->blockLength);
-    zGm.SetGlobalBuffer((__gm__ float *)z + offset, this->blockLength);
+    uint64_t elementOffset = static_cast<uint64_t>(blockStartRow) * static_cast<uint64_t>(rowLength);
 
-    gammaGm.SetGlobalBuffer((__gm__ float *)gamma, this->channels);
-    betaGm.SetGlobalBuffer((__gm__ float *)beta, this->channels);
+    xGm.SetGlobalBuffer((__gm__ float *)x + elementOffset, blockLength);
+    zGm.SetGlobalBuffer((__gm__ float *)z + elementOffset, blockLength);
 
-    pipe.InitBuffer(bufX, this->chunkLen * sizeof(float));
-    pipe.InitBuffer(bufY, this->chunkLen * sizeof(float));
-    pipe.InitBuffer(tmpBuf1, 64 * sizeof(float));
-    pipe.InitBuffer(tmpBuf2, 64 * sizeof(float));
-    pipe.InitBuffer(bufGamma, this->channels * sizeof(float));
-    pipe.InitBuffer(bufBeta, this->channels * sizeof(float));
+    gammaGm.SetGlobalBuffer((__gm__ float *)gamma, channelCount);
+    betaGm.SetGlobalBuffer((__gm__ float *)beta, channelCount);
+
+    pipe.InitBuffer(queueX, BUFFER_NUM, tileLength * sizeof(float));
+    pipe.InitBuffer(queueZ, BUFFER_NUM, tileLength * sizeof(float));
+
+    pipe.InitBuffer(tmpBuffer1, 64 * sizeof(float));
+    pipe.InitBuffer(tmpBuffer2, 64 * sizeof(float));
+    pipe.InitBuffer(onesBuffer, 64 * sizeof(float));
+
+    pipe.InitBuffer(queueGamma, 1, channelCount * sizeof(float));
+    pipe.InitBuffer(queueBeta, 1, channelCount * sizeof(float));
   }
-
   __aicore__ inline void Process() {
-    // load gamma and beta once
-    AscendC::LocalTensor<float> gammaLocal = bufGamma.Get<float>();
-    AscendC::LocalTensor<float> betaLocal = bufBeta.Get<float>();
-    AscendC::DataCopy(gammaLocal, gammaGm[0], this->channels);
-    AscendC::DataCopy(betaLocal, betaGm[0], this->channels);
-
-    // process each assigned row (group within batch)
-    for (uint32_t r = 0; r < this->rowNum; ++r) {
-      ComputeRow(r, gammaLocal, betaLocal);
+    for (uint32_t i = 0; i < loopCount; i++) {
+      CopyIn(i, tileLoop);
+      Compute(i, tileLoop);
+      CopyOut(i, tileLoop);
+    }
+    if (leftRow > 0) {
+      CopyIn(loopCount, leftRow);
+      Compute(loopCount, leftRow);
+      CopyOut(loopCount, leftRow);
     }
   }
 
  private:
-  __aicore__ inline void ComputeRow(uint32_t localRowIdx,
-                                    AscendC::LocalTensor<float>& gammaLocal,
-                                    AscendC::LocalTensor<float>& betaLocal) {
-    // first pass: compute mean and variance for this group
-    float sum = 0.0f;
-    float sumsq = 0.0f;
+  __aicore__ inline void CopyIn(uint32_t progress, uint32_t rows) {
+    AscendC::LocalTensor<float> xLocal = queueX.AllocTensor<float>();
+    AscendC::LocalTensor<float> gammaLocal = queueGamma.AllocTensor<float>();
+    AscendC::LocalTensor<float> betaLocal = queueBeta.AllocTensor<float>();
 
-    AscendC::LocalTensor<float> xLocal = bufX.Get<float>();
-    AscendC::LocalTensor<float> yLocal = bufY.Get<float>();
-    AscendC::LocalTensor<float> tmp1 = tmpBuf1.Get<float>();
-    AscendC::LocalTensor<float> tmp2 = tmpBuf2.Get<float>();
+    AscendC::DataCopy(xLocal, xGm[progress * tileLength], rowLength * rows);
+    AscendC::DataCopy(gammaLocal, gammaGm[0], channelCount);
+    AscendC::DataCopy(betaLocal, betaGm[0], channelCount);
 
-    // Row base in current GM view
-    uint32_t rowBase = localRowIdx * this->rowLength;
+    queueX.EnQue(xLocal);
+    queueGamma.EnQue(gammaLocal);
+    queueBeta.EnQue(betaLocal);
+  }
 
-    // reduction over channelsPerGroup * hw
-    for (uint32_t ch = 0; ch < this->channelsPerGroup; ++ch) {
-      uint32_t chBase = rowBase + ch * this->hw;
-      uint32_t processed = 0;
-      while (processed < this->hw) {
-        uint32_t len = AscendC::min(this->chunkLen, this->hw - processed);
-        AscendC::DataCopy(xLocal, xGm[chBase + processed], len);
+  __aicore__ inline void Compute(uint32_t progress, uint32_t rows) {
+    AscendC::LocalTensor<float> xLocal = queueX.DeQue<float>();
+    AscendC::LocalTensor<float> gammaLocal = queueGamma.DeQue<float>();
+    AscendC::LocalTensor<float> betaLocal = queueBeta.DeQue<float>();
 
-        // sum
-        AscendC::ReduceSum<float>(tmp2[0], xLocal, tmp1, len);
-        sum += tmp2.GetValue(0);
+    AscendC::LocalTensor<float> tmpTensor1 = tmpBuffer1.Get<float>();
+    AscendC::LocalTensor<float> tmpTensor2 = tmpBuffer2.Get<float>();
+    AscendC::LocalTensor<float> onesLocal = onesBuffer.Get<float>();
+    AscendC::LocalTensor<float> zLocal = queueZ.AllocTensor<float>();
 
-        // sum of squares
-        AscendC::Mul(yLocal, xLocal, xLocal, len);
-        AscendC::ReduceSum<float>(tmp2[0], yLocal, tmp1, len);
-        sumsq += tmp2.GetValue(0);
+    AscendC::Duplicate<float>(onesLocal, 1.0f, tileLoop);
 
-        processed += len;
+    // Compute mean per row
+    for (uint32_t j = 0; j < rows; ++j) {
+      uint32_t buffIndex = j * rowLength;
+      AscendC::ReduceSum<float>(tmpTensor2[j], xLocal[buffIndex], tmpTensor1, rowLength);
+    }
+
+    // Center x by mean: x = x + (-mean)
+    AscendC::Muls(zLocal, tmpTensor2, mfactor, rows);
+    for (uint32_t j = 0; j < rows; ++j) {
+      uint32_t buffIndex = j * rowLength;
+      AscendC::Adds(xLocal[buffIndex], xLocal[buffIndex], zLocal.GetValue(j), rowLength);
+    }
+
+    // Variance: mean of squared centered values
+    for (uint32_t j = 0; j < rows; ++j) {
+      uint32_t buffIndex = j * rowLength;
+      AscendC::Mul(zLocal[buffIndex], xLocal[buffIndex], xLocal[buffIndex], rowLength);
+    }
+    for (uint32_t j = 0; j < rows; ++j) {
+      uint32_t buffIndex = j * rowLength;
+      AscendC::ReduceSum<float>(tmpTensor2[j], zLocal[buffIndex], tmpTensor1, rowLength);
+    }
+
+    AscendC::Muls(tmpTensor2, tmpTensor2, factor, rows);  // variance
+    AscendC::Adds(tmpTensor2, tmpTensor2, eps, rows);     // variance + eps
+    AscendC::Sqrt(tmpTensor2, tmpTensor2, rows);          // std
+    AscendC::Div(tmpTensor2, onesLocal, tmpTensor2, rows); // inv_std
+
+    // Normalize: z = x * inv_std
+    for (uint32_t j = 0; j < rows; ++j) {
+      uint32_t buffIndex = j * rowLength;
+      AscendC::Muls(zLocal[buffIndex], xLocal[buffIndex], tmpTensor2.GetValue(j), rowLength);
+    }
+
+    // Apply per-channel affine within each group
+    for (uint32_t j = 0; j < rows; ++j) {
+      uint32_t buffIndex = j * rowLength;
+      // Compute global row index
+      uint32_t globalRow = baseRowIndex + progress * tileLoop + j;
+      uint32_t groupIndex = (numGroups > 0) ? (globalRow % numGroups) : 0;
+      uint32_t groupStartChannel = groupIndex * channelsPerGroup;
+
+      for (uint32_t c = 0; c < channelsPerGroup; ++c) {
+        uint32_t chIndex = groupStartChannel + c;
+        float g = gammaLocal.GetValue(chIndex);
+        float b = betaLocal.GetValue(chIndex);
+        uint32_t chOffset = buffIndex + c * innerSize;
+
+        AscendC::Muls(zLocal[chOffset], zLocal[chOffset], g, innerSize);
+        AscendC::Adds(zLocal[chOffset], zLocal[chOffset], b, innerSize);
       }
     }
 
-    float mean = sum * this->factor;
-    float var = sumsq * this->factor - mean * mean;
-    float inv_std = AscendC::rsqrt(var + this->eps);
+    queueZ.EnQue<float>(zLocal);
+    queueGamma.FreeTensor(gammaLocal);
+    queueBeta.FreeTensor(betaLocal);
+    queueX.FreeTensor(xLocal);
+  }
 
-    // second pass: normalize, then scale/shift by per-channel gamma/beta
-    uint32_t globalRow = this->baseRowIndex + localRowIdx;
-    uint32_t groupIdxInBatch = (this->groups == 0) ? 0 : (globalRow % this->groups);
-    uint32_t groupCStart = groupIdxInBatch * this->channelsPerGroup;
-
-    for (uint32_t ch = 0; ch < this->channelsPerGroup; ++ch) {
-      uint32_t cIdx = groupCStart + ch;
-      float gVal = gammaLocal.GetValue(cIdx);
-      float bVal = betaLocal.GetValue(cIdx);
-
-      uint32_t chBase = rowBase + ch * this->hw;
-      uint32_t processed = 0;
-      while (processed < this->hw) {
-        uint32_t len = AscendC::min(this->chunkLen, this->hw - processed);
-        AscendC::DataCopy(xLocal, xGm[chBase + processed], len);
-
-        AscendC::Adds(xLocal, xLocal, -mean, len);
-        AscendC::Muls(xLocal, xLocal, inv_std, len);
-
-        AscendC::Muls(yLocal, xLocal, gVal, len);
-        AscendC::Adds(yLocal, yLocal, bVal, len);
-
-        AscendC::DataCopy(zGm[chBase + processed], yLocal, len);
-        processed += len;
-      }
-    }
+  __aicore__ inline void CopyOut(uint32_t progress, uint32_t rows) {
+    AscendC::LocalTensor<float> zLocal = queueZ.DeQue<float>();
+    AscendC::DataCopy(zGm[progress * tileLength], zLocal, rows * rowLength);
+    queueZ.FreeTensor(zLocal);
   }
 
  private:
   AscendC::TPipe pipe;
-
-  AscendC::TBuf<AscendC::QuePosition::VECCALC> bufX;
-  AscendC::TBuf<AscendC::QuePosition::VECCALC> bufY;
-  AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuf1, tmpBuf2;
-  AscendC::TBuf<AscendC::QuePosition::VECCALC> bufGamma, bufBeta;
+  AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2, onesBuffer;
+  AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> queueX;
+  AscendC::TQue<AscendC::QuePosition::VECIN, 1> queueGamma, queueBeta;
+  AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> queueZ;
 
   AscendC::GlobalTensor<float> xGm;
   AscendC::GlobalTensor<float> gammaGm;
@@ -369,25 +390,23 @@ class KernelGroupNorm {
 
   uint32_t blockLength = 0;
   uint32_t leftRow = 0;
-  uint32_t rowNum = 0;
+  uint32_t rowNum = 0;         // rows assigned to this block
+  uint32_t rowNumCore = 0;     // base rows per block before pivot
   uint32_t rowNumSp = 0;
   uint32_t rowLength = 0;
   uint32_t blockPivot = 0;
-  uint32_t tileLoop = 1;
+  uint32_t tileLoop = 0;
   uint32_t tileLength = 0;
   uint32_t loopCount = 0;
-
-  uint32_t groups = 1;
-  uint32_t channels = 1;
-  uint32_t channelsPerGroup = 1;
-  uint32_t hw = 1;
-  uint32_t chunkLen = 4096;
-
-  uint32_t baseRowIndex = 0;
-
-  float factor = 1.0f;
-  float mfactor = -1.0f;
+  float factor = 0.0f;
+  float mfactor = 0.0f;
   float eps = 1e-5f;
+
+  uint32_t numGroups = 1;
+  uint32_t channelsPerGroup = 1;
+  uint32_t innerSize = 1;
+  uint32_t channelCount = 1;
+  uint32_t baseRowIndex = 0;
 };
 
 extern "C" __global__ __aicore__ void group_norm_custom(
@@ -400,7 +419,6 @@ extern "C" __global__ __aicore__ void group_norm_custom(
   }
 }
 """
-
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
@@ -413,7 +431,7 @@ at::Tensor group_norm_impl_npu(const at::Tensor& x,
                                int64_t num_groups,
                                double epsilon) {
     at::Tensor result = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnGroupNormCustom, x, gamma, beta, epsilon, num_groups, result);
+    EXEC_NPU_CMD(aclnnGroupNormCustom, x, gamma, beta, num_groups, epsilon, result);
     return result;
 }
 
@@ -425,14 +443,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("group_norm_custom", &group_norm_impl_npu, "group norm");
 }
 """
-
 model_src='''
 import torch, torch_npu, custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     def __init__(self, num_features: int, num_groups: int):
         super(ModelNew, self).__init__()
-        self.num_features = num_features
         self.num_groups = num_groups
         self.epsilon = 1e-5
         self.gamma = torch.nn.Parameter(torch.ones(num_features))

@@ -1,0 +1,61 @@
+**Defining fused operator inputs**
+
+I’m thinking the fused operator should take inputs like x (batch_size, input_size), weight (hidden_size, input_size), and a scalar scaling_factor—maybe as an attribute or an additional input. The division by 2 is constant, and I'll sum along axis 1 and scale by scaling_factor. For the Ascend custom op, I could name it "GemmDivideSumScalingCustom" and define inputs accordingly. I also need to consider whether to add "attr" or "attr_desc" in project_json_src based on the NPU op schema.**Updating init inputs**
+
+The example shows that get_init_inputs returns [input_size, hidden_size, scaling_factor] because the architecture uses Python parameters for these sizes and factors in initialization. In ModelNew, I need to update it to create a scaling tensor or pass a scalar attribute to the operator call.
+
+The python_bind_src should implement a torch op named "gemm_divide_sum_scaling_custom" under the namespace myops, which they used in the example. I’ll define the operator ACLNN function name as "aclnnGemmDivideSumScalingCustom" for the NPU execution macro. The macro will search for 'aclnn' plus PascalCase: 'aclnnGemmDivideSumScalingCustom'.
+
+I'll pass the right arguments to the underlying op interface, following the pattern of input x, weight, and scaling (as scalar or tensor), with the output being the result. For shape allocation, I can use at::empty with sizes {x.size(0), 1}. But since shape is dynamic, leveraging empty_like of x.select(1) might not be straightforward.**Implementing the fused operation**
+
+I'm planning to compute dimensions based on x and weight for implementation. Now, for the kernel source, I need to write the AscendC kernel that implements the fused operation. Writing a fully correct GEMM plus reduce sum can get complex, but typically, examples use simple vector operations. 
+
+It’s acceptable to provide a simplified tile-wise compute using MatMul plus reduction along the columns. I can implement a naive approach to compute s = sum_j (sum_k x[i,k] * weight[j,k] / 2) across j in hidden_size. This expression simplifies to (1/2) * dot(x[i,:], sum_j weight[j,:]). I can precompute the column-wise sum over j of weight along dimension 0, which will give a vector w_sum of shape [input]. Finally, for each batch i, the output will be y[i] = scaling_factor * (1/2) * dot(x[i,:], w_sum).**Optimizing compute with semantics**
+
+By reducing the computation, I’m changing the semantics only if we assume a sum over the result across j. 
+
+For calculation: y_i = sum over j of ( (x_i @ weight[j].T) / 2 ) equals (1/2) * sum_j sum_k x_i_k * weight[j,k], which simplifies to (1/2) * sum_k x_i_k * sum_j weight[j,k]. So yes, it's equal. 
+
+I can implement a fused kernel that first reduces weight across the hidden dimension to create a vector w_sum, then computes the dot product with each input row and scales by the scaling_factor. 
+
+This approach is mathematically equivalent and reduces compute to O(B*I + H*I but requires precomputing w_sum only once. Now, can we precompute w_sum on the CPU? The operator gets weight and computes w_sum on-device within the kernel. Since weight is constant per call and same across the batch, I can perform a two-phase operation inside the kernel: first compute w_sum by reducing across axis 0 for weight, then compute outputs.**Implementing AscendC kernel**
+
+I'm working on the AscendC kernel for the AICore that will implement reduction and dot products using simple tile loops. My approach involves defining tiling with 1D flatten lengths and implementing a row-wise dot with the w_sum vector. 
+
+We need to ensure DTYPE macros are set up correctly because the example uses types like DTYPE_X, but they aren't defined in the included header. The kernel should compile conceptually, and I plan to adopt a similar pattern while ensuring it supports three inputs: x, weight, and scaling, producing one output, y.
+
+In the kernel code, I'll define template classes for Local/GlobalTensor types and compute the w_sum vector of length input_size. This involves allocating a local buffer for summation across weight rows, but since weight has a shape of [hidden_size, input_size], this could lead to a large vector. 
+
+To keep things straightforward, I may employ a naive approach where each block processes a chunk of input_size columns for reduction and then combine results across blocks. Alternatively, I could precompute w_sum on the host and pass it as an additional input, calculated in Python. 
+
+Although computing weight.sum in Python may lose some efficiency, it's still usable on the GPU. I'll define the operator to solely take x, weight, and a constant scaling_factor attribute, implementing a straightforward kernel to compute the full operation. 
+
+For kernel optimization, I'll fuse operations while considering block synchronization issues. By precomputing w_sum and modifying ModelNew for forward computations, it will ensure equivalent semantics to the original chain. 
+
+Now, the inputs will be structured as x (B, I), w_sum (I), and the scale as a scalar. I'll adjust these in the ModelNew, calling the custom op for output y.
+
+In the kernel, I will compute the dot product for each batch row efficiently, probably using AscendC's vector operations for multiply and reduce sum, while ensuring syntactic correctness with plausible code that uses AscendC::Mul and AscendC::ReduceSum.**Implementing AscendC kernel operations**
+
+I'm setting up the functions for AscendC kernels, starting with "AscendC::Mul" for multiplying LocalTensors and "AscendC::ReduceSum" for summing them. I'll first get a local tile of the x row and the wsum, compute ztile as the product of x and wsum, and then reduce it to a scalar using AscendC::ReduceSum. 
+
+I'll manage input queues for x and wsum. Recopied wsum will be stored locally for each tile. My tiling strategy will focus on columns, where each block processes a set of rows, and I will define tiling data to include batch size and input size. 
+
+Setting BLOCK_DIM to a fixed number like 8 will simplify the process, as I compute rows per block and iterate through them effectively. For the kernel interface, it's crucial that the input order matches the function definition, consisting of x, wsum, scale, and outputs y. 
+
+I'll standardize data types using macros for clarity, but fixed types could work as well, opting for 'float' given its flexibility in AscendC. The kernel will handle tiling and operations in an organized way. 
+
+After initializing essential variables for each row processed, I'll copy tiles, compute their products, reduce them to a scalar, and accumulate the result. Finally, I'll multiply the accumulated value by scale and update the output y accordingly while addressing memory management concerns.**Structuring Kernel operations**
+
+I'm forming a structure for the `KernelGemmDivideSumScaling` class. It will include members for tensors like `xGm`, `wsumGm`, and `scaleGm`. I plan to allocate input and output queues, avoiding using an `outQueue` and instead writing directly to global memory for outputs.
+
+During initialization, I'll set base pointers for tensors and preload the scale value. The computation involves iterating through rows and tiles to calculate results, making sure to incorporate the division by 2 effectively into the scaling.
+
+For tiling, I'm focusing on defining essential data fields and ensuring that computations align properly with defined constants. I'll also use the `AscendC::Mul` and `AscendC::ReduceSum` functions appropriately while managing data copying and ensuring memory addresses are accurate. Each tile will require careful handling to ensure we don’t exceed boundaries, and local accumulation will be done thoughtfully to produce a final output stored in global memory.**Implementing kernel scaling**
+
+I'm setting up a kernel for `GemmDivideSumScaling`. First, I’ll load the scaling factor into a local variable and use functions like `AscendC::Dup` to initialize it. For each row, I’ll allocate a local accumulator and handle tile processing by copying, multiplying, and reducing data. I need to ensure proper memory management, especially with local allocations and copies.
+
+Next, I'll define the tiling function to manage dimensions and read input shapes accordingly. I’ll also ensure our Python bindings encapsulate the operation neatly, keeping the code concise while managing data types and tensor shapes throughout the implementation.**Finalizing the code structure**
+
+I need to ensure consistency by matching the header name for tiling to "gemm_divide_sum_scaling_custom_tiling.h," similar to how it's done in the "add_custom_tiling.h" example. I'm noticing that some code utilizes APIs like `GetOriginShape`, and I’ll replicate that style in my implementation.
+
+Additionally, I need to account for workspace sizes — I'll set `currentWorkspace` to use `GetWorkspaceSizes(1)` as instructed. Finally, I’ll double-check the variable names and confirm that function names stay consistent with "gemm_divide_sum_scaling_custom" before producing the final code.

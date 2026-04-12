@@ -1,0 +1,337 @@
+project_json_src='''
+[
+    {
+        "op": "MambaReturnFinalStateCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MambaReturnFinalStateCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, channels);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, tileCols);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MambaReturnFinalStateCustom, MambaReturnFinalStateCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "mamba_return_final_state_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t GetDimSafe(const gert::Shape* s, int idx) {
+    auto storage = s->GetStorageShape();
+    if (idx < 0 || idx >= storage.GetDimNum()) return 0;
+    return static_cast<uint32_t>(storage.GetDim(idx));
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MambaReturnFinalStateCustomTilingData tiling;
+
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    uint32_t rows = GetDimSafe(x_shape, 0);
+    uint32_t channels = GetDimSafe(x_shape, 1);
+    uint32_t cols = GetDimSafe(x_shape, 2);
+
+    uint32_t tileCols = cols >= 1024 ? 1024 : (cols > 0 ? cols : 1);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_rows(rows);
+    tiling.set_channels(channels);
+    tiling.set_cols(cols);
+    tiling.set_tileCols(tileCols);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    // Try to set to (rows, cols) if available, otherwise fallback to input shape
+    auto storage = x_shape->GetStorageShape();
+    if (storage.GetDimNum() >= 3) {
+        gert::Shape out;
+        out.MutableStorageShape().SetDimNum(2);
+        out.MutableStorageShape().SetDim(0, storage.GetDim(0));
+        out.MutableStorageShape().SetDim(1, storage.GetDim(2));
+        out.MutableOriginShape() = out.MutableStorageShape();
+        *y_shape = out;
+    } else {
+        *y_shape = *x_shape;
+    }
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MambaReturnFinalStateCustom : public OpDef {
+public:
+    explicit MambaReturnFinalStateCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MambaReturnFinalStateCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelMambaReturnFinalState {
+public:
+    __aicore__ inline KernelMambaReturnFinalState() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t rows, uint32_t channels, uint32_t cols, uint32_t tileCols)
+    {
+        this->rows = rows;
+        this->channels = channels;
+        this->cols = cols;
+        this->tileCols = tileCols;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, (uint64_t)rows * channels * cols);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y, (uint64_t)rows * cols);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileCols * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileCols * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Distribute rows across blocks
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t rowsPerBlock = (rows + blockNum - 1) / blockNum;
+        uint32_t rowStart = rowsPerBlock * blockIdx;
+        uint32_t rowEnd = rowStart + rowsPerBlock;
+        if (rowEnd > rows) rowEnd = rows;
+
+        for (uint32_t r = rowStart; r < rowEnd; ++r) {
+            for (uint32_t c0 = 0; c0 < cols; c0 += tileCols) {
+                uint32_t currTile = (c0 + tileCols <= cols) ? tileCols : (cols - c0);
+
+                // Accumulator buffer
+                AscendC::LocalTensor<DTYPE_Z> accLocal = outQueueY.AllocTensor<DTYPE_Z>();
+
+                // Initialize accumulator with first channel
+                {
+                    AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                    uint64_t offset = ((uint64_t)r * channels * cols) + (uint64_t)0 * cols + c0;
+                    AscendC::DataCopy(xLocal, xGm[offset], currTile);
+                    // Cast or copy to accumulator
+                    AscendC::DataCopy(accLocal, xLocal, currTile);
+                    inQueueX.EnQue(xLocal);
+                    inQueueX.FreeTensor(xLocal);
+                }
+
+                // Accumulate remaining channels
+                for (uint32_t ch = 1; ch < channels; ++ch) {
+                    AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                    uint64_t offset = ((uint64_t)r * channels * cols) + (uint64_t)ch * cols + c0;
+                    AscendC::DataCopy(xLocal, xGm[offset], currTile);
+                    inQueueX.EnQue(xLocal);
+
+                    AscendC::LocalTensor<DTYPE_X> xLocalDeq = inQueueX.DeQue<DTYPE_X>();
+                    // accLocal = accLocal + xLocalDeq
+                    AscendC::Add(accLocal, accLocal, xLocalDeq, currTile);
+                    inQueueX.FreeTensor(xLocalDeq);
+                }
+
+                // Write out
+                uint64_t yoff = (uint64_t)r * cols + c0;
+                AscendC::DataCopy(yGm[yoff], accLocal, currTile);
+                outQueueY.EnQue<DTYPE_Z>(accLocal);
+                outQueueY.FreeTensor(accLocal);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    uint32_t rows;
+    uint32_t channels;
+    uint32_t cols;
+    uint32_t tileCols;
+};
+
+extern "C" __global__ __aicore__ void mamba_return_final_state_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMambaReturnFinalState op;
+    op.Init(x, y, tiling_data.rows, tiling_data.channels, tiling_data.cols, tiling_data.tileCols);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor mamba_return_final_state_custom_impl_npu(const at::Tensor& x) {
+    TORCH_CHECK(x.dim() == 3, "Input x must be 3D [rows, channels, cols]");
+    auto rows = x.size(0);
+    auto cols = x.size(2);
+    at::Tensor result = at::empty({rows, cols}, x.options());
+    EXEC_NPU_CMD(aclnnMambaReturnFinalStateCustom, x, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("mamba_return_final_state_custom", &mamba_return_final_state_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mamba_return_final_state_custom", &mamba_return_final_state_custom_impl_npu, "Reduce-sum over channel axis to return final state");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+from einops import rearrange
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        super(ModelNew, self).__init__()
+        assert seq_length % block_len == 0, "Sequence length must be divisible by block length"
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.block_len = block_len
+
+        self.A = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+
+    def segsum(self, x):
+        T = x.size(-1)
+        x_cumsum = torch.cumsum(x, dim=-1)
+        x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
+        x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+        return x_segsum
+
+    def forward(self, X, initial_states=None):
+        # Rearrange into blocks/chunks
+        X_blocks, A_blocks, B_blocks, C_blocks = [
+            rearrange(x, "b (c l) ... -> b c l ...", l=self.block_len)
+            for x in (X, self.A, self.B, self.C)
+        ]
+
+        A_blocks = rearrange(A_blocks, "b c l h -> b h c l")
+        A_cumsum = torch.cumsum(A_blocks, dim=-1)
+
+        # 1. Compute diagonal block outputs
+        L = torch.exp(self.segsum(A_blocks))
+        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp",
+                              C_blocks, B_blocks, L, X_blocks)
+
+        # 2. Compute intra-chunk states
+        decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
+        states = torch.einsum("bclhn,bhcl,bclhp->bchpn",
+                              B_blocks, decay_states, X_blocks)
+
+        # 3. Compute inter-chunk recurrence
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+        states = torch.cat([initial_states, states], dim=1)  # b (c+1) h p n
+
+        decay_chunk = torch.exp(self.segsum(torch.nn.functional.pad(A_cumsum[:, :, :, -1], (1, 0))))
+        # Take the last z-slice of decay_chunk for weighted sum over c
+        decay_last = decay_chunk[:, :, -1, :]  # b h (c+1)
+
+        # Prepare tensors to call custom kernel:
+        # We compute weighted states per (b,h) over c to get final state (p,n)
+        # states: b (c+1) h p n -> b h (c+1) p n
+        states_bh_cpn = states.permute(0, 2, 1, 3, 4).contiguous()
+        # Broadcast multiply by decay_last over c
+        weighted_states = states_bh_cpn * decay_last[:, :, :, None, None]
+        b, h, c_len, p, n = weighted_states.shape
+
+        # Reshape to [rows=B*H, channels=C, cols=P*N]
+        rows = b * h
+        cols = p * n
+        x3d = weighted_states.reshape(rows, c_len, cols).contiguous()
+
+        # Call custom NPU kernel that reduces over channel (dim=1) to produce [rows, cols]
+        out2d = custom_ops_lib.mamba_return_final_state_custom(x3d)
+
+        # Reshape back to [b, h, p, n] and return
+        final_state = out2d.reshape(b, h, p, n).contiguous()
+        return final_state
+'''

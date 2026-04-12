@@ -1,0 +1,365 @@
+project_json_src='''
+[
+    {
+        "op": "MobilenetV2Custom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MobilenetV2CustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, outter);
+  TILING_DATA_FIELD_DEF(uint32_t, inner);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, tmpSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MobilenetV2Custom, MobilenetV2CustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "mobilenet_v2_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MobilenetV2CustomTilingData tiling;
+
+    const gert::StorageShape *src_shape = context->GetInputShape(0);
+    // 期望输入为 [B, C, H, W]
+    uint32_t b = 1, c = 1, h = 1, w = 1;
+    auto dims = src_shape->GetStorageShape().GetDims();
+    if (dims.size() >= 4) {
+        b = static_cast<uint32_t>(dims[0]);
+        c = static_cast<uint32_t>(dims[1]);
+        h = static_cast<uint32_t>(dims[2]);
+        w = static_cast<uint32_t>(dims[3]);
+    } else if (dims.size() == 3) {
+        b = static_cast<uint32_t>(dims[0]);
+        c = static_cast<uint32_t>(dims[1]);
+        h = static_cast<uint32_t>(dims[2]);
+        w = 1;
+    } else if (dims.size() == 2) {
+        b = static_cast<uint32_t>(dims[0]);
+        c = static_cast<uint32_t>(dims[1]);
+        h = 1;
+        w = 1;
+    }
+
+    uint32_t outter = b * c;
+    uint32_t n = h * w;
+    uint32_t inner = n; // 直接按实际长度作为inner
+
+    // 数据类型
+    auto dt = context->GetInputTensor(0)->GetDataType();
+    uint32_t typeSize = (dt == ge::DT_FLOAT16) ? 2 : 4;
+
+    // 计算Mean最小/最大临时空间，示例中按框架分配临时空间，因此置0
+    uint32_t maxValue = 0;
+    uint32_t minValue = 0;
+    AscendC::GetMeanMaxMinTmpSize(n, typeSize, typeSize, false, maxValue, minValue);
+
+    tiling.set_outter(outter);
+    tiling.set_inner(inner);
+    tiling.set_n(n);
+    tiling.set_tmpSize(0); // 使用框架分配临时空间
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto dims = in_shape->GetStorageShape().GetDims();
+    uint64_t b = 1, c = 1;
+    if (dims.size() >= 2) {
+        b = dims[0];
+        c = dims[1];
+    } else if (dims.size() == 1) {
+        b = dims[0];
+        c = 1;
+    }
+    // 输出形状为 [B, C]，对应全局平均池化到1x1再展平
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    out_shape->GetStorageShape().SetDimNum(2);
+    out_shape->GetStorageShape().SetDim(0, b);
+    out_shape->GetStorageShape().SetDim(1, c);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MobilenetV2Custom : public OpDef {
+public:
+    explicit MobilenetV2Custom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape)
+            .SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MobilenetV2Custom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "mobilenet_v2_custom_tiling_data.h"
+
+// 将 [B, C, H, W] 展平为二维 [outter=B*C, inner=H*W]，调用 AscendC::Mean 进行空间维度全局平均
+
+template <typename T, typename accType>
+class KernelMobilenetV2Mean {
+public:
+    __aicore__ inline KernelMobilenetV2Mean() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t outter, uint32_t inner, uint32_t n, uint32_t tmpSize)
+    {
+        meanParams.outter = outter;
+        meanParams.inner  = inner;  // 这里按实际长度设置
+        meanParams.n      = n;
+        this->tmpSize     = tmpSize;
+
+        srcGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(x));
+        dstGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(y));
+        // 输入是 outter * inner，输出是 outter
+        pipe.InitBuffer(inQueueX, 1, meanParams.outter * meanParams.inner * sizeof(T));
+        pipe.InitBuffer(outQueueY, 1, ((meanParams.outter * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) /
+            AscendC::ONE_BLK_SIZE) * AscendC::ONE_BLK_SIZE);
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<T> srcLocal = inQueueX.AllocTensor<T>();
+        AscendC::DataCopy(srcLocal, srcGlobal, meanParams.outter * meanParams.inner);
+        inQueueX.EnQue(srcLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<T> srcLocal = inQueueX.DeQue<T>();
+        AscendC::LocalTensor<T> dstLocal = outQueueY.AllocTensor<T>();
+        if (tmpSize != 0) {
+            pipe.InitBuffer(tmplocalBuf, tmpSize);
+            AscendC::LocalTensor<uint8_t> tmpTensor = tmplocalBuf.Get<uint8_t>();
+            AscendC::Mean<T, accType>(dstLocal, srcLocal, tmpTensor, meanParams);
+        } else {
+            AscendC::Mean<T, accType>(dstLocal, srcLocal, meanParams);
+        }
+        outQueueY.EnQue<T>(dstLocal);
+        inQueueX.FreeTensor(srcLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<T> dstLocal = outQueueY.DeQue<T>();
+        // 仅拷贝 outter 个元素
+        AscendC::DataCopy(dstGlobal, dstLocal, meanParams.outter);
+        outQueueY.FreeTensor(dstLocal);
+    }
+
+private:
+    AscendC::GlobalTensor<T> srcGlobal;
+    AscendC::GlobalTensor<T> dstGlobal;
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tmplocalBuf;
+    AscendC::MeanParams meanParams;
+    uint32_t tmpSize = 0;
+};
+
+extern "C" __global__ __aicore__ void mobilenet_v2_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+
+    // 仅示例 float 版本
+    KernelMobilenetV2Mean<float, float> op;
+    op.Init(x, y, tiling_data.outter, tiling_data.inner, tiling_data.n, tiling_data.tmpSize);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor mobilenet_v2_custom_impl_npu(const at::Tensor& x) {
+    // 输入 x: [B, C, H, W]，输出 y: [B, C]
+    TORCH_CHECK(x.dim() >= 2, "Input must have at least 2 dims");
+    auto B = x.size(0);
+    auto C = x.size(1);
+    at::Tensor y = at::empty({B, C}, x.options());
+    EXEC_NPU_CMD(aclnnMobilenetV2Custom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("mobilenet_v2_custom", &mobilenet_v2_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mobilenet_v2_custom", &mobilenet_v2_custom_impl_npu, "GlobalAvgPool2d + Flatten to [B, C]");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        super(ModelNew, self).__init__()
+
+        def _make_divisible(v, divisor, min_value=None):
+            if min_value is None:
+                min_value = divisor
+            new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+            if new_v < 0.9 * v:
+                new_v += divisor
+            return new_v
+
+        def _inverted_residual_block(inp, oup, stride, expand_ratio):
+            hidden_dim = int(inp * expand_ratio)
+            layers = []
+            if expand_ratio != 1:
+                layers.append(nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False))
+                layers.append(nn.BatchNorm2d(hidden_dim))
+                layers.append(nn.ReLU6(inplace=True))
+            layers.extend([
+                nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True),
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+            ])
+            return nn.Sequential(*layers)
+
+        input_channel = 32
+        last_channel = 1280
+        inverted_residual_setting = [
+            [1, 16, 1, 1],
+            [6, 24, 2, 2],
+            [6, 32, 3, 2],
+            [6, 64, 4, 2],
+            [6, 96, 3, 1],
+            [6, 160, 3, 2],
+            [6, 320, 1, 1],
+        ]
+
+        features = [nn.Conv2d(3, input_channel, 3, 2, 1, bias=False),
+                    nn.BatchNorm2d(input_channel),
+                    nn.ReLU6(inplace=True)]
+
+        for t, c, n, s in inverted_residual_setting:
+            output_channel = _make_divisible(c, 8)
+            for i in range(n):
+                stride = s if i == 0 else 1
+                features.append(_inverted_residual_block(input_channel, output_channel, stride, expand_ratio=t))
+                input_channel = output_channel
+
+        features.append(nn.Conv2d(input_channel, last_channel, 1, 1, 0, bias=False))
+        features.append(nn.BatchNorm2d(last_channel))
+        features.append(nn.ReLU6(inplace=True))
+        # 原模型这里是 AdaptiveAvgPool2d((1, 1))，使用自定义核替换，不再添加该层
+        self.features = nn.Sequential(*features)
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.0),
+            nn.Linear(last_channel, num_classes),
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        x = self.features(x)          # [B, C, H, W]
+        x = custom_ops_lib.mobilenet_v2_custom(x)  # [B, C] 使用AscendC Mean核实现全局平均池化
+        x = self.classifier(x)        # [B, num_classes]
+        return x
+'''

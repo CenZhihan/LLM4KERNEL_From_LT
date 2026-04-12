@@ -56,9 +56,9 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(IndexCopyCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, srcRows);
   TILING_DATA_FIELD_DEF(uint32_t, cols);
-  TILING_DATA_FIELD_DEF(uint32_t, indicesNum);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(IndexCopyCustom, IndexCopyCustomTilingData)
@@ -69,36 +69,49 @@ host_operator_src="""
 #include "index_copy_custom_tiling.h"
 #include "register/op_def_registry.h"
 
-namespace optiling {
+namespace {
+inline uint32_t GetRows(const gert::Shape& shape) {
+    // Assume index_copy along dim 0, rows = first dimension
+    if (shape.GetRealDimCnt() == 0) {
+        return 0;
+    }
+    return static_cast<uint32_t>(shape.GetDim(0));
+}
+}
 
-const uint32_t BLOCK_DIM = 1;
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 1;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     IndexCopyCustomTilingData tiling;
 
-    auto* xShape = context->GetInputShape(0);
-    auto* idxShape = context->GetInputShape(1);
-    auto* srcShape = context->GetInputShape(2);
+    const auto* x_shape = context->GetInputShape(0);
+    const auto* indices_shape = context->GetInputShape(1);
+    const auto* src_shape = context->GetInputShape(2);
 
-    uint64_t xSize = xShape->GetOriginShape().GetShapeSize();      // N * C
-    uint64_t mSize = idxShape->GetOriginShape().GetShapeSize();    // M
-    uint64_t srcSize = srcShape->GetOriginShape().GetShapeSize();  // M * C
+    auto x_origin = x_shape->GetOriginShape();
+    auto src_origin = src_shape->GetOriginShape();
+    auto indices_origin = indices_shape->GetOriginShape();
 
-    uint32_t M = static_cast<uint32_t>(mSize);
-    uint32_t C = static_cast<uint32_t>(srcSize / (mSize == 0 ? 1 : mSize));
-    uint32_t N = static_cast<uint32_t>(xSize / (C == 0 ? 1 : C));
+    uint32_t x_rows = GetRows(x_origin);
+    uint32_t total_elems_x = static_cast<uint32_t>(x_origin.GetShapeSize());
+    uint32_t cols = (x_rows == 0) ? 0u : (total_elems_x / x_rows);
+
+    uint32_t src_rows = static_cast<uint32_t>(indices_origin.GetShapeSize()); // M
 
     context->SetBlockDim(BLOCK_DIM);
-    tiling.set_rows(N);
-    tiling.set_cols(C);
-    tiling.set_indicesNum(M);
+    tiling.set_srcRows(src_rows);
+    tiling.set_cols(cols);
+    tiling.set_tileNum(TILE_NUM);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -107,15 +120,15 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
-    gert::Shape* z_shape = context->GetOutputShape(0);
-    *z_shape = *x_shape;
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const auto xType = context->GetInputDataType(0);
-    context->SetOutputDataType(0, xType);
-    return GRAPH_SUCCESS;
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
 }
 }
 
@@ -146,7 +159,9 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -157,100 +172,98 @@ OP_ADD(IndexCopyCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "index_copy_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 1;
+using DTYPE_DATA = float;
+using DTYPE_INDICES = int32_t;
+
+constexpr int32_t BUFFER_NUM = 2;
 
 class KernelIndexCopy {
 public:
     __aicore__ inline KernelIndexCopy() {}
-
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR indices, GM_ADDR src, GM_ADDR z,
-                                uint32_t rows, uint32_t cols, uint32_t indicesNum)
+                                uint32_t srcRows, uint32_t cols, uint32_t /*tileNum*/)
     {
-        this->rows = rows;
         this->cols = cols;
-        this->indicesNum = indicesNum;
+        this->srcRows = srcRows;
 
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(x), rows * cols);
-        idxGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(indices), indicesNum);
-        srcGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(src), indicesNum * cols);
-        zGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(z), rows * cols);
+        // Split rows among blocks
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t bid = AscendC::GetBlockIdx();
+        uint32_t rowsPerBlock = (srcRows + blockNum - 1) / blockNum;
+        this->rowStart = rowsPerBlock * bid;
+        this->rowEnd = this->rowStart + rowsPerBlock;
+        if (this->rowEnd > srcRows) {
+            this->rowEnd = srcRows;
+        }
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, cols * sizeof(float));
-        pipe.InitBuffer(inQueueSrc, BUFFER_NUM, cols * sizeof(float));
-        pipe.InitBuffer(inQueueIdx, BUFFER_NUM, 1 * sizeof(int32_t));
+        xGm.SetGlobalBuffer((__gm__ DTYPE_DATA *)x, 0); // unused, keep signature
+        idxGm.SetGlobalBuffer((__gm__ DTYPE_INDICES *)indices, srcRows);
+        srcGm.SetGlobalBuffer((__gm__ DTYPE_DATA *)src, (uint32_t)srcRows * cols);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_DATA *)z, 0xFFFFFFFF);
+
+        pipe.InitBuffer(inQueueSrc, BUFFER_NUM, this->cols * sizeof(DTYPE_DATA));
+        pipe.InitBuffer(inQueueIdx, BUFFER_NUM, sizeof(DTYPE_INDICES));
     }
 
     __aicore__ inline void Process()
     {
-        CopyBaseToOutput();
-        ScatterCopy();
-    }
-
-private:
-    __aicore__ inline void CopyBaseToOutput()
-    {
-        for (uint32_t r = 0; r < rows; ++r) {
-            AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-            AscendC::DataCopy(xLocal, xGm[r * cols], cols);
-            inQueueX.EnQue(xLocal);
-
-            AscendC::LocalTensor<float> xLocalDeq = inQueueX.DeQue<float>();
-            AscendC::DataCopy(zGm[r * cols], xLocalDeq, cols);
-            inQueueX.FreeTensor(xLocalDeq);
-        }
-    }
-
-    __aicore__ inline void ScatterCopy()
-    {
-        for (uint32_t i = 0; i < indicesNum; ++i) {
-            // load one index
-            AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.AllocTensor<int32_t>();
-            AscendC::DataCopy(idxLocal, idxGm[i], 1);
-            inQueueIdx.EnQue(idxLocal);
-
-            // load one source row
-            AscendC::LocalTensor<float> srcLocal = inQueueSrc.AllocTensor<float>();
-            AscendC::DataCopy(srcLocal, srcGm[i * cols], cols);
-            inQueueSrc.EnQue(srcLocal);
-
-            AscendC::LocalTensor<int32_t> idxLocalDeq = inQueueIdx.DeQue<int32_t>();
-            AscendC::LocalTensor<float> srcLocalDeq = inQueueSrc.DeQue<float>();
-
-            // read index value from local tensor
-            int32_t dstRow = idxLocalDeq.GetValue(0); // obtain scalar from LocalTensor
-
-            // write to destination row in z
-            AscendC::DataCopy(zGm[static_cast<uint32_t>(dstRow) * cols], srcLocalDeq, cols);
-
-            inQueueIdx.FreeTensor(idxLocalDeq);
-            inQueueSrc.FreeTensor(srcLocalDeq);
+        // Stream by rows, double-buffered
+        for (uint32_t r = rowStart; r < rowEnd; ++r) {
+            CopyIn(r);
+            ComputeAndWrite();
         }
     }
 
 private:
-    uint32_t rows;
-    uint32_t cols;
-    uint32_t indicesNum;
+    __aicore__ inline void CopyIn(uint32_t r)
+    {
+        // Load one row of src
+        AscendC::LocalTensor<DTYPE_DATA> sLocal = inQueueSrc.AllocTensor<DTYPE_DATA>();
+        AscendC::DataCopy(sLocal, srcGm[r * this->cols], this->cols);
+        inQueueSrc.EnQue(sLocal);
 
+        // Load one index
+        AscendC::LocalTensor<DTYPE_INDICES> iLocal = inQueueIdx.AllocTensor<DTYPE_INDICES>();
+        AscendC::DataCopy(iLocal, idxGm[r], 1);
+        inQueueIdx.EnQue(iLocal);
+    }
+
+    __aicore__ inline void ComputeAndWrite()
+    {
+        AscendC::LocalTensor<DTYPE_DATA> sLocal = inQueueSrc.DeQue<DTYPE_DATA>();
+        AscendC::LocalTensor<DTYPE_INDICES> iLocal = inQueueIdx.DeQue<DTYPE_INDICES>();
+
+        // Get destination row
+        int32_t dstRow = iLocal.GetValue(0);
+
+        // Write the row into destination location in z
+        AscendC::DataCopy(zGm[static_cast<uint32_t>(dstRow) * this->cols], sLocal, this->cols);
+
+        inQueueSrc.FreeTensor(sLocal);
+        inQueueIdx.FreeTensor(iLocal);
+    }
+
+private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueSrc;
     AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueIdx;
 
-    AscendC::GlobalTensor<float> xGm;
-    AscendC::GlobalTensor<int32_t> idxGm;
-    AscendC::GlobalTensor<float> srcGm;
-    AscendC::GlobalTensor<float> zGm;
+    AscendC::GlobalTensor<DTYPE_DATA> xGm;
+    AscendC::GlobalTensor<DTYPE_DATA> srcGm;
+    AscendC::GlobalTensor<DTYPE_DATA> zGm;
+    AscendC::GlobalTensor<DTYPE_INDICES> idxGm;
+
+    uint32_t cols;
+    uint32_t srcRows;
+    uint32_t rowStart;
+    uint32_t rowEnd;
 };
 
-extern "C" __global__ __aicore__ void index_copy_custom(GM_ADDR x, GM_ADDR indices, GM_ADDR src, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void index_copy_custom(GM_ADDR x, GM_ADDR indices, GM_ADDR src, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelIndexCopy op;
-    op.Init(x, indices, src, z, tiling_data.rows, tiling_data.cols, tiling_data.indicesNum);
+    op.Init(x, indices, src, z, tiling_data.srcRows, tiling_data.cols, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -261,18 +274,32 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor index_copy_custom_impl_npu(const at::Tensor& x, const at::Tensor& indices, const at::Tensor& src) {
-    at::Tensor result = at::empty_like(x);
+at::Tensor index_copy_custom_impl_npu(const at::Tensor& x, at::Tensor indices, const at::Tensor& src) {
+    TORCH_CHECK(x.dim() >= 2, \"index_copy_custom expects x to be at least 2-D\");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, \"x must be float32\");
+    TORCH_CHECK(src.scalar_type() == at::kFloat, \"src must be float32\");
+    TORCH_CHECK(indices.dim() == 1, \"indices must be 1-D\");
+    TORCH_CHECK(src.size(0) == indices.size(0), \"src and indices first dimension must match\");
+    TORCH_CHECK(src.sizes().slice(1) == x.sizes().slice(1), \"src trailing dims must match x\");
+
+    if (indices.scalar_type() != at::kInt) {
+        indices = indices.to(at::kInt);
+    }
+
+    at::Tensor result = x.clone();
     EXEC_NPU_CMD(aclnnIndexCopyCustom, x, indices, src, result);
     return result;
 }
 
+TORCH_LIBRARY(myops, m) {
+    m.def(\"index_copy_custom(Tensor x, Tensor indices, Tensor src) -> Tensor\");
+}
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("index_copy_custom", &index_copy_custom_impl_npu);
+    m.impl(\"index_copy_custom\", &index_copy_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("index_copy_custom", &index_copy_custom_impl_npu, "index_copy(dim=0)");
+    m.def(\"index_copy_custom\", &index_copy_custom_impl_npu, \"x.index_copy(0, indices, src)\");
 }
 """
 
@@ -282,9 +309,9 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
     def forward(self, x, indices, src):
+        # Ensure expected dtype for indices
+        if indices.dtype != torch.int32:
+            indices = indices.to(torch.int32)
         return custom_ops_lib.index_copy_custom(x, indices, src)
 '''

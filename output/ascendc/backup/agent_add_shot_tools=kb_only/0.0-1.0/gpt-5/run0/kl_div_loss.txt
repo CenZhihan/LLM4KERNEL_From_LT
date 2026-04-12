@@ -1,0 +1,369 @@
+project_json_src='''
+[
+    {
+        "op": "KlDivLossCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "log_p",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "log_q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "loss",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(KlDivLossCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, outter);     // batch size
+  TILING_DATA_FIELD_DEF(uint32_t, inner);      // aligned inner size (32B aligned)
+  TILING_DATA_FIELD_DEF(uint32_t, n);          // actual inner size
+  TILING_DATA_FIELD_DEF(uint32_t, tmpSize);    // tmp buffer size for Sum
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(KlDivLossCustom, KlDivLossCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "kl_div_loss_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+static inline uint32_t Align32Bytes(uint32_t bytes) {
+    const uint32_t align = 32;
+    return (bytes + align - 1) / align * align;
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    KlDivLossCustomTilingData tiling;
+
+    // 输入0形状（log_p），与log_q/q一致
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto dt = context->GetInputTensor(0)->GetDataType();
+    uint32_t typeSize = (dt == ge::DT_FLOAT) ? 4 : 4; // 仅支持float
+
+    // 假设输入为二维 [B, N]，若为更高维，按最后一维为inner，其余维度乘积为outter
+    uint64_t totalElems = in_shape->GetOriginShape().GetShapeSize();
+    int64_t dims = in_shape->GetOriginShape().GetDimNum();
+    int64_t n = 1;
+    if (dims >= 1) {
+        n = in_shape->GetOriginShape().GetDim(dims - 1);
+    }
+    uint64_t outter = (n > 0) ? (totalElems / static_cast<uint64_t>(n)) : 0;
+
+    // inner按32B对齐
+    uint32_t innerAligned = Align32Bytes(static_cast<uint32_t>(n) * typeSize) / typeSize;
+
+    // Sum两次：第一次按inner做reduce（n），第二次按outter做reduce（outter）
+    uint32_t max1 = 0, min1 = 0;
+    AscendC::GetSumMaxMinTmpSize(static_cast<uint32_t>(n), typeSize, false, max1, min1);
+    uint32_t max2 = 0, min2 = 0;
+    AscendC::GetSumMaxMinTmpSize(static_cast<uint32_t>(outter), typeSize, false, max2, min2);
+    uint32_t tmpSize = (min1 > min2) ? min1 : min2;
+
+    // 配置tiling
+    context->SetBlockDim(8);
+    tiling.set_outter(static_cast<uint32_t>(outter));
+    tiling.set_inner(innerAligned);
+    tiling.set_n(static_cast<uint32_t>(n));
+    tiling.set_tmpSize(tmpSize);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输出为标量（以1元素ND表示）
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    std::vector<int64_t> scalar_shape = {1};
+    y_shape->SetDimNum(1);
+    y_shape->SetDim(0, 1);
+    y_shape->SetOriginShape(scalar_shape);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class KlDivLossCustom : public OpDef {
+public:
+    explicit KlDivLossCustom(const char* name) : OpDef(name)
+    {
+        this->Input("log_p")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("log_q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("loss")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(KlDivLossCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "kl_div_loss_custom_tiling_data.h"
+
+constexpr int32_t BUFFER_NUM = 1;
+
+template <typename T>
+class KernelKlDivLoss {
+public:
+    __aicore__ inline KernelKlDivLoss() {}
+    __aicore__ inline void Init(GM_ADDR logp, GM_ADDR logq, GM_ADDR q, GM_ADDR loss,
+                                uint32_t outter, uint32_t inner, uint32_t n, uint32_t tmpSize)
+    {
+        this->outter = outter;   // batch size
+        this->inner = inner;     // 32B对齐后长度
+        this->nNum = n;          // 实际inner长度
+        this->tmpSize = tmpSize;
+
+        logpGm.SetGlobalBuffer((__gm__ T *)logp, outter * inner);
+        logqGm.SetGlobalBuffer((__gm__ T *)logq, outter * inner);
+        qGm.SetGlobalBuffer((__gm__ T *)q, outter * inner);
+        lossGm.SetGlobalBuffer((__gm__ T *)loss, 1);
+
+        // 本示例直接将全部矩阵搬入本地进行演示（与文档Sum示例一致做法）
+        pipe.InitBuffer(inQueueLogP, BUFFER_NUM, outter * inner * sizeof(T));
+        pipe.InitBuffer(inQueueLogQ, BUFFER_NUM, outter * inner * sizeof(T));
+        pipe.InitBuffer(inQueueQ,    BUFFER_NUM, outter * inner * sizeof(T));
+
+        // 中间矩阵 tmp = q * (log_q - log_p)
+        pipe.InitBuffer(tmpMatQueue, BUFFER_NUM, outter * inner * sizeof(T));
+
+        // 行归约结果长度为outter，需按32B对齐
+        uint32_t rowAligned = (outter * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE;
+        pipe.InitBuffer(rowSumQueue, BUFFER_NUM, rowAligned);
+
+        // 标量（最终loss）按一个块对齐
+        pipe.InitBuffer(scalarQueue, BUFFER_NUM, AscendC::ONE_BLK_SIZE);
+
+        // Sum临时空间
+        pipe.InitBuffer(workQueue, BUFFER_NUM, tmpSize);
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<T> logpLocal = inQueueLogP.AllocTensor<T>();
+        AscendC::LocalTensor<T> logqLocal = inQueueLogQ.AllocTensor<T>();
+        AscendC::LocalTensor<T> qLocal    = inQueueQ.AllocTensor<T>();
+
+        AscendC::DataCopy(logpLocal, logpGm, outter * inner);
+        AscendC::DataCopy(logqLocal, logqGm, outter * inner);
+        AscendC::DataCopy(qLocal,    qGm,    outter * inner);
+
+        inQueueLogP.EnQue(logpLocal);
+        inQueueLogQ.EnQue(logqLocal);
+        inQueueQ.EnQue(qLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<T> logpLocal = inQueueLogP.DeQue<T>();
+        AscendC::LocalTensor<T> logqLocal = inQueueLogQ.DeQue<T>();
+        AscendC::LocalTensor<T> qLocal    = inQueueQ.DeQue<T>();
+
+        AscendC::LocalTensor<T> tmpLocal = tmpMatQueue.AllocTensor<T>();
+        AscendC::LocalTensor<uint8_t> workLocal = workQueue.AllocTensor<uint8_t>();
+
+        // tmpLocal = log_q - log_p
+        AscendC::Sub(tmpLocal, logqLocal, logpLocal, outter * inner);
+        // tmpLocal = q * (log_q - log_p)
+        AscendC::Mul(tmpLocal, tmpLocal, qLocal, outter * inner);
+
+        // 第一次Sum：按inner归约，得到每个样本的行和（outter个）
+        AscendC::LocalTensor<T> rowSumLocal = rowSumQueue.AllocTensor<T>();
+        AscendC::SumParams params1{outter, inner, nNum};
+        T zero(0);
+        uint32_t rowAlignedElems = ((outter * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE) * (AscendC::ONE_BLK_SIZE / sizeof(T));
+        AscendC::Duplicate<T>(rowSumLocal, zero, rowAlignedElems);
+        AscendC::Sum(rowSumLocal, tmpLocal, params1);
+
+        // 第二次Sum：将outter个行和再归约到标量
+        AscendC::LocalTensor<T> scalarLocal = scalarQueue.AllocTensor<T>();
+        AscendC::SumParams params2{1,
+                                   (uint32_t)((outter * sizeof(T) + 32 - 1) / 32 * 32 / sizeof(T)),
+                                   outter};
+        uint32_t scalarAlignedElems = AscendC::ONE_BLK_SIZE / sizeof(T);
+        AscendC::Duplicate<T>(scalarLocal, zero, scalarAlignedElems);
+        AscendC::Sum(scalarLocal, rowSumLocal, params2);
+
+        // batchmean：除以batch size（outter）
+        T factor = static_cast<T>(1.0f / static_cast<float>(outter));
+        AscendC::LocalTensor<T> factorLocal = scalarQueue.AllocTensor<T>();
+        AscendC::Duplicate<T>(factorLocal, factor, scalarAlignedElems);
+        AscendC::Mul(scalarLocal, scalarLocal, factorLocal, scalarAlignedElems);
+
+        // 回写到GM
+        outScalar = scalarLocal;
+
+        // 释放
+        rowSumQueue.FreeTensor(rowSumLocal);
+        tmpMatQueue.FreeTensor(tmpLocal);
+        workQueue.FreeTensor(workLocal);
+        inQueueLogP.FreeTensor(logpLocal);
+        inQueueLogQ.FreeTensor(logqLocal);
+        inQueueQ.FreeTensor(qLocal);
+        scalarQueue.FreeTensor(factorLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        // 将标量对齐长度的数据拷回，用户只使用第一个元素
+        AscendC::LocalTensor<T> scalarLocal = outScalar;
+        AscendC::DataCopy(lossGm, scalarLocal, AscendC::ONE_BLK_SIZE / sizeof(T));
+        scalarQueue.FreeTensor(scalarLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM>  inQueueLogP, inQueueLogQ, inQueueQ;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpMatQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM>  rowSumQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM>  scalarQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM>   workQueue;
+
+    AscendC::GlobalTensor<T> logpGm, logqGm, qGm, lossGm;
+
+    AscendC::LocalTensor<T> outScalar;
+
+    uint32_t outter = 0;
+    uint32_t inner = 0;
+    uint32_t nNum = 0;
+    uint32_t tmpSize = 0;
+};
+
+extern "C" __global__ __aicore__ void kl_div_loss_custom(GM_ADDR logp, GM_ADDR logq, GM_ADDR q, GM_ADDR loss, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    KernelKlDivLoss<DTYPE_LOG_P> op;
+    op.Init(logp, logq, q, loss, tilingData.outter, tilingData.inner, tilingData.n, tilingData.tmpSize);
+    if (TILING_KEY_IS(1)) {
+        op.Process();
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor kl_div_loss_custom_impl_npu(const at::Tensor& log_p, const at::Tensor& log_q, const at::Tensor& q) {
+    // 输出为标量（1元素）
+    at::Tensor result = at::empty({1}, log_p.options());
+    EXEC_NPU_CMD(aclnnKlDivLossCustom, log_p, log_q, q, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("kl_div_loss_custom", &kl_div_loss_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("kl_div_loss_custom", &kl_div_loss_custom_impl_npu, "KLDivLoss (batchmean)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, predictions, targets):
+        # 依据PyTorch F.kl_div 定义: input为log_proba，target为proba
+        log_p = torch.log(predictions)
+        log_q = torch.log(targets)
+        return custom_ops_lib.kl_div_loss_custom(log_p, log_q, targets)
+'''

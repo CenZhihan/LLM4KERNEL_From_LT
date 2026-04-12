@@ -1,0 +1,349 @@
+project_json_src='''
+[
+    {
+        "op": "LinearAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "Q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "K",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "V",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "O",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(LinearAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, seqLen);
+  TILING_DATA_FIELD_DEF(uint32_t, dModel);
+  TILING_DATA_FIELD_DEF(uint32_t, qTile);
+  TILING_DATA_FIELD_DEF(uint32_t, vTile);
+  TILING_DATA_FIELD_DEF(uint32_t, dChunk);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(LinearAttentionCustom, LinearAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "linear_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    auto* in_shape = context->GetInputShape(0);
+    if (in_shape == nullptr) return ge::GRAPH_FAILED;
+    const auto origin = in_shape->GetOriginShape();
+    if (origin.GetDimNum() != 3) return ge::GRAPH_FAILED;
+    uint32_t B = static_cast<uint32_t>(origin.GetDim(0));
+    uint32_t S = static_cast<uint32_t>(origin.GetDim(1));
+    uint32_t D = static_cast<uint32_t>(origin.GetDim(2));
+
+    LinearAttentionCustomTilingData tiling;
+    tiling.set_batch(B);
+    tiling.set_seqLen(S);
+    tiling.set_dModel(D);
+
+    // 简单设定分块参数，实际可根据平台UB等做自适应
+    const uint32_t qTile = 8;
+    const uint32_t vTile = 64;
+    const uint32_t dChunk = 64; // float场景下，每次ReduceSum块大小
+    tiling.set_qTile(qTile);
+    tiling.set_vTile(vTile);
+    tiling.set_dChunk(dChunk);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace_sizes = context->GetWorkspaceSizes(1);
+    workspace_sizes[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    // 输出形状: [B, S, D] -> [B, S, D]
+    gert::Shape* o_shape = context->GetOutputShape(0);
+    *o_shape = *q_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class LinearAttentionCustom : public OpDef {
+public:
+    explicit LinearAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("Q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("K")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("V")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("O")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(LinearAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr float EPS = 1e-6f;
+
+class KernelLinearAttentionCustom {
+public:
+    __aicore__ inline KernelLinearAttentionCustom() {}
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o,
+                                uint32_t B, uint32_t S, uint32_t D,
+                                uint32_t qTile, uint32_t vTile, uint32_t dChunk)
+    {
+        this->B = B;
+        this->S = S;
+        this->D = D;
+        this->qTile = qTile;
+        this->vTile = vTile;
+        this->dChunk = dChunk;
+
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->bPerBlock = (B + blockNum - 1) / blockNum;
+        this->bStart = blockIdx * bPerBlock;
+        this->bEnd = (this->bStart + this->bPerBlock) < B ? (this->bStart + this->bPerBlock) : B;
+
+        qGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(q), B * S * D);
+        kGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(k), B * S * D);
+        vGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(v), B * S * D);
+        oGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(o), B * S * D);
+
+        // 初始化本地缓冲
+        pipe.InitBuffer(qBlockQue, 1, qTile * D * sizeof(float));
+        pipe.InitBuffer(kRowQue, 1, D * sizeof(float));
+        pipe.InitBuffer(vTileQue, 1, vTile * sizeof(float));
+        pipe.InitBuffer(outTileQue, 1, qTile * vTile * sizeof(float));
+        pipe.InitBuffer(scaledVecQue, 1, vTile * sizeof(float));
+        pipe.InitBuffer(mulVecQue, 1, dChunk * sizeof(float));
+        pipe.InitBuffer(workQue, 1, dChunk * sizeof(float));
+        pipe.InitBuffer(sumQue, 1, sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t b = bStart; b < bEnd; ++b) {
+            for (uint32_t q0 = 0; q0 < S; q0 += qTile) {
+                uint32_t validQ = (q0 + qTile <= S) ? qTile : (S - q0);
+
+                // 加载并预处理Q块: ReLU + EPS
+                AscendC::LocalTensor<float> qBlockLocal = qBlockQue.AllocTensor<float>();
+                for (uint32_t qi = 0; qi < validQ; ++qi) {
+                    uint64_t qRowOffset = ((uint64_t)b * S + (q0 + qi)) * D;
+                    AscendC::DataCopy(qBlockLocal[qi * D], qGm[qRowOffset], D);
+                    AscendC::Relu(qBlockLocal[qi * D], qBlockLocal[qi * D], D);
+                    AscendC::Adds(qBlockLocal[qi * D], qBlockLocal[qi * D], EPS, D);
+                }
+
+                for (uint32_t v0 = 0; v0 < D; v0 += vTile) {
+                    uint32_t validV = (v0 + vTile <= D) ? vTile : (D - v0);
+                    AscendC::LocalTensor<float> outTileLocal = outTileQue.AllocTensor<float>();
+                    float zero = 0.0f;
+                    AscendC::Duplicate(outTileLocal, zero, validQ * validV);
+
+                    // 逐k累加: out[b, q, v0:v0+validV] += (Q_row · K_row) * V_row[v0:v0+validV]
+                    for (uint32_t kIdx = 0; kIdx < S; ++kIdx) {
+                        // K_row 预处理: ReLU + EPS
+                        AscendC::LocalTensor<float> kRowLocal = kRowQue.AllocTensor<float>();
+                        uint64_t kRowOffset = ((uint64_t)b * S + kIdx) * D;
+                        AscendC::DataCopy(kRowLocal, kGm[kRowOffset], D);
+                        AscendC::Relu(kRowLocal, kRowLocal, D);
+                        AscendC::Adds(kRowLocal, kRowLocal, EPS, D);
+
+                        // V_tile 加载（不做激活）
+                        AscendC::LocalTensor<float> vTileLocal = vTileQue.AllocTensor<float>();
+                        uint64_t vRowOffset = ((uint64_t)b * S + kIdx) * D + v0;
+                        AscendC::DataCopy(vTileLocal, vGm[vRowOffset], validV);
+
+                        // 对每个q行计算 s = dot(Q_row, K_row)，然后 out_row += s * V_tile
+                        for (uint32_t qi = 0; qi < validQ; ++qi) {
+                            float s = 0.0f;
+                            // 分块累加点积
+                            for (uint32_t d0 = 0; d0 < D; d0 += dChunk) {
+                                uint32_t cur = (d0 + dChunk <= D) ? dChunk : (D - d0);
+                                AscendC::LocalTensor<float> mulLocal = mulVecQue.AllocTensor<float>();
+                                AscendC::LocalTensor<float> workLocal = workQue.AllocTensor<float>();
+                                AscendC::LocalTensor<float> sumLocal = sumQue.AllocTensor<float>();
+
+                                AscendC::Mul(mulLocal, qBlockLocal[qi * D + d0], kRowLocal[d0], cur);
+                                AscendC::ReduceSum(sumLocal, mulLocal, workLocal, cur);
+                                float part = AscendC::GetAccVal<float>();
+                                s += part;
+
+                                mulVecQue.FreeTensor(mulLocal);
+                                workQue.FreeTensor(workLocal);
+                                sumQue.FreeTensor(sumLocal);
+                            }
+
+                            AscendC::LocalTensor<float> scaledLocal = scaledVecQue.AllocTensor<float>();
+                            AscendC::DataCopy(scaledLocal, vTileLocal, validV);
+                            AscendC::Muls(scaledLocal, scaledLocal, s, validV);
+                            AscendC::Add(outTileLocal[qi * validV], outTileLocal[qi * validV], scaledLocal, validV);
+                            scaledVecQue.FreeTensor(scaledLocal);
+                        }
+
+                        vTileQue.FreeTensor(vTileLocal);
+                        kRowQue.FreeTensor(kRowLocal);
+                    }
+
+                    // 将outTile写回GM
+                    for (uint32_t qi = 0; qi < validQ; ++qi) {
+                        uint64_t oRowOffset = ((uint64_t)b * S + (q0 + qi)) * D + v0;
+                        AscendC::DataCopy(oGm[oRowOffset], outTileLocal[qi * validV], validV);
+                    }
+                    outTileQue.FreeTensor(outTileLocal);
+                }
+                qBlockQue.FreeTensor(qBlockLocal);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::GlobalTensor<float> qGm, kGm, vGm, oGm;
+
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> qBlockQue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> kRowQue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> vTileQue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outTileQue;
+
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> scaledVecQue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> mulVecQue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> workQue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> sumQue;
+
+    uint32_t B, S, D;
+    uint32_t qTile, vTile, dChunk;
+
+    uint32_t bPerBlock, bStart, bEnd;
+};
+
+extern "C" __global__ __aicore__ void linear_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelLinearAttentionCustom op;
+    op.Init(q, k, v, o,
+            tiling_data.batch, tiling_data.seqLen, tiling_data.dModel,
+            tiling_data.qTile, tiling_data.vTile, tiling_data.dChunk);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor linear_attention_custom_impl_npu(const at::Tensor& Q, const at::Tensor& K, const at::Tensor& V) {
+    auto sizes = Q.sizes();
+    at::Tensor O = at::empty_like(Q); // 输出形状为 [B, S, D]
+    EXEC_NPU_CMD(aclnnLinearAttentionCustom, Q, K, V, O);
+    return O;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("linear_attention_custom", &linear_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("linear_attention_custom", &linear_attention_custom_impl_npu, "Linear Attention Custom");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, Q, K, V):
+        return custom_ops_lib.linear_attention_custom(Q, K, V)
+'''

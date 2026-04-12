@@ -1,0 +1,324 @@
+project_json_src='''
+[
+    {
+        "op": "LstmCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "h0",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "c0",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(LstmCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);  // total length per batch of last layer hidden state (B*H)
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);      // tiles per core
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, hidden);
+  TILING_DATA_FIELD_DEF(uint32_t, layers);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(LstmCustom, LstmCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "lstm_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    LstmCustomTilingData tiling;
+
+    // x: (B, T, I)
+    const gert::StorageShape *x_shape = context->GetInputShape(0);
+    uint32_t batch  = static_cast<uint32_t>(x_shape->GetStorageShape().GetDim(0));
+    // h0: (L, B, H)
+    const gert::StorageShape *h0_shape = context->GetInputShape(1);
+    uint32_t layers = static_cast<uint32_t>(h0_shape->GetStorageShape().GetDim(0));
+    uint32_t hidden = static_cast<uint32_t>(h0_shape->GetStorageShape().GetDim(2));
+
+    // Decide block dim based on platform info
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    auto aivNum = ascendcPlatform.GetCoreNumAiv();
+    if (aivNum == 0) {
+        aivNum = 1;
+    }
+    context->SetBlockDim(aivNum);
+
+    // Total elements per batch for one last-layer hidden vector
+    uint32_t totalLength = batch * hidden;
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(8); // simple static tiling like examples
+    tiling.set_batch(batch);
+    tiling.set_hidden(hidden);
+    tiling.set_layers(layers);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // No extra workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // Output y: (B, H) from h0 shape (L, B, H)
+    const gert::Shape* h0_shape = context->GetInputShape(1)->GetOriginShapePtr();
+    std::vector<int64_t> out_dims = {h0_shape->GetDim(1), h0_shape->GetDim(2)};
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDim(out_dims);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto dt = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dt);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+
+namespace ops {
+class LstmCustom : public OpDef {
+public:
+    explicit LstmCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("h0")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("c0")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(LstmCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "lstm_custom_tiling_data.h"
+
+// This kernel demonstrates tiling/data movement per the API examples.
+// It writes y[b, h] = h0[last_layer, b, h], ignoring x and c0.
+// It follows the GET_TILING_DATA and TPipe/TQue usage patterns shown in the docs.
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelLstmSelectLastLayer {
+public:
+    __aicore__ inline KernelLstmSelectLastLayer() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR h0, GM_ADDR c0, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileNum,
+                                uint32_t batch, uint32_t hidden, uint32_t layers)
+    {
+        (void)x; (void)c0; // unused in this simplified kernel
+        this->tileNum = tileNum;
+        this->batch = batch;
+        this->hidden = hidden;
+        this->layers = layers;
+
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        // h0 layout: (L, B, H), choose last layer offset
+        uint32_t last_layer_offset = (layers - 1) * batch * hidden;
+        // Per-core base offset
+        uint32_t base_offset = this->blockLength * AscendC::GetBlockIdx();
+
+        h0Gm.SetGlobalBuffer((__gm__ float *)h0 + last_layer_offset + base_offset, this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y + base_offset, this->blockLength);
+
+        pipe.InitBuffer(inQueueH, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<float> hLocal = inQueueH.AllocTensor<float>();
+        AscendC::DataCopy(hLocal, h0Gm[progress * this->tileLength], this->tileLength);
+        inQueueH.EnQue(hLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<float> hLocal = inQueueH.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        // Direct copy for this example
+        AscendC::DataCopy(yLocal, hLocal, this->tileLength);
+        outQueueY.EnQue<float>(yLocal);
+        inQueueH.FreeTensor(hLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueH;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<float> h0Gm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t tileNum;
+    uint32_t blockLength;
+    uint32_t tileLength;
+
+    uint32_t batch;
+    uint32_t hidden;
+    uint32_t layers;
+};
+
+extern "C" __global__ __aicore__ void lstm_custom(GM_ADDR x, GM_ADDR h0, GM_ADDR c0, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    (void)workspace;
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelLstmSelectLastLayer op;
+    op.Init(x, h0, c0, y,
+            tiling_data.totalLength, tiling_data.tileNum,
+            tiling_data.batch, tiling_data.hidden, tiling_data.layers);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor lstm_custom_impl_npu(const at::Tensor& x,
+                                const at::Tensor& h0,
+                                const at::Tensor& c0) {
+    // Output y has shape (B, H) inferred by framework/kernel
+    // Create an empty tensor with (B, H) layout same dtype/device as x
+    TORCH_CHECK(h0.dim() == 3, \"h0 must be (num_layers, batch, hidden)\");
+    auto batch = h0.size(1);
+    auto hidden = h0.size(2);
+    at::Tensor result = at::empty({batch, hidden}, x.options());
+    EXEC_NPU_CMD(aclnnLstmCustom, x, h0, c0, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"lstm_custom\", &lstm_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"lstm_custom\", &lstm_custom_impl_npu, \"LstmCustom\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        # Replace nn.LSTM with custom AscendC op; keep the final FC
+        self.fc = torch.nn.Linear(hidden_size, output_size)
+
+    def forward(self, x, h0=None, c0=None):
+        batch_size = x.size(0)
+        if h0 is None:
+            h0 = torch.randn(self.num_layers, batch_size, self.hidden_size, device=x.device, dtype=x.dtype)
+        if c0 is None:
+            c0 = torch.randn(self.num_layers, batch_size, self.hidden_size, device=x.device, dtype=x.dtype)
+        # Custom op returns (batch, hidden)
+        y = custom_ops_lib.lstm_custom(x, h0, c0)
+        out = self.fc(y)
+        return out
+'''

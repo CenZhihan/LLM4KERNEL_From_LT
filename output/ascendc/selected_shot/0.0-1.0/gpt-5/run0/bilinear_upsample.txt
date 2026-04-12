@@ -1,0 +1,345 @@
+project_json_src='''
+[
+    {
+        "op": "BilinearUpsampleCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(BilinearUpsampleCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(BilinearUpsampleCustom, BilinearUpsampleCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "bilinear_upsample_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint64_t CeilDiv(uint64_t a, uint64_t b) {
+    return (a + b - 1) / b;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    BilinearUpsampleCustomTilingData tiling;
+
+    auto inShape = context->GetInputShape(0)->GetOriginShape();
+    if (inShape.GetDimNum() != 4) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    uint32_t N = static_cast<uint32_t>(inShape.GetDim(0));
+    uint32_t C = static_cast<uint32_t>(inShape.GetDim(1));
+    uint32_t H = static_cast<uint32_t>(inShape.GetDim(2));
+    uint32_t W = static_cast<uint32_t>(inShape.GetDim(3));
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_N(N);
+    tiling.set_C(C);
+    tiling.set_H(H);
+    tiling.set_W(W);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // Workspace for horizontal pass (N*C*H*2W floats)
+    size_t* workspaces = context->GetWorkspaceSizes(1);
+    uint64_t tmpElems = static_cast<uint64_t>(N) * C * H * (static_cast<uint64_t>(W) * 2);
+    workspaces[0] = tmpElems * sizeof(float);
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    if (x_shape->GetDimNum() != 4) {
+        return GRAPH_PARAM_INVALID;
+    }
+    int64_t N = x_shape->GetDim(0);
+    int64_t C = x_shape->GetDim(1);
+    int64_t H = x_shape->GetDim(2);
+    int64_t W = x_shape->GetDim(3);
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(4);
+    y_shape->SetDim(0, N);
+    y_shape->SetDim(1, C);
+    y_shape->SetDim(2, H * 2);
+    y_shape->SetDim(3, W * 2);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class BilinearUpsampleCustom : public OpDef {
+public:
+    explicit BilinearUpsampleCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(BilinearUpsampleCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM_IN = 2;
+constexpr int32_t BUFFER_NUM_OUT = 1;
+
+__aicore__ inline int32_t clamp_int(int32_t v, int32_t lo, int32_t hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+class KernelBilinearUpsample {
+public:
+    __aicore__ inline KernelBilinearUpsample() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR z, GM_ADDR workspace, uint32_t N, uint32_t C, uint32_t H, uint32_t W, uint32_t tileNum)
+    {
+        this->N = N;
+        this->C = C;
+        this->H = H;
+        this->W = W;
+        this->OH = H * 2;
+        this->OW = W * 2;
+
+        this->rowsIn = static_cast<uint64_t>(N) * C * H;
+        this->rowsOut = static_cast<uint64_t>(N) * C * this->OH;
+
+        this->tileNum = tileNum;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, static_cast<uint64_t>(N) * C * H * W);
+        tmpGm.SetGlobalBuffer((__gm__ DTYPE_X *)workspace, static_cast<uint64_t>(N) * C * H * this->OW);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z, static_cast<uint64_t>(N) * C * this->OH * this->OW);
+
+        // Allocate UB buffers large enough to hold one expanded row (2W)
+        pipe.InitBuffer(inQueue, BUFFER_NUM_IN, this->OW * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueue, BUFFER_NUM_OUT, this->OW * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        HorizontalPass();
+        VerticalPass();
+    }
+
+private:
+    __aicore__ inline void HorizontalPass()
+    {
+        // Distribute input rows across blocks
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t bidx = AscendC::GetBlockIdx();
+
+        uint64_t rowsPerBlock = (rowsIn + blockNum - 1) / blockNum;
+        uint64_t rowStart = static_cast<uint64_t>(bidx) * rowsPerBlock;
+        uint64_t rowEnd = rowStart + rowsPerBlock;
+        if (rowEnd > rowsIn) rowEnd = rowsIn;
+
+        for (uint64_t row = rowStart; row < rowEnd; ++row) {
+            // Load input row (length W)
+            AscendC::LocalTensor<DTYPE_X> xLocal = inQueue.AllocTensor<DTYPE_X>();
+            AscendC::DataCopy(xLocal, xGm[row * W], W);
+
+            // Temporary local for expanded horizontal row (length 2W)
+            AscendC::LocalTensor<DTYPE_X> tmpLocal = inQueue.AllocTensor<DTYPE_X>();
+
+            // Compute horizontal linear interpolation with align_corners=False and scale=2
+            for (uint32_t ow = 0; ow < OW; ++ow) {
+                float in_w = (static_cast<float>(ow) - 0.5f) * 0.5f; // (ow - 0.5)/2
+                int32_t w0 = static_cast<int32_t>(AscendC::Floor(in_w));
+                float w1_alpha = in_w - static_cast<float>(w0);
+                float w0_alpha = 1.0f - w1_alpha;
+                int32_t iw0 = clamp_int(w0, 0, static_cast<int32_t>(W) - 1);
+                int32_t iw1 = clamp_int(w0 + 1, 0, static_cast<int32_t>(W) - 1);
+                // Read two pixels and blend
+                float v0 = static_cast<float>(xLocal[iw0]);
+                float v1 = static_cast<float>(xLocal[iw1]);
+                tmpLocal[ow] = static_cast<DTYPE_X>(v0 * w0_alpha + v1 * w1_alpha);
+            }
+
+            // Store expanded row to workspace
+            AscendC::DataCopy(tmpGm[row * OW], tmpLocal, OW);
+
+            inQueue.FreeTensor(xLocal);
+            inQueue.FreeTensor(tmpLocal);
+        }
+    }
+
+    __aicore__ inline void VerticalPass()
+    {
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t bidx = AscendC::GetBlockIdx();
+
+        uint64_t rowsPerBlock = (rowsOut + blockNum - 1) / blockNum;
+        uint64_t rowStart = static_cast<uint64_t>(bidx) * rowsPerBlock;
+        uint64_t rowEnd = rowStart + rowsPerBlock;
+        if (rowEnd > rowsOut) rowEnd = rowsOut;
+
+        for (uint64_t orow = rowStart; orow < rowEnd; ++orow) {
+            // Compute corresponding input row indices for vertical interpolation
+            // Decompose orow into (n,c,oh)
+            uint64_t rowsPerNC_out = static_cast<uint64_t>(OH);
+            uint64_t nc = orow / rowsPerNC_out;
+            uint32_t oh = static_cast<uint32_t>(orow % rowsPerNC_out);
+
+            float in_h = (static_cast<float>(oh) - 0.5f) * 0.5f; // (oh - 0.5)/2
+            int32_t h0 = static_cast<int32_t>(AscendC::Floor(in_h));
+            float h1_alpha = in_h - static_cast<float>(h0);
+            float h0_alpha = 1.0f - h1_alpha;
+            int32_t ih0 = clamp_int(h0, 0, static_cast<int32_t>(H) - 1);
+            int32_t ih1 = clamp_int(h0 + 1, 0, static_cast<int32_t>(H) - 1);
+
+            uint64_t baseInRow0 = nc * static_cast<uint64_t>(H) + static_cast<uint64_t>(ih0);
+            uint64_t baseInRow1 = nc * static_cast<uint64_t>(H) + static_cast<uint64_t>(ih1);
+
+            // Load two horizontally-expanded rows from workspace
+            AscendC::LocalTensor<DTYPE_X> tmp0 = inQueue.AllocTensor<DTYPE_X>();
+            AscendC::LocalTensor<DTYPE_X> tmp1 = inQueue.AllocTensor<DTYPE_X>();
+            AscendC::DataCopy(tmp0, tmpGm[baseInRow0 * OW], OW);
+            AscendC::DataCopy(tmp1, tmpGm[baseInRow1 * OW], OW);
+
+            // Output local row
+            AscendC::LocalTensor<DTYPE_Z> outLocal = outQueue.AllocTensor<DTYPE_Z>();
+
+            for (uint32_t ow = 0; ow < OW; ++ow) {
+                float v0 = static_cast<float>(tmp0[ow]);
+                float v1 = static_cast<float>(tmp1[ow]);
+                outLocal[ow] = static_cast<DTYPE_Z>(v0 * h0_alpha + v1 * h1_alpha);
+            }
+
+            // Store final row
+            AscendC::DataCopy(zGm[orow * OW], outLocal, OW);
+
+            inQueue.FreeTensor(tmp0);
+            inQueue.FreeTensor(tmp1);
+            outQueue.FreeTensor(outLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM_IN> inQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM_OUT> outQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_X> tmpGm; // workspace
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+
+    uint32_t N, C, H, W, OH, OW;
+    uint32_t tileNum;
+    uint64_t rowsIn;
+    uint64_t rowsOut;
+};
+
+extern "C" __global__ __aicore__ void bilinear_upsample_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    // Note: interface keeps (x, [unused], z). 'y' is not used for this 1-input op.
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelBilinearUpsample op;
+    op.Init(x, z, workspace, tiling_data.N, tiling_data.C, tiling_data.H, tiling_data.W, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor bilinear_upsample_custom_impl_npu(const at::Tensor& self) {
+    auto sizes = self.sizes();
+    TORCH_CHECK(sizes.size() == 4, "Input must be NCHW");
+    // Output allocated by kernel
+    at::Tensor result = at::empty({sizes[0], sizes[1], sizes[2] * 2, sizes[3] * 2}, self.options());
+    EXEC_NPU_CMD(aclnnBilinearUpsampleCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("bilinear_upsample_custom", &bilinear_upsample_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bilinear_upsample_custom", &bilinear_upsample_custom_impl_npu, "bilinear upsample x2 (align_corners=False, bilinear)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def forward(self, x):
+        return custom_ops_lib.bilinear_upsample_custom(x)
+'''

@@ -1,0 +1,305 @@
+project_json_src='''
+[
+    {
+        "op": "SumReductionOverADimensionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(SumReductionOverADimensionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, size);   // tmp buffer size (UB) reserved by framework
+  TILING_DATA_FIELD_DEF(uint32_t, outter); // rows
+  TILING_DATA_FIELD_DEF(uint32_t, inner);  // padded inner length (elements)
+  TILING_DATA_FIELD_DEF(uint32_t, n);      // actual inner length (elements)
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(SumReductionOverADimensionCustom, SumReductionOverADimensionCustomTilingData)
+}
+"""
+host_operator_src="""
+#include "sum_reduction_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    SumReductionOverADimensionCustomTilingData tiling;
+
+    // Read attributes passed from Python binding (outter and n for 2D input [outter, n])
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    uint32_t outter = *(attrs->GetAttrPointer<uint32_t>(0)); // "outter"
+    uint32_t n = *(attrs->GetAttrPointer<uint32_t>(1));      // "n"
+
+    // Determine dtype size
+    auto dt = context->GetInputTensor(0)->GetDataType();
+    uint32_t dtypesize = (dt == ge::DT_FLOAT16) ? 2 : 4;
+
+    // Compute padded inner according to Sum API requirement: inner*sizeof(T) is 32B-aligned
+    uint32_t inner = ((n * dtypesize + 32 - 1) / 32) * (32 / dtypesize);
+
+    // Query min tmp buffer via Sum tiling API
+    uint32_t maxValue = 0;
+    uint32_t minValue = 0;
+    AscendC::GetSumMaxMinTmpSize(n, dtypesize, false, maxValue, minValue);
+
+    tiling.set_outter(outter);
+    tiling.set_inner(inner);
+    tiling.set_n(n);
+    tiling.set_size(minValue);
+
+    // Block dim config
+    context->SetBlockDim(8);
+
+    // Save tiling
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // No workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    // Keep output shape same as input for simplicity; Python side will reshape/select first column.
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class SumReductionOverADimensionCustom : public OpDef
+{
+public:
+    explicit SumReductionOverADimensionCustom(const char *name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // Attributes passed from Python for tiling (for 2D input [outter, n])
+        this->Attr("outter").AttrType(REQUIRED).Int(0);
+        this->Attr("n").AttrType(REQUIRED).Int(0);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(SumReductionOverADimensionCustom);
+}
+"""
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "sum_reduction_over_a_dimension_custom_tiling_data.h"
+
+template <typename T>
+class KernelSumReductionOverADimension {
+public:
+    __aicore__ inline KernelSumReductionOverADimension() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t tmpSize, uint32_t outter, uint32_t inner, uint32_t n)
+    {
+        height = outter;
+        width = inner;
+        nNum = n;
+
+        srcGlobal.SetGlobalBuffer((__gm__ T *)x);
+        dstGlobal.SetGlobalBuffer((__gm__ T *)y);
+
+        // Initialize UB queues. Copy entire [outter x inner] once as in official example.
+        pipe.InitBuffer(inQueueSrc, 1, height * width * sizeof(T));
+        // Output buffer: align to ONE_BLK_SIZE by height elements
+        uint32_t outAlignElems = (height * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(T);
+        pipe.InitBuffer(outQueueDst, 1, outAlignElems * sizeof(T));
+        // Tmp buffer reserved for Sum internal computation
+        pipe.InitBuffer(workQueue, 1, tmpSize);
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<T> srcLocal = inQueueSrc.AllocTensor<T>();
+        AscendC::DataCopy(srcLocal, srcGlobal, height * width);
+        inQueueSrc.EnQue(srcLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<T> srcLocal = inQueueSrc.DeQue<T>();
+        AscendC::LocalTensor<uint8_t> workLocal = workQueue.AllocTensor<uint8_t>();
+        AscendC::LocalTensor<T> dstLocal = outQueueDst.AllocTensor<T>();
+
+        AscendC::SumParams params{height, width, nNum};
+
+        // Zero init dst buffer for aligned region
+        uint32_t outAlignElems = (height * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(T);
+        T zeroVal(0);
+        AscendC::Duplicate<T>(dstLocal, zeroVal, outAlignElems);
+
+        // Call Sum API (reduce along last axis), framework-managed tmp buffer reserved via tiling
+        AscendC::Sum(dstLocal, srcLocal, params);
+
+        outQueueDst.EnQue<T>(dstLocal);
+        workQueue.FreeTensor(workLocal);
+        inQueueSrc.FreeTensor(srcLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<T> dstLocal = outQueueDst.DeQue<T>();
+        uint32_t outAlignElems = (height * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(T);
+        AscendC::DataCopy(dstGlobal, dstLocal, outAlignElems);
+        outQueueDst.FreeTensor(dstLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueSrc;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> workQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueDst;
+    AscendC::GlobalTensor<T> srcGlobal, dstGlobal;
+
+    uint32_t width = 0;   // inner (padded)
+    uint32_t height = 0;  // outter
+    uint32_t nNum = 0;    // actual inner
+};
+
+extern "C" __global__ __aicore__ void sum_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+#ifdef DTYPE_X
+    using TypeT = DTYPE_X;
+#else
+    using TypeT = float;
+#endif
+    KernelSumReductionOverADimension<TypeT> op;
+    op.Init(x, y, tiling_data.size, tiling_data.outter, tiling_data.inner, tiling_data.n);
+    op.Process();
+}
+"""
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor sum_reduction_over_a_dimension_custom_impl_npu(const at::Tensor& self) {
+    // self is 2D: [outter, n], reduce along last dim
+    TORCH_CHECK(self.dim() == 2, "sum_reduction_over_a_dimension_custom expects 2D input");
+    uint32_t outter = static_cast<uint32_t>(self.size(0));
+    uint32_t n = static_cast<uint32_t>(self.size(1));
+    // Output kept same shape as input in kernel; we will take first column later in Python model
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnSumReductionOverADimensionCustom, self, outter, n, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("sum_reduction_over_a_dimension_custom", &sum_reduction_over_a_dimension_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("sum_reduction_over_a_dimension_custom", &sum_reduction_over_a_dimension_custom_impl_npu, "Sum reduction over last dimension (2D)");
+}
+"""
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model: reduce over arbitrary dim by
+    1) permuting target dim to last,
+    2) reshaping to 2D [outter, n],
+    3) calling custom AscendC Sum (reduces last axis),
+    4) reshaping back with keepdim=True.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d = self.dim
+        ndim = x.dim()
+        if d < 0:
+            d += ndim
+        # Move reduce dim to last
+        perm = [i for i in range(ndim) if i != d] + [d]
+        x_perm = x.permute(perm).contiguous()
+        n = x_perm.size(-1)
+        others_shape = [x_perm.size(i) for i in range(x_perm.dim() - 1)]
+        outter = 1
+        for s in others_shape:
+            outter *= s
+        # Flatten to 2D
+        x_2d = x_perm.reshape(outter, n)
+        # Call custom op: returns same shape as input; take first column as reduced result
+        y_2d_full = custom_ops_lib.sum_reduction_over_a_dimension_custom(x_2d)
+        y_2d = y_2d_full[:, :1]  # keepdim=True -> [outter, 1]
+        # Restore shape and permute back
+        y_perm = y_2d.reshape(*others_shape, 1)
+        inv_perm = [0] * ndim
+        for i, p in enumerate(perm):
+            inv_perm[p] = i
+        y = y_perm.permute(inv_perm).contiguous()
+        return y
+'''

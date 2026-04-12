@@ -1,0 +1,380 @@
+project_json_src='''
+[
+    {
+        "op": "VisionAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "gx",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "beta",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "gamma",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(VisionAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(DeepNormTiling, tiling);
+  TILING_DATA_FIELD_DEF(float, alpha);
+  TILING_DATA_FIELD_DEF(float, epsilon);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(VisionAttentionCustom, VisionAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "vision_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    VisionAttentionCustomTilingData tilingData;
+
+    const gert::StorageShape *x_shape = context->GetInputShape(0);
+    // Expect ND shape [B, S, H]
+    uint32_t B = x_shape->GetStorageShape().GetDim(0);
+    uint32_t S = x_shape->GetStorageShape().GetDim(1);
+    uint32_t H = x_shape->GetStorageShape().GetDim(2);
+
+    DeepNormTiling dtiling;
+    dtiling.bLength = B;
+    dtiling.sLength = S;
+    dtiling.hLength = H;
+
+    tilingData.set_tiling(dtiling);
+    tilingData.set_alpha(1.0f);          // residual alpha = 1.0
+    tilingData.set_epsilon(1e-5f);       // typical LayerNorm epsilon
+
+    context->SetBlockDim(1);
+    tilingData.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                            context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tilingData.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class VisionAttentionCustom : public OpDef {
+public:
+    explicit VisionAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("gx")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("beta")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("gamma")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(VisionAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "vision_attention_custom_tiling_data.h"
+
+namespace MyKernel {
+template <typename T>
+class KernelVisionAttention {
+public:
+    __aicore__ inline KernelVisionAttention() {}
+
+    __aicore__ inline void Init(GM_ADDR xGm, GM_ADDR gxGm, GM_ADDR betaGm, GM_ADDR gammaGm,
+                                GM_ADDR yGm, const optiling::VisionAttentionCustomTilingData &t)
+    {
+        tiling_ = t.tiling();
+        alpha_ = t.alpha();
+        epsilon_ = t.epsilon();
+
+        bLength_ = tiling_.bLength;
+        sLength_ = tiling_.sLength;
+        hLength_ = tiling_.hLength;
+        bshLength_ = bLength_ * sLength_ * hLength_;
+        bsLength_ = bLength_ * sLength_;
+
+        xGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(xGm), bshLength_);
+        gxGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(gxGm), bshLength_);
+        betaGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(betaGm), hLength_);
+        gammaGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(gammaGm), hLength_);
+        yGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(yGm), bshLength_);
+
+        pipe_.InitBuffer(inQueueX_, 1, sizeof(T) * bshLength_);
+        pipe_.InitBuffer(inQueueGx_, 1, sizeof(T) * bshLength_);
+        pipe_.InitBuffer(inQueueBeta_, 1, sizeof(T) * hLength_);
+        pipe_.InitBuffer(inQueueGamma_, 1, sizeof(T) * hLength_);
+        pipe_.InitBuffer(outQueueY_, 1, sizeof(T) * bshLength_);
+        pipe_.InitBuffer(outMeanQueue_, 1, sizeof(T) * bsLength_);
+        pipe_.InitBuffer(outRstdQueue_, 1, sizeof(T) * bsLength_);
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<T> xLocal = inQueueX_.AllocTensor<T>();
+        AscendC::LocalTensor<T> gxLocal = inQueueGx_.AllocTensor<T>();
+        AscendC::LocalTensor<T> betaLocal = inQueueBeta_.AllocTensor<T>();
+        AscendC::LocalTensor<T> gammaLocal = inQueueGamma_.AllocTensor<T>();
+
+        AscendC::DataCopy(xLocal, xGlobal_, bshLength_);
+        AscendC::DataCopy(gxLocal, gxGlobal_, bshLength_);
+        AscendC::DataCopy(betaLocal, betaGlobal_, hLength_);
+        AscendC::DataCopy(gammaLocal, gammaGlobal_, hLength_);
+
+        inQueueX_.EnQue(xLocal);
+        inQueueGx_.EnQue(gxLocal);
+        inQueueBeta_.EnQue(betaLocal);
+        inQueueGamma_.EnQue(gammaLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<T> xLocal = inQueueX_.DeQue<T>();
+        AscendC::LocalTensor<T> gxLocal = inQueueGx_.DeQue<T>();
+        AscendC::LocalTensor<T> betaLocal = inQueueBeta_.DeQue<T>();
+        AscendC::LocalTensor<T> gammaLocal = inQueueGamma_.DeQue<T>();
+
+        AscendC::LocalTensor<T> yLocal = outQueueY_.AllocTensor<T>();
+        AscendC::LocalTensor<T> meanLocal = outMeanQueue_.AllocTensor<T>();
+        AscendC::LocalTensor<T> rstdLocal = outRstdQueue_.AllocTensor<T>();
+
+        // Use DeepNorm: y = LayerNorm(alpha * x + gx)
+        AscendC::DeepNorm<T, false, false>(yLocal,
+                                           meanLocal,
+                                           rstdLocal,
+                                           xLocal,
+                                           gxLocal,
+                                           betaLocal,
+                                           gammaLocal,
+                                           static_cast<T>(alpha_),
+                                           static_cast<T>(epsilon_),
+                                           tiling_);
+
+        // enqueue outputs
+        outQueueY_.EnQue(yLocal);
+        outMeanQueue_.EnQue(meanLocal);
+        outRstdQueue_.EnQue(rstdLocal);
+
+        inQueueX_.FreeTensor(xLocal);
+        inQueueGx_.FreeTensor(gxLocal);
+        inQueueBeta_.FreeTensor(betaLocal);
+        inQueueGamma_.FreeTensor(gammaLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<T> yLocal = outQueueY_.DeQue<T>();
+        AscendC::LocalTensor<T> meanLocal = outMeanQueue_.DeQue<T>();
+        AscendC::LocalTensor<T> rstdLocal = outRstdQueue_.DeQue<T>();
+
+        AscendC::DataCopy(yGlobal_, yLocal, bshLength_);
+
+        outQueueY_.FreeTensor(yLocal);
+        outMeanQueue_.FreeTensor(meanLocal);
+        outRstdQueue_.FreeTensor(rstdLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX_;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueGx_;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueBeta_;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueGamma_;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY_;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outMeanQueue_;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outRstdQueue_;
+
+    AscendC::GlobalTensor<T> xGlobal_;
+    AscendC::GlobalTensor<T> gxGlobal_;
+    AscendC::GlobalTensor<T> betaGlobal_;
+    AscendC::GlobalTensor<T> gammaGlobal_;
+    AscendC::GlobalTensor<T> yGlobal_;
+
+    uint32_t bLength_;
+    uint32_t sLength_;
+    uint32_t hLength_;
+    uint32_t bshLength_;
+    uint32_t bsLength_;
+    DeepNormTiling tiling_;
+    float alpha_;
+    float epsilon_;
+};
+}
+
+extern "C" __global__ __aicore__ void vision_attention_custom(GM_ADDR x, GM_ADDR gx, GM_ADDR beta,
+                                                              GM_ADDR gamma, GM_ADDR y,
+                                                              GM_ADDR workspace, GM_ADDR tiling)
+{
+    if ASCEND_IS_AIC {
+        return;
+    }
+    optiling::VisionAttentionCustomTilingData tilingData;
+    CopyTiling(&tilingData, tiling);
+
+    MyKernel::KernelVisionAttention<float> op;
+    op.Init(x, gx, beta, gamma, y, tilingData);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor vision_attention_custom_impl_npu(const at::Tensor& x,
+                                            const at::Tensor& gx,
+                                            const at::Tensor& beta,
+                                            const at::Tensor& gamma) {
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnVisionAttentionCustom, x, gx, beta, gamma, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("vision_attention_custom", &vision_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("vision_attention_custom", &vision_attention_custom_impl_npu, "Residual+LayerNorm via DeepNorm");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.attn = torch.nn.MultiheadAttention(embed_dim, num_heads)
+        self.norm = torch.nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        B, C, H, W = x.shape
+        # Prepare sequence for MHA: [S, B, C]
+        x_seq = x.view(B, C, H * W).permute(2, 0, 1).contiguous()
+        attn_output, _ = self.attn(x_seq, x_seq, x_seq)  # [S, B, C]
+        # Convert to [B, S, C] for custom kernel
+        x_bsc = x_seq.permute(1, 0, 2).contiguous()
+        gx_bsc = attn_output.permute(1, 0, 2).contiguous()
+        # Fused residual (+) and LayerNorm using AscendC DeepNorm: y = LN(x + gx)
+        y_bsc = custom_ops_lib.vision_attention_custom(x_bsc, gx_bsc, self.norm.bias, self.norm.weight)
+        # Back to image layout
+        y_seq = y_bsc.permute(1, 0, 2).contiguous()        # [S, B, C]
+        y = y_seq.permute(1, 2, 0).contiguous().view(B, C, H, W)
+        return y
+'''

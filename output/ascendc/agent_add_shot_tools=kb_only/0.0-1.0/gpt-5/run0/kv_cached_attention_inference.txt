@@ -15,7 +15,7 @@ project_json_src='''
                 ]
             },
             {
-                "name": "k_cache",
+                "name": "k",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -25,7 +25,7 @@ project_json_src='''
                 ]
             },
             {
-                "name": "v_cache",
+                "name": "v",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -53,87 +53,83 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
-
 BEGIN_TILING_DATA_DEF(KvCachedAttentionInferenceCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, batch);
-  TILING_DATA_FIELD_DEF(uint32_t, q_len);
-  TILING_DATA_FIELD_DEF(uint32_t, kv_len);
-  TILING_DATA_FIELD_DEF(uint32_t, d_model);
-  TILING_DATA_FIELD_DEF_STRUCT(SoftMaxTiling, softmaxTilingData);
+  TILING_DATA_FIELD_DEF(uint32_t, qLen);
+  TILING_DATA_FIELD_DEF(uint32_t, kvLen);
+  TILING_DATA_FIELD_DEF(uint32_t, dModel);
+  TILING_DATA_FIELD_DEF(uint32_t, tileD);
+  TILING_DATA_FIELD_DEF(float, scale);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(KvCachedAttentionInferenceCustom, KvCachedAttentionInferenceCustomTilingData)
-
-} // namespace optiling
+}
 """
 
 host_operator_src="""
 #include "kv_cached_attention_inference_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
+#include <cmath>
 
 namespace optiling {
+static const uint32_t BLOCK_DIM = 1; // 需要全局softmax，单block执行以简化实现
+static const uint32_t DEFAULT_TILE_D = 256; // 沿d_model分块
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     KvCachedAttentionInferenceCustomTilingData tiling;
 
-    // 输入形状：Q:[B, q_len, D], K:[B, kv_len, D], V:[B, kv_len, D]
-    const gert::StorageShape* q_shape = context->GetInputShape(0);
-    const gert::StorageShape* k_shape = context->GetInputShape(1);
+    // 输入0: q [B, Q, D]
+    const gert::Shape* qShape = context->GetInputShape(0);
+    const gert::Shape* kShape = context->GetInputShape(1);
+    if (qShape == nullptr || kShape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
 
-    uint32_t batch  = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(0));
-    uint32_t q_len  = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(1));
-    uint32_t d_model= static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(2));
-    uint32_t kv_len = static_cast<uint32_t>(k_shape->GetOriginShape().GetDim(1));
+    uint32_t b = static_cast<uint32_t>(qShape->GetOriginShape().GetDim(0));
+    uint32_t qLen = static_cast<uint32_t>(qShape->GetOriginShape().GetDim(1));
+    uint32_t dModel = static_cast<uint32_t>(qShape->GetOriginShape().GetDim(2));
+    uint32_t kvLen = static_cast<uint32_t>(kShape->GetOriginShape().GetDim(1));
 
-    tiling.set_batch(batch);
-    tiling.set_q_len(q_len);
-    tiling.set_kv_len(kv_len);
-    tiling.set_d_model(d_model);
+    // 简化：面向推理KV缓存场景，推荐B=1, Q=1。此处仍保留通用字段
+    context->SetBlockDim(BLOCK_DIM);
 
-    // SoftMax over last axis N=kv_len, with M = B * q_len
-    std::vector<int64_t> shapeVec = {static_cast<int64_t>(batch * q_len), static_cast<int64_t>(kv_len)};
-    ge::Shape srcShape(shapeVec);
+    float scale = 1.0f / std::sqrt(static_cast<float>(dModel));
 
-    // 参考文档：使用最小临时空间确保功能正确
-    const uint32_t localWorkSpaceSize = AscendC::GetSoftMaxMinTmpSize(srcShape, sizeof(float), false);
-    AscendC::SoftMaxTilingFunc(srcShape, sizeof(float), localWorkSpaceSize, tiling.softmaxTilingData);
+    tiling.set_batch(b);
+    tiling.set_qLen(qLen);
+    tiling.set_kvLen(kvLen);
+    tiling.set_dModel(dModel);
+    tiling.set_tileD(DEFAULT_TILE_D);
+    tiling.set_scale(scale);
 
-    context->SetBlockDim(1);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-    context->SetTilingKey(1);
 
-    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0; // 本示例不申请workspace
     return ge::GRAPH_SUCCESS;
 }
-
-} // namespace optiling
-
+}
 
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 输出形状与 Q 一致：[B, q_len, D]
-    const gert::Shape* q_shape = context->GetInputShape(0);
-    gert::Shape* out_shape = context->GetOutputShape(0);
-    *out_shape = *q_shape;
+    // out shape = q shape
+    const gert::Shape* qShape = context->GetInputShape(0);
+    gert::Shape* outShape = context->GetOutputShape(0);
+    *outShape = *qShape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const auto dt = context->GetInputDataType(0);
-    context->SetOutputDataType(0, dt);
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
-} // namespace ge
-
+}
 
 namespace ops {
 class KvCachedAttentionInferenceCustom : public OpDef {
@@ -145,19 +141,16 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Input("k_cache")
+        this->Input("k")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Input("v_cache")
+        this->Input("v")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("out")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -172,106 +165,196 @@ public:
 };
 
 OP_ADD(KvCachedAttentionInferenceCustom);
-} // namespace ops
+}
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "kv_cached_attention_inference_custom_tiling_data.h"
 
-// 本核实现对输入logits进行SoftMax（沿最后一维kv_len），用于KV缓存推理中的注意力权重计算。
-// 注意：为方便工程集成，本核的GM参数名沿用(q, k_cache, v_cache)，但仅使用q作为logits输入。
+// 注意：该核面向B=1, Q=1的自回归推理KV缓存常见场景，数据类型float。
+// 实现思路：
+// 1) 将q拷入UB；按行逐行扫描k，基于分块(tileD)做分段点积累加，得到scores[kvLen]；
+// 2) 对scores执行scaled + softmax（两次遍历做max与sum）；
+// 3) 按d_model分块(tileD)，遍历kv行，累加prob[i] * v[i, d:d+tileD]，得到输出out[1,1,d_model]；
+// 该实现强调可读性，便于验证功能正确性。实际优化可考虑更细致的向量化与并行化。
 
-class KernelKvCachedAttentionInfer {
+constexpr int32_t Q_BUF_NUM = 1;
+constexpr int32_t SCRATCH_BUF_NUM = 1;
+
+class KernelKvCachedAttention {
 public:
-    __aicore__ inline KernelKvCachedAttentionInfer() {}
-
-    __aicore__ inline void Init(GM_ADDR logits, GM_ADDR dummy_k, GM_ADDR out_probs,
-                                uint32_t batch, uint32_t q_len, uint32_t kv_len, uint32_t d_model,
-                                const SoftMaxTiling &softmaxTilingData)
+    __aicore__ inline KernelKvCachedAttention() {}
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out,
+                                uint32_t batch, uint32_t qLen, uint32_t kvLen,
+                                uint32_t dModel, uint32_t tileD, float scale)
     {
-        (void)dummy_k; // 未使用
+        // 简化：仅实现batch=1, qLen=1
         this->batch = batch;
-        this->q_len = q_len;
-        this->kv_len = kv_len;
-        this->d_model = d_model;
-        this->height = batch * q_len;
-        this->width = kv_len;
-        this->tiling = softmaxTilingData;
+        this->qLen = qLen;
+        this->kvLen = kvLen;
+        this->dModel = dModel;
+        this->tileD = tileD;
+        this->scale = scale;
 
-        srcGlobal.SetGlobalBuffer((__gm__ float*)logits);
-        dstGlobal.SetGlobalBuffer((__gm__ float*)out_probs);
+        qGm.SetGlobalBuffer((__gm__ float*)q, batch * qLen * dModel);
+        kGm.SetGlobalBuffer((__gm__ float*)k, batch * kvLen * dModel);
+        vGm.SetGlobalBuffer((__gm__ float*)v, batch * kvLen * dModel);
+        outGm.SetGlobalBuffer((__gm__ float*)out, batch * qLen * dModel);
 
-        // 缓冲区：一次性处理 [height, width]
-        pipe.InitBuffer(inQueueSrc, 1, height * width * sizeof(float));
-        pipe.InitBuffer(outQueueDst, 1, height * width * sizeof(float));
-        // SoftMax临时空间（参考最小空间，按kv_len尺度分配）
-        pipe.InitBuffer(tmpBuf, width * sizeof(float) * 4); // 参考文档：最小临时空间可保证功能正确
+        // UB分配
+        // qLocal: dModel
+        pipe.InitBuffer(qQueue, Q_BUF_NUM, dModel * sizeof(float));
+        // scores / probs: kvLen
+        pipe.InitBuffer(scoresQueue, 1, kvLen * sizeof(float));
+        pipe.InitBuffer(probsQueue, 1, kvLen * sizeof(float));
+        // scratch块：tileD
+        pipe.InitBuffer(kTileQueue, SCRATCH_BUF_NUM, tileD * sizeof(float));
+        pipe.InitBuffer(vTileQueue, SCRATCH_BUF_NUM, tileD * sizeof(float));
+        pipe.InitBuffer(outTileQueue, SCRATCH_BUF_NUM, tileD * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        CopyIn();
-        Compute();
+        // 假设batch=1, qLen=1
+        CopyInQ();
+        ComputeScores();
+        SoftmaxScores();
+        WeightedSumV();
         CopyOut();
     }
 
 private:
-    __aicore__ inline void CopyIn()
+    __aicore__ inline void CopyInQ()
     {
-        AscendC::LocalTensor<float> srcLocal = inQueueSrc.AllocTensor<float>();
-        AscendC::DataCopy(srcLocal, srcGlobal, height * width);
-        inQueueSrc.EnQue(srcLocal);
+        // 将q拷入UB
+        qLocal = qQueue.AllocTensor<float>();
+        AscendC::DataCopy(qLocal, qGm, dModel);
+        qQueue.EnQue(qLocal);
     }
 
-    __aicore__ inline void Compute()
+    __aicore__ inline void ComputeScores()
     {
-        AscendC::LocalTensor<float> srcLocal = inQueueSrc.DeQue<float>();
-        AscendC::LocalTensor<float> dstLocal = outQueueDst.AllocTensor<float>();
-        AscendC::LocalTensor<uint8_t> tmpLocal = tmpBuf.Get<uint8_t>();
+        AscendC::LocalTensor<float> qVec = qQueue.DeQue<float>();
 
-        AscendC::SoftMaxShapeInfo shapeInfo = { height, width, height, width };
-        // 使用SoftMax高阶API（参考5.3.1.9 SoftMax/SimpleSoftMax Tiling）
-        AscendC::SoftMax<float>(dstLocal, srcLocal, tmpLocal, tiling, shapeInfo);
+        // scores缓冲
+        scoresLocal = scoresQueue.AllocTensor<float>();
+        // 逐行计算点积
+        for (uint32_t i = 0; i < kvLen; ++i) {
+            float acc = 0.0f;
+            // 按tileD分段
+            for (uint32_t d0 = 0; d0 < dModel; d0 += tileD) {
+                uint32_t cur = AscendC::Min(tileD, dModel - d0);
+                AscendC::LocalTensor<float> kTile = kTileQueue.AllocTensor<float>();
+                // 从K中取出一行的分段
+                AscendC::DataCopy(kTile, kGm[i * dModel + d0], cur);
+                // 对tile做标量MAC（为简洁，这里用标量循环）
+                for (uint32_t t = 0; t < cur; ++t) {
+                    acc += qVec[d0 + t] * kTile[t];
+                }
+                kTileQueue.FreeTensor(kTile);
+            }
+            // 记录scaled分数
+            scoresLocal[i] = acc * scale;
+        }
+        scoresQueue.EnQue(scoresLocal);
+        qQueue.FreeTensor(qVec);
+    }
 
-        outQueueDst.EnQue<float>(dstLocal);
-        inQueueSrc.FreeTensor(srcLocal);
+    __aicore__ inline void SoftmaxScores()
+    {
+        AscendC::LocalTensor<float> scores = scoresQueue.DeQue<float>();
+        probsLocal = probsQueue.AllocTensor<float>();
+
+        // 先求max
+        float maxVal = -3.4e38f;
+        for (uint32_t i = 0; i < kvLen; ++i) {
+            float v = scores[i];
+            maxVal = v > maxVal ? v : maxVal;
+        }
+        // 计算exp并累积sum
+        float sumVal = 0.0f;
+        for (uint32_t i = 0; i < kvLen; ++i) {
+            float e = AscendC::Exp(scores[i] - maxVal);
+            probsLocal[i] = e;
+            sumVal += e;
+        }
+        // 归一化
+        float invSum = 1.0f / sumVal;
+        for (uint32_t i = 0; i < kvLen; ++i) {
+            probsLocal[i] = probsLocal[i] * invSum;
+        }
+
+        probsQueue.EnQue(probsLocal);
+        scoresQueue.FreeTensor(scores);
+    }
+
+    __aicore__ inline void WeightedSumV()
+    {
+        AscendC::LocalTensor<float> probs = probsQueue.DeQue<float>();
+        // 输出按d_model分块累加
+        for (uint32_t d0 = 0; d0 < dModel; d0 += tileD) {
+            uint32_t cur = AscendC::Min(tileD, dModel - d0);
+            AscendC::LocalTensor<float> outTile = outTileQueue.AllocTensor<float>();
+            // outTile清零
+            for (uint32_t t = 0; t < cur; ++t) { outTile[t] = 0.0f; }
+
+            for (uint32_t i = 0; i < kvLen; ++i) {
+                AscendC::LocalTensor<float> vTile = vTileQueue.AllocTensor<float>();
+                AscendC::DataCopy(vTile, vGm[i * dModel + d0], cur);
+                float p = probs[i];
+                for (uint32_t t = 0; t < cur; ++t) {
+                    outTile[t] += p * vTile[t];
+                }
+                vTileQueue.FreeTensor(vTile);
+            }
+            // 回写到outGm
+            AscendC::DataCopy(outGm[d0], outTile, cur);
+            outTileQueue.FreeTensor(outTile);
+        }
+
+        probsQueue.FreeTensor(probs);
     }
 
     __aicore__ inline void CopyOut()
     {
-        AscendC::LocalTensor<float> dstLocal = outQueueDst.DeQue<float>();
-        AscendC::DataCopy(dstGlobal, dstLocal, height * width);
-        outQueueDst.FreeTensor(dstLocal);
+        // 已在WeightedSumV内按块写回
+        return;
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueSrc;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueDst;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> tmpBuf;
 
-    AscendC::GlobalTensor<float> srcGlobal;
-    AscendC::GlobalTensor<float> dstGlobal;
+    AscendC::TQue<AscendC::TPosition::VECIN, Q_BUF_NUM> qQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> scoresQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> probsQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, SCRATCH_BUF_NUM> kTileQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, SCRATCH_BUF_NUM> vTileQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, SCRATCH_BUF_NUM> outTileQueue;
+
+    AscendC::GlobalTensor<float> qGm, kGm, vGm, outGm;
+
+    AscendC::LocalTensor<float> qLocal;
+    AscendC::LocalTensor<float> scoresLocal;
+    AscendC::LocalTensor<float> probsLocal;
 
     uint32_t batch;
-    uint32_t q_len;
-    uint32_t kv_len;
-    uint32_t d_model;
-    uint32_t height;
-    uint32_t width;
-    SoftMaxTiling tiling;
+    uint32_t qLen;
+    uint32_t kvLen;
+    uint32_t dModel;
+    uint32_t tileD;
+    float scale;
 };
 
-extern "C" __global__ __aicore__ void kv_cached_attention_inference_custom(GM_ADDR q, GM_ADDR k_cache, GM_ADDR v_cache, GM_ADDR workspace, GM_ADDR tiling)
-{
-    (void)workspace;
-    GET_TILING_DATA(tilingData, tiling);
-    KernelKvCachedAttentionInfer op;
-    op.Init(q, k_cache, v_cache,
-            tilingData.batch, tilingData.q_len, tilingData.kv_len, tilingData.d_model,
-            tilingData.softmaxTilingData);
+extern "C" __global__ __aicore__ void kv_cached_attention_inference_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelKvCachedAttention op;
+    op.Init(q, k, v, out,
+            tiling_data.batch(),
+            tiling_data.qLen(),
+            tiling_data.kvLen(),
+            tiling_data.dModel(),
+            tiling_data.tileD(),
+            tiling_data.scale());
     op.Process();
 }
 """
@@ -279,39 +362,31 @@ extern "C" __global__ __aicore__ void kv_cached_attention_inference_custom(GM_AD
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
-#include "pytorch_npu_helper.hpp"
+#include \"pytorch_npu_helper.hpp\"
 #include <torch/extension.h>
-#include <cmath>
 
-at::Tensor kv_cached_attention_inference_custom_impl_npu(const at::Tensor& Q,
-                                                         const at::Tensor& K_cache,
-                                                         const at::Tensor& V_cache) {
-    // 计算注意力logits: [B, q_len, kv_len]
-    auto d_model = Q.size(-1);
-    at::Tensor Kt = K_cache.transpose(-2, -1); // [B, D, kv_len]
-    at::Tensor logits = at::matmul(Q, Kt) / std::sqrt(static_cast<double>(d_model));
-
-    // 调用自定义核进行SoftMax（沿最后一维kv_len）
-    at::Tensor probs = at::empty_like(logits);
-    // 说明：为匹配算子签名(3输入1输出)，这里将V_cache作为第三个输入传入，但内核仅使用第一个输入(logits)
-    EXEC_NPU_CMD(aclnnKvCachedAttentionInferenceCustom, logits, K_cache, probs);
-
-    // 输出：attn @ V_cache -> [B, q_len, D]
-    at::Tensor out = at::matmul(probs, V_cache);
+at::Tensor kv_cached_attention_inference_custom_impl_npu(const at::Tensor& q,
+                                                         const at::Tensor& k,
+                                                         const at::Tensor& v) {
+    // 要求float32，ND，连续
+    auto q_c = q.contiguous();
+    auto k_c = k.contiguous();
+    auto v_c = v.contiguous();
+    at::Tensor out = at::empty_like(q_c);
+    EXEC_NPU_CMD(aclnnKvCachedAttentionInferenceCustom, q_c, k_c, v_c, out);
     return out;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("kv_cached_attention_inference_custom", &kv_cached_attention_inference_custom_impl_npu);
+    m.impl(\"kv_cached_attention_inference_custom\", &kv_cached_attention_inference_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("kv_cached_attention_inference_custom", &kv_cached_attention_inference_custom_impl_npu, "KV Cached Attention Inference (SoftMax fused)");
+    m.def(\"kv_cached_attention_inference_custom\", &kv_cached_attention_inference_custom_impl_npu, \"SDPA with KV cache (B=1,Q=1)\");
 }
 """
 
 model_src='''
-import math
 import torch
 import torch_npu
 import custom_ops_lib

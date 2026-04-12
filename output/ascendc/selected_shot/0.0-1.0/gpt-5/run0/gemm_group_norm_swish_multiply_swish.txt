@@ -1,0 +1,344 @@
+project_json_src='''
+[
+    {
+        "op": "GemmGroupNormSwishMultiplySwishCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "gamma",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "beta",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "mw",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "groups",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["int32"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmGroupNormSwishMultiplySwishCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, groups);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmGroupNormSwishMultiplySwishCustom, GemmGroupNormSwishMultiplySwishCustomTilingData)
+}
+"""
+host_operator_src="""
+#include "gemm_group_norm_swish_multiply_swish_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GemmGroupNormSwishMultiplySwishCustomTilingData tiling;
+
+    uint32_t n = 1;
+    uint32_t c = 1;
+    const auto *shape0 = context->GetInputShape(0);
+    if (shape0 != nullptr && shape0->GetOriginShape().GetDimNum() >= 2) {
+        n = static_cast<uint32_t>(shape0->GetOriginShape().GetDim(0));
+        c = static_cast<uint32_t>(shape0->GetOriginShape().GetDim(1));
+    } else {
+        uint64_t sz = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+        n = 1;
+        c = static_cast<uint32_t>(sz);
+    }
+
+    // Read groups from the 5th input's shape size if available (expect a scalar tensor)
+    uint32_t groups = 1;
+    const auto *groupsShape = context->GetInputShape(4);
+    if (groupsShape != nullptr) {
+        auto sz = groupsShape->GetOriginShape().GetShapeSize();
+        (void)sz; // not used here; kernel will load actual value from GM
+        // Use a placeholder; kernel will read actual groups integer from the tensor
+        groups = 1;
+    }
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_groups(groups);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GemmGroupNormSwishMultiplySwishCustom : public OpDef {
+public:
+    explicit GemmGroupNormSwishMultiplySwishCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("gamma")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("beta")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("mw")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("groups")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmGroupNormSwishMultiplySwishCustom);
+}
+"""
+kernel_src="""
+#include "kernel_operator.h"
+#include <cmath>
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelGNSwishMulSwish {
+public:
+    __aicore__ inline KernelGNSwishMulSwish() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR mw, GM_ADDR groups,
+                                GM_ADDR y, uint32_t n, uint32_t c, uint32_t tileNum)
+    {
+        this->n = n;
+        this->c = c;
+        this->tileNum = tileNum;
+
+        xGm = (__gm__ float*)x;
+        gammaGm = (__gm__ float*)gamma;
+        betaGm = (__gm__ float*)beta;
+        mwGm = (__gm__ float*)mw;
+        groupsGm = (__gm__ int32_t*)groups;
+        yGm = (__gm__ float*)y;
+
+        // Partition by batch across blocks
+        uint32_t blocks = AscendC::GetBlockNum();
+        rowsPerBlock = (n + blocks - 1) / blocks; // ceil-div
+        startRow = AscendC::GetBlockIdx() * rowsPerBlock;
+        if (startRow + rowsPerBlock > n) {
+            rowsPerBlock = (n > startRow) ? (n - startRow) : 0;
+        }
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (rowsPerBlock == 0) {
+            return;
+        }
+        int32_t groups = 1;
+        // Read groups value from GM scalar
+        groups = groupsGm[0] <= 0 ? 1 : groupsGm[0];
+        uint32_t groupSize = c / (uint32_t)groups;
+        if (groupSize == 0) {
+            groupSize = c; // fallback no grouping
+            groups = 1;
+        }
+
+        for (uint32_t r = 0; r < rowsPerBlock; ++r) {
+            uint32_t globalRow = startRow + r;
+            if (globalRow >= n) break;
+
+            // For each group, compute mean/var then normalize and apply fused activations
+            for (int32_t g = 0; g < groups; ++g) {
+                uint32_t start = (uint32_t)g * groupSize;
+                uint32_t end = (g == groups - 1) ? c : (start + groupSize);
+                float sum = 0.f;
+                float sqsum = 0.f;
+
+                // compute mean/var
+                for (uint32_t idx = start; idx < end; ++idx) {
+                    float v = xGm[globalRow * c + idx];
+                    sum += v;
+                    sqsum += v * v;
+                }
+                uint32_t len = end - start;
+                float mean = sum / (float)len;
+                float var = sqsum / (float)len - mean * mean;
+                float invStd = 1.0f / sqrtf(var + 1e-5f);
+
+                // normalize + affine + swish + multiply + swish
+                for (uint32_t idx = start; idx < end; ++idx) {
+                    float v = xGm[globalRow * c + idx];
+                    float gVal = gammaGm[idx];
+                    float bVal = betaGm[idx];
+                    float mVal = mwGm[idx];
+
+                    float norm = (v - mean) * invStd;
+                    float affine = norm * gVal + bVal;
+
+                    float sig1 = 1.0f / (1.0f + expf(-affine));
+                    float sw1 = affine * sig1;
+
+                    float mul = sw1 * mVal;
+
+                    float sig2 = 1.0f / (1.0f + expf(-mul));
+                    float sw2 = mul * sig2;
+
+                    yGm[globalRow * c + idx] = sw2;
+                }
+            }
+        }
+    }
+
+private:
+    __gm__ float* xGm;
+    __gm__ float* gammaGm;
+    __gm__ float* betaGm;
+    __gm__ float* mwGm;
+    __gm__ int32_t* groupsGm;
+    __gm__ float* yGm;
+
+    uint32_t n;
+    uint32_t c;
+    uint32_t tileNum;
+
+    uint32_t rowsPerBlock;
+    uint32_t startRow;
+};
+
+extern "C" __global__ __aicore__ void gemm_group_norm_swish_multiply_swish_custom(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR mw, GM_ADDR groups, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGNSwishMulSwish op;
+    op.Init(x, gamma, beta, mw, groups, y,
+            tiling_data.n, tiling_data.c, tiling_data.tileNum);
+    op.Process();
+}
+"""
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gemm_group_norm_swish_multiply_swish_custom_impl_npu(const at::Tensor& x,
+                                                                const at::Tensor& gamma,
+                                                                const at::Tensor& beta,
+                                                                const at::Tensor& mw,
+                                                                const at::Tensor& groups) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnGemmGroupNormSwishMultiplySwishCustom, x, gamma, beta, mw, groups, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_group_norm_swish_multiply_swish_custom", &gemm_group_norm_swish_multiply_swish_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_group_norm_swish_multiply_swish_custom", &gemm_group_norm_swish_multiply_swish_custom_impl_npu, "Fused GroupNorm+Swish+Multiply+Swish");
+}
+"""
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model using custom AscendC kernel for GroupNorm + Swish + Multiply + Swish
+    after GEMM. GEMM (Linear) is kept as nn.Linear for weight management and matmul,
+    while the normalization and activations are fused in a single custom op.
+    """
+    def __init__(self, in_features, out_features, num_groups, multiply_weight_shape):
+        super(ModelNew, self).__init__()
+        self.gemm = torch.nn.Linear(in_features, out_features)
+        self.group_norm = torch.nn.GroupNorm(num_groups, out_features)
+        self.multiply_weight = torch.nn.Parameter(torch.randn(multiply_weight_shape))
+
+    def forward(self, x):
+        # GEMM
+        x = self.gemm(x)
+        # Fused GroupNorm + Swish + Multiply + Swish
+        groups_tensor = torch.tensor([self.group_norm.num_groups], dtype=torch.int32, device=x.device)
+        x = custom_ops_lib.gemm_group_norm_swish_multiply_swish_custom(
+            x, self.group_norm.weight, self.group_norm.bias, self.multiply_weight, groups_tensor
+        )
+        return x
+'''

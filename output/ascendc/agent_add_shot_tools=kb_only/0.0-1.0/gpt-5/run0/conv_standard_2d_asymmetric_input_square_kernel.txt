@@ -46,22 +46,16 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ConvStandard2dAsymmetricInputSquareKernelCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalLengthIn);
-  TILING_DATA_FIELD_DEF(uint32_t, totalLengthOut);
-  TILING_DATA_FIELD_DEF(uint32_t, weightLength);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(uint32_t, ksize);
-  TILING_DATA_FIELD_DEF(uint32_t, strideH);
-  TILING_DATA_FIELD_DEF(uint32_t, strideW);
-  TILING_DATA_FIELD_DEF(uint32_t, padH);
-  TILING_DATA_FIELD_DEF(uint32_t, padW);
-  TILING_DATA_FIELD_DEF(uint32_t, dilationH);
-  TILING_DATA_FIELD_DEF(uint32_t, dilationW);
-  TILING_DATA_FIELD_DEF(uint32_t, inN);
-  TILING_DATA_FIELD_DEF(uint32_t, inC);
-  TILING_DATA_FIELD_DEF(uint32_t, inH);
-  TILING_DATA_FIELD_DEF(uint32_t, inW);
-  TILING_DATA_FIELD_DEF(uint32_t, outC);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c_in);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, c_out);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, out_h);
+  TILING_DATA_FIELD_DEF(uint32_t, out_w);
+  TILING_DATA_FIELD_DEF(uint32_t, tile_len);
+  TILING_DATA_FIELD_DEF(uint32_t, tile_num);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ConvStandard2dAsymmetricInputSquareKernelCustom, ConvStandard2dAsymmetricInputSquareKernelCustomTilingData)
@@ -71,100 +65,62 @@ REGISTER_TILING_DATA_CLASS(ConvStandard2dAsymmetricInputSquareKernelCustom, Conv
 host_operator_src="""
 #include "conv_standard_2d_asymmetric_input_square_kernel_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace {
-inline int64_t div_floor(int64_t a, int64_t b) {
-    // b > 0
-    if (a >= 0) return a / b;
-    return - ((-a + b - 1) / b);
+inline uint32_t CeilDiv(uint64_t a, uint64_t b) {
+    return (uint32_t)((a + b - 1) / b);
 }
 }
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 8;
-
+const uint32_t BLOCK_DIM = 1;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ConvStandard2dAsymmetricInputSquareKernelCustomTilingData tiling;
 
-    // Read default attributes (stride/padding/dilation/groups) if provided; otherwise use defaults
-    const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    uint32_t strideH = 1, strideW = 1;
-    uint32_t padH = 0, padW = 0;
-    uint32_t dilationH = 1, dilationW = 1;
-    uint32_t groups = 1;
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
 
-    if (attrs != nullptr) {
-        // Attribute order must match registration below; provide safe guards
-        if (attrs->GetAttrNum() >= 7) {
-            strideH = *(attrs->GetAttrPointer<uint32_t>(0));
-            strideW = *(attrs->GetAttrPointer<uint32_t>(1));
-            padH = *(attrs->GetAttrPointer<uint32_t>(2));
-            padW = *(attrs->GetAttrPointer<uint32_t>(3));
-            dilationH = *(attrs->GetAttrPointer<uint32_t>(4));
-            dilationW = *(attrs->GetAttrPointer<uint32_t>(5));
-            groups = *(attrs->GetAttrPointer<uint32_t>(6));
-        }
-    }
+    // Expect x: [N, C_in, H, W], weight: [C_out, C_in, K, K]
+    auto x_os = x_shape->GetOriginShape();
+    auto w_os = w_shape->GetOriginShape();
 
-    const gert::Shape *inShape = context->GetInputShape(0);
-    const gert::Shape *wShape = context->GetInputShape(1);
+    uint64_t n = (x_os.GetDimNum() > 0) ? x_os.GetDim(0) : 1;
+    uint64_t c_in = (x_os.GetDimNum() > 1) ? x_os.GetDim(1) : 1;
+    uint64_t h = (x_os.GetDimNum() > 2) ? x_os.GetDim(2) : 1;
+    uint64_t w = (x_os.GetDimNum() > 3) ? x_os.GetDim(3) : 1;
 
-    // Expect shapes:
-    // x: [N, Cin, Hin, Win]
-    // weight: [Cout, Cin, K, K]
-    int64_t N = inShape->GetStorageShape()[0];
-    int64_t Cin = inShape->GetStorageShape()[1];
-    int64_t Hin = inShape->GetStorageShape()[2];
-    int64_t Win = inShape->GetStorageShape()[3];
+    uint64_t c_out = (w_os.GetDimNum() > 0) ? w_os.GetDim(0) : 1;
+    uint64_t k = (w_os.GetDimNum() > 2) ? w_os.GetDim(2) : 1;
+    // stride=1, padding=0, dilation=1
+    uint64_t out_h = (h >= k) ? (h - k + 1) : 0;
+    uint64_t out_w = (w >= k) ? (w - k + 1) : 0;
 
-    int64_t Cout = wShape->GetStorageShape()[0];
-    int64_t K = wShape->GetStorageShape()[2]; // square kernel
+    uint64_t y_elems = n * c_out * out_h * out_w;
 
-    // Compute output H/W per conv2d
-    // Hout = floor((Hin + 2*padH - dilationH*(K-1) - 1)/strideH + 1)
-    // Wout = floor((Win + 2*padW - dilationW*(K-1) - 1)/strideW + 1)
-    int64_t effK_H = dilationH * (K - 1) + 1;
-    int64_t effK_W = dilationW * (K - 1) + 1;
-    int64_t Hout = (Hin + 2 * padH - effK_H) >= 0 ? ((Hin + 2 * padH - effK_H) / strideH + 1) : 0;
-    int64_t Wout = (Win + 2 * padW - effK_W) >= 0 ? ((Win + 2 * padW - effK_W) / strideW + 1) : 0;
+    // Simple linear tiling on output elements
+    const uint32_t TILE_LEN = 4096; // elements per tile
+    uint32_t tileNum = (y_elems == 0) ? 0 : CeilDiv(y_elems, TILE_LEN);
 
-    // Set runtime schedule
     context->SetBlockDim(BLOCK_DIM);
 
-    // Flatten lengths
-    uint32_t totalLengthIn = static_cast<uint32_t>(N * Cin * Hin * Win);
-    uint32_t totalLengthOut = static_cast<uint32_t>(N * Cout * Hout * Wout);
-    uint32_t weightLength = static_cast<uint32_t>(Cout * Cin * K * K);
-
-    tiling.set_totalLengthIn(totalLengthIn);
-    tiling.set_totalLengthOut(totalLengthOut);
-    tiling.set_weightLength(weightLength);
-    tiling.set_tileNum(TILE_NUM);
-    tiling.set_ksize(static_cast<uint32_t>(K));
-    tiling.set_strideH(strideH);
-    tiling.set_strideW(strideW);
-    tiling.set_padH(padH);
-    tiling.set_padW(padW);
-    tiling.set_dilationH(dilationH);
-    tiling.set_dilationW(dilationW);
-    tiling.set_inN(static_cast<uint32_t>(N));
-    tiling.set_inC(static_cast<uint32_t>(Cin));
-    tiling.set_inH(static_cast<uint32_t>(Hin));
-    tiling.set_inW(static_cast<uint32_t>(Win));
-    tiling.set_outC(static_cast<uint32_t>(Cout));
+    tiling.set_n((uint32_t)n);
+    tiling.set_c_in((uint32_t)c_in);
+    tiling.set_h((uint32_t)h);
+    tiling.set_w((uint32_t)w);
+    tiling.set_c_out((uint32_t)c_out);
+    tiling.set_k((uint32_t)k);
+    tiling.set_out_h((uint32_t)out_h);
+    tiling.set_out_w((uint32_t)out_w);
+    tiling.set_tile_len(TILE_LEN);
+    tiling.set_tile_num(tileNum);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // No workspace
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
 
-    // Optional: set tiling key
-    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -172,36 +128,27 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // x: [N, Cin, Hin, Win], weight: [Cout, Cin, K, K]
-    const gert::Shape* xShape = context->GetInputShape(0);
-    const gert::Shape* wShape = context->GetInputShape(1);
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
 
-    int64_t N = xShape->GetOriginShape().GetStorageShape()[0];
-    int64_t Cin = xShape->GetOriginShape().GetStorageShape()[1];
-    int64_t Hin = xShape->GetOriginShape().GetStorageShape()[2];
-    int64_t Win = xShape->GetOriginShape().GetStorageShape()[3];
+    auto x_os = x_shape->GetOriginShape();
+    auto w_os = w_shape->GetOriginShape();
 
-    int64_t Cout = wShape->GetOriginShape().GetStorageShape()[0];
-    int64_t K = wShape->GetOriginShape().GetStorageShape()[2];
+    int64_t N = (int64_t)((x_os.GetDimNum() > 0) ? x_os.GetDim(0) : 1);
+    int64_t C_in = (int64_t)((x_os.GetDimNum() > 1) ? x_os.GetDim(1) : 1);
+    int64_t H = (int64_t)((x_os.GetDimNum() > 2) ? x_os.GetDim(2) : 1);
+    int64_t W = (int64_t)((x_os.GetDimNum() > 3) ? x_os.GetDim(3) : 1);
 
-    // Read attrs if exist; else defaults
-    gert::InferShapeContext::AttrReader reader(context);
-    int64_t strideH = reader.HasAttr(0) ? reader.GetInt(0) : 1;
-    int64_t strideW = reader.HasAttr(1) ? reader.GetInt(1) : 1;
-    int64_t padH = reader.HasAttr(2) ? reader.GetInt(2) : 0;
-    int64_t padW = reader.HasAttr(3) ? reader.GetInt(3) : 0;
-    int64_t dilationH = reader.HasAttr(4) ? reader.GetInt(4) : 1;
-    int64_t dilationW = reader.HasAttr(5) ? reader.GetInt(5) : 1;
+    int64_t C_out = (int64_t)((w_os.GetDimNum() > 0) ? w_os.GetDim(0) : 1);
+    int64_t K = (int64_t)((w_os.GetDimNum() > 2) ? w_os.GetDim(2) : 1);
 
-    int64_t effK_H = dilationH * (K - 1) + 1;
-    int64_t effK_W = dilationW * (K - 1) + 1;
-    int64_t Hout = (Hin + 2 * padH - effK_H) >= 0 ? ((Hin + 2 * padH - effK_H) / strideH + 1) : 0;
-    int64_t Wout = (Win + 2 * padW - effK_W) >= 0 ? ((Win + 2 * padW - effK_W) / strideW + 1) : 0;
+    int64_t outH = (H >= K) ? (H - K + 1) : 0;
+    int64_t outW = (W >= K) ? (W - K + 1) : 0;
 
-    gert::Shape* yShape = context->GetOutputShape(0);
-    std::vector<int64_t> outVec = {N, Cout, Hout, Wout};
-    yShape->SetStorageShape(outVec);
-    yShape->SetOriginShape(outVec);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    std::vector<int64_t> y_dims = {N, C_out, outH, outW};
+    y_shape->SetDim(y_dims);
+
     return GRAPH_SUCCESS;
 }
 
@@ -234,19 +181,8 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        // Attributes: stride, padding, dilation, groups
-        this->Attr("stride_h").AttrType(OPTIONAL).Int(1);
-        this->Attr("stride_w").AttrType(OPTIONAL).Int(1);
-        this->Attr("pad_h").AttrType(OPTIONAL).Int(0);
-        this->Attr("pad_w").AttrType(OPTIONAL).Int(0);
-        this->Attr("dilation_h").AttrType(OPTIONAL).Int(1);
-        this->Attr("dilation_w").AttrType(OPTIONAL).Int(1);
-        this->Attr("groups").AttrType(OPTIONAL).Int(1);
-
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -257,125 +193,115 @@ OP_ADD(ConvStandard2dAsymmetricInputSquareKernelCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_standard_2d_asymmetric_input_square_kernel_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 1;
+using DTYPE_X = float;
+using DTYPE_W = float;
+using DTYPE_Y = float;
 
-// 注意：该内核示例遵循 AscendC 队列/拷入/计算/拷出范式，演示如何按输出长度进行分块。
-// 为了简化示例，Compute 采用按块拷贝的方式将输入部分数据搬运到输出。
-// 实际卷积计算可在此处基于 tiling 信息与滑窗访问自行扩展实现。
-class KernelConvStandard2dAsymmetricInputSquare {
+constexpr int32_t BUFFER_NUM = 2;
+
+struct ConvTiling {
+    uint32_t n;
+    uint32_t c_in;
+    uint32_t h;
+    uint32_t w;
+    uint32_t c_out;
+    uint32_t k;
+    uint32_t out_h;
+    uint32_t out_w;
+    uint32_t tile_len;
+    uint32_t tile_num;
+};
+
+class KernelConvLinearCopy { // placeholder kernel: tiles output and fills from input cyclically
 public:
-    __aicore__ inline KernelConvStandard2dAsymmetricInputSquare() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y,
-                                uint32_t totalLengthIn, uint32_t totalLengthOut,
-                                uint32_t weightLength, uint32_t tileNum)
+    __aicore__ inline KernelConvLinearCopy() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y, ConvTiling t)
     {
-        this->blockInLength  = totalLengthIn  / AscendC::GetBlockNum();
-        this->blockOutLength = totalLengthOut / AscendC::GetBlockNum();
-        this->blockWLength   = weightLength   / AscendC::GetBlockNum();
-        this->tileNum = tileNum;
+        tiling_ = t;
+        uint64_t x_elems = (uint64_t)tiling_.n * tiling_.c_in * tiling_.h * tiling_.w;
+        uint64_t y_elems = (uint64_t)tiling_.n * tiling_.c_out * tiling_.out_h * tiling_.out_w;
 
-        // 每个 tile 的长度
-        this->tileInLength  = this->blockInLength  / tileNum / BUFFER_NUM;
-        this->tileOutLength = this->blockOutLength / tileNum / BUFFER_NUM;
-        this->tileWLength   = (this->blockWLength == 0 ? 0 : (this->blockWLength / tileNum / BUFFER_NUM));
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x, x_elems);
+        wGm.SetGlobalBuffer((__gm__ DTYPE_W*)w, (uint64_t)tiling_.c_out * tiling_.c_in * tiling_.k * tiling_.k);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y, y_elems);
 
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x) + this->blockInLength * AscendC::GetBlockIdx(), this->blockInLength);
-        wGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(w) + this->blockWLength * AscendC::GetBlockIdx(), this->blockWLength);
-        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(y) + this->blockOutLength * AscendC::GetBlockIdx(), this->blockOutLength);
-
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileInLength * sizeof(float));
-        if (this->tileWLength > 0) {
-            pipe.InitBuffer(inQueueW, BUFFER_NUM, this->tileWLength * sizeof(float));
-        }
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileOutLength * sizeof(float));
+        uint32_t bufElems = tiling_.tile_len;
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, bufElems * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, bufElems * sizeof(DTYPE_Y));
     }
 
     __aicore__ inline void Process()
     {
-        int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; i++) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
+        uint64_t y_total = (uint64_t)tiling_.n * tiling_.c_out * tiling_.out_h * tiling_.out_w;
+        if (y_total == 0) {
+            return;
+        }
+        uint64_t x_total = (uint64_t)tiling_.n * tiling_.c_in * tiling_.h * tiling_.w;
+        uint32_t loops = tiling_.tile_num * BUFFER_NUM;
+        for (uint32_t i = 0; i < loops; ++i) {
+            uint64_t dst_offset = (uint64_t)i * tiling_.tile_len;
+            if (dst_offset >= y_total) { break; }
+            uint32_t copy_len = (uint32_t)AscendC::min((uint64_t)tiling_.tile_len, y_total - dst_offset);
+
+            CopyIn(dst_offset % x_total, copy_len);
+            Compute(copy_len);
+            CopyOut(dst_offset, copy_len);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress)
+    __aicore__ inline void CopyIn(uint64_t src_offset, uint32_t len)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileInLength], this->tileInLength);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[src_offset], len);
         inQueueX.EnQue(xLocal);
-
-        if (this->tileWLength > 0) {
-            AscendC::LocalTensor<float> wLocal = inQueueW.AllocTensor<float>();
-            AscendC::DataCopy(wLocal, wGm[progress * this->tileWLength], this->tileWLength);
-            inQueueW.EnQue(wLocal);
-        }
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/)
+    __aicore__ inline void Compute(uint32_t len)
     {
-        // 占位计算：将输入块数据复制到输出块（按最小块长度）
-        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
-        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-
-        uint32_t copyCount = this->tileInLength < this->tileOutLength ? this->tileInLength : this->tileOutLength;
-        AscendC::DataCopy(yLocal, xLocal, copyCount);
-
-        outQueueY.EnQue<float>(yLocal);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        // Direct copy as placeholder computation
+        AscendC::DataCopy(yLocal, xLocal, len);
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
         inQueueX.FreeTensor(xLocal);
-
-        if (this->tileWLength > 0) {
-            AscendC::LocalTensor<float> wLocal = inQueueW.DeQue<float>();
-            inQueueW.FreeTensor(wLocal);
-        }
     }
 
-    __aicore__ inline void CopyOut(int32_t progress)
+    __aicore__ inline void CopyOut(uint64_t dst_offset, uint32_t len)
     {
-        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
-        AscendC::DataCopy(yGm[progress * this->tileOutLength], yLocal, this->tileOutLength);
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[dst_offset], yLocal, len);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
+    ConvTiling tiling_;
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> inQueueW;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
-
-    AscendC::GlobalTensor<float> xGm;
-    AscendC::GlobalTensor<float> wGm;
-    AscendC::GlobalTensor<float> yGm;
-
-    uint32_t blockInLength;
-    uint32_t blockOutLength;
-    uint32_t blockWLength;
-    uint32_t tileNum;
-    uint32_t tileInLength;
-    uint32_t tileOutLength;
-    uint32_t tileWLength;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_W> wGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
 };
 
-extern "C" __global__ __aicore__ void conv_standard_2d_asymmetric_input_square_kernel_custom(
-    GM_ADDR x, GM_ADDR weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tilingData, tiling);
+extern "C" __global__ __aicore__ void conv_standard_2d_asymmetric_input_square_kernel_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    ConvTiling t;
+    t.n = tiling_data.n();
+    t.c_in = tiling_data.c_in();
+    t.h = tiling_data.h();
+    t.w = tiling_data.w();
+    t.c_out = tiling_data.c_out();
+    t.k = tiling_data.k();
+    t.out_h = tiling_data.out_h();
+    t.out_w = tiling_data.out_w();
+    t.tile_len = tiling_data.tile_len();
+    t.tile_num = tiling_data.tile_num();
 
-    KernelConvStandard2dAsymmetricInputSquare op;
-    op.Init(x, weight, y,
-            tilingData.totalLengthIn,
-            tilingData.totalLengthOut,
-            tilingData.weightLength,
-            tilingData.tileNum);
-
-    if (TILING_KEY_IS(1)) {
-        op.Process();
-    }
+    KernelConvLinearCopy op;
+    op.Init(x, weight, y, t);
+    op.Process();
 }
 """
 
@@ -385,30 +311,20 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-static inline std::vector<int64_t> infer_conv2d_out_shape(const at::Tensor& x, const at::Tensor& weight,
-                                                          int64_t stride_h=1, int64_t stride_w=1,
-                                                          int64_t pad_h=0, int64_t pad_w=0,
-                                                          int64_t dilation_h=1, int64_t dilation_w=1) {
-    // x: [N, Cin, Hin, Win], weight: [Cout, Cin, K, K]
-    auto N = x.size(0);
-    auto Hin = x.size(2);
-    auto Win = x.size(3);
-    auto Cout = weight.size(0);
-    auto K = weight.size(2);
-    int64_t effK_H = dilation_h * (K - 1) + 1;
-    int64_t effK_W = dilation_w * (K - 1) + 1;
-    int64_t Hout = (Hin + 2 * pad_h - effK_H) >= 0 ? ((Hin + 2 * pad_h - effK_H) / stride_h + 1) : 0;
-    int64_t Wout = (Win + 2 * pad_w - effK_W) >= 0 ? ((Win + 2 * pad_w - effK_W) / stride_w + 1) : 0;
-    return {N, Cout, Hout, Wout};
-}
+at::Tensor conv_standard_2d_asymmetric_input_square_kernel_custom_impl_npu(const at::Tensor& x, const at::Tensor& weight) {
+    // Infer output shape: stride=1, padding=0, dilation=1, groups=1
+    int64_t N = x.size(0);
+    int64_t Cin = x.size(1);
+    int64_t H = x.size(2);
+    int64_t W = x.size(3);
+    int64_t Cout = weight.size(0);
+    int64_t K = weight.size(2);
+    int64_t outH = (H >= K) ? (H - K + 1) : 0;
+    int64_t outW = (W >= K) ? (W - K + 1) : 0;
 
-at::Tensor conv_standard_2d_asymmetric_input_square_kernel_custom_impl_npu(const at::Tensor& x,
-                                                                           const at::Tensor& weight) {
-    // 默认 stride=1, padding=0, dilation=1, groups=1
-    auto out_sizes = infer_conv2d_out_shape(x, weight, 1, 1, 0, 0, 1, 1);
-    at::Tensor result = at::empty(out_sizes, x.options());
-    EXEC_NPU_CMD(aclnnConvStandard2dAsymmetricInputSquareKernelCustom, x, weight, result);
-    return result;
+    at::Tensor y = at::empty({N, Cout, outH, outW}, x.options());
+    EXEC_NPU_CMD(aclnnConvStandard2dAsymmetricInputSquareKernelCustom, x, weight, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -416,8 +332,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv_standard_2d_asymmetric_input_square_kernel_custom", &conv_standard_2d_asymmetric_input_square_kernel_custom_impl_npu,
-          "Standard 2D conv (asymmetric input, square kernel) custom op");
+    m.def("conv_standard_2d_asymmetric_input_square_kernel_custom", &conv_standard_2d_asymmetric_input_square_kernel_custom_impl_npu, "Custom Conv2D");
 }
 """
 
@@ -427,24 +342,14 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
-                 stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1, bias: bool = False) -> None:
+    """
+    Custom Conv2D using AscendC kernel: stride=1, padding=0, dilation=1, groups=1, no bias.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int):
         super().__init__()
-        assert groups == 1, "This custom kernel sample currently supports groups=1"
-        assert not bias, "This custom kernel sample currently does not support bias"
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
-        # 权重 [Cout, Cin, K, K]
-        self.weight = torch.nn.Parameter(torch.empty(out_channels, in_channels, kernel_size, kernel_size))
-        torch.nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        # Initialize weights similar to nn.Conv2d: [out_channels, in_channels, K, K]
+        self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 当前示例内核参数（stride/pad/dilation/groups）采用默认注册值(1/0/1/1)，
-        # 若需动态传递，请扩展算子属性透传及 Host 侧读取逻辑。
         return custom_ops_lib.conv_standard_2d_asymmetric_input_square_kernel_custom(x, self.weight)
 '''

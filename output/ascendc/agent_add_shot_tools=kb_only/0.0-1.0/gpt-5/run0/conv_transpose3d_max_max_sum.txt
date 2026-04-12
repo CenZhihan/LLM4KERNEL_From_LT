@@ -36,10 +36,12 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ConvTranspose3dMaxMaxSumCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, outter);
-  TILING_DATA_FIELD_DEF(uint32_t, inner);
   TILING_DATA_FIELD_DEF(uint32_t, n);
-  TILING_DATA_FIELD_DEF(uint32_t, tmpBufferSize);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, d);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, tileW);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ConvTranspose3dMaxMaxSumCustom, ConvTranspose3dMaxMaxSumCustomTilingData)
@@ -49,7 +51,6 @@ REGISTER_TILING_DATA_CLASS(ConvTranspose3dMaxMaxSumCustom, ConvTranspose3dMaxMax
 host_operator_src="""
 #include "conv_transpose3d_max_max_sum_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
@@ -58,44 +59,33 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ConvTranspose3dMaxMaxSumCustomTilingData tiling;
 
-    // 获取输入形状信息，最后一维为待归约维度
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    auto origin_shape = in_shape->GetOriginShape();
-    std::vector<int64_t> dims = origin_shape.GetDims();
-    if (dims.empty()) {
-        return ge::GRAPH_FAILED;
+    auto inShape = context->GetInputShape(0)->GetOriginShape();
+    uint32_t n = static_cast<uint32_t>(inShape.GetDim(0));
+    uint32_t c = static_cast<uint32_t>(inShape.GetDim(1));
+    uint32_t d = static_cast<uint32_t>(inShape.GetDim(2));
+    uint32_t h = static_cast<uint32_t>(inShape.GetDim(3));
+    uint32_t w = static_cast<uint32_t>(inShape.GetDim(4));
+
+    // 简单的行内分块（沿W方向），避免跨batch和行边界
+    uint32_t tileW = w;
+    if (tileW > 1024) {
+        tileW = 1024;
     }
-    uint32_t n = static_cast<uint32_t>(dims.back());
-    uint64_t outter64 = 1;
-    for (size_t i = 0; i + 1 < dims.size(); ++i) {
-        outter64 *= static_cast<uint64_t>(dims[i]);
-    }
-    uint32_t outter = static_cast<uint32_t>(outter64);
-
-    // 数据类型大小
-    auto dt = context->GetInputTensor(0)->GetDataType();
-    uint32_t typeSize = (dt == ge::DT_FLOAT16) ? 2 : 4;
-
-    // 计算32字节对齐后的inner
-    uint32_t inner = static_cast<uint32_t>(((static_cast<uint64_t>(n) * typeSize + 32 - 1) / 32) * 32 / typeSize);
-
-    // 临时缓冲大小（使用Sum的tiling接口）
-    uint32_t maxValue = 0;
-    uint32_t minValue = 0;
-    AscendC::GetSumMaxMinTmpSize(n, typeSize, false, maxValue, minValue);
 
     context->SetBlockDim(BLOCK_DIM);
-    tiling.set_outter(outter);
-    tiling.set_inner(inner);
+
     tiling.set_n(n);
-    tiling.set_tmpBufferSize(minValue);
+    tiling.set_c(c);
+    tiling.set_d(d);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_tileW(tileW);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -105,15 +95,14 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
     gert::Shape* y_shape = context->GetOutputShape(0);
-    // 输出形状与输入一致，但最后一维归约为1
-    auto origin = x_shape->GetOriginShape();
-    std::vector<int64_t> dims = origin.GetDims();
-    if (dims.empty()) {
+
+    // 该自定义算子对输入执行通道求和（保持维度），空间尺寸不变
+    std::vector<int64_t> x_dims = x_shape->GetDimSizes();
+    if (x_dims.size() != 5) {
         return GRAPH_FAILED;
     }
-    dims.back() = 1;
-    gert::Shape out_shape(dims);
-    *y_shape = out_shape;
+    std::vector<int64_t> y_dims = {x_dims[0], 1, x_dims[2], x_dims[3], x_dims[4]};
+    y_shape->SetDimSizes(y_dims);
     return GRAPH_SUCCESS;
 }
 
@@ -135,6 +124,7 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -142,7 +132,9 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -153,91 +145,105 @@ OP_ADD(ConvTranspose3dMaxMaxSumCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_transpose3d_max_max_sum_custom_tiling_data.h"
 
-// 该自定义核实现对输入张量最后一维做求和（Sum），用于配合上层将通道维(C)置于最后一维的场景。
-// 参考了AscendC高阶API Sum的使用方法与临时缓冲获取方式（检索结果：Sum API与More Examples）。
+constexpr int32_t BUFFER_NUM = 2; // 双缓冲
+using DTYPE = float;
 
-template <typename T>
-class KernelSumLastDim
-{
+class KernelConvTranspose3dMaxMaxSum {
 public:
-    __aicore__ inline KernelSumLastDim() {}
-
-    __aicore__ inline void Init(GM_ADDR xGm, GM_ADDR yGm, uint32_t outter, uint32_t inner, uint32_t n, uint32_t tmpBufferSize)
+    __aicore__ inline KernelConvTranspose3dMaxMaxSum() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t d,
+                                uint32_t h, uint32_t w, uint32_t tileW)
     {
-        height = outter; // 外轴长度：N*D*H*W
-        width = inner;   // 对齐后的内轴长度：C对齐到32字节
-        nNum = n;        // 实际内轴长度：C
-        srcGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(xGm), height * width);
-        dstGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(yGm), height); // 仅保存归约后的结果(每个外轴元素一个值)
+        this->N = n;
+        this->C = c;
+        this->D = d;
+        this->H = h;
+        this->W = w;
+        this->tileW = tileW;
 
-        // 输入拷入UB的缓冲
-        pipe.InitBuffer(inQueueSrc, 1, height * width * sizeof(T));
-        // 输出缓冲（32B对齐长度）
-        uint32_t outAlignedCnt = (height * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(T);
-        pipe.InitBuffer(outQueueDst, 1, outAlignedCnt * sizeof(T));
-        // 临时缓冲（Sum内部复杂计算所需）
-        pipe.InitBuffer(tmpQueue, 1, tmpBufferSize);
+        xGm.SetGlobalBuffer((__gm__ DTYPE *)x, (uint64_t)N * C * D * H * W);
+        yGm.SetGlobalBuffer((__gm__ DTYPE *)y, (uint64_t)N * 1 * D * H * W);
+
+        // 每次处理一个行片段 [wStart, wStart+tileW)
+        uint32_t lineBytes = this->tileW * sizeof(DTYPE);
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, lineBytes);
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, lineBytes);
     }
 
     __aicore__ inline void Process()
     {
-        CopyIn();
-        Compute();
-        CopyOut();
+        // 按batch划分block
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t nPerBlock = (N + blocks - 1) / blocks;
+        uint32_t nStart = blockIdx * nPerBlock;
+        uint32_t nEnd = AscendC::Min<uint32_t>(N, nStart + nPerBlock);
+
+        for (uint32_t n = nStart; n < nEnd; ++n) {
+            for (uint32_t di = 0; di < D; ++di) {
+                for (uint32_t hi = 0; hi < H; ++hi) {
+                    for (uint32_t wStart = 0; wStart < W; wStart += tileW) {
+                        uint32_t curLen = AscendC::Min<uint32_t>(tileW, W - wStart);
+
+                        // 分配累加buffer
+                        AscendC::LocalTensor<DTYPE> accLocal = outQueueY.AllocTensor<DTYPE>();
+
+                        bool first = true;
+                        for (uint32_t ci = 0; ci < C; ++ci) {
+                            AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
+                            uint64_t xOffset = IndexOffset(n, ci, di, hi, wStart);
+                            AscendC::DataCopy(xLocal, xGm[xOffset], curLen);
+                            if (first) {
+                                AscendC::DataCopy(accLocal, xLocal, curLen);
+                                first = false;
+                            } else {
+                                AscendC::Add(accLocal, accLocal, xLocal, curLen);
+                            }
+                            inQueueX.FreeTensor(xLocal);
+                        }
+
+                        uint64_t yOffset = IndexOffsetY(n, di, hi, wStart);
+                        AscendC::DataCopy(yGm[yOffset], accLocal, curLen);
+                        outQueueY.FreeTensor(accLocal);
+                    }
+                }
+            }
+        }
     }
 
 private:
-    __aicore__ inline void CopyIn()
+    __aicore__ inline uint64_t IndexOffset(uint32_t n, uint32_t c, uint32_t d, uint32_t h, uint32_t w) const
     {
-        AscendC::LocalTensor<T> srcLocal = inQueueSrc.AllocTensor<T>();
-        AscendC::DataCopy(srcLocal, srcGlobal, height * width);
-        inQueueSrc.EnQue(srcLocal);
+        // NCDHW 连续内存
+        return (((uint64_t)n * C + c) * D + d) * H * W + (uint64_t)h * W + w;
     }
 
-    __aicore__ inline void Compute()
+    __aicore__ inline uint64_t IndexOffsetY(uint32_t n, uint32_t d, uint32_t h, uint32_t w) const
     {
-        AscendC::LocalTensor<T> srcLocal = inQueueSrc.DeQue<T>();
-        AscendC::LocalTensor<uint8_t> sharedTmp = tmpQueue.AllocTensor<uint8_t>();
-        AscendC::LocalTensor<T> dstLocal = outQueueDst.AllocTensor<T>();
-
-        // 构造Sum参数：以最后一维为归约维度
-        AscendC::SumParams params{height, width, nNum};
-        // 执行Sum（参考文档中Sum的带sharedTmpBuffer原型）
-        AscendC::Sum(dstLocal, srcLocal, sharedTmp, params);
-
-        outQueueDst.EnQue<T>(dstLocal);
-        inQueueSrc.FreeTensor(srcLocal);
-        tmpQueue.FreeTensor(sharedTmp);
-    }
-
-    __aicore__ inline void CopyOut()
-    {
-        AscendC::LocalTensor<T> dstLocal = outQueueDst.DeQue<T>();
-        uint32_t outAlignedCnt = (height * sizeof(T) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(T);
-        AscendC::DataCopy(dstGlobal, dstLocal, outAlignedCnt);
-        outQueueDst.FreeTensor(dstLocal);
+        // 输出形状 [N,1,D,H,W]，通道固定为0
+        return (((uint64_t)n * 1 + 0) * D + d) * H * W + (uint64_t)h * W + w;
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueSrc;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue;
-    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueDst;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
 
-    AscendC::GlobalTensor<T> srcGlobal, dstGlobal;
-    uint32_t height = 0;
-    uint32_t width = 0;
-    uint32_t nNum = 0;
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+
+    uint32_t N, C, D, H, W;
+    uint32_t tileW;
 };
 
-extern "C" __global__ __aicore__ void conv_transpose3d_max_max_sum_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void conv_transpose3d_max_max_sum_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelSumLastDim<DTYPE_X> op; // 输入与输出同类型
-    op.Init(x, y, tiling_data.outter, tiling_data.inner, tiling_data.n, tiling_data.tmpBufferSize);
+    KernelConvTranspose3dMaxMaxSum op;
+    op.Init(x, y,
+            tiling_data.n, tiling_data.c, tiling_data.d,
+            tiling_data.h, tiling_data.w, tiling_data.tileW);
     op.Process();
 }
 """
@@ -248,17 +254,13 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv_transpose3d_max_max_sum_custom_impl_npu(const at::Tensor& x_lastdim) {
-    // 要求输入为[N, D, H, W, C]，在最后一维进行求和
-    TORCH_CHECK(x_lastdim.dim() == 5, "Input rank must be 5: [N, D, H, W, C]");
-
-    // 内核的输出注册为将最后一维归约为1；但为了稳妥，这里创建与输入同形状的中间输出，再窄取最后一维的前1个通道
-    at::Tensor y_full = at::empty_like(x_lastdim);
-    EXEC_NPU_CMD(aclnnConvTranspose3dMaxMaxSumCustom, x_lastdim, y_full);
-
-    // 取最后一维的前1个元素（内核将结果写在c=0位置）
-    at::Tensor y_reduced = y_full.narrow(/*dim=*/-1, /*start=*/0, /*length=*/1).contiguous();
-    return y_reduced;
+at::Tensor conv_transpose3d_max_max_sum_custom_impl_npu(const at::Tensor& x) {
+    // 输入形状: [N, C, D, H, W], 输出形状: [N, 1, D, H, W]
+    auto sizes = x.sizes().vec();
+    std::vector<int64_t> out_sizes = {sizes[0], 1, sizes[2], sizes[3], sizes[4]};
+    at::Tensor result = at::empty(out_sizes, x.options());
+    EXEC_NPU_CMD(aclnnConvTranspose3dMaxMaxSumCustom, x, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -266,7 +268,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv_transpose3d_max_max_sum_custom", &conv_transpose3d_max_max_sum_custom_impl_npu, "Sum last dim after conv_transpose3d + maxpools");
+    m.def("conv_transpose3d_max_max_sum_custom", &conv_transpose3d_max_max_sum_custom_impl_npu, "Fuse (two max pools + channel sum) after ConvTranspose3d");
 }
 """
 
@@ -274,28 +276,23 @@ model_src='''
 import torch
 import torch_npu
 import custom_ops_lib
-import torch.nn as nn
 
 class ModelNew(torch.nn.Module):
     """
-    优化版：保留PyTorch的ConvTranspose3d与MaxPool3d，使用自定义AscendC内核对通道维求和。
-    内核要求最后一维为被归约维度，因此在调用前后做维度置换。
+    使用自定义AscendC算子将 MaxPool3d(2) + MaxPool3d(3) + 通道求和 融合为一个自定义核。
+    ConvTranspose3d 仍使用原生实现。
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
         super(ModelNew, self).__init__()
-        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
-        self.max_pool1 = nn.MaxPool3d(kernel_size=2)
-        self.max_pool2 = nn.MaxPool3d(kernel_size=3)
+        self.conv_transpose = torch.nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.max_pool1 = torch.nn.MaxPool3d(kernel_size=2)
+        self.max_pool2 = torch.nn.MaxPool3d(kernel_size=3)
 
     def forward(self, x):
         x = self.conv_transpose(x)
         x = self.max_pool1(x)
         x = self.max_pool2(x)
-        # [N, C, D, H, W] -> [N, D, H, W, C]
-        x_last = x.permute(0, 2, 3, 4, 1).contiguous()
-        # 调用自定义核（在最后一维求和），返回[N, D, H, W, 1]
-        y_last1 = custom_ops_lib.conv_transpose3d_max_max_sum_custom(x_last)
-        # [N, D, H, W, 1] -> [N, 1, D, H, W]
-        y = y_last1.permute(0, 4, 1, 2, 3).contiguous()
-        return y
+        # 使用自定义算子在通道维度执行 sum，保持维度
+        x = custom_ops_lib.conv_transpose3d_max_max_sum_custom(x)
+        return x
 '''

@@ -69,22 +69,22 @@ const uint32_t BLOCK_DIM = 48;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context) {
   RmsNormCustomTilingData tiling;
-  const gert::StorageShape* x_shape = context->GetInputShape(0);
-  const gert::Shape shape = x_shape->GetStorageShape();
-  auto rowNumTotal = shape.GetDim(0);
+  const gert::StorageShape* x_shape_ptr = context->GetInputShape(0);
+  const gert::Shape shape = x_shape_ptr->GetStorageShape();
+  auto rowNumAll = shape.GetDim(0);
   auto colNum = shape.GetDim(1);
 
-  uint32_t coreRowNum = rowNumTotal / BLOCK_DIM;
-  uint32_t pivot = rowNumTotal - coreRowNum * BLOCK_DIM;
+  uint32_t coreRowNum = rowNumAll / BLOCK_DIM;
 
   const float* epsilonAttr = context->GetAttrs()->GetAttrPointer<float>(0);
   tiling.set_eps(*epsilonAttr);
   tiling.set_rowNum(coreRowNum);
   tiling.set_rowNumSp(coreRowNum + 1);
   tiling.set_rowLength(colNum);
-  tiling.set_blockPivot(pivot);
+  tiling.set_blockPivot(rowNumAll - coreRowNum * BLOCK_DIM);
 
-  uint32_t tileLoop = 32;
+  uint32_t tileLoop = 32; // rows processed per iteration inside a block
+  if (tileLoop > 64) tileLoop = 64;
   tiling.set_tileLoop(tileLoop);
   tiling.set_tileLength(tileLoop * colNum);
   tiling.set_loopCount(coreRowNum / tileLoop);
@@ -95,6 +95,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context) {
                       context->GetRawTilingData()->GetCapacity());
   context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
   context->SetTilingKey(1);
+
   return ge::GRAPH_SUCCESS;
 }
 }  // namespace optiling
@@ -125,6 +126,7 @@ class RmsNormCustom : public OpDef {
     this->Attr("epsilon").AttrType(OPTIONAL).Float(1e-05);
 
     this->SetInferShape(ge::InferShape);
+
     this->AICore().SetTiling(optiling::TilingFunc);
     this->AICore().AddConfig("ascend910b");
   }
@@ -167,7 +169,8 @@ class KernelRmsNorm {
     if (AscendC::GetBlockIdx() < this->blockPivot) {
       offset = this->blockLength * AscendC::GetBlockIdx();
     } else {
-      offset = this->blockLength * AscendC::GetBlockIdx() + this->rowLength * this->blockPivot;
+      offset = this->blockLength * AscendC::GetBlockIdx() +
+               this->rowLength * this->blockPivot;
     }
 
     xGm.SetGlobalBuffer((__gm__ float *)x + offset, this->blockLength);
@@ -194,43 +197,39 @@ class KernelRmsNorm {
   }
 
  private:
-  __aicore__ inline void CopyIn(int32_t progress, int32_t rowNum) {
+  __aicore__ inline void CopyIn(int32_t progress, int32_t rows) {
     AscendC::LocalTensor<float> xLocal = queueX.AllocTensor<float>();
-    AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->rowLength * rowNum);
+    AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->rowLength * rows);
     queueX.EnQue(xLocal);
   }
 
-  __aicore__ inline void Compute(int32_t progress, int32_t rowNum) {
+  __aicore__ inline void Compute(int32_t progress, int32_t rows) {
     AscendC::LocalTensor<float> xLocal = queueX.DeQue<float>();
 
-    AscendC::LocalTensor<float> tmpTensor1 = tmpBuffer1.Get<float>(); // workspace for reduce
-    AscendC::LocalTensor<float> tmpTensor2 = tmpBuffer2.Get<float>(); // holds per-row scalars
+    AscendC::LocalTensor<float> tmpTensor1 = tmpBuffer1.Get<float>();
+    AscendC::LocalTensor<float> tmpTensor2 = tmpBuffer2.Get<float>();
     AscendC::LocalTensor<float> onesLocal = onesBuffer.Get<float>();
     AscendC::LocalTensor<float> zLocal = queueZ.AllocTensor<float>();
     AscendC::Duplicate<float>(onesLocal, 1.0f, this->tileLoop);
 
-    // square each element into zLocal buffer
-    for (uint32_t j = 0; j < (uint32_t)rowNum; ++j) {
+    // Compute sum of squares per row
+    for (uint32_t j = 0; j < (uint32_t)rows; ++j) {
       uint32_t buffIndex = j * this->rowLength;
       AscendC::Mul(zLocal[buffIndex], xLocal[buffIndex], xLocal[buffIndex], this->rowLength);
     }
-
-    // reduce sum of squares per row
-    for (uint32_t j = 0; j < (uint32_t)rowNum; ++j) {
+    for (uint32_t j = 0; j < (uint32_t)rows; ++j) {
       uint32_t buffIndex = j * this->rowLength;
       AscendC::ReduceSum<float>(tmpTensor2[j], zLocal[buffIndex], tmpTensor1, this->rowLength);
     }
 
-    // mean of squares
-    AscendC::Muls(tmpTensor2, tmpTensor2, this->factor, rowNum);
-    // add epsilon and compute sqrt
-    AscendC::Adds(tmpTensor2, tmpTensor2, this->eps, rowNum);
-    AscendC::Sqrt(tmpTensor2, tmpTensor2, rowNum);
-    // compute reciprocal sqrt: inv_rms = 1 / sqrt(mean_sq + eps)
-    AscendC::Div(tmpTensor2, onesLocal, tmpTensor2, rowNum);
+    // mean -> +eps -> sqrt -> reciprocal
+    AscendC::Muls(tmpTensor2, tmpTensor2, this->factor, rows);
+    AscendC::Adds(tmpTensor2, tmpTensor2, this->eps, rows);
+    AscendC::Sqrt(tmpTensor2, tmpTensor2, rows);
+    AscendC::Div(tmpTensor2, onesLocal, tmpTensor2, rows);
 
-    // scale original x by inv_rms
-    for (uint32_t j = 0; j < (uint32_t)rowNum; ++j) {
+    // Normalize: x / rms = x * inv_rms
+    for (uint32_t j = 0; j < (uint32_t)rows; ++j) {
       uint32_t buffIndex = j * this->rowLength;
       AscendC::Muls(zLocal[buffIndex], xLocal[buffIndex], tmpTensor2.GetValue(j), this->rowLength);
     }
@@ -239,9 +238,9 @@ class KernelRmsNorm {
     queueX.FreeTensor(xLocal);
   }
 
-  __aicore__ inline void CopyOut(int32_t progress, int32_t rowNum) {
+  __aicore__ inline void CopyOut(int32_t progress, int32_t rows) {
     AscendC::LocalTensor<float> zLocal = queueZ.DeQue<float>();
-    AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, rowNum * this->rowLength);
+    AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, rows * this->rowLength);
     queueZ.FreeTensor(zLocal);
   }
 
@@ -262,7 +261,7 @@ class KernelRmsNorm {
   uint32_t tileLoop = 0;
   uint32_t tileLength = 0;
   uint32_t loopCount = 0;
-  float factor = 0.0f;
+  float factor = 0.f;
   float eps = 1e-5f;
 };
 
@@ -307,11 +306,21 @@ class ModelNew(torch.nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Move channel dimension to last for contiguous reduction, flatten positions
-        x_cl = x.movedim(1, -1).contiguous()
-        x_2d = x_cl.reshape(-1, self.num_features).contiguous()
-        y_2d = custom_ops_lib.rms_norm_custom(x_2d, self.eps)
-        y_cl = y_2d.reshape(x_cl.shape)
-        y = y_cl.movedim(-1, 1).contiguous()
-        return y
+        # Move feature dimension to the last to make it contiguous per row
+        dims = list(range(x.dim()))
+        # Expect features at dim=1, move it to the last
+        perm = [0] + list(range(2, x.dim())) + [1]
+        y = x.permute(perm).contiguous()
+        # Collapse all but the last dim (features) into rows
+        y2d = y.view(-1, self.num_features)
+        # Custom RMSNorm kernel on (rows, features)
+        z2d = custom_ops_lib.rms_norm_custom(y2d, self.eps)
+        # Restore original shape and order
+        z = z2d.view(y.shape)
+        # Inverse permutation
+        inv_perm = [0] * len(perm)
+        for i, p in enumerate(perm):
+            inv_perm[p] = i
+        out = z.permute(inv_perm).contiguous()
+        return out
 '''

@@ -1,0 +1,350 @@
+project_json_src='''
+[
+    {
+        "op": "GemmDivideSumScalingCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "wsum",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "scale",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmDivideSumScalingCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batchSize);
+  TILING_DATA_FIELD_DEF(uint32_t, inputSize);
+  TILING_DATA_FIELD_DEF(uint32_t, rowsPerBlock);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmDivideSumScalingCustom, GemmDivideSumScalingCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gemm_divide_sum_scaling_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GemmDivideSumScalingCustomTilingData tiling;
+
+    // x: [batch, input], wsum: [input], scale: [1]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    uint32_t batch = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t inputSize = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+
+    uint32_t rowsPerBlock = (batch + BLOCK_DIM - 1) / BLOCK_DIM;
+    // choose a reasonable tile length along input dimension
+    uint32_t tileLength = 1024;
+    if (tileLength > inputSize) tileLength = inputSize;
+    if (tileLength == 0) tileLength = 1;
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_batchSize(batch);
+    tiling.set_inputSize(inputSize);
+    tiling.set_rowsPerBlock(rowsPerBlock);
+    tiling.set_tileLength(tileLength);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    std::vector<int64_t> out_dims(2);
+    out_dims[0] = x_shape->GetDim(0);
+    out_dims[1] = 1;
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, out_dims[0]);
+    y_shape->SetDim(1, out_dims[1]);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GemmDivideSumScalingCustom : public OpDef {
+public:
+    explicit GemmDivideSumScalingCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("wsum")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("scale")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmDivideSumScalingCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2; // double buffer tiles
+
+class KernelGemmDivideSumScaling {
+public:
+    __aicore__ inline KernelGemmDivideSumScaling() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR wsum, GM_ADDR scale, GM_ADDR y,
+                                uint32_t batchSize, uint32_t inputSize,
+                                uint32_t rowsPerBlock, uint32_t tileLength)
+    {
+        this->batchSize = batchSize;
+        this->inputSize = inputSize;
+        this->rowsPerBlock = rowsPerBlock;
+        this->tileLength = tileLength;
+
+        uint32_t startRow = AscendC::GetBlockIdx() * rowsPerBlock;
+        xGm.SetGlobalBuffer((__gm__ float*)x + (uint64_t)startRow * inputSize, (uint64_t)rowsPerBlock * inputSize);
+        wsumGm.SetGlobalBuffer((__gm__ float*)wsum, inputSize);
+        scaleGm.SetGlobalBuffer((__gm__ float*)scale, 1);
+        yGm.SetGlobalBuffer((__gm__ float*)y + startRow, rowsPerBlock);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueW, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(sumQueue, BUFFER_NUM, 1 * sizeof(float));
+        pipe.InitBuffer(scaleQueue, 1, 1 * sizeof(float)); // hold scale value
+    }
+
+    __aicore__ inline void Process()
+    {
+        // preload scale
+        AscendC::LocalTensor<float> scaleLocal = scaleQueue.AllocTensor<float>();
+        AscendC::DataCopy(scaleLocal, scaleGm[0], 1);
+        scaleQueue.EnQue(scaleLocal);
+
+        uint32_t startRow = AscendC::GetBlockIdx() * rowsPerBlock;
+        uint32_t endRow = AscendC::Min(startRow + rowsPerBlock, batchSize);
+        uint32_t validRows = endRow - startRow;
+
+        for (uint32_t r = 0; r < validRows; ++r) {
+            RowDot(r);
+        }
+    }
+
+private:
+    __aicore__ inline void RowDot(uint32_t rowIdxInBlock)
+    {
+        // accumulator as 1-length local tensor initialized to 0
+        AscendC::LocalTensor<float> acc = sumQueue.AllocTensor<float>();
+        AscendC::Dup(acc, 0.0f, 1U);
+
+        // number of tiles over inputSize
+        uint32_t tiles = (inputSize + tileLength - 1) / tileLength;
+
+        for (uint32_t t = 0; t < tiles; ++t) {
+            uint32_t offset = t * tileLength;
+            uint32_t copyLen = AscendC::Min(tileLength, inputSize - offset);
+
+            // Copy a tile of x row and wsum
+            AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+            AscendC::LocalTensor<float> wLocal = inQueueW.AllocTensor<float>();
+            AscendC::DataCopy(xLocal, xGm[(uint64_t)rowIdxInBlock * inputSize + offset], copyLen);
+            AscendC::DataCopy(wLocal, wsumGm[offset], copyLen);
+            inQueueX.EnQue(xLocal);
+            inQueueW.EnQue(wLocal);
+
+            // Compute partial products and reduce to a scalar
+            xLocal = inQueueX.DeQue<float>();
+            wLocal = inQueueW.DeQue<float>();
+            AscendC::LocalTensor<float> prodLocal = tmpQueue.AllocTensor<float>();
+            AscendC::Mul(prodLocal, xLocal, wLocal, copyLen);
+
+            AscendC::LocalTensor<float> tileSum = sumQueue.AllocTensor<float>();
+            AscendC::ReduceSum(tileSum, prodLocal, copyLen);
+
+            // accumulate
+            AscendC::Add(acc, acc, tileSum, 1U);
+
+            tmpQueue.FreeTensor(prodLocal);
+            sumQueue.FreeTensor(tileSum);
+            inQueueX.FreeTensor(xLocal);
+            inQueueW.FreeTensor(wLocal);
+        }
+
+        // multiply by 0.5 and scaling factor
+        AscendC::Muls(acc, acc, 0.5f, 1U);
+        AscendC::LocalTensor<float> scaleLocal = scaleQueue.DeQue<float>();
+        AscendC::Mul(acc, acc, scaleLocal, 1U);
+        scaleQueue.EnQue(scaleLocal);
+
+        // write result to output
+        AscendC::DataCopy(yGm[rowIdxInBlock], acc, 1U);
+        sumQueue.FreeTensor(acc);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueW;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> sumQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> scaleQueue;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> wsumGm;
+    AscendC::GlobalTensor<float> scaleGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t batchSize;
+    uint32_t inputSize;
+    uint32_t rowsPerBlock;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void gemm_divide_sum_scaling_custom(GM_ADDR x,
+                                                                      GM_ADDR wsum,
+                                                                      GM_ADDR scale,
+                                                                      GM_ADDR y,
+                                                                      GM_ADDR workspace,
+                                                                      GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGemmDivideSumScaling op;
+    op.Init(x, wsum, scale, y,
+            tiling_data.batchSize,
+            tiling_data.inputSize,
+            tiling_data.rowsPerBlock,
+            tiling_data.tileLength);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gemm_divide_sum_scaling_custom_impl_npu(const at::Tensor& x,
+                                                   const at::Tensor& wsum,
+                                                   const at::Tensor& scale) {
+    TORCH_CHECK(x.is_cuda() || x.device().type() == at::kPrivateUse1, "Input x must be on NPU");
+    TORCH_CHECK(wsum.dim() == 1, "wsum must be a 1-D tensor of length input_size");
+    TORCH_CHECK(scale.numel() == 1, "scale must be a scalar tensor");
+
+    auto sizes = x.sizes();
+    TORCH_CHECK(sizes.size() == 2, "x must be 2-D [batch, input]");
+    int64_t batch = sizes[0];
+
+    at::Tensor result = at::empty({batch, 1}, x.options());
+    EXEC_NPU_CMD(aclnnGemmDivideSumScalingCustom, x, wsum, scale, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_divide_sum_scaling_custom", &gemm_divide_sum_scaling_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_divide_sum_scaling_custom", &gemm_divide_sum_scaling_custom_impl_npu, "fused gemm/divide/sum/scale");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Fused model using custom AscendC kernel:
+    y = (sum_j (x @ W^T / 2)) * scaling_factor
+      = (x @ sum_j W) * (scaling_factor / 2)
+    Implemented as a batched dot with pre-summed weights and scaling on device.
+    """
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.weight = torch.nn.Parameter(torch.randn(hidden_size, input_size))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        # Precompute sum over hidden dimension of weight: shape [input_size]
+        wsum = self.weight.sum(dim=0)
+        # Scale will be applied inside kernel along with division by 2
+        scale_tensor = torch.tensor([self.scaling_factor], dtype=x.dtype, device=x.device)
+        return custom_ops_lib.gemm_divide_sum_scaling_custom(x, wsum, scale_tensor)
+'''

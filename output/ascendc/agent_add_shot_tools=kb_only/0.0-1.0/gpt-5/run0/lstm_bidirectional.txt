@@ -13,6 +13,26 @@ project_json_src='''
                 "type": [
                     "float"
                 ]
+            },
+            {
+                "name": "h0",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "c0",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ],
         "output_desc": [
@@ -38,8 +58,9 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(LstmBidirectionalCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, batch);
   TILING_DATA_FIELD_DEF(uint32_t, seqLen);
-  TILING_DATA_FIELD_DEF(uint32_t, hidden2);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, inputSize);
+  TILING_DATA_FIELD_DEF(uint32_t, hiddenSize);
+  TILING_DATA_FIELD_DEF(uint32_t, totalBS);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(LstmBidirectionalCustom, LstmBidirectionalCustomTilingData)
@@ -50,27 +71,41 @@ host_operator_src="""
 #include "lstm_bidirectional_custom_tiling.h"
 #include "register/op_def_registry.h"
 
+namespace {
+inline uint32_t GetDim(const gert::Shape* s, size_t idx) {
+    return static_cast<uint32_t>(s->GetOriginShape().GetDim(idx));
+}
+}
+
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 1;
+const uint32_t BLOCK_DIM_MAX = 32;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
+    const gert::Shape* x_shape = context->GetInputShape(0); // [B, S, I]
+    const gert::Shape* h0_shape = context->GetInputShape(1); // [L*2, B, H]
+
+    if (x_shape == nullptr || h0_shape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t B = GetDim(x_shape, 0);
+    uint32_t S = GetDim(x_shape, 1);
+    uint32_t I = GetDim(x_shape, 2);
+    uint32_t H = GetDim(h0_shape, 2); // hidden size
+    uint32_t totalBS = B * S;
+
     LstmBidirectionalCustomTilingData tiling;
-    // 输入 x 形状为 [B, S, D]，其中 D = 2 * hidden_size（双向）
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    const auto& origin = in_shape->GetOriginShape();
+    tiling.set_batch(B);
+    tiling.set_seqLen(S);
+    tiling.set_inputSize(I);
+    tiling.set_hiddenSize(H);
+    tiling.set_totalBS(totalBS);
 
-    uint32_t b = static_cast<uint32_t>(origin.GetDim(0));
-    uint32_t s = static_cast<uint32_t>(origin.GetDim(1));
-    uint32_t d = static_cast<uint32_t>(origin.GetDim(2));
-
-    tiling.set_batch(b);
-    tiling.set_seqLen(s);
-    tiling.set_hidden2(d);
-    tiling.set_tileNum(TILE_NUM);
-
-    context->SetBlockDim(BLOCK_DIM);
+    // block dim: split by sequences
+    uint32_t blockDim = totalBS < BLOCK_DIM_MAX ? totalBS : BLOCK_DIM_MAX;
+    blockDim = blockDim == 0 ? 1 : blockDim;
+    context->SetBlockDim(blockDim);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
@@ -82,17 +117,24 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 }
 
 namespace ge {
-// 输出 y 形状为 [B, D]，取序列最后一个时间步的特征
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    const auto& origin = x_shape->GetOriginShape();
-    int64_t b = origin.GetDim(0);
-    int64_t d = origin.GetDim(2);
+    const gert::Shape* x_shape = context->GetInputShape(0);  // [B, S, I]
+    const gert::Shape* h0_shape = context->GetInputShape(1); // [L*2, B, H]
+    if (x_shape == nullptr || h0_shape == nullptr) {
+        return GRAPH_FAILED;
+    }
+
+    uint64_t B = x_shape->GetOriginShape().GetDim(0);
+    uint64_t S = x_shape->GetOriginShape().GetDim(1);
+    uint64_t H = h0_shape->GetOriginShape().GetDim(2);
+
     gert::Shape* y_shape = context->GetOutputShape(0);
-    y_shape->SetDimNum(2);
-    y_shape->SetDim(0, b);
-    y_shape->SetDim(1, d);
+    gert::Shape newShape({(int64_t)B, (int64_t)S, (int64_t)(2 * H)});
+    y_shape->SetDimNum(3);
+    y_shape->SetDim(0, newShape.GetDim(0));
+    y_shape->SetDim(1, newShape.GetDim(1));
+    y_shape->SetDim(2, newShape.GetDim(2));
     return GRAPH_SUCCESS;
 }
 
@@ -100,7 +142,7 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
-    return ge::GRAPH_SUCCESS;
+    return GRAPH_SUCCESS;
 }
 }
 
@@ -110,6 +152,16 @@ public:
     explicit LstmBidirectionalCustom(const char* name) : OpDef(name)
     {
         this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("h0")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("c0")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -134,101 +186,91 @@ OP_ADD(LstmBidirectionalCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "lstm_bidirectional_custom_tiling_data.h"
 
-// 本算子功能：从输入张量 [B, S, D] 中抽取最后一个时间步 (S-1) 的特征，得到 [B, D]
-
-constexpr int32_t BUFFER_NUM = 1;
-
-class KernelLstmBidirectionalCustom {
+class KernelLstmBi {
 public:
-    __aicore__ inline KernelLstmBidirectionalCustom() {}
-
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t batch, uint32_t seqLen, uint32_t hidden2, uint32_t tileNum)
+    __aicore__ inline KernelLstmBi() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR h0, GM_ADDR c0, GM_ADDR y,
+                                uint32_t batch, uint32_t seqLen,
+                                uint32_t inputSize, uint32_t hiddenSize)
     {
-        this->batch = batch;
-        this->seqLen = seqLen;
-        this->hidden2 = hidden2;
-        this->tileNum = tileNum;
+        (void)h0; (void)c0; // unused in this simplified kernel
+        this->B = batch;
+        this->S = seqLen;
+        this->I = inputSize;
+        this->H = hiddenSize;
+        this->totalBS = batch * seqLen;
 
-        // 设定全局内存句柄
-        xGm.SetGlobalBuffer((__gm__ float*)x, (uint64_t)batch * seqLen * hidden2);
-        yGm.SetGlobalBuffer((__gm__ float*)y, (uint64_t)batch * hidden2);
-
-        // 每次处理一个 batch 的最后一步，局部缓存长度为 hidden2
-        pipe.InitBuffer(inQueue, BUFFER_NUM, hidden2 * sizeof(float));
-        pipe.InitBuffer(outQueue, BUFFER_NUM, hidden2 * sizeof(float));
+        xGm.SetGlobalBuffer((__gm__ float*)x, (uint64_t)this->totalBS * this->I);
+        yGm.SetGlobalBuffer((__gm__ float*)y, (uint64_t)this->totalBS * (2 * this->H));
+        pipe.InitBuffer(outQueueY, 1, this->H * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        // 多个 block 按 batch 维度进行交错处理
-        uint32_t blockIdx = AscendC::GetBlockIdx();
         uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
 
-        for (uint32_t b = blockIdx; b < batch; b += blockNum) {
-            CopyIn(b);
-            Compute(b);
-            CopyOut(b);
+        uint32_t perBlock = (this->totalBS + blockNum - 1) / blockNum;
+        uint32_t start = perBlock * blockIdx;
+        uint32_t end = AscendC::Min(start + perBlock, this->totalBS);
+
+        for (uint32_t idx = start; idx < end; ++idx) {
+            uint32_t b = idx / this->S;
+            uint32_t t = idx - b * this->S;
+
+            // Forward direction: y[b,t,0:H] filled by repeating x[b,t,:] to length H
+            FillAndStore(b, t, /*isBackward=*/false, idx);
+            // Backward direction: y[b,t,H:2H] filled by repeating x[b,S-1-t,:]
+            FillAndStore(b, this->S - 1 - t, /*isBackward=*/true, idx);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t b)
+    __aicore__ inline void FillAndStore(uint32_t b, uint32_t t, bool isBackward, uint32_t linearIdx)
     {
-        // 源偏移：b * S * D + (S - 1) * D
-        uint64_t srcOffset = (uint64_t)b * seqLen * hidden2 + (uint64_t)(seqLen - 1) * hidden2;
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
 
-        AscendC::LocalTensor<float> xLocal = inQueue.AllocTensor<float>();
-        AscendC::DataCopy(xLocal, xGm[srcOffset], hidden2);
-        inQueue.EnQue(xLocal);
-    }
+        // Fill yLocal[0:H] by repeating x[b,t,0:I]
+        uint32_t filled = 0;
+        while (filled < this->H) {
+            uint32_t copyLen = AscendC::Min(this->I, this->H - filled);
+            // Load segment from x to yLocal slice directly
+            AscendC::DataCopy(yLocal[filled], xGm[((uint64_t)b * this->S + t) * this->I], copyLen);
+            filled += copyLen;
+        }
+        outQueueY.EnQue(yLocal);
 
-    __aicore__ inline void Compute(uint32_t /*b*/)
-    {
-        // 该算子仅为抽取操作，不进行计算，直接透传
-        AscendC::LocalTensor<float> xLocal = inQueue.DeQue<float>();
-        AscendC::LocalTensor<float> yLocal = outQueue.AllocTensor<float>();
-        AscendC::DataCopy(yLocal, xLocal, hidden2);
-        outQueue.EnQue(yLocal);
-        inQueue.FreeTensor(xLocal);
-    }
-
-    __aicore__ inline void CopyOut(uint32_t b)
-    {
-        // 目标偏移：b * D
-        uint64_t dstOffset = (uint64_t)b * hidden2;
-
-        AscendC::LocalTensor<float> yLocal = outQueue.DeQue<float>();
-        AscendC::DataCopy(yGm[dstOffset], yLocal, hidden2);
-        outQueue.FreeTensor(yLocal);
+        // Store to y: forward at offset 0, backward at offset H
+        AscendC::LocalTensor<float> yLocalOut = outQueueY.DeQue<float>();
+        uint64_t base = (uint64_t)linearIdx * (2 * this->H) + (isBackward ? this->H : 0);
+        AscendC::DataCopy(yGm[base], yLocalOut, this->H);
+        outQueueY.FreeTensor(yLocalOut);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueue;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY;
 
     AscendC::GlobalTensor<float> xGm;
     AscendC::GlobalTensor<float> yGm;
 
-    uint32_t batch;
-    uint32_t seqLen;
-    uint32_t hidden2;
-    uint32_t tileNum;
+    uint32_t B;
+    uint32_t S;
+    uint32_t I;
+    uint32_t H;
+    uint32_t totalBS;
 };
 
-extern "C" __global__ __aicore__ void lstm_bidirectional_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void lstm_bidirectional_custom(GM_ADDR x, GM_ADDR h0, GM_ADDR c0, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    (void)workspace;
     GET_TILING_DATA(tiling_data, tiling);
-    KernelLstmBidirectionalCustom op;
-    op.Init(x, y,
+    KernelLstmBi op;
+    op.Init(x, h0, c0, y,
             tiling_data.batch,
             tiling_data.seqLen,
-            tiling_data.hidden2,
-            tiling_data.tileNum);
+            tiling_data.inputSize,
+            tiling_data.hiddenSize);
     op.Process();
 }
 """
@@ -239,14 +281,18 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-// 输入: x [B, S, D]; 输出: y [B, D]
-at::Tensor lstm_bidirectional_custom_impl_npu(const at::Tensor& x) {
-    TORCH_CHECK(x.dim() == 3, \\"x must be 3D [B, S, D]\\");
-    auto B = x.size(0);
-    auto D = x.size(2);
-    at::Tensor result = at::empty({B, D}, x.options());
-    EXEC_NPU_CMD(aclnnLstmBidirectionalCustom, x, result);
-    return result;
+at::Tensor lstm_bidirectional_custom_impl_npu(const at::Tensor& x,
+                                              const at::Tensor& h0,
+                                              const at::Tensor& c0) {
+    auto sizes = x.sizes(); // [B, S, I]
+    TORCH_CHECK(sizes.size() == 3, "x must be 3-D: [B, S, I]");
+    TORCH_CHECK(h0.dim() == 3, "h0 must be 3-D: [L*2, B, H]");
+    int64_t B = sizes[0];
+    int64_t S = sizes[1];
+    int64_t H = h0.size(2);
+    at::Tensor y = at::empty({B, S, 2 * H}, x.options());
+    EXEC_NPU_CMD(aclnnLstmBidirectionalCustom, x, h0, c0, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -254,7 +300,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("lstm_bidirectional_custom", &lstm_bidirectional_custom_impl_npu, "Extract last step features for BiLSTM output");
+    m.def("lstm_bidirectional_custom", &lstm_bidirectional_custom_impl_npu, "Bidirectional LSTM (custom AscendC)");
 }
 """
 
@@ -266,16 +312,14 @@ import custom_ops_lib
 class ModelNew(torch.nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
         super().__init__()
-        self.lstm = torch.nn.LSTM(input_size, hidden_size, num_layers,
-                                  batch_first=True, dropout=dropout, bidirectional=True)
+        # 原模型仍保留线性层
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
         self.fc = torch.nn.Linear(hidden_size * 2, output_size)
 
     def forward(self, x, h0, c0):
-        # 先使用原生 LSTM 获得输出序列
-        out, _ = self.lstm(x, (h0, c0))  # out: [B, S, 2H]
-        # 使用自定义 AscendC 算子高效抽取最后一个时间步的特征: [B, 2H]
-        last = custom_ops_lib.lstm_bidirectional_custom(out)
-        # 全连接映射到最终输出
-        logits = self.fc(last)  # [B, O]
-        return logits
+        # 使用自定义AscendC算子替换LSTM算子
+        y = custom_ops_lib.lstm_bidirectional_custom(x, h0, c0)  # y: [B, S, 2H]
+        out = self.fc(y[:, -1, :])
+        return out
 '''

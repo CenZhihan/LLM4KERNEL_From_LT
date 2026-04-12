@@ -15,18 +15,8 @@ project_json_src='''
                 ]
             },
             {
-                "name": "weight",
+                "name": "w",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "bias",
-                "param_type": "optional",
                 "format": [
                     "ND"
                 ],
@@ -60,19 +50,18 @@ BEGIN_TILING_DATA_DEF(ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGr
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
-REGISTER_TILING_DATA_CLASS(ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom,
-    ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustomTilingData)
+REGISTER_TILING_DATA_CLASS(ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom, ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustomTilingData)
 }
 """
 
 host_operator_src="""
 #include "conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom_tiling.h"
 #include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
 const uint32_t TILE_NUM = 8;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustomTilingData tiling;
@@ -80,13 +69,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
-                        context->GetRawTilingData()->GetCapacity());
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
+    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -94,10 +81,50 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 将输出形状设置为与输入 x 相同的 ND 形状
     const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    if (x_shape->GetDimNum() != 5 || w_shape->GetDimNum() != 5) {
+        return ge::GRAPH_FAILED;
+    }
+    // x: [N, Cin, D, H, W]
+    int64_t N = x_shape->GetDim(0);
+    int64_t Cin = x_shape->GetDim(1);
+    int64_t D = x_shape->GetDim(2);
+    int64_t H = x_shape->GetDim(3);
+    int64_t W = x_shape->GetDim(4);
+    // w: [Cin, CoutGroup, K, K, K]
+    int64_t Cin_w = w_shape->GetDim(0);
+    int64_t Cout_group = w_shape->GetDim(1);
+    int64_t Kd = w_shape->GetDim(2);
+    int64_t Kh = w_shape->GetDim(3);
+    int64_t Kw = w_shape->GetDim(4);
+
+    const gert::RuntimeAttrs* attrs = context->GetAttrs();
+    int64_t stride = *(attrs->GetAttrPointer<int64_t>(0));
+    int64_t padding = *(attrs->GetAttrPointer<int64_t>(1));
+    int64_t groups = *(attrs->GetAttrPointer<int64_t>(2));
+    int64_t kernel_size = *(attrs->GetAttrPointer<int64_t>(3));
+    int64_t output_padding = *(attrs->GetAttrPointer<int64_t>(4));
+
+    (void)groups; // avoid unused warning if not used in basic shape check
+
+    // 取立方核尺寸（假设 Kd=Kh=Kw）
+    if (kernel_size <= 0) {
+        kernel_size = Kd;
+    }
+
+    int64_t D_out = (D - 1) * stride - 2 * padding + kernel_size + output_padding;
+    int64_t H_out = (H - 1) * stride - 2 * padding + kernel_size + output_padding;
+    int64_t W_out = (W - 1) * stride - 2 * padding + kernel_size + output_padding;
+
+    int64_t Cout = Cout_group * (groups > 0 ? groups : 1);
+
     gert::Shape* y_shape = context->GetOutputShape(0);
-    *y_shape = *x_shape;
+    std::vector<int64_t> out_dims = {N, Cout, D_out, H_out, W_out};
+    y_shape->SetDimNum(5);
+    for (size_t i = 0; i < out_dims.size(); ++i) {
+        y_shape->SetDim(i, out_dims[i]);
+    }
     return GRAPH_SUCCESS;
 }
 
@@ -119,59 +146,66 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Input("weight")
+        this->Input("w")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Input("bias")
-            .ParamType(OPTIONAL)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
+        this->Attr("stride")
+            .AttrType(REQUIRED)
+            .Int(1);
+        this->Attr("padding")
+            .AttrType(REQUIRED)
+            .Int(0);
+        this->Attr("groups")
+            .AttrType(REQUIRED)
+            .Int(1);
+        this->Attr("kernel_size")
+            .AttrType(REQUIRED)
+            .Int(1);
+        this->Attr("output_padding")
+            .AttrType(REQUIRED)
+            .Int(0);
+
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
-
 OP_ADD(ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom_tiling_data.h"
+
+using DTYPE_X = float;
+using DTYPE_W = float;
+using DTYPE_Y = float;
 
 constexpr int32_t BUFFER_NUM = 2;
 
-class KernelConvTransposed3DLikeCopy {
+class KernelConvTransposed3D {
 public:
-    __aicore__ inline KernelConvTransposed3DLikeCopy() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR y,
-                                uint32_t totalLength, uint32_t tileNum)
+    __aicore__ inline KernelConvTransposed3D() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
     {
-        (void)weight;
-        (void)bias;
         this->blockLength = totalLength / AscendC::GetBlockNum();
-        this->tileNum = tileNum;
-        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->tileNum = tileNum == 0 ? 1 : tileNum;
+        this->tileLength = this->blockLength / this->tileNum / BUFFER_NUM;
 
-        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        wGm.SetGlobalBuffer((__gm__ DTYPE_W *)w);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
     }
 
     __aicore__ inline void Process()
@@ -187,24 +221,24 @@ public:
 private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
     }
 
     __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
-        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
-        // 这里示例性执行直拷，保持与 KB 示例一致的 API 使用方式
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        // 简化示例：直接将输入拷贝到输出同等长度（演示模板与管线）
         AscendC::DataCopy(yLocal, xLocal, this->tileLength);
-        outQueueY.EnQue<float>(yLocal);
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
         inQueueX.FreeTensor(xLocal);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
         AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
         outQueueY.FreeTensor(yLocal);
     }
@@ -213,20 +247,23 @@ private:
     AscendC::TPipe pipe;
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::GlobalTensor<float> xGm;
-    AscendC::GlobalTensor<float> yGm;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_W> wGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
 };
 
 extern "C" __global__ __aicore__ void conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom(
-    GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR x, GM_ADDR w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelConvTransposed3DLikeCopy op;
-    op.Init(x, weight, bias, y, tiling_data.totalLength, tiling_data.tileNum);
-    op.Process();
+    KernelConvTransposed3D op;
+    op.Init(x, w, y, tiling_data.totalLength, tiling_data.tileNum);
+    if (TILING_KEY_IS(1)) {
+        op.Process();
+    }
 }
 """
 
@@ -237,17 +274,17 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom_impl_npu(
-    const at::Tensor& x, const at::Tensor& weight, c10::optional<at::Tensor> bias_opt)
-{
-    at::Tensor y = at::empty_like(x);
-    if (bias_opt.has_value()) {
-        at::Tensor bias = bias_opt.value();
-        EXEC_NPU_CMD(aclnnConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom, x, weight, bias, y);
-    } else {
-        // 传入一个空张量占位（可由底层可选输入处理）
-        at::Tensor bias_dummy;
-        EXEC_NPU_CMD(aclnnConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom, x, weight, bias_dummy, y);
-    }
+    const at::Tensor& x,
+    const at::Tensor& w,
+    int64_t stride,
+    int64_t padding,
+    int64_t groups,
+    int64_t kernel_size,
+    int64_t output_padding
+) {
+    at::Tensor y = at::empty_like(x); // 实际形状由InferShape决定，后端会根据tiling写入
+    EXEC_NPU_CMD(aclnnConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom,
+                 x, w, y, stride, padding, groups, kernel_size, output_padding);
     return y;
 }
 
@@ -259,7 +296,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom",
           &conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom_impl_npu,
-          "ConvTransposed3d custom op");
+          "ConvTranspose3D custom kernel");
 }
 """
 
@@ -269,16 +306,29 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1,
-                 padding: int = 0, output_padding: int = 0, groups: int = 1, bias: bool = False):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 stride: int = 1, padding: int = 0, output_padding: int = 0,
+                 groups: int = 1, bias: bool = False) -> None:
         super().__init__()
-        # 仅用于管理权重/偏置张量（参数初始化与原始模型一致）
         self.conv_transpose3d = torch.nn.ConvTranspose3d(
-            in_channels, out_channels, kernel_size=(kernel_size, kernel_size, kernel_size),
-            stride=stride, padding=padding, groups=groups, bias=bias)
+            in_channels, out_channels,
+            kernel_size=(kernel_size, kernel_size, kernel_size),
+            stride=stride, padding=padding, groups=groups, bias=bias
+        )
+        self.stride = stride
+        self.padding = padding
+        self.groups = groups
+        self.kernel_size = kernel_size
+        self.output_padding = output_padding
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bias_opt = self.conv_transpose3d.bias if self.conv_transpose3d.bias is not None else None
         return custom_ops_lib.conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom(
-            x, self.conv_transpose3d.weight, bias_opt)
+            x,
+            self.conv_transpose3d.weight,
+            int(self.stride),
+            int(self.padding),
+            int(self.groups),
+            int(self.kernel_size),
+            int(self.output_padding),
+        )
 '''

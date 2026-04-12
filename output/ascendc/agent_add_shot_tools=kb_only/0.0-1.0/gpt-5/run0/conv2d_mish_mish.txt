@@ -70,9 +70,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    gert::Shape* out_shape = context->GetOutputShape(0);
-    *out_shape = *in_shape;
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
@@ -111,31 +111,37 @@ OP_ADD(Conv2dMishMishCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv2d_mish_mish_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
-class KernelConv2dMishMish {
+// mish(x) = x * tanh(softplus(x)), softplus(x) = ln(1 + exp(x))
+// This kernel applies mish twice: y = mish(mish(x))
+class KernelMishTwice {
 public:
-    __aicore__ inline KernelConv2dMishMish() {}
+    __aicore__ inline KernelMishTwice() {}
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
     {
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x) + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(y) + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+
+        // temp buffers
+        pipe.InitBuffer(tmp0, 1, this->tileLength * sizeof(float)); // t / t2
+        pipe.InitBuffer(tmp1, 1, this->tileLength * sizeof(float)); // ones
+        pipe.InitBuffer(tmp2, 1, this->tileLength * sizeof(float)); // sp
+        pipe.InitBuffer(tmp3, 1, this->tileLength * sizeof(float)); // tanh(sp)
     }
 
     __aicore__ inline void Process()
     {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; ++i) {
+        for (int32_t i = 0; i < loopCount; i++) {
             CopyIn(i);
             Compute(i);
             CopyOut(i);
@@ -155,12 +161,39 @@ private:
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
 
-        // 简化：此处仅作占位的逐元素传递（通常应实现 mish(mish(x))）
-        // 使用 DataCopy 在本地张量间复制
-        AscendC::DataCopy(yLocal, xLocal, this->tileLength);
+        AscendC::LocalTensor<float> tLocal   = tmp0.AllocTensor<float>();
+        AscendC::LocalTensor<float> oneLocal = tmp1.AllocTensor<float>();
+        AscendC::LocalTensor<float> spLocal  = tmp2.AllocTensor<float>();
+        AscendC::LocalTensor<float> thLocal  = tmp3.AllocTensor<float>();
+
+        // softplus(x): tLocal = exp(x)
+        AscendC::Exp(tLocal, xLocal, this->tileLength);
+        // oneLocal = 1.0
+        AscendC::Duplicate(oneLocal, 1.0f, this->tileLength);
+        // tLocal = tLocal + 1
+        AscendC::Add(tLocal, tLocal, oneLocal, this->tileLength);
+        // spLocal = ln(tLocal)
+        AscendC::Ln(spLocal, tLocal, this->tileLength);
+        // thLocal = tanh(spLocal)
+        AscendC::Tanh(thLocal, spLocal, this->tileLength);
+        // yLocal = xLocal * thLocal  (first mish)
+        AscendC::Mul(yLocal, xLocal, thLocal, this->tileLength);
+
+        // softplus(yLocal): reuse tLocal
+        AscendC::Exp(tLocal, yLocal, this->tileLength);
+        AscendC::Add(tLocal, tLocal, oneLocal, this->tileLength);
+        AscendC::Ln(spLocal, tLocal, this->tileLength);
+        AscendC::Tanh(thLocal, spLocal, this->tileLength);
+        // yLocal = yLocal * thLocal  (second mish)
+        AscendC::Mul(yLocal, yLocal, thLocal, this->tileLength);
 
         outQueueY.EnQue<float>(yLocal);
+
         inQueueX.FreeTensor(xLocal);
+        tmp0.FreeTensor(tLocal);
+        tmp1.FreeTensor(oneLocal);
+        tmp2.FreeTensor(spLocal);
+        tmp3.FreeTensor(thLocal);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
@@ -172,8 +205,10 @@ private:
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM>  inQueueX;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmp0, tmp1, tmp2, tmp3;
+
     AscendC::GlobalTensor<float> xGm;
     AscendC::GlobalTensor<float> yGm;
 
@@ -183,8 +218,9 @@ private:
 };
 
 extern "C" __global__ __aicore__ void conv2d_mish_mish_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    (void)workspace;
     GET_TILING_DATA(tiling_data, tiling);
-    KernelConv2dMishMish op;
+    KernelMishTwice op;
     op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
@@ -196,10 +232,10 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv2d_mish_mish_custom_impl_npu(const at::Tensor& x) {
-    at::Tensor y = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnConv2dMishMishCustom, x, y);
-    return y;
+at::Tensor conv2d_mish_mish_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnConv2dMishMishCustom, self, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -207,7 +243,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv2d_mish_mish_custom", &conv2d_mish_mish_custom_impl_npu, "Conv2d + Mish + Mish (fused, custom)");
+    m.def("conv2d_mish_mish_custom", &conv2d_mish_mish_custom_impl_npu, "mish(mish(x))");
 }
 """
 
@@ -217,6 +253,9 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
+    """
+    Conv2d followed by fused Mish(Mish(.)) custom AscendC kernel.
+    """
     def __init__(self, in_channels, out_channels, kernel_size):
         super(ModelNew, self).__init__()
         self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size)

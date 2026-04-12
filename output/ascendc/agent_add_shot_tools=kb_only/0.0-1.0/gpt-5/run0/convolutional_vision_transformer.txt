@@ -5,7 +5,7 @@ project_json_src='''
         "language": "cpp",
         "input_desc": [
             {
-                "name": "x",
+                "name": "cls",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -15,7 +15,7 @@ project_json_src='''
                 ]
             },
             {
-                "name": "cls",
+                "name": "x",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -27,7 +27,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "out",
+                "name": "y",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -48,6 +48,7 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(ConvolutionalVisionTransformerCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, batch);
   TILING_DATA_FIELD_DEF(uint32_t, embedDim);
+  TILING_DATA_FIELD_DEF(uint32_t, tileE);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ConvolutionalVisionTransformerCustom, ConvolutionalVisionTransformerCustomTilingData)
@@ -59,29 +60,29 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ConvolutionalVisionTransformerCustomTilingData tiling;
 
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    auto x_origin = x_shape->GetOriginShape();
-    // Expect x of shape [B, E]
-    uint32_t dim_num = x_origin.GetDimNum();
-    if (dim_num < 2) {
-        return ge::GRAPH_FAILED;
-    }
-    uint32_t batch = static_cast<uint32_t>(x_origin.GetDim(0));
-    uint32_t embedDim = static_cast<uint32_t>(x_origin.GetDim(1));
+    // x shape is [B, E]
+    uint32_t batch = static_cast<uint32_t>(context->GetInputShape(1)->GetOriginShape().GetDim(0));
+    uint32_t embedDim = static_cast<uint32_t>(context->GetInputShape(1)->GetOriginShape().GetDim(1));
 
-    context->SetBlockDim(1);
+    // simple tile size, can be tuned
+    uint32_t tileE = 1024;
+    if (embedDim < tileE) tileE = embedDim;
+
+    context->SetBlockDim(BLOCK_DIM);
     tiling.set_batch(batch);
     tiling.set_embedDim(embedDim);
+    tiling.set_tileE(tileE);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -89,22 +90,18 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // out: [B, 2, E]
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    auto x_origin = x_shape->GetOriginShape();
-    if (x_origin.GetDimNum() < 2) {
-        return GRAPH_FAILED;
-    }
-    int64_t B = x_origin.GetDim(0);
-    int64_t E = x_origin.GetDim(1);
-    gert::Shape* out_shape = context->GetOutputShape(0);
-    out_shape->SetDimNum(3);
-    out_shape->SetDim(0, B);
-    out_shape->SetDim(1, 2);
-    out_shape->SetDim(2, E);
+    // cls: [B, 1, E], x: [B, E], y: [B, 2, E]
+    const gert::Shape* cls_shape = context->GetInputShape(0);
+    const auto B = cls_shape->GetOriginShape().GetDim(0);
+    const auto E = cls_shape->GetOriginShape().GetDim(2);
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(3);
+    y_shape->SetDim(0, B);
+    y_shape->SetDim(1, 2);
+    y_shape->SetDim(2, E);
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -118,90 +115,156 @@ class ConvolutionalVisionTransformerCustom : public OpDef {
 public:
     explicit ConvolutionalVisionTransformerCustom(const char* name) : OpDef(name)
     {
-        this->Input("x")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Input("cls")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("out")
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
-
 OP_ADD(ConvolutionalVisionTransformerCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "convolutional_vision_transformer_custom_tiling_data.h"
 
-template <typename T>
-class KernelCvtTokenConcat {
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCViTCat {
 public:
-    __aicore__ inline KernelCvtTokenConcat() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR cls, GM_ADDR out, uint32_t batch, uint32_t embedDim)
+    __aicore__ inline KernelCViTCat() {}
+    __aicore__ inline void Init(GM_ADDR cls, GM_ADDR x, GM_ADDR y, uint32_t batch, uint32_t embedDim, uint32_t tileE)
     {
         this->batch = batch;
         this->embedDim = embedDim;
+        this->tileE = tileE;
 
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(x), static_cast<uint32_t>(batch * embedDim));
-        clsGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(cls), embedDim);
-        outGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(out), static_cast<uint32_t>(batch * 2 * embedDim));
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t idx = AscendC::GetBlockIdx();
 
-        pipe.InitBuffer(inQueueX, 1, embedDim * sizeof(T));
-        pipe.InitBuffer(inQueueCls, 1, embedDim * sizeof(T));
+        uint32_t base = batch / blocks;
+        uint32_t rem = batch % blocks;
+
+        if (idx < rem) {
+            startB = idx * (base + 1);
+            blockB = base + 1;
+        } else {
+            startB = rem * (base + 1) + (idx - rem) * base;
+            blockB = base;
+        }
+
+        // Set GM buffers with offsets
+        clsGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(cls) + startB * embedDim, blockB * embedDim);
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(x) + startB * embedDim, blockB * embedDim);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(y) + startB * 2 * embedDim, blockB * 2 * embedDim);
+
+        pipe.InitBuffer(inQueueCls, BUFFER_NUM, this->tileE * sizeof(float));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileE * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileE * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        for (uint32_t b = 0; b < batch; ++b) {
-            // Load cls once per batch and write to output at [b, 0, :]
-            AscendC::LocalTensor<T> clsLocal = inQueueCls.AllocTensor<T>();
-            AscendC::DataCopy(clsLocal, clsGm, embedDim);
-            AscendC::DataCopy(outGm[(b * 2) * embedDim], clsLocal, embedDim);
-            inQueueCls.FreeTensor(clsLocal);
-
-            // Load x[b, :] and write to output at [b, 1, :]
-            AscendC::LocalTensor<T> xLocal = inQueueX.AllocTensor<T>();
-            AscendC::DataCopy(xLocal, xGm[b * embedDim], embedDim);
-            AscendC::DataCopy(outGm[(b * 2 + 1) * embedDim], xLocal, embedDim);
-            inQueueX.FreeTensor(xLocal);
+        if (blockB == 0 || embedDim == 0) {
+            return;
+        }
+        for (uint32_t b = 0; b < blockB; ++b) {
+            // write channel 0 from cls
+            for (uint32_t pos = 0; pos < embedDim; pos += tileE) {
+                uint32_t cur = (pos + tileE <= embedDim) ? tileE : (embedDim - pos);
+                CopyInCls(b, pos, cur);
+                ComputeCopyToY(b, 0, pos, cur); // channel 0
+                CopyOutY(b, 0, pos, cur);
+            }
+            // write channel 1 from x
+            for (uint32_t pos = 0; pos < embedDim; pos += tileE) {
+                uint32_t cur = (pos + tileE <= embedDim) ? tileE : (embedDim - pos);
+                CopyInX(b, pos, cur);
+                ComputeCopyToY(b, 1, pos, cur); // channel 1
+                CopyOutY(b, 1, pos, cur);
+            }
         }
     }
 
 private:
+    __aicore__ inline void CopyInCls(uint32_t b, uint32_t pos, uint32_t len)
+    {
+        AscendC::LocalTensor<float> clsLocal = inQueueCls.AllocTensor<float>();
+        AscendC::DataCopy(clsLocal, clsGm[b * embedDim + pos], len);
+        inQueueCls.EnQue(clsLocal);
+    }
+
+    __aicore__ inline void CopyInX(uint32_t b, uint32_t pos, uint32_t len)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm[b * embedDim + pos], len);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void ComputeCopyToY(uint32_t b, uint32_t ch, uint32_t pos, uint32_t len)
+    {
+        AscendC::LocalTensor<float> srcLocal;
+        if (ch == 0) {
+            srcLocal = inQueueCls.DeQue<float>();
+        } else {
+            srcLocal = inQueueX.DeQue<float>();
+        }
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        AscendC::DataCopy(yLocal, srcLocal, len);
+        outQueueY.EnQue(yLocal);
+        if (ch == 0) {
+            inQueueCls.FreeTensor(srcLocal);
+        } else {
+            inQueueX.FreeTensor(srcLocal);
+        }
+    }
+
+    __aicore__ inline void CopyOutY(uint32_t b, uint32_t ch, uint32_t pos, uint32_t len)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        // y layout: [B, 2, E] flattened. Offset for channel ch is ch * E
+        AscendC::DataCopy(yGm[b * 2 * embedDim + ch * embedDim + pos], yLocal, len);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueCls;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueCls;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
 
-    AscendC::GlobalTensor<T> xGm;
-    AscendC::GlobalTensor<T> clsGm;
-    AscendC::GlobalTensor<T> outGm;
+    AscendC::GlobalTensor<float> clsGm;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
 
-    uint32_t batch = 0;
-    uint32_t embedDim = 0;
+    uint32_t batch;
+    uint32_t embedDim;
+    uint32_t tileE;
+
+    uint32_t startB;
+    uint32_t blockB;
 };
 
-extern "C" __global__ __aicore__ void convolutional_vision_transformer_custom(
-    GM_ADDR x, GM_ADDR cls, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void convolutional_vision_transformer_custom(GM_ADDR cls, GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelCvtTokenConcat<float> op;
-    op.Init(x, cls, out, tiling_data.batch, tiling_data.embedDim);
+    KernelCViTCat op;
+    op.Init(cls, x, y, tiling_data.batch, tiling_data.embedDim, tiling_data.tileE);
     op.Process();
 }
 """
@@ -212,14 +275,17 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor convolutional_vision_transformer_custom_impl_npu(const at::Tensor& x, const at::Tensor& cls) {
-    TORCH_CHECK(x.dim() == 2, \\"x must be [B, E]\\");
-    TORCH_CHECK(cls.dim() == 2 && cls.size(0) == 1, \\"cls must be [1, E]\\");
-    auto B = x.size(0);
-    auto E = x.size(1);
-    at::Tensor out = at::empty({B, 2, E}, x.options());
-    EXEC_NPU_CMD(aclnnConvolutionalVisionTransformerCustom, x, cls, out);
-    return out;
+at::Tensor convolutional_vision_transformer_custom_impl_npu(const at::Tensor& cls, const at::Tensor& x) {
+    // cls: [B, 1, E], x: [B, E]
+    TORCH_CHECK(cls.dim() == 3, "cls must be [B,1,E]");
+    TORCH_CHECK(x.dim() == 2, "x must be [B,E]");
+    TORCH_CHECK(cls.size(0) == x.size(0), "batch dim mismatch");
+    TORCH_CHECK(cls.size(2) == x.size(1), "embed dim mismatch");
+    auto B = cls.size(0);
+    auto E = cls.size(2);
+    at::Tensor y = at::empty({B, 2, E}, cls.options());
+    EXEC_NPU_CMD(aclnnConvolutionalVisionTransformerCustom, cls, x, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -227,7 +293,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("convolutional_vision_transformer_custom", &convolutional_vision_transformer_custom_impl_npu, "CLS concat for CViT");
+    m.def("convolutional_vision_transformer_custom", &convolutional_vision_transformer_custom_impl_npu, "CViT concat [CLS] and token");
 }
 """
 
@@ -239,8 +305,7 @@ import custom_ops_lib
 class ModelNew(torch.nn.Module):
     def __init__(self, num_classes, embed_dim=512, num_heads=8, num_layers=6, 
                  mlp_ratio=4.0, patch_size=4, in_channels=3, image_size=32):
-        super(ModelNew, self).__init__()
-
+        super().__init__()
         self.patch_size = patch_size
         self.image_size = image_size
         self.embed_dim = embed_dim
@@ -264,16 +329,16 @@ class ModelNew(torch.nn.Module):
 
     def forward(self, x):
         B = x.size(0)
-        x = self.conv1(x)                  # (B, E, H/ps, W/ps)
-        x = x.flatten(start_dim=1)         # (B, E * num_patches)
-        x = self.linear_proj(x)            # (B, E)
+        x = self.conv1(x)                 # (B, E, H/ps, W/ps)
+        x = x.flatten(start_dim=1)        # (B, E * num_patches)
+        x = self.linear_proj(x)           # (B, E)
 
-        # Use custom AscendC kernel to create [CLS, token] sequence -> (B, 2, E)
-        cls_flat = self.cls_token.view(1, self.embed_dim).contiguous()  # (1, E)
-        x = custom_ops_lib.convolutional_vision_transformer_custom(x, cls_flat)
+        cls_tokens = self.cls_token.expand(B, -1, -1).contiguous()     # (B, 1, E)
+        # Replace cat with custom kernel: (B, 2, E)
+        x = custom_ops_lib.convolutional_vision_transformer_custom(cls_tokens, x)
 
         for layer in self.transformer_layers:
-            x = layer(x)                   # (B, 2, E)
+            x = layer(x)
 
-        return self.fc_out(x[:, 0])
+        return self.fc_out(x[:, 0])       # (B, num_classes)
 '''

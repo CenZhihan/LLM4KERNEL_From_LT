@@ -1,0 +1,372 @@
+project_json_src='''
+[
+    {
+        "op": "BicubicUpsampleCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(BicubicUpsampleCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h_in);
+  TILING_DATA_FIELD_DEF(uint32_t, w_in);
+  TILING_DATA_FIELD_DEF(uint32_t, h_out);
+  TILING_DATA_FIELD_DEF(uint32_t, w_out);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(BicubicUpsampleCustom, BicubicUpsampleCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "bicubic_upsample_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    BicubicUpsampleCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    // Expect ND format with dims [N,C,H,W]
+    auto n = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(0));
+    auto c = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(1));
+    auto h_in = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(2));
+    auto w_in = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(3));
+
+    // Fixed output size per problem statement
+    const uint32_t h_out = 256;
+    const uint32_t w_out = 256;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_h_in(h_in);
+    tiling.set_w_in(w_in);
+    tiling.set_h_out(h_out);
+    tiling.set_w_out(w_out);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    context->SetTilingKey(1);
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    auto n = x_shape->GetOriginShape().GetDim(0);
+    auto c = x_shape->GetOriginShape().GetDim(1);
+    // Fixed output H,W = 256
+    y_shape->SetDim(0, n);
+    y_shape->SetDim(1, c);
+    y_shape->SetDim(2, 256);
+    y_shape->SetDim(3, 256);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+
+namespace ops {
+class BicubicUpsampleCustom : public OpDef {
+public:
+    explicit BicubicUpsampleCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(BicubicUpsampleCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "bicubic_upsample_custom_tiling_data.h"
+
+// 参考 AscendC 基础模板（Add/Mean/RmsNorm/UnPad），采用单输入单输出算子框架
+// 本示例固定实现 NCHW 的双三次上采样到 256x256，align_corners = true，数据类型 float
+
+class KernelBicubicUpsample {
+public:
+    __aicore__ inline KernelBicubicUpsample() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t n, uint32_t c,
+                                uint32_t h_in, uint32_t w_in,
+                                uint32_t h_out, uint32_t w_out) {
+        this->n = n;
+        this->c = c;
+        this->h_in = h_in;
+        this->w_in = w_in;
+        this->h_out = h_out;
+        this->w_out = w_out;
+
+        inLength  = (uint64_t)n * c * h_in  * w_in;
+        outLength = (uint64_t)n * c * h_out * w_out;
+
+        xGm.SetGlobalBuffer((__gm__ float*)x, inLength);
+        yGm.SetGlobalBuffer((__gm__ float*)y, outLength);
+
+        // 简化实现：一次性搬运（示例用法，参考 RmsNorm/Mean/UnPad 模板）
+        pipe.InitBuffer(inQueue, 1, inLength * sizeof(float));
+        pipe.InitBuffer(outQueue, 1, outLength * sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn() {
+        AscendC::LocalTensor<float> xLocal = inQueue.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm, inLength);
+        inQueue.EnQue(xLocal);
+    }
+
+    // 双三次插值核函数（Keys Cubic，a=-0.75）
+    __aicore__ inline float cubic_weight(float a, float x) {
+        x = (x < 0) ? -x : x;
+        float x2 = x * x;
+        float x3 = x2 * x;
+        if (x <= 1.0f) {
+            return (a + 2.0f)*x3 - (a + 3.0f)*x2 + 1.0f;
+        } else if (x < 2.0f) {
+            return a*x3 - 5.0f*a*x2 + 8.0f*a*x - 4.0f*a;
+        } else {
+            return 0.0f;
+        }
+    }
+
+    __aicore__ inline uint32_t clamp_int(int x, int lo, int hi) {
+        return (uint32_t)((x < lo) ? lo : ((x > hi) ? hi : x));
+    }
+
+    __aicore__ inline void Compute() {
+        AscendC::LocalTensor<float> xLocal = inQueue.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueue.AllocTensor<float>();
+
+        // 获取指针（示例性写法，具体 LocalTensor 访问接口以实际版本为准）
+        float* xptr = reinterpret_cast<float*>(xLocal.GetData());
+        float* yptr = reinterpret_cast<float*>(yLocal.GetData());
+
+        const float a = -0.75f;
+        const uint64_t in_n_stride  = (uint64_t)c * h_in  * w_in;
+        const uint64_t in_c_stride  = (uint64_t)h_in  * w_in;
+        const uint64_t in_h_stride  = (uint64_t)w_in;
+
+        const uint64_t out_n_stride = (uint64_t)c * h_out * w_out;
+        const uint64_t out_c_stride = (uint64_t)h_out * w_out;
+        const uint64_t out_h_stride = (uint64_t)w_out;
+
+        const float scale_h = (h_out > 1 && h_in > 1) ? (float)(h_in - 1) / (float)(h_out - 1) : 0.0f;
+        const float scale_w = (w_out > 1 && w_in > 1) ? (float)(w_in - 1) / (float)(w_out - 1) : 0.0f;
+
+        for (uint32_t ni = 0; ni < n; ++ni) {
+            for (uint32_t ci = 0; ci < c; ++ci) {
+                const uint64_t in_base  = (uint64_t)ni * in_n_stride  + (uint64_t)ci * in_c_stride;
+                const uint64_t out_base = (uint64_t)ni * out_n_stride + (uint64_t)ci * out_c_stride;
+
+                for (uint32_t yo = 0; yo < h_out; ++yo) {
+                    float y_src = (h_out == 1) ? 0.0f : (scale_h * yo);  // align_corners = true
+                    int   y_int = (int)AscendC::Floor(y_src);
+                    float dy    = y_src - (float)y_int;
+
+                    int y0 = y_int - 1;
+                    int y1 = y_int + 0;
+                    int y2 = y_int + 1;
+                    int y3 = y_int + 2;
+
+                    float wy0 = cubic_weight(a, 1.0f + dy);
+                    float wy1 = cubic_weight(a, dy);
+                    float wy2 = cubic_weight(a, 1.0f - dy);
+                    float wy3 = cubic_weight(a, 2.0f - dy);
+
+                    uint32_t y0c = clamp_int(y0, 0, (int)h_in - 1);
+                    uint32_t y1c = clamp_int(y1, 0, (int)h_in - 1);
+                    uint32_t y2c = clamp_int(y2, 0, (int)h_in - 1);
+                    uint32_t y3c = clamp_int(y3, 0, (int)h_in - 1);
+
+                    const uint64_t in_y0 = in_base + (uint64_t)y0c * in_h_stride;
+                    const uint64_t in_y1 = in_base + (uint64_t)y1c * in_h_stride;
+                    const uint64_t in_y2 = in_base + (uint64_t)y2c * in_h_stride;
+                    const uint64_t in_y3 = in_base + (uint64_t)y3c * in_h_stride;
+
+                    const uint64_t out_row = out_base + (uint64_t)yo * out_h_stride;
+
+                    for (uint32_t xo = 0; xo < w_out; ++xo) {
+                        float x_src = (w_out == 1) ? 0.0f : (scale_w * xo);
+                        int   x_int = (int)AscendC::Floor(x_src);
+                        float dx    = x_src - (float)x_int;
+
+                        int x0 = x_int - 1;
+                        int x1 = x_int + 0;
+                        int x2 = x_int + 1;
+                        int x3 = x_int + 2;
+
+                        float wx0 = cubic_weight(a, 1.0f + dx);
+                        float wx1 = cubic_weight(a, dx);
+                        float wx2 = cubic_weight(a, 1.0f - dx);
+                        float wx3 = cubic_weight(a, 2.0f - dx);
+
+                        uint32_t x0c = clamp_int(x0, 0, (int)w_in - 1);
+                        uint32_t x1c = clamp_int(x1, 0, (int)w_in - 1);
+                        uint32_t x2c = clamp_int(x2, 0, (int)w_in - 1);
+                        uint32_t x3c = clamp_int(x3, 0, (int)w_in - 1);
+
+                        float v0 = xptr[in_y0 + x0c] * wx0 + xptr[in_y0 + x1c] * wx1 + xptr[in_y0 + x2c] * wx2 + xptr[in_y0 + x3c] * wx3;
+                        float v1 = xptr[in_y1 + x0c] * wx0 + xptr[in_y1 + x1c] * wx1 + xptr[in_y1 + x2c] * wx2 + xptr[in_y1 + x3c] * wx3;
+                        float v2 = xptr[in_y2 + x0c] * wx0 + xptr[in_y2 + x1c] * wx1 + xptr[in_y2 + x2c] * wx2 + xptr[in_y2 + x3c] * wx3;
+                        float v3 = xptr[in_y3 + x0c] * wx0 + xptr[in_y3 + x1c] * wx1 + xptr[in_y3 + x2c] * wx2 + xptr[in_y3 + x3c] * wx3;
+
+                        float val = v0 * wy0 + v1 * wy1 + v2 * wy2 + v3 * wy3;
+
+                        yptr[out_row + xo] = val;
+                    }
+                }
+            }
+        }
+
+        outQueue.EnQue(yLocal);
+        inQueue.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut() {
+        AscendC::LocalTensor<float> yLocal = outQueue.DeQue<float>();
+        AscendC::DataCopy(yGm, yLocal, outLength);
+        outQueue.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  inQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t n, c, h_in, w_in, h_out, w_out;
+    uint64_t inLength, outLength;
+};
+
+extern "C" __global__ __aicore__ void bicubic_upsample_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelBicubicUpsample op;
+    op.Init(x, y,
+            tiling_data.n(), tiling_data.c(),
+            tiling_data.h_in(), tiling_data.w_in(),
+            tiling_data.h_out(), tiling_data.w_out());
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor bicubic_upsample_custom_impl_npu(const at::Tensor& self) {
+    // 输出固定为 256x256，保持 N、C 不变
+    auto sizes = self.sizes();
+    TORCH_CHECK(sizes.size() == 4, "Input must be NCHW");
+    auto N = sizes[0];
+    auto C = sizes[1];
+    auto H = 256;
+    auto W = 256;
+    at::Tensor result = at::empty({N, C, H, W}, self.options());
+    EXEC_NPU_CMD(aclnnBicubicUpsampleCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("bicubic_upsample_custom", &bicubic_upsample_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bicubic_upsample_custom", &bicubic_upsample_custom_impl_npu, "bicubic upsample to 256x256 (align_corners=True)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x):
+        return custom_ops_lib.bicubic_upsample_custom(x)
+'''

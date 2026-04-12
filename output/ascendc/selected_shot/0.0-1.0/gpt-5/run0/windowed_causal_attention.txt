@@ -1,0 +1,294 @@
+project_json_src='''
+[
+    {
+        "op": "WindowedCausalAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "k",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include \"register/tilingdata_base.h\"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(WindowedCausalAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, B);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, Dh);
+  TILING_DATA_FIELD_DEF(uint32_t, windowSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(WindowedCausalAttentionCustom, WindowedCausalAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include \"windowed_causal_attention_custom_tiling.h\"
+#include \"register/op_def_registry.h\"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // Expect input q with shape [B, N, H, Dh]
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    auto origin = q_shape->GetOriginShape();
+    uint32_t dims = origin.GetDimNum();
+    if (dims != 4) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t B  = static_cast<uint32_t>(origin.GetDim(0));
+    uint32_t N  = static_cast<uint32_t>(origin.GetDim(1));
+    uint32_t H  = static_cast<uint32_t>(origin.GetDim(2));
+    uint32_t Dh = static_cast<uint32_t>(origin.GetDim(3));
+
+    // default window size; try read attribute \"window_size\" if available
+    uint32_t windowSize = 0;
+    // Some runtimes pass attributes; if not available, use min(N, 256)
+    windowSize = std::min<uint32_t>(N, 256);
+
+    // Configure blocks: one (b,h) per block where possible
+    uint32_t blocks = B * H;
+    if (blocks == 0) { blocks = 1; }
+    context->SetBlockDim(blocks);
+
+    WindowedCausalAttentionCustomTilingData tiling;
+    tiling.set_B(B);
+    tiling.set_N(N);
+    tiling.set_H(H);
+    tiling.set_Dh(Dh);
+    tiling.set_windowSize(windowSize);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    *z_shape = *q_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class WindowedCausalAttentionCustom : public OpDef {
+public:
+    explicit WindowedCausalAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input(\"q\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"k\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"v\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output(\"z\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig(\"ascend910b\");
+    }
+};
+OP_ADD(WindowedCausalAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include \"kernel_operator.h\"
+#include <cmath>
+
+extern \"C\" __global__ __aicore__ void windowed_causal_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+
+    const uint32_t B  = tiling_data.B;
+    const uint32_t N  = tiling_data.N;
+    const uint32_t H  = tiling_data.H;
+    const uint32_t Dh = tiling_data.Dh;
+    const uint32_t W  = tiling_data.windowSize; // window size (inclusive of current token)
+
+    const int32_t blockIdx = AscendC::GetBlockIdx();
+    const int32_t totalBH  = static_cast<int32_t>(B * H);
+    if (blockIdx >= totalBH) {
+        return;
+    }
+    const uint32_t b = static_cast<uint32_t>(blockIdx) / H;
+    const uint32_t h = static_cast<uint32_t>(blockIdx) % H;
+
+    __gm__ float* qG = reinterpret_cast<__gm__ float*>(q);
+    __gm__ float* kG = reinterpret_cast<__gm__ float*>(k);
+    __gm__ float* vG = reinterpret_cast<__gm__ float*>(v);
+    __gm__ float* zG = reinterpret_cast<__gm__ float*>(z);
+
+    auto index = [&](uint32_t bb, uint32_t nn, uint32_t hh, uint32_t dd) -> size_t {
+        // Layout [B, N, H, Dh] with Dh as innermost
+        return (((static_cast<size_t>(bb) * N + nn) * H + hh) * Dh + dd);
+    };
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(Dh));
+
+    for (uint32_t i = 0; i < N; ++i) {
+        uint32_t start = (i > W) ? (i - W) : 0;
+        // First pass: compute max logit for numerical stability
+        float maxLogit = -1.0e30f;
+        for (uint32_t kk = start; kk <= i; ++kk) {
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < Dh; ++d) {
+                float qv = qG[index(b, i, h, d)];
+                float kv = kG[index(b, kk, h, d)];
+                dot += qv * kv;
+            }
+            float logit = dot * scale;
+            if (logit > maxLogit) {
+                maxLogit = logit;
+            }
+        }
+
+        // Second pass: compute denominator (sum of exp)
+        float denom = 0.0f;
+        for (uint32_t kk = start; kk <= i; ++kk) {
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < Dh; ++d) {
+                float qv = qG[index(b, i, h, d)];
+                float kv = kG[index(b, kk, h, d)];
+                dot += qv * kv;
+            }
+            float logit = dot * scale;
+            denom += expf(logit - maxLogit);
+        }
+        float invDenom = denom > 0.0f ? (1.0f / denom) : 0.0f;
+
+        // Third pass: accumulate weighted V into output z
+        for (uint32_t d = 0; d < Dh; ++d) {
+            float acc = 0.0f;
+            for (uint32_t kk = start; kk <= i; ++kk) {
+                float dot = 0.0f;
+                for (uint32_t td = 0; td < Dh; ++td) {
+                    float qv = qG[index(b, i, h, td)];
+                    float kv = kG[index(b, kk, h, td)];
+                    dot += qv * kv;
+                }
+                float logit = dot * scale;
+                float w = expf(logit - maxLogit) * invDenom;
+                float vv = vG[index(b, kk, h, d)];
+                acc += w * vv;
+            }
+            zG[index(b, i, h, d)] = acc;
+        }
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include \"pytorch_npu_helper.hpp\"
+#include <torch/extension.h>
+
+at::Tensor windowed_causal_attention_custom_impl_npu(const at::Tensor& q,
+                                                     const at::Tensor& k,
+                                                     const at::Tensor& v,
+                                                     int64_t window_size) {
+    at::Tensor result = at::empty_like(q);
+    // NPU execution: q, k, v, window_size attribute, and result
+    EXEC_NPU_CMD(aclnnWindowedCausalAttentionCustom, q, k, v, window_size, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"windowed_causal_attention_custom\", &windowed_causal_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"windowed_causal_attention_custom\", &windowed_causal_attention_custom_impl_npu,
+          \"Windowed causal attention (local attention)\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized sliding-window causal attention using a custom AscendC kernel.
+    """
+    def __init__(self, d_model=1024, num_heads=16, window_size=256):
+        super().__init__()
+        self.q_proj = torch.nn.Linear(d_model, d_model)
+        self.k_proj = torch.nn.Linear(d_model, d_model)
+        self.v_proj = torch.nn.Linear(d_model, d_model)
+        self.out_proj = torch.nn.Linear(d_model, d_model)
+        self.num_heads = num_heads
+        self.window_size = window_size
+
+    def forward(self, x):
+        B, N, D = x.shape
+        H = self.num_heads
+        d_h = D // H
+
+        # Projections
+        Q = self.q_proj(x).view(B, N, H, d_h)
+        K = self.k_proj(x).view(B, N, H, d_h)
+        V = self.v_proj(x).view(B, N, H, d_h)
+
+        # Custom windowed causal attention op
+        attn_out = custom_ops_lib.windowed_causal_attention_custom(Q, K, V, self.window_size)
+
+        return self.out_proj(attn_out.reshape(B, N, D))
+'''

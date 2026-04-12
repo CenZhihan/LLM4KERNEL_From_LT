@@ -7,16 +7,24 @@ project_json_src='''
             {
                 "name": "x",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ],
         "output_desc": [
             {
                 "name": "y",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ],
         "attr": [
@@ -33,12 +41,14 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(SoftmaxCustomTilingData)
-TILING_DATA_FIELD_DEF(uint32_t, rowsPerBlock);
-TILING_DATA_FIELD_DEF(uint32_t, lastBlockRows);
-TILING_DATA_FIELD_DEF(uint32_t, rowLength);
+TILING_DATA_FIELD_DEF(uint32_t, m);
+TILING_DATA_FIELD_DEF(uint32_t, k);
+TILING_DATA_FIELD_DEF(uint32_t, tmpBufferSize);
+TILING_DATA_FIELD_DEF_STRUCT(AscendC::SoftMaxTiling, softmaxTilingData);
 TILING_DATA_FIELD_DEF(int64_t, dim);
 END_TILING_DATA_DEF;
 
@@ -49,59 +59,49 @@ REGISTER_TILING_DATA_CLASS(SoftmaxCustom, SoftmaxCustomTilingData)
 host_operator_src="""
 #include "softmax_custom_tiling.h"
 #include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
 
 namespace optiling {
-static constexpr uint32_t DEFAULT_BLOCK_DIM = 48;
-
 static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
     SoftmaxCustomTilingData tiling;
+    // 读取输入形状 (假设为二维 [m, k])
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    const ge::Shape &ori_shape = x_shape->GetOriginShape();
+    int64_t dim0 = ori_shape.GetDim(0);
+    int64_t dim1 = ori_shape.GetDim(1);
+    uint32_t m = static_cast<uint32_t>(dim0);
+    uint32_t k = static_cast<uint32_t>(dim1);
 
-    const gert::Shape *in_shape = context->GetInputShape(0);
-    // 仅支持ND输入，按最后一个维度做softmax
-    uint32_t dims = in_shape->GetDimNum();
-    if (dims == 0) {
-        return ge::GRAPH_FAILED;
-    }
-
-    // 计算行数(m)与列数(n)，按最后一维为n
-    uint64_t m = 1;
-    for (uint32_t i = 0; i + 1 < dims; ++i) {
-        m *= static_cast<uint64_t>(in_shape->GetDim(i));
-    }
-    uint64_t n = static_cast<uint64_t>(in_shape->GetDim(dims - 1));
-
-    // 设置block并行在m维（行）
-    uint32_t blockDim = static_cast<uint32_t>(std::min<uint64_t>(DEFAULT_BLOCK_DIM, m == 0 ? 1 : m));
-    if (blockDim == 0) blockDim = 1;
-
-    uint32_t rowsPerBlock = static_cast<uint32_t>(m / blockDim);
-    if (rowsPerBlock == 0) {
-        // 当m < blockDim时，确保前(m-1)个block处理1行，最后一个处理剩余
-        rowsPerBlock = 1;
-        blockDim = static_cast<uint32_t>(m);
-    }
-    uint32_t lastBlockRows = static_cast<uint32_t>(m - static_cast<uint64_t>(rowsPerBlock) * (blockDim - 1));
-
+    // 读取属性 dim（仅支持最后一维/第二维）
     const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    int64_t dim = 1;
-    if (attrs != nullptr && attrs->GetAttrNum() > 0) {
-        const int64_t *pdim = attrs->GetAttrPointer<int64_t>(0);
-        if (pdim != nullptr) dim = *pdim;
-    }
+    const int64_t *dim_attr = attrs->GetAttrPointer<int64_t>(0);
+    int64_t dim = (dim_attr != nullptr) ? *dim_attr : 1; // 默认与 PyTorch 中一致
 
-    context->SetBlockDim(blockDim);
+    // 设置并行核数（可根据需要调整）
+    const uint32_t BLOCK_DIM = 8;
+    context->SetBlockDim(BLOCK_DIM);
 
-    tiling.set_rowsPerBlock(rowsPerBlock);
-    tiling.set_lastBlockRows(lastBlockRows);
-    tiling.set_rowLength(static_cast<uint32_t>(n));
+    // 计算 SoftMax 需要的最小临时空间，并生成 tiling
+    std::vector<int64_t> vec = {dim0, dim1};
+    ge::Shape srcShape(vec);
+    const uint32_t localWorkSpaceSize = AscendC::GetSoftMaxMinTmpSize(srcShape, sizeof(float), false);
+    AscendC::SoftMaxTilingFunc(srcShape, sizeof(float), localWorkSpaceSize, tiling.get_softmaxTilingData());
+
+    // 保存 tiling 数据
+    tiling.set_m(m);
+    tiling.set_k(k);
+    tiling.set_tmpBufferSize(localWorkSpaceSize);
     tiling.set_dim(dim);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t *workspace = context->GetWorkspaceSizes(1);
-    workspace[0] = 0; // 不使用workspace
+    // 无需 workspace
+    size_t *workspace_sizes = context->GetWorkspaceSizes(1);
+    workspace_sizes[0] = 0;
+
+    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 } // namespace optiling
@@ -132,62 +132,66 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Attr("dim").AttrType(OPTIONAL).Int(1);
+
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(SoftmaxCustom);
-}
+} // namespace ops
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "softmax_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor个数
+constexpr int32_t IN_Q_DEPTH = 1;
+constexpr int32_t OUT_Q_DEPTH = 1;
 
 class KernelSoftmax {
 public:
     __aicore__ inline KernelSoftmax() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t rowsPerBlock, uint32_t lastBlockRows,
-                                uint32_t rowLength)
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t m, uint32_t k, uint32_t tmpBufferSize,
+                                const AscendC::SoftMaxTiling &tiling, int64_t dim)
     {
-        this->rowLength = rowLength;
+        this->m = m;
+        this->k = k;
+        this->tmpBufferSize = tmpBufferSize;
+        this->tiling = tiling;
+        this->dim = dim;
 
-        uint32_t blockIdx = AscendC::GetBlockIdx();
-        uint32_t blockNum = AscendC::GetBlockNum();
+        // 每个核心处理的起始行与行数
+        uint32_t block_num = AscendC::GetBlockNum();
+        uint32_t block_idx = AscendC::GetBlockIdx();
+        uint32_t rows_per_core = m / block_num;
+        uint32_t remainder = m % block_num;
+        startRow = block_idx * rows_per_core + (block_idx < remainder ? block_idx : remainder);
+        rowsThisCore = rows_per_core + (block_idx < remainder ? 1 : 0);
 
-        if (blockIdx == blockNum - 1) {
-            this->rowsThisBlock = lastBlockRows;
-        } else {
-            this->rowsThisBlock = rowsPerBlock;
-        }
-        if (this->rowsThisBlock == 0 || this->rowLength == 0) return;
+        xGm.SetGlobalBuffer((__gm__ float *)x + startRow * k, rowsThisCore * k);
+        yGm.SetGlobalBuffer((__gm__ float *)y + startRow * k, rowsThisCore * k);
 
-        uint64_t startRow = static_cast<uint64_t>(rowsPerBlock) * blockIdx;
-        uint64_t totalElemsThisBlock = static_cast<uint64_t>(this->rowsThisBlock) * this->rowLength;
-
-        xGm.SetGlobalBuffer((__gm__ float*)x + startRow * this->rowLength, totalElemsThisBlock);
-        yGm.SetGlobalBuffer((__gm__ float*)y + startRow * this->rowLength, totalElemsThisBlock);
-
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->rowLength * sizeof(float));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->rowLength * sizeof(float));
+        // 队列与缓冲区初始化（按行处理）
+        pipe.InitBuffer(inQueue, IN_Q_DEPTH, k * sizeof(float));
+        pipe.InitBuffer(outQueue, OUT_Q_DEPTH, k * sizeof(float));
+        pipe.InitBuffer(tmpQueue, 1, tmpBufferSize);
     }
 
     __aicore__ inline void Process()
     {
-        if (this->rowsThisBlock == 0 || this->rowLength == 0) return;
-
-        for (uint32_t r = 0; r < this->rowsThisBlock; ++r) {
+        // 仅支持最后一维 softmax（dim == 1），与模型一致
+        for (uint32_t r = 0; r < rowsThisCore; ++r) {
             CopyIn(r);
             Compute();
             CopyOut(r);
@@ -197,48 +201,65 @@ public:
 private:
     __aicore__ inline void CopyIn(uint32_t rowIdx)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        AscendC::DataCopy(xLocal, xGm[rowIdx * this->rowLength], this->rowLength);
-        inQueueX.EnQue(xLocal);
+        AscendC::LocalTensor<float> xLocal = inQueue.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm[rowIdx * k], k);
+        inQueue.EnQue<float>(xLocal);
     }
 
     __aicore__ inline void Compute()
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
-        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        AscendC::LocalTensor<float> xLocal = inQueue.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueue.AllocTensor<float>();
+        AscendC::LocalTensor<uint8_t> sharedTmpBuffer = tmpQueue.AllocTensor<uint8_t>();
 
-        // 使用高阶SoftMax API，按最后一维(rowLength)进行softmax
-        SoftMaxTiling tilingInfo; // 由API内部根据shape校验并确定
-        SoftMaxShapeInfo shapeInfo = {1, this->rowLength}; // [m=1, k=rowLength]
-        AscendC::SoftMax(yLocal, xLocal, tilingInfo, shapeInfo);
+        // SoftMax 形状信息：按行处理，srcM = 1，srcK = k
+        AscendC::SoftMaxShapeInfo shapeInfo;
+        shapeInfo.srcM = 1;
+        shapeInfo.srcK = k;
+        shapeInfo.oriSrcM = 1;
+        shapeInfo.oriSrcK = k;
 
-        outQueueY.EnQue<float>(yLocal);
-        inQueueX.FreeTensor(xLocal);
+        // 使用带 sharedTmpBuffer 的 SoftMax 高级 API
+        AscendC::SoftMax<float, false, false>(yLocal, xLocal, sharedTmpBuffer, tiling, shapeInfo);
+
+        outQueue.EnQue<float>(yLocal);
+        inQueue.FreeTensor(xLocal);
+        tmpQueue.FreeTensor(sharedTmpBuffer);
     }
 
     __aicore__ inline void CopyOut(uint32_t rowIdx)
     {
-        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
-        AscendC::DataCopy(yGm[rowIdx * this->rowLength], yLocal, this->rowLength);
-        outQueueY.FreeTensor(yLocal);
+        AscendC::LocalTensor<float> yLocal = outQueue.DeQue<float>();
+        AscendC::DataCopy(yGm[rowIdx * k], yLocal, k);
+        outQueue.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::GlobalTensor<float> xGm, yGm;
+    AscendC::TQue<AscendC::QuePosition::VECIN, IN_Q_DEPTH> inQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, OUT_Q_DEPTH> outQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpQueue;
 
-    uint32_t rowLength = 0;
-    uint32_t rowsThisBlock = 0;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t m;
+    uint32_t k;
+    uint32_t startRow;
+    uint32_t rowsThisCore;
+    uint32_t tmpBufferSize;
+    AscendC::SoftMaxTiling tiling;
+    int64_t dim;
 };
 
 extern "C" __global__ __aicore__ void softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
-    GET_TILING_DATA(tiling_data, tiling);
+    GET_TILING_DATA(tilingData, tiling);
     KernelSoftmax op;
-    op.Init(x, y, tiling_data.rowsPerBlock, tiling_data.lastBlockRows, tiling_data.rowLength);
-    op.Process();
+    op.Init(x, y, tilingData.m, tilingData.k, tilingData.tmpBufferSize, tilingData.softmaxTilingData, tilingData.dim);
+    if (TILING_KEY_IS(1)) {
+        op.Process();
+    }
 }
 """
 
@@ -259,7 +280,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("softmax_custom", &softmax_impl_npu, "Softmax activation");
+    m.def("softmax_custom", &softmax_impl_npu, "Softmax custom");
 }
 """
 
@@ -270,12 +291,12 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Optimized model that performs a Softmax activation using custom AscendC kernel.
+    优化后的模型：使用自定义 AscendC Softmax 内核
     """
-    def __init__(self, dim: int = 1):
+    def __init__(self):
         super(ModelNew, self).__init__()
-        self.dim = dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return custom_ops_lib.softmax_custom(x, self.dim)
+        # 与原模型保持一致，沿维度1执行 Softmax
+        return custom_ops_lib.softmax_custom(x, 1)
 '''

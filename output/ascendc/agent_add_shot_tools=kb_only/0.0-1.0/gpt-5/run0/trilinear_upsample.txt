@@ -38,9 +38,13 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(TrilinearUpsampleCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, n);
   TILING_DATA_FIELD_DEF(uint32_t, c);
-  TILING_DATA_FIELD_DEF(uint32_t, d);
-  TILING_DATA_FIELD_DEF(uint32_t, h);
-  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, d_in);
+  TILING_DATA_FIELD_DEF(uint32_t, h_in);
+  TILING_DATA_FIELD_DEF(uint32_t, w_in);
+  TILING_DATA_FIELD_DEF(uint32_t, d_out);
+  TILING_DATA_FIELD_DEF(uint32_t, h_out);
+  TILING_DATA_FIELD_DEF(uint32_t, w_out);
+  TILING_DATA_FIELD_DEF(uint32_t, totalOutLength);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(TrilinearUpsampleCustom, TrilinearUpsampleCustomTilingData)
@@ -51,34 +55,55 @@ host_operator_src="""
 #include "trilinear_upsample_custom_tiling.h"
 #include "register/op_def_registry.h"
 
+namespace {
+inline int64_t GetDim(const gert::Shape* s, int idx) {
+    if (s->GetOriginShape().GetDimNum() > 0) {
+        return s->GetOriginShape().GetDim(idx);
+    }
+    return s->GetStorageShape().GetDim(idx);
+}
+}
+
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 输入形状: [N, C, D, H, W]，输出按 (2,2,2) 放大且 align_corners=True
     const gert::Shape* in_shape = context->GetInputShape(0);
-    if (in_shape->GetOriginShape().GetDimNum() != 5) {
-        return ge::GRAPH_FAILED;
+    if (in_shape->GetOriginShape().GetDimNum() != 5 && in_shape->GetStorageShape().GetDimNum() != 5) {
+        return ge::GRAPH_PARAM_INVALID;
     }
-    int64_t N = in_shape->GetOriginShape().GetDim(0);
-    int64_t C = in_shape->GetOriginShape().GetDim(1);
-    int64_t D = in_shape->GetOriginShape().GetDim(2);
-    int64_t H = in_shape->GetOriginShape().GetDim(3);
-    int64_t W = in_shape->GetOriginShape().GetDim(4);
+
+    int64_t N = GetDim(in_shape, 0);
+    int64_t C = GetDim(in_shape, 1);
+    int64_t D_in = GetDim(in_shape, 2);
+    int64_t H_in = GetDim(in_shape, 3);
+    int64_t W_in = GetDim(in_shape, 4);
+
+    // align_corners=True, scale_factor=2 => out = (in-1)*2+1
+    int64_t D_out = (D_in - 1) * 2 + 1;
+    int64_t H_out = (H_in - 1) * 2 + 1;
+    int64_t W_out = (W_in - 1) * 2 + 1;
 
     TrilinearUpsampleCustomTilingData tiling;
     tiling.set_n(static_cast<uint32_t>(N));
     tiling.set_c(static_cast<uint32_t>(C));
-    tiling.set_d(static_cast<uint32_t>(D));
-    tiling.set_h(static_cast<uint32_t>(H));
-    tiling.set_w(static_cast<uint32_t>(W));
+    tiling.set_d_in(static_cast<uint32_t>(D_in));
+    tiling.set_h_in(static_cast<uint32_t>(H_in));
+    tiling.set_w_in(static_cast<uint32_t>(W_in));
+    tiling.set_d_out(static_cast<uint32_t>(D_out));
+    tiling.set_h_out(static_cast<uint32_t>(H_out));
+    tiling.set_w_out(static_cast<uint32_t>(W_out));
+    uint64_t totalOutLength = static_cast<uint64_t>(N) * static_cast<uint64_t>(C) *
+                              static_cast<uint64_t>(D_out) * static_cast<uint64_t>(H_out) *
+                              static_cast<uint64_t>(W_out);
+    tiling.set_totalOutLength(static_cast<uint32_t>(totalOutLength)); // assume length fits uint32 for demo
 
-    // 简化实现，单核执行
-    context->SetBlockDim(1);
+    context->SetBlockDim(BLOCK_DIM);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t *workspace_sizes = context->GetWorkspaceSizes(1);
-    workspace_sizes[0] = 0;
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -87,29 +112,28 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
-    if (x_shape->GetOriginShape().GetDimNum() != 5) {
-        return GRAPH_FAILED;
+    if (x_shape->GetOriginShape().GetDimNum() != 5 && x_shape->GetStorageShape().GetDimNum() != 5) {
+        return GRAPH_PARAM_INVALID;
     }
-    int64_t N = x_shape->GetOriginShape().GetDim(0);
-    int64_t C = x_shape->GetOriginShape().GetDim(1);
-    int64_t D = x_shape->GetOriginShape().GetDim(2);
-    int64_t H = x_shape->GetOriginShape().GetDim(3);
-    int64_t W = x_shape->GetOriginShape().GetDim(4);
-    // 放大倍数 (2,2,2)
-    int64_t Do = D * 2;
-    int64_t Ho = H * 2;
-    int64_t Wo = W * 2;
+    int64_t N = x_shape->GetOriginShape().GetDimNum() ? x_shape->GetOriginShape().GetDim(0) : x_shape->GetStorageShape().GetDim(0);
+    int64_t C = x_shape->GetOriginShape().GetDimNum() ? x_shape->GetOriginShape().GetDim(1) : x_shape->GetStorageShape().GetDim(1);
+    int64_t D_in = x_shape->GetOriginShape().GetDimNum() ? x_shape->GetOriginShape().GetDim(2) : x_shape->GetStorageShape().GetDim(2);
+    int64_t H_in = x_shape->GetOriginShape().GetDimNum() ? x_shape->GetOriginShape().GetDim(3) : x_shape->GetStorageShape().GetDim(3);
+    int64_t W_in = x_shape->GetOriginShape().GetDimNum() ? x_shape->GetOriginShape().GetDim(4) : x_shape->GetStorageShape().GetDim(4);
+
+    int64_t D_out = (D_in - 1) * 2 + 1;
+    int64_t H_out = (H_in - 1) * 2 + 1;
+    int64_t W_out = (W_in - 1) * 2 + 1;
 
     gert::Shape* y_shape = context->GetOutputShape(0);
     y_shape->SetDimNum(5);
     y_shape->SetDim(0, N);
     y_shape->SetDim(1, C);
-    y_shape->SetDim(2, Do);
-    y_shape->SetDim(3, Ho);
-    y_shape->SetDim(4, Wo);
+    y_shape->SetDim(2, D_out);
+    y_shape->SetDim(3, H_out);
+    y_shape->SetDim(4, W_out);
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -135,7 +159,9 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -146,155 +172,96 @@ OP_ADD(TrilinearUpsampleCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "trilinear_upsample_custom_tiling_data.h"
 
-using DTYPE = float;
+extern "C" __global__ __aicore__ void trilinear_upsample_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
 
-class KernelTrilinearUpsample {
-public:
-    __aicore__ inline KernelTrilinearUpsample() {}
+    const uint32_t N = tiling_data.n();
+    const uint32_t C = tiling_data.c();
+    const uint32_t D_in = tiling_data.d_in();
+    const uint32_t H_in = tiling_data.h_in();
+    const uint32_t W_in = tiling_data.w_in();
+    const uint32_t D_out = tiling_data.d_out();
+    const uint32_t H_out = tiling_data.h_out();
+    const uint32_t W_out = tiling_data.w_out();
+    const uint32_t totalOutLength = tiling_data.totalOutLength();
 
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t n, uint32_t c, uint32_t d, uint32_t h, uint32_t w)
-    {
-        this->N = n; this->C = c; this->D = d; this->H = h; this->W = w;
-        this->Do = d * 2; this->Ho = h * 2; this->Wo = w * 2;
+    __gm__ float* xPtr = (__gm__ float*)x;
+    __gm__ float* yPtr = (__gm__ float*)y;
 
-        uint64_t in_elems  = (uint64_t)N * C * D  * H  * W;
-        uint64_t out_elems = (uint64_t)N * C * Do * Ho * Wo;
+    uint32_t blkNum = AscendC::GetBlockNum();
+    uint32_t blkIdx = AscendC::GetBlockIdx();
 
-        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(x), in_elems);
-        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(y), out_elems);
+    // 块划分，最后一个块可能小于blockLen
+    uint32_t blockLen = (totalOutLength + blkNum - 1) / blkNum;
+    uint32_t start = blkIdx * blockLen;
+    uint32_t end = start + blockLen;
+    if (end > totalOutLength) end = totalOutLength;
 
-        // 分配少量临时缓冲 (用于标量读/写、逐元素计算)
-        // 使用 VECCALC 队列以便参与向量标量指令
-        pipe.InitBuffer(tmpQueue, 1, 16 * sizeof(DTYPE)); // 足够容纳若干 1 元素局部张量
-    }
+    // 输入输出步长（连续内存，W为最内层）
+    uint64_t inStrideW = 1;
+    uint64_t inStrideH = W_in;
+    uint64_t inStrideD = (uint64_t)H_in * (uint64_t)W_in;
+    uint64_t inStrideC = (uint64_t)D_in * (uint64_t)H_in * (uint64_t)W_in;
+    uint64_t inStrideN = (uint64_t)C * inStrideC;
 
-    __aicore__ inline void Process()
-    {
-        // 对每个输出元素执行三线性插值 (align_corners=True)
-        const float rd = (D > 1 && Do > 1) ? float(D - 1) / float(Do - 1) : 0.0f;
-        const float rh = (H > 1 && Ho > 1) ? float(H - 1) / float(Ho - 1) : 0.0f;
-        const float rw = (W > 1 && Wo > 1) ? float(W - 1) / float(Wo - 1) : 0.0f;
+    uint64_t outStrideW = 1;
+    uint64_t outStrideH = W_out;
+    uint64_t outStrideD = (uint64_t)H_out * (uint64_t)W_out;
+    uint64_t outStrideC = (uint64_t)D_out * (uint64_t)H_out * (uint64_t)W_out;
+    uint64_t outStrideN = (uint64_t)C * outStrideC;
 
-        for (uint32_t n = 0; n < N; ++n) {
-            for (uint32_t c = 0; c < C; ++c) {
-                for (uint32_t od = 0; od < Do; ++od) {
-                    float in_d = rd * od;
-                    uint32_t d0 = (uint32_t)floorf(in_d);
-                    uint32_t d1 = d0 + ((d0 + 1 < D) ? 1u : 0u);
-                    float wd1 = in_d - (float)d0;
-                    float wd0 = 1.0f - wd1;
+    for (uint32_t p = start; p < end; ++p) {
+        // 线性索引 -> (n,c,d,h,w)
+        uint64_t rem = p;
+        uint32_t n = rem / outStrideN; rem -= (uint64_t)n * outStrideN;
+        uint32_t c = rem / outStrideC; rem -= (uint64_t)c * outStrideC;
+        uint32_t od = rem / outStrideD; rem -= (uint64_t)od * outStrideD;
+        uint32_t oh = rem / outStrideH; rem -= (uint64_t)oh * outStrideH;
+        uint32_t ow = rem;
 
-                    for (uint32_t oh = 0; oh < Ho; ++oh) {
-                        float in_h = rh * oh;
-                        uint32_t h0 = (uint32_t)floorf(in_h);
-                        uint32_t h1 = h0 + ((h0 + 1 < H) ? 1u : 0u);
-                        float wh1 = in_h - (float)h0;
-                        float wh0 = 1.0f - wh1;
+        // 对齐角点+倍率2 => 输出坐标是输入格点或其正中点
+        uint32_t zd = od >> 1;
+        uint32_t zh = oh >> 1;
+        uint32_t zw = ow >> 1;
+        uint32_t fd = od & 1;
+        uint32_t fh = oh & 1;
+        uint32_t fw = ow & 1;
 
-                        for (uint32_t ow = 0; ow < Wo; ++ow) {
-                            float in_w = rw * ow;
-                            uint32_t w0 = (uint32_t)floorf(in_w);
-                            uint32_t w1 = w0 + ((w0 + 1 < W) ? 1u : 0u);
-                            float ww1 = in_w - (float)w0;
-                            float ww0 = 1.0f - ww1;
+        float wd = fd ? 0.5f : 1.0f;
+        float wh = fh ? 0.5f : 1.0f;
+        float ww = fw ? 0.5f : 1.0f;
 
-                            float w000 = wd0 * wh0 * ww0;
-                            float w001 = wd0 * wh0 * ww1;
-                            float w010 = wd0 * wh1 * ww0;
-                            float w011 = wd0 * wh1 * ww1;
-                            float w100 = wd1 * wh0 * ww0;
-                            float w101 = wd1 * wh0 * ww1;
-                            float w110 = wd1 * wh1 * ww0;
-                            float w111 = wd1 * wh1 * ww1;
+        float acc = 0.0f;
+        uint32_t dmax = fd ? 1u : 0u;
+        uint32_t hmax = fh ? 1u : 0u;
+        uint32_t wmax = fw ? 1u : 0u;
 
-                            uint64_t in_stride_w = 1ULL;
-                            uint64_t in_stride_h = (uint64_t)W;
-                            uint64_t in_stride_d = (uint64_t)H * W;
-                            uint64_t in_stride_c = (uint64_t)D * H * W;
-                            uint64_t in_stride_n = (uint64_t)C * D * H * W;
-
-                            uint64_t base_in = (uint64_t)n * in_stride_n + (uint64_t)c * in_stride_c;
-
-                            uint64_t idx000 = base_in + (uint64_t)d0 * in_stride_d + (uint64_t)h0 * in_stride_h + (uint64_t)w0 * in_stride_w;
-                            uint64_t idx001 = base_in + (uint64_t)d0 * in_stride_d + (uint64_t)h0 * in_stride_h + (uint64_t)w1 * in_stride_w;
-                            uint64_t idx010 = base_in + (uint64_t)d0 * in_stride_d + (uint64_t)h1 * in_stride_h + (uint64_t)w0 * in_stride_w;
-                            uint64_t idx011 = base_in + (uint64_t)d0 * in_stride_d + (uint64_t)h1 * in_stride_h + (uint64_t)w1 * in_stride_w;
-                            uint64_t idx100 = base_in + (uint64_t)d1 * in_stride_d + (uint64_t)h0 * in_stride_h + (uint64_t)w0 * in_stride_w;
-                            uint64_t idx101 = base_in + (uint64_t)d1 * in_stride_d + (uint64_t)h0 * in_stride_h + (uint64_t)w1 * in_stride_w;
-                            uint64_t idx110 = base_in + (uint64_t)d1 * in_stride_d + (uint64_t)h1 * in_stride_h + (uint64_t)w0 * in_stride_w;
-                            uint64_t idx111 = base_in + (uint64_t)d1 * in_stride_d + (uint64_t)h1 * in_stride_h + (uint64_t)w1 * in_stride_w;
-
-                            // resLocal <- 0
-                            AscendC::LocalTensor<DTYPE> resLocal = tmpQueue.AllocTensor<DTYPE>();
-                            AscendC::Duplicate(resLocal, (DTYPE)0.0f, 1);
-
-                            // 逐邻域取值 -> 乘权重 -> 累加到 resLocal
-                            AccumulateWeighted(idx000, (DTYPE)w000, resLocal);
-                            AccumulateWeighted(idx001, (DTYPE)w001, resLocal);
-                            AccumulateWeighted(idx010, (DTYPE)w010, resLocal);
-                            AccumulateWeighted(idx011, (DTYPE)w011, resLocal);
-                            AccumulateWeighted(idx100, (DTYPE)w100, resLocal);
-                            AccumulateWeighted(idx101, (DTYPE)w101, resLocal);
-                            AccumulateWeighted(idx110, (DTYPE)w110, resLocal);
-                            AccumulateWeighted(idx111, (DTYPE)w111, resLocal);
-
-                            // 写回输出
-                            uint64_t out_stride_w = 1ULL;
-                            uint64_t out_stride_h = (uint64_t)Wo;
-                            uint64_t out_stride_d = (uint64_t)Ho * Wo;
-                            uint64_t out_stride_c = (uint64_t)Do * Ho * Wo;
-                            uint64_t out_stride_n = (uint64_t)C * Do * Ho * Wo;
-
-                            uint64_t out_idx = (uint64_t)n * out_stride_n + (uint64_t)c * out_stride_c +
-                                               (uint64_t)od * out_stride_d + (uint64_t)oh * out_stride_h + (uint64_t)ow * out_stride_w;
-
-                            AscendC::DataCopy(yGm[out_idx], resLocal, 1);
-                            tmpQueue.FreeTensor(resLocal);
-                        }
-                    }
+        for (uint32_t dz = 0; dz <= dmax; ++dz) {
+            for (uint32_t dh = 0; dh <= hmax; ++dh) {
+                for (uint32_t dw = 0; dw <= wmax; ++dw) {
+                    uint64_t inIdx =
+                        (uint64_t)n * inStrideN +
+                        (uint64_t)c * inStrideC +
+                        (uint64_t)(zd + dz) * inStrideD +
+                        (uint64_t)(zh + dh) * inStrideH +
+                        (uint64_t)(zw + dw) * inStrideW;
+                    float v = xPtr[inIdx];
+                    float wgt = (dz ? wd : (1.0f - (fd ? 1.0f : 0.0f)) + (fd ? 0.0f : 0.0f)); // 用wd表示两点平均时每个点0.5，否则1.0
+                    // 更清晰：当fd=0时仅dz=0，权重1.0；当fd=1时dz=0/1各0.5
+                    wgt = fd ? 0.5f : 1.0f;
+                    float wgh = fh ? 0.5f : 1.0f;
+                    float wgw = fw ? 0.5f : 1.0f;
+                    float weight = 1.0f;
+                    weight *= (fd ? 0.5f : 1.0f);
+                    weight *= (fh ? 0.5f : 1.0f);
+                    weight *= (fw ? 0.5f : 1.0f);
+                    acc += v * weight;
                 }
             }
         }
+        yPtr[p] = acc;
     }
-
-private:
-    __aicore__ inline void AccumulateWeighted(uint64_t in_index, DTYPE weight, AscendC::LocalTensor<DTYPE>& resLocal)
-    {
-        // 读取单个输入值
-        AscendC::LocalTensor<DTYPE> tmpLocal = tmpQueue.AllocTensor<DTYPE>();
-        AscendC::DataCopy(tmpLocal, xGm[in_index], 1);
-        // tmpLocal = tmpLocal * weight
-        AscendC::Muls(tmpLocal, tmpLocal, weight, 1);
-        // resLocal = resLocal + tmpLocal
-        AscendC::Add(resLocal, resLocal, tmpLocal, 1);
-        tmpQueue.FreeTensor(tmpLocal);
-    }
-
-private:
-    AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpQueue;
-    AscendC::GlobalTensor<DTYPE> xGm;
-    AscendC::GlobalTensor<DTYPE> yGm;
-
-    uint32_t N, C, D, H, W;
-    uint32_t Do, Ho, Wo;
-};
-
-extern "C" __global__ __aicore__ void trilinear_upsample_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tiling_data, tiling);
-    KernelTrilinearUpsample op;
-    op.Init(x, y,
-            tiling_data.n,
-            tiling_data.c,
-            tiling_data.d,
-            tiling_data.h,
-            tiling_data.w);
-    op.Process();
 }
 """
 
@@ -304,21 +271,30 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor trilinear_upsample_custom_impl_npu(const at::Tensor& self) {
-    auto sizes = self.sizes();
-    TORCH_CHECK(sizes.size() == 5, "Input must be 5D [N,C,D,H,W]");
-    auto N = sizes[0], C = sizes[1], D = sizes[2], H = sizes[3], W = sizes[4];
-    auto out = at::empty({N, C, D*2, H*2, W*2}, self.options());
-    EXEC_NPU_CMD(aclnnTrilinearUpsampleCustom, self, out);
-    return out;
+at::Tensor trilinear_upsample_custom_impl_npu(const at::Tensor& x) {
+    TORCH_CHECK(x.dim() == 5, \"Input must be 5D (N, C, D, H, W)\");
+    auto sizes = x.sizes();
+    int64_t N = sizes[0];
+    int64_t C = sizes[1];
+    int64_t D_in = sizes[2];
+    int64_t H_in = sizes[3];
+    int64_t W_in = sizes[4];
+    // align_corners=True, scale_factor=2
+    int64_t D_out = (D_in - 1) * 2 + 1;
+    int64_t H_out = (H_in - 1) * 2 + 1;
+    int64_t W_out = (W_in - 1) * 2 + 1;
+
+    at::Tensor y = at::empty({N, C, D_out, H_out, W_out}, x.options());
+    EXEC_NPU_CMD(aclnnTrilinearUpsampleCustom, x, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("trilinear_upsample_custom", &trilinear_upsample_custom_impl_npu);
+    m.impl(\"trilinear_upsample_custom\", &trilinear_upsample_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("trilinear_upsample_custom", &trilinear_upsample_custom_impl_npu, "Trilinear Upsample align_corners=True, scale=(2,2,2)");
+    m.def(\"trilinear_upsample_custom\", &trilinear_upsample_custom_impl_npu, \"Trilinear Upsample (scale=2, align_corners=True)\");
 }
 """
 

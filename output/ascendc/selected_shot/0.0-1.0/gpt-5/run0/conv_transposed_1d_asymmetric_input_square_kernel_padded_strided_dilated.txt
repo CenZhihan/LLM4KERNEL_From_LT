@@ -1,0 +1,399 @@
+project_json_src='''
+[
+  {
+    "op": "ConvTransposed1dAsymmetricInputSquareKernelPaddedStridedDilatedCustom",
+    "language": "cpp",
+    "input_desc": [
+      {
+        "name": "x",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "weight",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      },
+      {
+        "name": "bias",
+        "param_type": "optional",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "y",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["float"]
+      }
+    ],
+    "attr": [
+      { "name": "stride", "type": "int" },
+      { "name": "padding", "type": "int" },
+      { "name": "dilation", "type": "int" }
+    ]
+  }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(ConvTransposed1dAsymmetricInputSquareKernelPaddedStridedDilatedCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cin);
+  TILING_DATA_FIELD_DEF(uint32_t, cout);
+  TILING_DATA_FIELD_DEF(uint32_t, lin);
+  TILING_DATA_FIELD_DEF(uint32_t, lout);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, stride);
+  TILING_DATA_FIELD_DEF(uint32_t, padding);
+  TILING_DATA_FIELD_DEF(uint32_t, dilation);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, hasBias);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTransposed1dAsymmetricInputSquareKernelPaddedStridedDilatedCustom, ConvTransposed1dAsymmetricInputSquareKernelPaddedStridedDilatedCustomTilingData)
+
+}
+"""
+
+host_operator_src="""
+#include "conv_transposed_1d_asymmetric_input_square_kernel_padded_strided_dilated_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTransposed1dAsymmetricInputSquareKernelPaddedStridedDilatedCustomTilingData tiling;
+
+    auto x_shape = context->GetInputShape(0)->GetOriginShape();
+    auto w_shape = context->GetInputShape(1)->GetOriginShape();
+
+    uint32_t n    = (x_shape.GetDimNum() >= 1) ? x_shape.GetDim(0) : 1;
+    uint32_t cin  = (x_shape.GetDimNum() >= 2) ? x_shape.GetDim(1) : 1;
+    uint32_t lin  = (x_shape.GetDimNum() >= 3) ? x_shape.GetDim(2) : 1;
+
+    uint32_t w_cin  = (w_shape.GetDimNum() >= 1) ? w_shape.GetDim(0) : cin;
+    uint32_t cout   = (w_shape.GetDimNum() >= 2) ? w_shape.GetDim(1) : 1;
+    uint32_t k      = (w_shape.GetDimNum() >= 3) ? w_shape.GetDim(2) : 1;
+
+    // Retrieve attributes (fallback to defaults if not set)
+    uint32_t stride = 1;
+    uint32_t padding = 0;
+    uint32_t dilation = 1;
+    // Best-effort attribute fetch; API names may vary across versions
+    if (context->GetAttrs() != nullptr) {
+        auto attrs = context->GetAttrs();
+        if (attrs->GetAttr("stride") != nullptr) {
+            stride = static_cast<uint32_t>(attrs->GetInt("stride"));
+        }
+        if (attrs->GetAttr("padding") != nullptr) {
+            padding = static_cast<uint32_t>(attrs->GetInt("padding"));
+        }
+        if (attrs->GetAttr("dilation") != nullptr) {
+            dilation = static_cast<uint32_t>(attrs->GetInt("dilation"));
+        }
+    }
+
+    // Output length for ConvTranspose1d: (L_in - 1)*stride - 2*padding + (k - 1)*dilation + 1
+    int64_t lout_calc = static_cast<int64_t>(lin - 1) * static_cast<int64_t>(stride) - 2LL * static_cast<int64_t>(padding)
+                        + static_cast<int64_t>(k - 1) * static_cast<int64_t>(dilation) + 1LL;
+    uint32_t lout = lout_calc > 0 ? static_cast<uint32_t>(lout_calc) : 0U;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_cin(cin);
+    tiling.set_cout(cout);
+    tiling.set_lin(lin);
+    tiling.set_lout(lout);
+    tiling.set_k(k);
+    tiling.set_stride(stride);
+    tiling.set_padding(padding);
+    tiling.set_dilation(dilation);
+    tiling.set_tileNum(TILE_NUM);
+    // Heuristic bias existence: if third input is provided and has at least 1 element
+    uint32_t hasBias = 0;
+    if (context->GetInputShapeNum() >= 3) {
+        auto bshape = context->GetInputShape(2)->GetOriginShape();
+        hasBias = (bshape.GetShapeSize() > 0) ? 1 : 0;
+    }
+    tiling.set_hasBias(hasBias);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+
+}
+
+namespace ge {
+
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    int64_t n   = (x_shape->GetDimNum() >= 1) ? x_shape->GetDim(0) : 1;
+    int64_t cin = (x_shape->GetDimNum() >= 2) ? x_shape->GetDim(1) : 1;
+    int64_t lin = (x_shape->GetDimNum() >= 3) ? x_shape->GetDim(2) : 1;
+
+    int64_t wcin = (w_shape->GetDimNum() >= 1) ? w_shape->GetDim(0) : cin;
+    int64_t cout = (w_shape->GetDimNum() >= 2) ? w_shape->GetDim(1) : 1;
+    int64_t k    = (w_shape->GetDimNum() >= 3) ? w_shape->GetDim(2) : 1;
+
+    // Attributes (defaults)
+    int64_t stride = 1, padding = 0, dilation = 1;
+    // Best-effort: some runtimes pass attributes through InferShapeContext
+    if (context->HasIntAttr("stride")) { stride = context->GetIntAttr("stride"); }
+    if (context->HasIntAttr("padding")) { padding = context->GetIntAttr("padding"); }
+    if (context->HasIntAttr("dilation")) { dilation = context->GetIntAttr("dilation"); }
+
+    int64_t lout = (lin - 1) * stride - 2 * padding + (k - 1) * dilation + 1;
+    if (lout < 0) lout = 0;
+
+    y_shape->SetDimNum(3);
+    y_shape->SetDim(0, n);
+    y_shape->SetDim(1, cout);
+    y_shape->SetDim(2, lout);
+
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return GRAPH_SUCCESS;
+}
+
+}
+
+namespace ops {
+
+class ConvTransposed1dAsymmetricInputSquareKernelPaddedStridedDilatedCustom : public OpDef {
+public:
+    explicit ConvTransposed1dAsymmetricInputSquareKernelPaddedStridedDilatedCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias")
+            .ParamType(OPTIONAL)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // Infer functions
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        // Attributes
+        this->Attr("stride").Int(1);
+        this->Attr("padding").Int(0);
+        this->Attr("dilation").Int(1);
+
+        // AICore and tiling
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTransposed1dAsymmetricInputSquareKernelPaddedStridedDilatedCustom);
+
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+extern "C" __global__ __aicore__ void conv_transposed_1d_asymmetric_input_square_kernel_padded_strided_dilated_custom(
+    GM_ADDR x,
+    GM_ADDR weight,
+    GM_ADDR bias,
+    GM_ADDR y,
+    GM_ADDR workspace,
+    GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+
+    // Retrieve tiling parameters
+    const int32_t N   = static_cast<int32_t>(tiling_data.n);
+    const int32_t Cin = static_cast<int32_t>(tiling_data.cin);
+    const int32_t Cout= static_cast<int32_t>(tiling_data.cout);
+    const int32_t Lin = static_cast<int32_t>(tiling_data.lin);
+    const int32_t Lout= static_cast<int32_t>(tiling_data.lout);
+    const int32_t K   = static_cast<int32_t>(tiling_data.k);
+    const int32_t S   = static_cast<int32_t>(tiling_data.stride);
+    const int32_t P   = static_cast<int32_t>(tiling_data.padding);
+    const int32_t D   = static_cast<int32_t>(tiling_data.dilation);
+    const int32_t hasBias = static_cast<int32_t>(tiling_data.hasBias);
+
+    // Process only by one block to avoid overlap in this simple kernel implementation
+    if (AscendC::GetBlockIdx() != 0) {
+        return;
+    }
+
+    __gm__ float* x_gm  = reinterpret_cast<__gm__ float*>(x);
+    __gm__ float* w_gm  = reinterpret_cast<__gm__ float*>(weight);
+    __gm__ float* b_gm  = reinterpret_cast<__gm__ float*>(bias);
+    __gm__ float* y_gm  = reinterpret_cast<__gm__ float*>(y);
+
+    // Initialize output to zero (or bias if provided)
+    for (int32_t n = 0; n < N; ++n) {
+        for (int32_t oc = 0; oc < Cout; ++oc) {
+            for (int32_t p = 0; p < Lout; ++p) {
+                int64_t y_off = static_cast<int64_t>(n) * Cout * Lout + static_cast<int64_t>(oc) * Lout + p;
+                float val = 0.0f;
+                if (hasBias) {
+                    val = b_gm[oc];
+                }
+                y_gm[y_off] = val;
+            }
+        }
+    }
+
+    // Deconvolution (transposed conv) accumulation
+    // weight layout: [Cin, Cout, K]
+    for (int32_t n = 0; n < N; ++n) {
+        for (int32_t ic = 0; ic < Cin; ++ic) {
+            for (int32_t i = 0; i < Lin; ++i) {
+                float xval = x_gm[ static_cast<int64_t>(n) * Cin * Lin + static_cast<int64_t>(ic) * Lin + i ];
+                // Contribute to output positions
+                for (int32_t k = 0; k < K; ++k) {
+                    int32_t out_pos = i * S - P + k * D;
+                    if (out_pos < 0 || out_pos >= Lout) continue;
+                    // for all oc
+                    for (int32_t oc = 0; oc < Cout; ++oc) {
+                        float wval = w_gm[ static_cast<int64_t>(ic) * Cout * K + static_cast<int64_t>(oc) * K + k ];
+                        int64_t y_off = static_cast<int64_t>(n) * Cout * Lout + static_cast<int64_t>(oc) * Lout + out_pos;
+                        y_gm[y_off] += xval * wval;
+                    }
+                }
+            }
+        }
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline int64_t get_int_from_scalar_or_tuple(const c10::ArrayRef<long>& arr_or_empty, int64_t default_val) {
+    if (arr_or_empty.size() >= 1) return arr_or_empty[0];
+    return default_val;
+}
+
+at::Tensor conv_transposed_1d_asymmetric_input_square_kernel_padded_strided_dilated_custom_impl_npu(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias_opt,
+    int64_t stride,
+    int64_t padding,
+    int64_t dilation)
+{
+    // Infer output shape
+    TORCH_CHECK(x.dim() == 3, "Input x must be 3D (N, Cin, Lin)");
+    TORCH_CHECK(weight.dim() == 3, "Weight must be 3D (Cin, Cout, K)");
+    int64_t N   = x.size(0);
+    int64_t Cin = x.size(1);
+    int64_t Lin = x.size(2);
+    int64_t Wcin= weight.size(0);
+    int64_t Cout= weight.size(1);
+    int64_t K   = weight.size(2);
+    TORCH_CHECK(Cin == Wcin, "Cin mismatch between input and weight in ConvTranspose1d");
+
+    int64_t Lout = (Lin - 1) * stride - 2 * padding + (K - 1) * dilation + 1;
+    TORCH_CHECK(Lout >= 0, "Computed output length is negative, check parameters");
+
+    at::Tensor y = at::empty({N, Cout, Lout}, x.options());
+
+    // Create bias tensor if missing
+    at::Tensor bias = bias_opt.has_value() ? bias_opt.value() : at::Tensor();
+    // Call custom operator via NPU command
+    if (bias.defined() && bias.numel() > 0) {
+        EXEC_NPU_CMD(aclnnConvTransposed1dAsymmetricInputSquareKernelPaddedStridedDilatedCustom, x, weight, bias, stride, padding, dilation, y);
+    } else {
+        // Pass an empty tensor for bias if not provided
+        at::Tensor empty_bias = at::empty({0}, x.options());
+        EXEC_NPU_CMD(aclnnConvTransposed1dAsymmetricInputSquareKernelPaddedStridedDilatedCustom, x, weight, empty_bias, stride, padding, dilation, y);
+    }
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transposed_1d_asymmetric_input_square_kernel_padded_strided_dilated_custom",
+        &conv_transposed_1d_asymmetric_input_square_kernel_padded_strided_dilated_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transposed_1d_asymmetric_input_square_kernel_padded_strided_dilated_custom",
+        &conv_transposed_1d_asymmetric_input_square_kernel_padded_strided_dilated_custom_impl_npu,
+        "Custom ConvTranspose1d");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized ConvTranspose1d implemented via custom AscendC kernel.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super().__init__()
+        self.conv1d_transpose = torch.nn.ConvTranspose1d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, dilation=dilation, bias=bias
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Fetch parameters
+        w = self.conv1d_transpose.weight
+        b = self.conv1d_transpose.bias
+        # attributes (ensure int)
+        stride = self.conv1d_transpose.stride
+        padding = self.conv1d_transpose.padding
+        dilation = self.conv1d_transpose.dilation
+        s = stride[0] if isinstance(stride, tuple) else int(stride)
+        p = padding[0] if isinstance(padding, tuple) else int(padding)
+        d = dilation[0] if isinstance(dilation, tuple) else int(dilation)
+        # Call custom op
+        if b is None:
+            empty_bias = torch.empty(0, dtype=x.dtype, device=x.device)
+            return custom_ops_lib.conv_transposed_1d_asymmetric_input_square_kernel_padded_strided_dilated_custom(x, w, empty_bias, s, p, d)
+        return custom_ops_lib.conv_transposed_1d_asymmetric_input_square_kernel_padded_strided_dilated_custom(x, w, b, s, p, d)
+'''

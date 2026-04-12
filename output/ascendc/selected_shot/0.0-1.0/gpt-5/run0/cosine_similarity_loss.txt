@@ -45,6 +45,7 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(CosineSimilarityLossCustomTilingData)
+    TILING_DATA_FIELD_DEF(uint32_t, totalLength);
     TILING_DATA_FIELD_DEF(uint32_t, rows);
     TILING_DATA_FIELD_DEF(uint32_t, cols);
     TILING_DATA_FIELD_DEF(uint32_t, tileNum);
@@ -60,7 +61,6 @@ host_operator_src="""
 #include "cosine_similarity_loss_custom_tiling.h"
 #include "register/op_def_registry.h"
 #include <string.h>
-#include <algorithm>
 
 namespace optiling {
 const uint32_t BLOCK_SIZE = 32;
@@ -68,38 +68,56 @@ const uint32_t BLOCK_SIZE = 32;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     CosineSimilarityLossCustomTilingData tiling;
+    uint32_t sizeofdatatype = 4; // float32
+    uint32_t totalLength = context->GetInputShape(0)->GetStorageShape().GetShapeSize();
 
-    auto storageShape = context->GetInputShape(0)->GetStorageShape();
-    uint32_t dimNum = static_cast<uint32_t>(storageShape.GetDimNum());
-    if (dimNum < 1) {
-        return ge::GRAPH_FAILED;
+    // Assume 2D [rows, cols]
+    uint32_t rows = context->GetInputShape(0)->GetStorageShape().GetDim(0);
+    if (rows == 0) rows = 1;
+    uint32_t cols = totalLength / rows;
+
+    uint32_t ALIGN_NUM = BLOCK_SIZE / sizeofdatatype; // elements per 32B
+    uint32_t ub_block_num = 1024;  // tunable
+
+    if (ub_block_num % 2 != 0) {
+        ub_block_num = ub_block_num - 1;
     }
-    uint32_t rows = static_cast<uint32_t>(storageShape.GetDim(0));
-    uint64_t totalLen64 = storageShape.GetShapeSize();
-    uint32_t cols = static_cast<uint32_t>(totalLen64 / (rows == 0 ? 1 : rows));
 
-    // UB-friendly tiling along feature dimension
-    uint32_t sizeofdatatype = 4; // float
-    uint32_t ALIGN_NUM = BLOCK_SIZE / sizeofdatatype; // 8 for float
-    uint32_t ub_block_num = 1024; // number of 32B blocks
-    if (ub_block_num % 2 != 0) ub_block_num -= 1;
-    uint32_t maxTile = ub_block_num * ALIGN_NUM; // in elements
+    // Align cols to ALIGN_NUM for better vectorization
+    uint32_t colsAligned = (cols % ALIGN_NUM == 0) ? cols : ((cols + ALIGN_NUM - 1) / ALIGN_NUM) * ALIGN_NUM;
 
-    uint32_t tileLength = std::min(cols, maxTile);
-    uint32_t tileNum = (cols + tileLength - 1) / tileLength;
-    uint32_t lasttileLength = cols - (tileNum - 1) * tileLength;
+    uint32_t tileLength;
+    uint32_t tileNum;
+    uint32_t lasttileLength;
+
+    uint32_t maxTile = ub_block_num * ALIGN_NUM;
+    if (colsAligned <= maxTile) {
+        tileLength = ((colsAligned / ALIGN_NUM) == 0 ? 1 : (colsAligned / ALIGN_NUM)) * ALIGN_NUM;
+        if (tileLength > colsAligned) tileLength = colsAligned;
+    } else {
+        tileLength = maxTile;
+    }
+
+    tileNum = (colsAligned + tileLength - 1) / tileLength;
+    lasttileLength = colsAligned - (tileNum - 1) * tileLength;
     if (tileNum == 0) {
         tileNum = 1;
-        lasttileLength = cols;
+        lasttileLength = tileLength;
+    }
+    if (lasttileLength == 0) {
+        lasttileLength = tileLength;
     }
 
+    tiling.set_totalLength(totalLength);
     tiling.set_rows(rows);
     tiling.set_cols(cols);
     tiling.set_tileNum(tileNum);
     tiling.set_tileLength(tileLength);
     tiling.set_lasttileLength(lasttileLength);
 
-    context->SetBlockDim(1);
+    auto block_dim = 1;
+    context->SetBlockDim(block_dim);
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
@@ -140,122 +158,106 @@ OP_ADD(CosineSimilarityLossCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-
 constexpr int32_t BUFFER_NUM = 1;
-constexpr float EPS_COS = 1e-8f;
 
 class KernelCosineSimilarityLoss {
 public:
     __aicore__ inline KernelCosineSimilarityLoss() {}
     __aicore__ inline void Init(GM_ADDR predict, GM_ADDR label, GM_ADDR y,
-                                uint32_t rows, uint32_t cols,
-                                uint32_t tileNum, uint32_t tileLength,
-                                uint32_t lasttileLength) {
+                                uint32_t totalLength, uint32_t rows, uint32_t cols,
+                                uint32_t tileNum, uint32_t tileLength, uint32_t lasttileLength) {
         ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
 
+        this->totalLength = totalLength;
         this->rows = rows;
         this->cols = cols;
         this->tileNum = tileNum;
         this->tileLength = tileLength;
         this->lasttileLength = lasttileLength;
-        this->loss_sum = 0.0f;
 
-        xGm.SetGlobalBuffer((__gm__ float*)predict, rows * cols);
-        yGm.SetGlobalBuffer((__gm__ float*)label, rows * cols);
+        xGm.SetGlobalBuffer((__gm__ float*)predict, this->totalLength);
+        yGm.SetGlobalBuffer((__gm__ float*)label, this->totalLength);
         outGm.SetGlobalBuffer((__gm__ float*)y, 32);
 
-        pipe.InitBuffer(inQueueIN, BUFFER_NUM, this->tileLength * 2 * sizeof(float));
-        pipe.InitBuffer(workBuf, this->tileLength * sizeof(float));
+        pipe.InitBuffer(xBuf, this->tileLength * sizeof(float));
+        pipe.InitBuffer(yBuf, this->tileLength * sizeof(float));
+        pipe.InitBuffer(wsBuf, this->tileLength * sizeof(float));
     }
 
     __aicore__ inline void Process() {
+        AscendC::LocalTensor<float> xLocal = xBuf.Get<float>();
+        AscendC::LocalTensor<float> yLocal = yBuf.Get<float>();
+        AscendC::LocalTensor<float> workspace = wsBuf.Get<float>();
+
+        float loss_sum = 0.0f;
+        const float eps = 1e-8f;
+
         for (uint32_t r = 0; r < rows; ++r) {
-            ProcessRow(r);
+            float sxy = 0.0f;
+            float sx2 = 0.0f;
+            float sy2 = 0.0f;
+
+            for (uint32_t t = 0; t < tileNum; ++t) {
+                uint32_t len = (t == tileNum - 1) ? lasttileLength : tileLength;
+                uint32_t base = r * cols + t * tileLength;
+
+                AscendC::DataCopy(xLocal, xGm[base], len);
+                AscendC::DataCopy(yLocal, yGm[base], len);
+
+                // sum of x*y
+                AscendC::Mul(yLocal, xLocal, yLocal, len);
+                AscendC::ReduceSum<float>(yLocal, yLocal, workspace, len);
+                sxy += yLocal.GetValue(0);
+
+                // sum of x^2
+                AscendC::Mul(xLocal, xLocal, xLocal, len);
+                AscendC::ReduceSum<float>(xLocal, xLocal, workspace, len);
+                sx2 += xLocal.GetValue(0);
+
+                // sum of y^2 (re-load y)
+                AscendC::DataCopy(yLocal, yGm[base], len);
+                AscendC::Mul(yLocal, yLocal, yLocal, len);
+                AscendC::ReduceSum<float>(yLocal, yLocal, workspace, len);
+                sy2 += yLocal.GetValue(0);
+            }
+
+            float denom = AscendC::Sqrt(sx2) * AscendC::Sqrt(sy2) + eps;
+            float cos_sim = sxy / denom;
+            loss_sum += (1.0f - cos_sim);
         }
+
         float mean_loss = loss_sum / static_cast<float>(rows);
         outGm.SetValue(0, mean_loss);
     }
 
 private:
-    __aicore__ inline void ProcessRow(uint32_t rowIdx) {
-        float sum_xy = 0.f;
-        float sum_x2 = 0.f;
-        float sum_y2 = 0.f;
-
-        uint32_t base = rowIdx * cols;
-
-        for (uint32_t t = 0; t < tileNum; ++t) {
-            uint32_t copyLen = (t == tileNum - 1) ? lasttileLength : tileLength;
-            if (copyLen == 0) continue;
-
-            AscendC::LocalTensor<float> inLocal = inQueueIN.AllocTensor<float>();
-            AscendC::DataCopy(inLocal[0], xGm[base + t * tileLength], copyLen);
-            AscendC::DataCopy(inLocal[tileLength], yGm[base + t * tileLength], copyLen);
-            inQueueIN.EnQue(inLocal);
-
-            AscendC::LocalTensor<float> loc = inQueueIN.DeQue<float>();
-            AscendC::LocalTensor<float> xLocal = loc;
-            AscendC::LocalTensor<float> yLocal = loc[tileLength];
-            AscendC::LocalTensor<float> scratch = workBuf.Get<float>();
-
-            // sum of products
-            AscendC::Mul(scratch, xLocal, yLocal, copyLen);
-            AscendC::ReduceSum<float>(scratch, scratch, xLocal, copyLen);
-            sum_xy += scratch.GetValue(0);
-
-            // sum of squares x
-            AscendC::Mul(scratch, xLocal, xLocal, copyLen);
-            AscendC::ReduceSum<float>(scratch, scratch, xLocal, copyLen);
-            sum_x2 += scratch.GetValue(0);
-
-            // sum of squares y
-            AscendC::Mul(scratch, yLocal, yLocal, copyLen);
-            AscendC::ReduceSum<float>(scratch, scratch, xLocal, copyLen);
-            sum_y2 += scratch.GetValue(0);
-
-            inQueueIN.FreeTensor(loc);
-        }
-
-        // compute cosine and accumulate loss
-        float normx, normy;
-        {
-            AscendC::LocalTensor<float> tmp = workBuf.Get<float>();
-            tmp.SetValue(0, sum_x2);
-            AscendC::Sqrt(tmp, tmp, 1);
-            normx = tmp.GetValue(0);
-
-            tmp.SetValue(0, sum_y2);
-            AscendC::Sqrt(tmp, tmp, 1);
-            normy = tmp.GetValue(0);
-        }
-        float denom = normx * normy + EPS_COS;
-        float cosine = sum_xy / denom;
-        loss_sum += (1.0f - cosine);
-    }
-
-private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueIN;
-    AscendC::TBuf<> workBuf;
+    AscendC::TBuf<> xBuf;
+    AscendC::TBuf<> yBuf;
+    AscendC::TBuf<> wsBuf;
 
     AscendC::GlobalTensor<float> xGm;
     AscendC::GlobalTensor<float> yGm;
     AscendC::GlobalTensor<float> outGm;
 
+    uint32_t totalLength;
     uint32_t rows;
     uint32_t cols;
     uint32_t tileNum;
     uint32_t tileLength;
     uint32_t lasttileLength;
-
-    float loss_sum;
 };
 
 extern "C" __global__ __aicore__ void cosine_similarity_loss_custom(GM_ADDR predict, GM_ADDR label, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelCosineSimilarityLoss op;
-    op.Init(predict, label, y, tiling_data.rows, tiling_data.cols,
-            tiling_data.tileNum, tiling_data.tileLength, tiling_data.lasttileLength);
+    op.Init(predict, label, y,
+            tiling_data.totalLength,
+            tiling_data.rows,
+            tiling_data.cols,
+            tiling_data.tileNum,
+            tiling_data.tileLength,
+            tiling_data.lasttileLength);
     op.Process();
 }
 """

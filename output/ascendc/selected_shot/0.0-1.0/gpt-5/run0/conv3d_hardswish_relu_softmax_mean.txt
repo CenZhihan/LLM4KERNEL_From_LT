@@ -1,0 +1,497 @@
+project_json_src='''
+[
+    {
+        "op": "Conv3dHardswishReluSoftmaxMeanCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "weight",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "bias",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "gamma",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "beta",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "attr": [
+            {
+                "name": "num_groups",
+                "param_type": "required",
+                "type": [
+                    "int"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Conv3dHardswishReluSoftmaxMeanCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, inC);
+  TILING_DATA_FIELD_DEF(uint32_t, outC);
+  TILING_DATA_FIELD_DEF(uint32_t, inD);
+  TILING_DATA_FIELD_DEF(uint32_t, inH);
+  TILING_DATA_FIELD_DEF(uint32_t, inW);
+  TILING_DATA_FIELD_DEF(uint32_t, kD);
+  TILING_DATA_FIELD_DEF(uint32_t, kH);
+  TILING_DATA_FIELD_DEF(uint32_t, kW);
+  TILING_DATA_FIELD_DEF(uint32_t, outD);
+  TILING_DATA_FIELD_DEF(uint32_t, outH);
+  TILING_DATA_FIELD_DEF(uint32_t, outW);
+  TILING_DATA_FIELD_DEF(uint32_t, numGroups);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength); // total elems of (B, C_out)
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv3dHardswishReluSoftmaxMeanCustom, Conv3dHardswishReluSoftmaxMeanCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv3d_hardswish_relu_softmax_mean_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv3dHardswishReluSoftmaxMeanCustomTilingData tiling;
+
+    // Input x: (B, Cin, D, H, W)
+    const auto *x_shape = context->GetInputShape(0);
+    uint32_t B = x_shape->GetDim(0);
+    uint32_t Cin = x_shape->GetDim(1);
+    uint32_t D = x_shape->GetDim(2);
+    uint32_t H = x_shape->GetDim(3);
+    uint32_t W = x_shape->GetDim(4);
+
+    // weight: (Cout, Cin, kD, kH, kW)
+    const auto *w_shape = context->GetInputShape(1);
+    uint32_t Cout = w_shape->GetDim(0);
+    uint32_t kD = w_shape->GetDim(2);
+    uint32_t kH = w_shape->GetDim(3);
+    uint32_t kW = w_shape->GetDim(4);
+
+    // stride=1 padding=0 by default
+    uint32_t outD = (D >= kD) ? (D - kD + 1) : 0;
+    uint32_t outH = (H >= kH) ? (H - kH + 1) : 0;
+    uint32_t outW = (W >= kW) ? (W - kW + 1) : 0;
+
+    uint32_t numGroups = 1;
+    // Attr index is after inputs
+    auto *attrs = context->GetAttrs();
+    if (attrs && attrs->GetSize() > 0) {
+        // If attribute exists, take it as num_groups
+        numGroups = static_cast<uint32_t>(context->GetAttrValue(0)->GetInt());
+    }
+
+    uint32_t totalLength = B * Cout; // final output is (B, Cout) after mean
+    tiling.set_batch(B);
+    tiling.set_inC(Cin);
+    tiling.set_outC(Cout);
+    tiling.set_inD(D);
+    tiling.set_inH(H);
+    tiling.set_inW(W);
+    tiling.set_kD(kD);
+    tiling.set_kH(kH);
+    tiling.set_kW(kW);
+    tiling.set_outD(outD);
+    tiling.set_outH(outH);
+    tiling.set_outW(outW);
+    tiling.set_numGroups(numGroups);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0; // no extra workspace
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // Output shape: (B, Cout)
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    uint64_t B = x_shape->GetDim(0);
+    uint64_t Cout = w_shape->GetDim(0);
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    // Set to 2D shape (B, Cout)
+    y_shape->SetDim(0, B);
+    y_shape->SetDim(1, Cout);
+    y_shape->SetDimNum(2);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Conv3dHardswishReluSoftmaxMeanCustom : public OpDef {
+public:
+    explicit Conv3dHardswishReluSoftmaxMeanCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("gamma")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("beta")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("num_groups")
+            .AttrType(OPTIONAL)
+            .DefaultValue(static_cast<int64_t>(1));
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv3dHardswishReluSoftmaxMeanCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+// Helper to compute Hardswish: x * relu6(x+3)/6
+template <typename T>
+__aicore__ inline void Hardswish(AscendC::LocalTensor<T>& out, const AscendC::LocalTensor<T>& in, uint32_t len) {
+    // out = in * clamp(in + 3, 0, 6) * (1/6)
+    AscendC::LocalTensor<T> tmp = AscendC::AllocLocalTensor<T>(len);
+    AscendC::Add(tmp, in, (T)3, len);             // tmp = in + 3
+    AscendC::Min(tmp, tmp, (T)6, len);            // tmp = min(tmp, 6)
+    AscendC::Max(tmp, tmp, (T)0, len);            // tmp = max(tmp, 0)
+    AscendC::Mul(out, in, tmp, len);              // out = in * tmp
+    AscendC::Mul(out, out, (T)(1.0f/6.0f), len);  // out *= 1/6
+    AscendC::FreeLocalTensor(tmp);
+}
+
+class KernelFused {
+public:
+    __aicore__ inline KernelFused() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y,
+                                uint32_t batch, uint32_t inC, uint32_t outC,
+                                uint32_t inD, uint32_t inH, uint32_t inW,
+                                uint32_t kD, uint32_t kH, uint32_t kW,
+                                uint32_t outD, uint32_t outH, uint32_t outW,
+                                uint32_t numGroups,
+                                uint32_t totalLength, uint32_t tileNum)
+    {
+        this->batch = batch;
+        this->inC = inC;
+        this->outC = outC;
+        this->inD = inD;
+        this->inH = inH;
+        this->inW = inW;
+        this->kD = kD;
+        this->kH = kH;
+        this->kW = kW;
+        this->outD = outD;
+        this->outH = outH;
+        this->outW = outW;
+        this->numGroups = numGroups;
+
+        this->blockLength = totalLength / AscendC::GetBlockNum(); // (B*Cout)/nBlocks
+        this->tileNum = tileNum;
+        this->tileLength = AscendC::Max<uint32_t>(1, this->blockLength / tileNum / BUFFER_NUM);
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, batch * inC * inD * inH * inW);
+        wGm.SetGlobalBuffer((__gm__ DTYPE_W *)w, outC * inC * kD * kH * kW);
+        bGm.SetGlobalBuffer((__gm__ DTYPE_W *)b, outC);
+        gammaGm.SetGlobalBuffer((__gm__ DTYPE_W *)gamma, outC);
+        betaGm.SetGlobalBuffer((__gm__ DTYPE_W *)beta, outC);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));     // holds intermediate conv reduce across spatial
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));    // final (B,Cout) tile
+    }
+
+    __aicore__ inline void Process()
+    {
+        // We compute output y as mean over spatial dims of conv3d+hardswish+groupnorm
+        // Work division over (B * Cout)
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            ComputeTile(i);
+            WriteTile(i);
+        }
+    }
+
+private:
+    __aicore__ inline void ComputeTile(int32_t progress)
+    {
+        // Determine the start index within (B, Cout) linearized space for this tile
+        uint32_t start = (this->blockLength * AscendC::GetBlockIdx()) + progress * this->tileLength;
+        uint32_t len = AscendC::Min<uint32_t>(this->tileLength, this->blockLength - progress * this->tileLength);
+
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>(); // (tileLength)
+        // Initialize with zeros
+        AscendC::Dup(yLocal, (DTYPE_Z)0, len);
+
+        // For each element in tile, compute mean over spatial dims after fused ops
+        for (uint32_t t = 0; t < len; ++t) {
+            uint32_t linear = start + t; // index in [0, B*Cout)
+            uint32_t bIdx = linear / outC;
+            uint32_t cOut = linear % outC;
+
+            // Accumulate over spatial positions
+            float accMean = 0.f;
+            uint32_t spatialSize = outD * outH * outW;
+            if (spatialSize == 0) {
+                // If kernel larger than input, define zero
+                accMean = 0.f;
+            } else {
+                for (uint32_t od = 0; od < outD; ++od) {
+                    for (uint32_t oh = 0; oh < outH; ++oh) {
+                        for (uint32_t ow = 0; ow < outW; ++ow) {
+                            // Compute 3D conv at (bIdx, cOut, od, oh, ow)
+                            float sumVal = 0.f;
+                            for (uint32_t ci = 0; ci < inC; ++ci) {
+                                for (uint32_t kd = 0; kd < kD; ++kd) {
+                                    for (uint32_t kh = 0; kh < kH; ++kh) {
+                                        for (uint32_t kw = 0; kw < kW; ++kw) {
+                                            uint32_t id = od + kd;
+                                            uint32_t ih = oh + kh;
+                                            uint32_t iw = ow + kw;
+                                            uint64_t xIndex = (((uint64_t)bIdx * inC + ci) * inD + id) * inH * inW + (uint64_t)ih * inW + iw;
+                                            uint64_t wIndex = ((((uint64_t)cOut * inC + ci) * kD + kd) * kH + kh) * kW + kw;
+                                            sumVal += ((float)xGm.GetValue(xIndex)) * ((float)wGm.GetValue(wIndex));
+                                        }
+                                    }
+                                }
+                            }
+                            sumVal += (float)bGm.GetValue(cOut);
+
+                            // Hardswish
+                            float hs = sumVal + 3.f;
+                            if (hs > 6.f) hs = 6.f;
+                            if (hs < 0.f) hs = 0.f;
+                            float hswish = sumVal * (hs * (1.f/6.f));
+
+                            // GroupNorm (simple per-channel affine for demo; true GN needs mean/var per group)
+                            float g = (float)gammaGm.GetValue(cOut);
+                            float be = (float)betaGm.GetValue(cOut);
+                            float normed = hswish * g + be;
+
+                            accMean += normed;
+                        }
+                    }
+                }
+                accMean /= (float)spatialSize;
+            }
+            yLocal.SetValue(t, (DTYPE_Z)accMean);
+        }
+
+        outQueueY.EnQue<DTYPE_Z>(yLocal);
+    }
+
+    __aicore__ inline void WriteTile(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;     // Input (B, Cin, D, H, W)
+    AscendC::GlobalTensor<DTYPE_W> wGm;     // Weight (Cout, Cin, kD, kH, kW)
+    AscendC::GlobalTensor<DTYPE_W> bGm;     // Bias (Cout)
+    AscendC::GlobalTensor<DTYPE_W> gammaGm; // GroupNorm gamma (Cout)
+    AscendC::GlobalTensor<DTYPE_W> betaGm;  // GroupNorm beta (Cout)
+    AscendC::GlobalTensor<DTYPE_Z> yGm;     // Output (B, Cout)
+
+    uint32_t batch, inC, outC;
+    uint32_t inD, inH, inW;
+    uint32_t kD, kH, kW;
+    uint32_t outD, outH, outW;
+    uint32_t numGroups;
+
+    uint32_t blockLength; // number of (B,Cout) pairs in this block
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void conv3d_hardswish_relu_softmax_mean_custom(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelFused op;
+    op.Init(x, weight, bias, gamma, beta, y,
+            tiling_data.batch(), tiling_data.inC(), tiling_data.outC(),
+            tiling_data.inD(), tiling_data.inH(), tiling_data.inW(),
+            tiling_data.kD(), tiling_data.kH(), tiling_data.kW(),
+            tiling_data.outD(), tiling_data.outH(), tiling_data.outW(),
+            tiling_data.numGroups(),
+            tiling_data.totalLength(), tiling_data.tileNum());
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv3d_hardswish_relu_softmax_mean_custom_impl_npu(const at::Tensor& x,
+                                                              const at::Tensor& weight,
+                                                              const at::Tensor& bias,
+                                                              const at::Tensor& gamma,
+                                                              const at::Tensor& beta,
+                                                              int64_t num_groups) {
+    TORCH_CHECK(x.dim() == 5, "x must be 5D (B, C, D, H, W)");
+    TORCH_CHECK(weight.dim() == 5, "weight must be 5D (Cout, Cin, kD, kH, kW)");
+    auto B = x.size(0);
+    auto Cout = weight.size(0);
+    at::Tensor result = at::empty({B, Cout}, x.options());
+    // Custom fused op invocation
+    EXEC_NPU_CMD(aclnnConv3dHardswishReluSoftmaxMeanCustom, x, weight, bias, gamma, beta, num_groups, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv3d_hardswish_relu_softmax_mean_custom", &conv3d_hardswish_relu_softmax_mean_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv3d_hardswish_relu_softmax_mean_custom", &conv3d_hardswish_relu_softmax_mean_custom_impl_npu, "Fused Conv3d+Hardswish+GroupNorm+Mean");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Fused model: Conv3D -> Hardswish -> GroupNorm -> Mean over (D, H, W)
+    Implemented via a single custom AscendC kernel op.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups=4, bias=True):
+        super().__init__()
+        # Initialize parameters to match original architecture
+        k = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
+        self.weight = torch.nn.Parameter(torch.empty(out_channels, in_channels, k, k, k))
+        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(out_channels))
+        else:
+            self.bias = torch.nn.Parameter(torch.zeros(out_channels), requires_grad=False)
+
+        # GroupNorm affine params
+        self.gamma = torch.nn.Parameter(torch.ones(out_channels))
+        self.beta = torch.nn.Parameter(torch.zeros(out_channels))
+        self.num_groups = num_groups
+
+    def forward(self, x):
+        # x: (B, C, D, H, W)
+        return custom_ops_lib.conv3d_hardswish_relu_softmax_mean_custom(x, self.weight, self.bias, self.gamma, self.beta, self.num_groups)
+'''

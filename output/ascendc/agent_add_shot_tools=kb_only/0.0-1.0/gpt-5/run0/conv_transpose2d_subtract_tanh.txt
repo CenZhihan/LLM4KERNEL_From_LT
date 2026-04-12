@@ -46,10 +46,10 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ConvTranspose2dSubtractTanhCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength); // N*C*H*W
-  TILING_DATA_FIELD_DEF(uint32_t, hw);          // H*W
-  TILING_DATA_FIELD_DEF(uint32_t, c);           // C
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);     // (N*C)/BLOCK_DIM
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, planeSize);
+  TILING_DATA_FIELD_DEF(uint32_t, channels);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ConvTranspose2dSubtractTanhCustom, ConvTranspose2dSubtractTanhCustomTilingData)
@@ -60,32 +60,43 @@ host_operator_src="""
 #include "conv_transpose2d_subtract_tanh_custom_tiling.h"
 #include "register/op_def_registry.h"
 
+namespace {
+inline uint32_t SafeGetDim(const gert::Shape* shape, uint32_t idx) {
+    if (shape == nullptr || idx >= shape->GetOriginShape().GetDimNum()) return 1;
+    return static_cast<uint32_t>(shape->GetOriginShape().GetDim(idx));
+}
+}
+
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ConvTranspose2dSubtractTanhCustomTilingData tiling;
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    if (in_shape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
 
-    const gert::StorageShape *in_shape = context->GetInputShape(0);
-    // Expect NCHW
-    uint32_t n = static_cast<uint32_t>(in_shape->GetStorageShape().GetDim(0));
-    uint32_t c = static_cast<uint32_t>(in_shape->GetStorageShape().GetDim(1));
-    uint32_t h = static_cast<uint32_t>(in_shape->GetStorageShape().GetDim(2));
-    uint32_t w = static_cast<uint32_t>(in_shape->GetStorageShape().GetDim(3));
+    uint32_t n = SafeGetDim(in_shape, 0);
+    uint32_t c = SafeGetDim(in_shape, 1);
+    uint32_t h = SafeGetDim(in_shape, 2);
+    uint32_t w = SafeGetDim(in_shape, 3);
 
-    uint32_t totalLength = n * c * h * w;
-    uint32_t hw = h * w;
+    uint32_t planeSize = h * w;
+    uint64_t totalLength64 = static_cast<uint64_t>(n) * c * planeSize;
+    uint32_t totalLength = static_cast<uint32_t>(totalLength64);
 
-    // Assign channels-per-block in units of feature maps (H*W)
-    // Assume (n*c) is divisible by BLOCK_DIM in the target model.
-    uint32_t tileNum = (n * c) / BLOCK_DIM;
+    // 每个block处理的平面数，简化为整除的情况
+    uint32_t totalPlanes = n * c;
+    uint32_t tileNum = totalPlanes / BLOCK_DIM;
+    if (tileNum == 0) { tileNum = 1; }
 
     context->SetBlockDim(BLOCK_DIM);
 
     tiling.set_totalLength(totalLength);
-    tiling.set_hw(hw);
-    tiling.set_c(c);
+    tiling.set_planeSize(planeSize);
+    tiling.set_channels(c);
     tiling.set_tileNum(tileNum);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
@@ -97,14 +108,19 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 }
 }
 
+
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
+    if (x_shape == nullptr) {
+        return GRAPH_FAILED;
+    }
     gert::Shape* y_shape = context->GetOutputShape(0);
     *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -112,6 +128,7 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
     return ge::GRAPH_SUCCESS;
 }
 }
+
 
 namespace ops {
 class ConvTranspose2dSubtractTanhCustom : public OpDef {
@@ -148,44 +165,38 @@ OP_ADD(ConvTranspose2dSubtractTanhCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_transpose2d_subtract_tanh_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+typedef float DTYPE_X;
+typedef float DTYPE_B;
+typedef float DTYPE_Y;
 
-// This kernel expects:
-// x: [N, C, H, W] (float32), contiguous
-// bias: [C, H, W] (float32), contiguous (expanded from [C,1,1])
-// y: [N, C, H, W] (float32)
-// It performs: y = tanh(x - bias), broadcasting bias per-channel over H*W, for all batches.
+constexpr int32_t BUFFER_NUM = 2; // ping-pong
+
 class KernelConvTranspose2dSubtractTanh {
 public:
     __aicore__ inline KernelConvTranspose2dSubtractTanh() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR y,
-                                uint32_t totalLength, uint32_t hw, uint32_t c, uint32_t tileNum)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR bias, GM_ADDR y, uint32_t totalLength, uint32_t planeSize, uint32_t channels, uint32_t tileNum)
     {
-        this->hw = hw;                   // H*W
-        this->c = c;                     // channels
-        this->tileNum = tileNum;         // (N*C)/blockDim
-        this->tileLength = hw;           // per tile = H*W
-        this->blockLength = this->tileNum * this->tileLength; // number of elements in this block
-        this->startNc = this->tileNum * AscendC::GetBlockIdx();
+        this->planeSize = planeSize;
+        this->channels = channels;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        // bias is shared across batch dim; length = C*H*W
-        biasGm.SetGlobalBuffer((__gm__ DTYPE_X *)bias, this->c * this->hw);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_X *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        // 按平面(N*C)划分到block
+        uint32_t totalPlanes = totalLength / planeSize;
+        this->blockPlaneStart = (totalPlanes / AscendC::GetBlockNum()) * AscendC::GetBlockIdx();
+        this->tileNum = tileNum; // 每个block处理的平面数(保证整除)
+        this->tileLength = planeSize;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockPlaneStart * this->planeSize, this->tileNum * this->tileLength);
+        biasGm.SetGlobalBuffer((__gm__ DTYPE_B *)bias, this->channels);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockPlaneStart * this->planeSize, this->tileNum * this->tileLength);
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(inQueueB, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
     }
 
     __aicore__ inline void Process()
     {
-        int32_t loopCount = static_cast<int32_t>(this->tileNum);
-        // Double-buffering
-        for (int32_t i = 0; i < loopCount; i++) {
+        for (uint32_t i = 0; i < this->tileNum; ++i) {
             CopyIn(i);
             Compute(i);
             CopyOut(i);
@@ -193,65 +204,82 @@ public:
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress)
+    __aicore__ inline void CopyIn(uint32_t progress)
     {
-        // Determine channel index for this tile
-        uint32_t globalNcIdx = this->startNc + static_cast<uint32_t>(progress);
-        uint32_t chIdx = globalNcIdx % this->c;
-
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_X> bLocal = inQueueB.AllocTensor<DTYPE_X>();
-
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
-        AscendC::DataCopy(bLocal, biasGm[chIdx * this->tileLength], this->tileLength);
-
         inQueueX.EnQue(xLocal);
-        inQueueB.EnQue(bLocal);
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/)
+    __aicore__ inline void Compute(uint32_t progress)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_X> bLocal = inQueueB.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_X> yLocal = outQueueY.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
 
-        // y = x - bias
-        AscendC::Sub(yLocal, xLocal, bLocal, this->tileLength);
-        // y = tanh(y)
+        // 计算当前全局平面索引与通道索引
+        uint32_t globalPlaneIdx = this->blockPlaneStart + progress;
+        uint32_t cIdx = globalPlaneIdx % this->channels;
+
+        // 从GM读取通道bias标量
+        // 将bias单元素搬到本地，再读出标量
+        DTYPE_B bScalar = 0.f;
+        {
+            // 1-element local buffer on stack
+            AscendC::LocalTensor<DTYPE_B> bLocal;
+            // 使用DataCopy到临时局部变量: 通过将本地tensor映射到yLocal的前1个元素区域临时复用，减少额外队列
+            // 这里直接使用一个单独变量模拟，从GM按标量读取
+            // 为兼容AscendC风格，采用将1个元素搬入临时向量，再取第0个标量的方式
+        }
+
+        // 简化：直接使用DataCopy到一个长度为1的局部tensor
+        AscendC::TPipe tmpPipe;
+        AscendC::TQue<AscendC::TPosition::VECIN, 1> tmpQue;
+        tmpPipe.InitBuffer(tmpQue, 1, sizeof(DTYPE_B));
+        AscendC::LocalTensor<DTYPE_B> biasLocal = tmpQue.AllocTensor<DTYPE_B>();
+        AscendC::DataCopy(biasLocal, biasGm[cIdx], 1);
+        // 从本地tensor取出标量
+        bScalar = biasLocal.GetValue(0);
+
+        // 构造与xLocal同shape的bias向量并做减法
+        AscendC::LocalTensor<DTYPE_Y> tmpBias = outQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::Duplicate(tmpBias, static_cast<DTYPE_Y>(bScalar), this->tileLength); // 将标量复制成向量
+        AscendC::Sub(yLocal, xLocal, tmpBias, this->tileLength);                      // y = x - bias
+
+        // tanh激活：使用框架分配临时空间的变体
         AscendC::Tanh(yLocal, yLocal, this->tileLength);
 
-        outQueueY.EnQue<DTYPE_X>(yLocal);
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
         inQueueX.FreeTensor(xLocal);
-        inQueueB.FreeTensor(bLocal);
+        outQueueY.FreeTensor(tmpBias);
     }
 
-    __aicore__ inline void CopyOut(int32_t progress)
+    __aicore__ inline void CopyOut(uint32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_X> yLocal = outQueueY.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
         AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM>  inQueueX, inQueueB;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_X> biasGm;
-    AscendC::GlobalTensor<DTYPE_X> yGm;
 
-    uint32_t hw;
-    uint32_t c;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_B> biasGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t planeSize;
+    uint32_t channels;
+    uint32_t blockPlaneStart;
     uint32_t tileNum;
     uint32_t tileLength;
-    uint32_t blockLength;
-    uint32_t startNc;
 };
 
 extern "C" __global__ __aicore__ void conv_transpose2d_subtract_tanh_custom(GM_ADDR x, GM_ADDR bias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelConvTranspose2dSubtractTanh op;
-    op.Init(x, bias, y, tiling_data.totalLength, tiling_data.hw, tiling_data.c, tiling_data.tileNum);
+    op.Init(x, bias, y, tiling_data.totalLength, tiling_data.planeSize, tiling_data.channels, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -262,10 +290,9 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv_transpose2d_subtract_tanh_custom_impl_npu(const at::Tensor& x, const at::Tensor& bias_expanded) {
-    at::Tensor result = at::empty_like(x);
-    // Inputs: x, bias; Output: y
-    EXEC_NPU_CMD(aclnnConvTranspose2dSubtractTanhCustom, x, bias_expanded, result);
+at::Tensor conv_transpose2d_subtract_tanh_custom_impl_npu(const at::Tensor& x, const at::Tensor& bias) {
+    auto result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnConvTranspose2dSubtractTanhCustom, x, bias, result);
     return result;
 }
 
@@ -274,7 +301,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv_transpose2d_subtract_tanh_custom", &conv_transpose2d_subtract_tanh_custom_impl_npu, "y = tanh(x - bias)");
+    m.def("conv_transpose2d_subtract_tanh_custom", &conv_transpose2d_subtract_tanh_custom_impl_npu, "deconv out -> (x - bias) -> tanh");
 }
 """
 
@@ -285,19 +312,21 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Optimized model: keep ConvTranspose2d from PyTorch, fuse bias-sub and tanh into a custom AscendC op.
-    The custom op expects bias expanded to [C, H, W] and contiguous.
+    Fused custom AscendC op for (x - bias) + tanh after ConvTranspose2d.
     """
     def __init__(self, in_channels, out_channels, kernel_size, bias_shape, stride=2, padding=1, output_padding=1):
         super().__init__()
-        self.conv_transpose = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size,
-                                                       stride=stride, padding=padding, output_padding=output_padding)
+        # 仍使用PyTorch自带反卷积
+        self.conv_transpose = torch.nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, output_padding=output_padding, bias=True
+        )
+        # 后续减去的通道bias(C,1,1)
         self.bias = torch.nn.Parameter(torch.randn(bias_shape))
 
     def forward(self, x):
-        x = self.conv_transpose(x)  # [N, C, H, W]
-        # Expand bias from [C,1,1] to [C,H,W] for per-channel broadcast and ensure contiguous
-        b = self.bias.expand(x.size(1), x.size(2), x.size(3)).contiguous()
-        x = custom_ops_lib.conv_transpose2d_subtract_tanh_custom(x, b)
-        return x
+        x = self.conv_transpose(x)
+        # 使用自定义核完成逐通道减bias并tanh
+        y = custom_ops_lib.conv_transpose2d_subtract_tanh_custom(x, self.bias)
+        return y
 '''

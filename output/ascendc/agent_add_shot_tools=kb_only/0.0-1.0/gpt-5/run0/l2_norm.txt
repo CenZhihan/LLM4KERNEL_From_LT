@@ -13,16 +13,6 @@ project_json_src='''
                 "type": [
                     "float"
                 ]
-            },
-            {
-                "name": "gamma",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
             }
         ],
         "output_desc": [
@@ -46,9 +36,10 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(L2NormCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(RmsNormTiling, rmsnormTilingData);
+  TILING_DATA_FIELD_DEF(uint32_t, aLength);
+  TILING_DATA_FIELD_DEF(uint32_t, rLength);
+  TILING_DATA_FIELD_DEF(uint32_t, rLengthWithPadding);
+  TILING_DATA_FIELD_DEF(uint32_t, rTileLength);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(L2NormCustom, L2NormCustomTilingData)
@@ -59,27 +50,36 @@ host_operator_src="""
 #include "l2_norm_custom_tiling.h"
 #include "register/op_def_registry.h"
 
-namespace {
-constexpr uint32_t BLOCK_DIM = 8;
-constexpr uint32_t TILE_NUM = 8;
-}
-
 namespace optiling {
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     L2NormCustomTilingData tiling;
-    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    const gert::Shape* ishape = context->GetInputShape(0);
+    auto origin = ishape->GetOriginShape();
+    uint32_t aLength = static_cast<uint32_t>(origin.GetDim(0));
+    uint32_t rLength = static_cast<uint32_t>(origin.GetDim(1));
+    // 32-byte alignment for float (4B) -> 8 elements
+    uint32_t rLengthWithPadding = (rLength + 7) / 8 * 8;
 
+    // set block dim
+    const uint32_t BLOCK_DIM = 8;
     context->SetBlockDim(BLOCK_DIM);
-    tiling.set_totalLength(totalLength);
-    tiling.set_tileNum(TILE_NUM);
-    // rmsnormTilingData will be generated inside kernel according to lengths if needed.
+
+    // choose a tile length along R axis, aligned to 64 elements (one repeat for float is 64 elems)
+    uint32_t rTile = 4096;
+    if (rTile > rLengthWithPadding) rTile = rLengthWithPadding;
+    rTile = (rTile + 63) / 64 * 64;
+
+    tiling.set_aLength(aLength);
+    tiling.set_rLength(rLength);
+    tiling.set_rLengthWithPadding(rLengthWithPadding);
+    tiling.set_rTileLength(rTile);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
-    workspaceSizes[0] = 0;
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -87,16 +87,12 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    const gert::Shape* gamma_shape = context->GetInputShape(1);
-    // Expect gamma to be [H] and x to be [..., H]. Basic check: last dim equal.
-    if (x_shape->GetDimNum() >= 1 && gamma_shape->GetDimNum() == 1) {
-        // No hard validation to keep simple
-    }
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    *y_shape = *x_shape;
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -115,11 +111,6 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("gamma")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -127,7 +118,6 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
@@ -139,20 +129,136 @@ OP_ADD(L2NormCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "l2_norm_custom_tiling_data.h"
+#include <cmath>
 
-// Implement L2 normalization via RMSNorm: y = x / sqrt(mean(x^2) + eps) * gamma.
-// Set gamma[i] = sqrt(H) and eps=0 on host side to get y = x / sqrt(sum(x^2)).
+typedef float DTYPE_X;
+typedef float DTYPE_Y;
 
-extern "C" __global__ __aicore__ void l2_norm_custom(GM_ADDR x, GM_ADDR gamma, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tilingData, tiling);
-    KernelRmsNorm op;
-    op.Init(x, gamma, y, tilingData.totalLength, tilingData.tileNum, tilingData.rmsnormTilingData);
-    if (TILING_KEY_IS(1)) {
-        op.Process();
+constexpr int32_t IN_BUF_NUM = 1;
+constexpr int32_t OUT_BUF_NUM = 1;
+
+class KernelL2Norm {
+public:
+    __aicore__ inline KernelL2Norm() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t aLength, uint32_t rLength, uint32_t rLengthWithPadding, uint32_t rTileLength)
+    {
+        this->aLength = aLength;
+        this->rLength = rLength;
+        this->rLengthWithPadding = rLengthWithPadding;
+        this->rTileLength = rTileLength;
+
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->rowsPerBlock = (aLength + blockNum - 1) / blockNum;
+        this->rowStart = this->rowsPerBlock * blockIdx;
+        uint32_t rowEnd = this->rowStart + this->rowsPerBlock;
+        if (rowEnd > aLength) rowEnd = aLength;
+        this->rowCount = (rowEnd > this->rowStart) ? (rowEnd - this->rowStart) : 0;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + (uint64_t)this->rowStart * this->rLengthWithPadding,
+                            (uint64_t)this->rowCount * this->rLengthWithPadding);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + (uint64_t)this->rowStart * this->rLengthWithPadding,
+                            (uint64_t)this->rowCount * this->rLengthWithPadding);
+
+        pipe.InitBuffer(inQueueX, IN_BUF_NUM, this->rTileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, OUT_BUF_NUM, this->rTileLength * sizeof(DTYPE_Y));
+        // temp buffer for squares
+        pipe.InitBuffer(tmpSqQueue, 1, this->rTileLength * sizeof(float));
+        // work buffer for ReduceSum, allocate conservative size
+        pipe.InitBuffer(workQueue, 1, 2048);
+        // small dst buffer for ReduceSum
+        pipe.InitBuffer(dstRedQueue, 1, 64 * sizeof(float));
     }
+
+    __aicore__ inline void Process()
+    {
+        if (this->rowCount == 0) {
+            return;
+        }
+        for (uint32_t r = 0; r < this->rowCount; ++r) {
+            float sumsq = 0.0f;
+            // Pass 1: accumulate sum of squares
+            for (uint32_t off = 0; off < this->rLengthWithPadding; off += this->rTileLength) {
+                uint32_t len = this->rTileLength;
+                if (off + len > this->rLengthWithPadding) {
+                    len = this->rLengthWithPadding - off;
+                }
+                AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xLocal, xGm[(uint64_t)r * this->rLengthWithPadding + off], len);
+                inQueueX.EnQue(xLocal);
+
+                xLocal = inQueueX.DeQue<DTYPE_X>();
+                AscendC::LocalTensor<float> sqLocal = tmpSqQueue.AllocTensor<float>();
+                AscendC::Mul(sqLocal, xLocal, xLocal, len);
+
+                AscendC::LocalTensor<uint8_t> workLocal = workQueue.AllocTensor<uint8_t>();
+                AscendC::LocalTensor<float> dstRedLocal = dstRedQueue.AllocTensor<float>();
+                AscendC::ReduceSum<float>(dstRedLocal, sqLocal, workLocal, len);
+                float partial = AscendC::GetAccVal<float>();
+                sumsq += partial;
+
+                dstRedQueue.FreeTensor(dstRedLocal);
+                workQueue.FreeTensor(workLocal);
+                tmpSqQueue.FreeTensor(sqLocal);
+                inQueueX.FreeTensor(xLocal);
+            }
+
+            float invnorm = 1.0f / sqrtf(sumsq);
+
+            // Pass 2: scale by invnorm
+            for (uint32_t off = 0; off < this->rLengthWithPadding; off += this->rTileLength) {
+                uint32_t len = this->rTileLength;
+                if (off + len > this->rLengthWithPadding) {
+                    len = this->rLengthWithPadding - off;
+                }
+                AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+                AscendC::DataCopy(xLocal, xGm[(uint64_t)r * this->rLengthWithPadding + off], len);
+                inQueueX.EnQue(xLocal);
+
+                xLocal = inQueueX.DeQue<DTYPE_X>();
+                AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+                AscendC::Muls(yLocal, xLocal, invnorm, len);
+                outQueueY.EnQue(yLocal);
+                inQueueX.FreeTensor(xLocal);
+
+                yLocal = outQueueY.DeQue<DTYPE_Y>();
+                AscendC::DataCopy(yGm[(uint64_t)r * this->rLengthWithPadding + off], yLocal, len);
+                outQueueY.FreeTensor(yLocal);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, IN_BUF_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, OUT_BUF_NUM> outQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpSqQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> workQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> dstRedQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t aLength;
+    uint32_t rLength;
+    uint32_t rLengthWithPadding;
+    uint32_t rTileLength;
+
+    uint32_t rowsPerBlock;
+    uint32_t rowStart;
+    uint32_t rowCount;
+};
+
+extern "C" __global__ __aicore__ void l2_norm_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+    KernelL2Norm op;
+    op.Init(x, y,
+            tilingData.aLength,
+            tilingData.rLength,
+            tilingData.rLengthWithPadding,
+            tilingData.rTileLength);
+    op.Process();
 }
 """
 
@@ -161,22 +267,11 @@ python_bind_src="""
 #include <torch/csrc/autograd/custom_function.h>
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
-#include <cmath>
 
-static at::Tensor build_gamma_like(const at::Tensor& x) {
-    // Expect x shape [B, H] or [..., H]; gamma is [H]
-    auto H = x.size(-1);
-    at::Tensor gamma = at::full({H}, std::sqrt(static_cast<double>(H)), x.options());
-    return gamma;
-}
-
-at::Tensor l2_norm_custom_impl_npu(const at::Tensor& x) {
-    TORCH_CHECK(x.dim() >= 1, "x must have at least 1 dimension");
-    at::Tensor y = at::empty_like(x);
-    at::Tensor gamma = build_gamma_like(x);
-    // Use RMSNorm kernel with gamma = sqrt(H), eps=0 set by construction.
-    EXEC_NPU_CMD(aclnnL2NormCustom, x, gamma, y);
-    return y;
+at::Tensor l2_norm_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnL2NormCustom, self, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -184,7 +279,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("l2_norm_custom", &l2_norm_custom_impl_npu, "L2 normalization via RMSNorm");
+    m.def("l2_norm_custom", &l2_norm_custom_impl_npu, "L2 normalization along dim=1");
 }
 """
 
@@ -194,9 +289,9 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return custom_ops_lib.l2_norm_custom(x)
 '''

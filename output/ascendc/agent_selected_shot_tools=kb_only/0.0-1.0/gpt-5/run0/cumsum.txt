@@ -1,0 +1,249 @@
+project_json_src='''
+[
+    {
+        "op": "CumsumCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CumsumCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, outter);
+  TILING_DATA_FIELD_DEF(uint32_t, inner);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CumsumCustom, CumsumCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cumsum_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CumsumCustomTilingData tiling;
+
+    // 使用存储形状(StorageShape)，确保最后一维满足32B对齐约束
+    const auto *shape = context->GetInputShape(0);
+    auto storageShape = shape->GetStorageShape();
+
+    uint32_t dimNum = storageShape.GetDimNum();
+    uint32_t outter = 1;
+    for (uint32_t i = 0; i + 1 < dimNum; ++i) {
+        outter *= static_cast<uint32_t>(storageShape.GetDim(i));
+    }
+    uint32_t inner = static_cast<uint32_t>(storageShape.GetDim(dimNum - 1));
+
+    tiling.set_outter(outter);
+    tiling.set_inner(inner);
+
+    context->SetBlockDim(1);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CumsumCustom : public OpDef {
+public:
+    explicit CumsumCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CumsumCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+// 行优先(最后一维)逐行处理的CumSum实现，满足UB容量限制
+template <typename T>
+class KernelCumsumCustom {
+public:
+    __aicore__ inline KernelCumsumCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t outter, uint32_t inner)
+    {
+        outer_ = outter;
+        inner_ = inner;
+
+        srcGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(x), outer_ * inner_);
+        dstGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(y), outer_ * inner_);
+
+        pipe_.InitBuffer(inQueue_, 1, inner_ * sizeof(T));
+        pipe_.InitBuffer(outQueue_, 1, inner_ * sizeof(T));
+        pipe_.InitBuffer(lastRowQueue_, 1, inner_ * sizeof(T));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t row = 0; row < outer_; ++row) {
+            CopyIn(row);
+            Compute();
+            CopyOut(row);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t row)
+    {
+        AscendC::LocalTensor<T> srcLocal = inQueue_.AllocTensor<T>();
+        AscendC::DataCopy(srcLocal, srcGlobal_[row * inner_], inner_);
+        inQueue_.EnQue(srcLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<T> dstLocal = outQueue_.AllocTensor<T>();
+        AscendC::LocalTensor<T> lastRowLocal = lastRowQueue_.AllocTensor<T>();
+        AscendC::LocalTensor<T> srcLocal = inQueue_.DeQue<T>();
+
+        static constexpr AscendC::CumSumConfig cumSumConfig{true, false, false}; // 最后一维前缀和
+        const AscendC::CumSumInfo info{1, inner_};
+        AscendC::CumSum<T, cumSumConfig>(dstLocal, lastRowLocal, srcLocal, info);
+
+        outQueue_.EnQue<T>(dstLocal);
+        lastRowQueue_.EnQue<T>(lastRowLocal);
+        inQueue_.FreeTensor(srcLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t row)
+    {
+        AscendC::LocalTensor<T> dstLocal = outQueue_.DeQue<T>();
+        AscendC::DataCopy(dstGlobal_[row * inner_], dstLocal, inner_);
+        outQueue_.FreeTensor(dstLocal);
+
+        // 丢弃lastRow结果（未对外输出）
+        AscendC::LocalTensor<T> lastRowLocal = lastRowQueue_.DeQue<T>();
+        lastRowQueue_.FreeTensor(lastRowLocal);
+    }
+
+private:
+    AscendC::TPipe pipe_;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueue_;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue_;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> lastRowQueue_;
+
+    AscendC::GlobalTensor<T> srcGlobal_;
+    AscendC::GlobalTensor<T> dstGlobal_;
+
+    uint32_t outer_{1};
+    uint32_t inner_{1};
+};
+
+extern "C" __global__ __aicore__ void cumsum_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCumsumCustom<DTYPE_X> op;
+    op.Init(x, y, tiling_data.outter, tiling_data.inner);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cumsum_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnCumsumCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cumsum_custom", &cumsum_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cumsum_custom", &cumsum_custom_impl_npu, "cumsum along last axis");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        # 仅在最后一维(等价于dim == x.dim() - 1)使用自定义核；否则回退至原生cumsum
+        if self.dim == x.dim() - 1 or self.dim == -1:
+            return custom_ops_lib.cumsum_custom(x)
+        else:
+            return torch.cumsum(x, dim=self.dim)
+'''

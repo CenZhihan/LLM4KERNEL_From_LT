@@ -17,7 +17,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "y",
+                "name": "z",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -26,124 +26,96 @@ project_json_src='''
                     "float"
                 ]
             }
+        ],
+        "attr_desc": [
+            {
+                "name": "kernel_size",
+                "type": "int"
+            },
+            {
+                "name": "stride",
+                "type": "int"
+            },
+            {
+                "name": "padding",
+                "type": "int"
+            }
         ]
     }
 ]
 '''
-
 host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(AveragePooling3dCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, N);
-  TILING_DATA_FIELD_DEF(uint32_t, C);
-  TILING_DATA_FIELD_DEF(uint32_t, D);
-  TILING_DATA_FIELD_DEF(uint32_t, H);
-  TILING_DATA_FIELD_DEF(uint32_t, W);
-
-  TILING_DATA_FIELD_DEF(uint32_t, K);
-  TILING_DATA_FIELD_DEF(uint32_t, S);
-  TILING_DATA_FIELD_DEF(uint32_t, P);
-
-  TILING_DATA_FIELD_DEF(uint32_t, OD);
-  TILING_DATA_FIELD_DEF(uint32_t, OH);
-  TILING_DATA_FIELD_DEF(uint32_t, OW);
-
-  TILING_DATA_FIELD_DEF(uint32_t, TotalOut);
-  TILING_DATA_FIELD_DEF(uint32_t, WinElems);
-  TILING_DATA_FIELD_DEF(uint32_t, WinInnerAligned);
-  TILING_DATA_FIELD_DEF(uint32_t, SumTmpBufSize);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, d);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, kd);
+  TILING_DATA_FIELD_DEF(uint32_t, sd);
+  TILING_DATA_FIELD_DEF(uint32_t, pd);
+  TILING_DATA_FIELD_DEF(uint32_t, od);
+  TILING_DATA_FIELD_DEF(uint32_t, oh);
+  TILING_DATA_FIELD_DEF(uint32_t, ow);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(AveragePooling3dCustom, AveragePooling3dCustomTilingData)
 }
 """
-
 host_operator_src="""
 #include "average_pooling_3d_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
-#include "kernel_operator.h"
 
 namespace {
-inline uint32_t div_floor(int64_t a, int64_t b) {
-    return static_cast<uint32_t>(a / b);
+inline int64_t floor_div(int64_t a, int64_t b) {
+    return a / b;
+}
+inline int64_t out_dim(int64_t in, int64_t k, int64_t s, int64_t p) {
+    return floor_div(in + 2 * p - k, s) + 1;
 }
 }
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     AveragePooling3dCustomTilingData tiling;
+    auto inShape = context->GetInputShape(0)->GetOriginShape();
+    int64_t n = inShape.GetDim(0);
+    int64_t c = inShape.GetDim(1);
+    int64_t d = inShape.GetDim(2);
+    int64_t h = inShape.GetDim(3);
+    int64_t w = inShape.GetDim(4);
 
-    // Read attributes
-    const gert::RuntimeAttrs* attrs = context->GetAttrs();
-    // Attr order must be consistent with OpDef below: kernel_size, stride, padding
-    uint32_t K = *(attrs->GetAttrPointer<uint32_t>(0));
-    uint32_t S = *(attrs->GetAttrPointer<uint32_t>(1));
-    uint32_t P = *(attrs->GetAttrPointer<uint32_t>(2));
+    int64_t k = context->GetIntAttr("kernel_size");
+    int64_t s = context->GetIntAttr("stride");
+    int64_t p = context->GetIntAttr("padding");
 
-    // Get input shape: N, C, D, H, W (NCDHW)
-    const gert::Shape* inShape = context->GetInputShape(0);
-    uint32_t N = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(0));
-    uint32_t C = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(1));
-    uint32_t D = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(2));
-    uint32_t H = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(3));
-    uint32_t W = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(4));
-
-    // Output sizes with padding included in average (PyTorch AvgPool3d default behavior)
-    uint32_t OD = div_floor((int64_t)D + 2 * (int64_t)P - (int64_t)K, (int64_t)S) + 1;
-    uint32_t OH = div_floor((int64_t)H + 2 * (int64_t)P - (int64_t)K, (int64_t)S) + 1;
-    uint32_t OW = div_floor((int64_t)W + 2 * (int64_t)P - (int64_t)K, (int64_t)S) + 1;
-
-    uint64_t totalOut64 = (uint64_t)N * C * OD * OH * OW;
-    uint32_t TotalOut = static_cast<uint32_t>(totalOut64);
-
-    uint32_t WinElems = K * K * K;
-
-    // Align inner axis to 32 bytes as required by Sum high-level API
-    // Ref: Sum API requires inner * sizeof(T) 32B aligned (CANN doc)
-    auto dt = context->GetInputTensor(0)->GetDataType();
-    uint32_t dtypesize = (dt == ge::DT_FLOAT16) ? 2 : 4;
-    uint32_t WinInnerAligned = ((WinElems * dtypesize + 32 - 1) / 32) * 32 / dtypesize;
-
-    // Reserve temp space for Sum (framework-managed temporary buffer)
-    uint32_t maxValue = 0;
-    uint32_t minValue = 0;
-    AscendC::GetSumMaxMinTmpSize(WinElems, dtypesize, false, maxValue, minValue);
-    uint32_t SumTmpBufSize = minValue;
-
-    tiling.set_N(N);
-    tiling.set_C(C);
-    tiling.set_D(D);
-    tiling.set_H(H);
-    tiling.set_W(W);
-
-    tiling.set_K(K);
-    tiling.set_S(S);
-    tiling.set_P(P);
-
-    tiling.set_OD(OD);
-    tiling.set_OH(OH);
-    tiling.set_OW(OW);
-
-    tiling.set_TotalOut(TotalOut);
-    tiling.set_WinElems(WinElems);
-    tiling.set_WinInnerAligned(WinInnerAligned);
-    tiling.set_SumTmpBufSize(SumTmpBufSize);
+    int64_t od = out_dim(d, k, s, p);
+    int64_t oh = out_dim(h, k, s, p);
+    int64_t ow = out_dim(w, k, s, p);
 
     context->SetBlockDim(BLOCK_DIM);
 
+    tiling.set_n(static_cast<uint32_t>(n));
+    tiling.set_c(static_cast<uint32_t>(c));
+    tiling.set_d(static_cast<uint32_t>(d));
+    tiling.set_h(static_cast<uint32_t>(h));
+    tiling.set_w(static_cast<uint32_t>(w));
+    tiling.set_kd(static_cast<uint32_t>(k));
+    tiling.set_sd(static_cast<uint32_t>(s));
+    tiling.set_pd(static_cast<uint32_t>(p));
+    tiling.set_od(static_cast<uint32_t>(od));
+    tiling.set_oh(static_cast<uint32_t>(oh));
+    tiling.set_ow(static_cast<uint32_t>(ow));
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
-    // No extra workspace requested
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -151,32 +123,32 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::RuntimeAttrs* attrs = context->GetAttrs();
-    uint32_t K = *(attrs->GetAttrPointer<uint32_t>(0));
-    uint32_t S = *(attrs->GetAttrPointer<uint32_t>(1));
-    uint32_t P = *(attrs->GetAttrPointer<uint32_t>(2));
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    int64_t n = x_shape->GetDim(0);
+    int64_t c = x_shape->GetDim(1);
+    int64_t d = x_shape->GetDim(2);
+    int64_t h = x_shape->GetDim(3);
+    int64_t w = x_shape->GetDim(4);
 
-    const gert::Shape* inShape = context->GetInputShape(0);
-    uint32_t N = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(0));
-    uint32_t C = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(1));
-    uint32_t D = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(2));
-    uint32_t H = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(3));
-    uint32_t W = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(4));
+    int64_t k = context->GetIntAttr("kernel_size");
+    int64_t s = context->GetIntAttr("stride");
+    int64_t p = context->GetIntAttr("padding");
 
-    uint32_t OD = static_cast<uint32_t>(((int64_t)D + 2 * (int64_t)P - (int64_t)K) / (int64_t)S + 1);
-    uint32_t OH = static_cast<uint32_t>(((int64_t)H + 2 * (int64_t)P - (int64_t)K) / (int64_t)S + 1);
-    uint32_t OW = static_cast<uint32_t>(((int64_t)W + 2 * (int64_t)P - (int64_t)K) / (int64_t)S + 1);
+    auto calc = [](int64_t in, int64_t k, int64_t s, int64_t p) {
+        return (in + 2 * p - k) / s + 1;
+    };
+    int64_t od = calc(d, k, s, p);
+    int64_t oh = calc(h, k, s, p);
+    int64_t ow = calc(w, k, s, p);
 
     gert::Shape* y_shape = context->GetOutputShape(0);
-    y_shape->SetDimNum(5);
-    y_shape->SetDim(0, N);
-    y_shape->SetDim(1, C);
-    y_shape->SetDim(2, OD);
-    y_shape->SetDim(3, OH);
-    y_shape->SetDim(4, OW);
-    return ge::GRAPH_SUCCESS;
+    y_shape->SetDim(0, n);
+    y_shape->SetDim(1, c);
+    y_shape->SetDim(2, od);
+    y_shape->SetDim(3, oh);
+    y_shape->SetDim(4, ow);
+    return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -195,28 +167,18 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Output("y")
+        this->Output("z")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        // Attributes: kernel_size, stride, padding
-        this->Attr("kernel_size")
-            .AttrType(REQUIRED)
-            .Int(0);
-        this->Attr("stride")
-            .AttrType(REQUIRED)
-            .Int(0);
-        this->Attr("padding")
-            .AttrType(REQUIRED)
-            .Int(0);
+        this->Attr("kernel_size").Int(1);
+        this->Attr("stride").Int(1);
+        this->Attr("padding").Int(0);
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -224,172 +186,115 @@ public:
 OP_ADD(AveragePooling3dCustom);
 }
 """
-
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "average_pooling_3d_custom_tiling_data.h"
 
-// 本实现基于 AscendC 高级/基础 API：
-// - DataCopy/Duplicate: 数据搬运与初始化（参考 CANN Ascend C API Reference 表1-3/数据填充Duplicate）
-// - Add/Muls: 向量与标量计算（参考 基础API 两操作数与标量两操作数）
-// - Sum: 高级API按最后一维归约求和，需满足inner 32B对齐并可通过GetSumMaxMinTmpSize预留临时空间（参考5.x Sum章节）
+#define DTYPE_X float
+#define DTYPE_Z float
 
-class KernelAveragePooling3d {
+class KernelAvgPool3D {
 public:
-    __aicore__ inline KernelAveragePooling3d() {}
+    __aicore__ inline KernelAvgPool3D() {}
 
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t N, uint32_t C, uint32_t D, uint32_t H, uint32_t W,
-                                uint32_t K, uint32_t S, uint32_t P,
-                                uint32_t OD, uint32_t OH, uint32_t OW,
-                                uint32_t TotalOut,
-                                uint32_t WinElems, uint32_t WinInnerAligned,
-                                uint32_t SumTmpBufSize)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR z,
+                                uint32_t n, uint32_t c, uint32_t d, uint32_t h, uint32_t w,
+                                uint32_t k, uint32_t s, uint32_t p,
+                                uint32_t od, uint32_t oh, uint32_t ow)
     {
-        this->N = N; this->C = C; this->D = D; this->H = H; this->W = W;
-        this->K = K; this->S = S; this->P = P;
-        this->OD = OD; this->OH = OH; this->OW = OW;
-        this->TotalOut = TotalOut;
-        this->WinElems = WinElems;
-        this->WinInnerAligned = WinInnerAligned;
+        this->n = n; this->c = c; this->d = d; this->h = h; this->w = w;
+        this->k = k; this->s = s; this->p = p;
+        this->od = od; this->oh = oh; this->ow = ow;
 
-        // 多核分工：按输出元素均分
-        this->blockOut = TotalOut / AscendC::GetBlockNum();
-        this->blockStart = this->blockOut * AscendC::GetBlockIdx();
-
-        // 绑定GM缓冲
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x, (uint64_t)N * C * D * H * W);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Z*)y, (uint64_t)N * C * OD * OH * OW);
-
-        // 工作队列：窗口缓冲（对齐到32B）
-        pipe.InitBuffer(winQueue, 1, WinInnerAligned * sizeof(DTYPE_X));
-        // 输出队列：至少分配一个数据块
-        pipe.InitBuffer(outQueue, 1, 32);
-        // Sum临时缓冲（由框架管理，需预留空间，参考Sum API说明）
-        if (SumTmpBufSize > 0) {
-            pipe.InitBuffer(tmpQueue, 1, SumTmpBufSize);
-        }
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, static_cast<uint64_t>(n) * c * d * h * w);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z, static_cast<uint64_t>(n) * c * od * oh * ow);
     }
 
     __aicore__ inline void Process()
     {
-        // 逐输出元素计算平均池化（包含padding计数）
-        for (uint32_t i = 0; i < blockOut; ++i) {
-            uint64_t outIndex = (uint64_t)blockStart + i;
-            // 反解线性索引到(N, C, od, oh, ow)
-            uint32_t ow = static_cast<uint32_t>(outIndex % OW);
-            uint64_t t1 = outIndex / OW;
-            uint32_t oh = static_cast<uint32_t>(t1 % OH);
-            uint64_t t2 = t1 / OH;
-            uint32_t od = static_cast<uint32_t>(t2 % OD);
-            uint64_t t3 = t2 / OD;
-            uint32_t c = static_cast<uint32_t>(t3 % C);
-            uint32_t n = static_cast<uint32_t>(t3 / C);
+        uint32_t totalNC = n * c;
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
 
-            ComputeOne(n, c, od, oh, ow, outIndex);
+        uint32_t base = (totalNC / blockNum) * blockIdx;
+        uint32_t tail = (blockIdx == blockNum - 1) ? totalNC : (base + (totalNC / blockNum));
+        if (blockIdx == blockNum - 1) {
+            tail = totalNC;
         }
-    }
 
-private:
-    __aicore__ inline void ComputeOne(uint32_t n, uint32_t c, uint32_t od, uint32_t oh, uint32_t ow, uint64_t outLinearIndex)
-    {
-        AscendC::LocalTensor<DTYPE_X> winLocal = winQueue.AllocTensor<DTYPE_X>();
-        // 预留Sum的临时缓冲（按Sum API说明）
-        AscendC::LocalTensor<uint8_t> sumTmp;
-        if (tmpQueue.IsValid()) {
-            sumTmp = tmpQueue.AllocTensor<uint8_t>();
-        }
-        // 窗口缓冲清零，长度按32B对齐
-        DTYPE_X zeroVal(0);
-        AscendC::Duplicate<DTYPE_X>(winLocal, zeroVal, WinInnerAligned);
+        uint64_t inStrideW = 1;
+        uint64_t inStrideH = w;
+        uint64_t inStrideD = static_cast<uint64_t>(h) * w;
+        uint64_t inStrideC = static_cast<uint64_t>(d) * h * w;
+        uint64_t inStrideN = static_cast<uint64_t>(c) * d * h * w;
 
-        // 窗口左上后起点（含padding）
-        int32_t d0 = static_cast<int32_t>(od) * static_cast<int32_t>(S) - static_cast<int32_t>(P);
-        int32_t h0 = static_cast<int32_t>(oh) * static_cast<int32_t>(S) - static_cast<int32_t>(P);
-        int32_t w0 = static_cast<int32_t>(ow) * static_cast<int32_t>(S) - static_cast<int32_t>(P);
+        uint64_t outStrideW = 1;
+        uint64_t outStrideH = ow;
+        uint64_t outStrideD = static_cast<uint64_t>(oh) * ow;
+        uint64_t outStrideC = static_cast<uint64_t>(od) * oh * ow;
+        uint64_t outStrideN = static_cast<uint64_t>(c) * od * oh * ow;
 
-        // 将有效输入拷入窗口缓冲，布局为 [kd, kh, kw] -> 紧密存储
-        for (uint32_t kd = 0; kd < K; ++kd) {
-            int32_t di = d0 + static_cast<int32_t>(kd);
-            if (di < 0 || di >= static_cast<int32_t>(D)) continue;
-            for (uint32_t kh = 0; kh < K; ++kh) {
-                int32_t hi = h0 + static_cast<int32_t>(kh);
-                if (hi < 0 || hi >= static_cast<int32_t>(H)) continue;
+        for (uint32_t ncIdx = base; ncIdx < tail; ++ncIdx) {
+            uint32_t nn = ncIdx / c;
+            uint32_t cc = ncIdx % c;
+            uint64_t inBase = nn * inStrideN + cc * inStrideC;
+            uint64_t outBase = nn * outStrideN + cc * outStrideC;
 
-                int32_t wStartValid = w0 < 0 ? 0 : w0;
-                int32_t wEndValid = (w0 + static_cast<int32_t>(K)) > static_cast<int32_t>(W)
-                                        ? static_cast<int32_t>(W)
-                                        : (w0 + static_cast<int32_t>(K));
-                int32_t validLen = wEndValid - wStartValid;
-                if (validLen <= 0) continue;
+            for (uint32_t z = 0; z < od; ++z) {
+                int64_t startD = static_cast<int64_t>(z) * s - static_cast<int64_t>(p);
+                for (uint32_t y = 0; y < oh; ++y) {
+                    int64_t startH = static_cast<int64_t>(y) * s - static_cast<int64_t>(p);
+                    for (uint32_t x = 0; x < ow; ++x) {
+                        int64_t startW = static_cast<int64_t>(x) * s - static_cast<int64_t>(p);
+                        float acc = 0.0f;
+                        uint32_t cnt = 0U;
 
-                // 输入起始偏移（N,C,D,H,W）
-                uint64_t inBase = ((((uint64_t)n * C + c) * D + (uint32_t)di) * H + (uint32_t)hi) * W;
-                uint64_t inOffset = inBase + (uint32_t)wStartValid;
-
-                // 窗口缓冲起始偏移：把有效段拷贝到 [kd*K*K + kh*K + (wStartValid - w0)]
-                uint32_t winRowBase = kd * K * K + kh * K;
-                uint32_t winOffset = winRowBase + static_cast<uint32_t>(wStartValid - w0);
-
-                AscendC::DataCopy(winLocal[winOffset], xGm[inOffset], static_cast<uint32_t>(validLen));
+                        for (uint32_t kd = 0; kd < k; ++kd) {
+                            int64_t id = startD + static_cast<int64_t>(kd);
+                            if (id < 0 || id >= static_cast<int64_t>(d)) continue;
+                            for (uint32_t kh = 0; kh < k; ++kh) {
+                                int64_t ih = startH + static_cast<int64_t>(kh);
+                                if (ih < 0 || ih >= static_cast<int64_t>(h)) continue;
+                                for (uint32_t kw = 0; kw < k; ++kw) {
+                                    int64_t iw = startW + static_cast<int64_t>(kw);
+                                    if (iw < 0 || iw >= static_cast<int64_t>(w)) continue;
+                                    uint64_t inIndex = inBase + static_cast<uint64_t>(id) * inStrideD
+                                                      + static_cast<uint64_t>(ih) * inStrideH
+                                                      + static_cast<uint64_t>(iw) * inStrideW;
+                                    acc += *((__gm__ DTYPE_X*)xGm.GetGlobalBuffer() + inIndex);
+                                    ++cnt;
+                                }
+                            }
+                        }
+                        float outVal = cnt > 0U ? (acc / static_cast<float>(cnt)) : 0.0f;
+                        uint64_t outIndex = outBase + static_cast<uint64_t>(z) * outStrideD
+                                          + static_cast<uint64_t>(y) * outStrideH
+                                          + static_cast<uint64_t>(x) * outStrideW;
+                        *((__gm__ DTYPE_Z*)zGm.GetGlobalBuffer() + outIndex) = outVal;
+                    }
+                }
             }
         }
-
-        // Sum按最后一维求和：outter=1, inner=WinInnerAligned(32B对齐), n=WinElems
-        AscendC::LocalTensor<DTYPE_X> accLocal = outQueue.AllocTensor<DTYPE_X>();
-        AscendC::SumParams sumParams{1u, WinInnerAligned, WinElems};
-        AscendC::Sum(accLocal, winLocal, sumParams);
-
-        // 标量乘以 1/(K^3) 得到平均值
-        float invWin = 1.0f / static_cast<float>(WinElems);
-        AscendC::Muls(accLocal, accLocal, invWin, 1);
-
-        // 写回输出张量（N,C,OD,OH,OW）
-        AscendC::LocalTensor<DTYPE_X> outLocal = accLocal;
-        AscendC::DataCopy(yGm[outLinearIndex], outLocal, 1);
-
-        outQueue.FreeTensor(accLocal);
-        if (tmpQueue.IsValid()) {
-            tmpQueue.FreeTensor(sumTmp);
-        }
-        winQueue.FreeTensor(winLocal);
     }
 
 private:
-    AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, 1> winQueue;
-    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueue;
-    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQueue;
-
     AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Z> yGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
 
-    uint32_t N, C, D, H, W;
-    uint32_t K, S, P;
-    uint32_t OD, OH, OW;
-    uint32_t TotalOut;
-    uint32_t WinElems, WinInnerAligned;
-
-    uint32_t blockOut;
-    uint32_t blockStart;
+    uint32_t n, c, d, h, w;
+    uint32_t k, s, p;
+    uint32_t od, oh, ow;
 };
 
-extern "C" __global__ __aicore__ void average_pooling_3d_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tiling_data, tiling);
-    KernelAveragePooling3d op;
-    op.Init(x, y,
-            tiling_data.N, tiling_data.C, tiling_data.D, tiling_data.H, tiling_data.W,
-            tiling_data.K, tiling_data.S, tiling_data.P,
-            tiling_data.OD, tiling_data.OH, tiling_data.OW,
-            tiling_data.TotalOut,
-            tiling_data.WinElems, tiling_data.WinInnerAligned,
-            tiling_data.SumTmpBufSize);
+extern "C" __global__ __aicore__ void average_pooling_3d_custom(GM_ADDR x, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+    KernelAvgPool3D op;
+    op.Init(x, z,
+            tilingData.n(), tilingData.c(), tilingData.d(), tilingData.h(), tilingData.w(),
+            tilingData.kd(), tilingData.sd(), tilingData.pd(),
+            tilingData.od(), tilingData.oh(), tilingData.ow());
     op.Process();
 }
 """
-
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
@@ -397,18 +302,19 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor average_pooling_3d_custom_impl_npu(const at::Tensor& self, int64_t kernel_size, int64_t stride, int64_t padding) {
-    TORCH_CHECK(self.dim() == 5, "Input must be 5D (N, C, D, H, W)");
+    TORCH_CHECK(self.dim() == 5, "Input must be 5D NCDHW");
     auto sizes = self.sizes();
     int64_t N = sizes[0], C = sizes[1], D = sizes[2], H = sizes[3], W = sizes[4];
 
-    // Output dims (count_include_pad = True)
-    int64_t OD = (D + 2 * padding - kernel_size) / stride + 1;
-    int64_t OH = (H + 2 * padding - kernel_size) / stride + 1;
-    int64_t OW = (W + 2 * padding - kernel_size) / stride + 1;
-    TORCH_CHECK(OD > 0 && OH > 0 && OW > 0, "Invalid pooling configuration leads to non-positive output size.");
+    auto calc = [](int64_t in, int64_t k, int64_t s, int64_t p) {
+        return (in + 2 * p - k) / s + 1;
+    };
+    int64_t Do = calc(D, kernel_size, stride, padding);
+    int64_t Ho = calc(H, kernel_size, stride, padding);
+    int64_t Wo = calc(W, kernel_size, stride, padding);
 
-    at::Tensor result = at::empty({N, C, OD, OH, OW}, self.options());
-    EXEC_NPU_CMD(aclnnAveragePooling3dCustom, self, (int32_t)kernel_size, (int32_t)stride, (int32_t)padding, result);
+    at::Tensor result = at::empty({N, C, Do, Ho, Wo}, self.options());
+    EXEC_NPU_CMD(aclnnAveragePooling3dCustom, self, kernel_size, stride, padding, result);
     return result;
 }
 
@@ -417,25 +323,21 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("average_pooling_3d_custom", &average_pooling_3d_custom_impl_npu, "AvgPool3d (custom AscendC)");
+    m.def("average_pooling_3d_custom", &average_pooling_3d_custom_impl_npu, "3D Average Pooling (custom AscendC)");
 }
 """
-
 model_src='''
 import torch
 import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    Replace nn.AvgPool3d with custom AscendC operator AveragePooling3dCustom.
-    """
     def __init__(self, kernel_size: int, stride: int = None, padding: int = 0):
         super().__init__()
         self.kernel_size = kernel_size
-        self.stride = kernel_size if stride is None else stride
+        self.stride = stride if stride is not None else kernel_size
         self.padding = padding
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return custom_ops_lib.average_pooling_3d_custom(x, self.kernel_size, self.stride, self.padding)
+        return custom_ops_lib.average_pooling_3d_custom(x, int(self.kernel_size), int(self.stride), int(self.padding))
 '''

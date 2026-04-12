@@ -1,0 +1,33 @@
+**Producing kernel code**
+
+I need to produce code involving six strings: project_json_src, host_tiling_src, host_operator_src, kernel_src, python_bind_src, and model_src. The kernel will be named index_add_custom in lower snake case and PascalCase IndexAddCustom. This operator implements index_add along dim=0, accumulating values into x at specified rows. 
+
+The shapes involve x with float32 and indices with int64. I'm considering how to handle scatter-add with duplicates using atomic adds. It seems AscendC supports vector atomic adds, which could help us implement this efficiently.**Simplifying the kernel approach**
+
+I can simplify our approach by using tiling per block, which splits the work by rows of x or the number of updates, M. I’ll likely iterate over chunks of updates for each block, performing atomic adds along the C dimension with vector operations. 
+
+I'll define DTYPE types: DTYPE_X as float, DTYPE_IDX as int32 or int64, and DTYPE_VAL and DTYPE_OUT as float. It seems macros for these types should be provided, as they weren't defined in the example, but they might be generated based on operation types in the project configuration. I'll follow the usual pattern in AscendC with appropriate macros for x, z, values, and indices.**Defining operator types and shapes**
+
+I need to add the operator definition for indices, using int32 or int64. It looks like on NPU with PyTorch, indexes are typically int32 on Ascend. To keep it simple, I’ll declare input_desc types: “int32” for indices and “float” for others. The user’s get_inputs method uses torch.randint with a default dtype of int64, so I wonder if a conversion occurs. To minimize mismatches, it’s better to declare that indices support both int32 and int64, which can be listed in project_json. As for the output shape, it will match the input0 shape, and I’ll set up tiling and block dimensions for efficient processing.**Implementing atomic addition**
+
+I’ll copy the value vector chunk into a local buffer and perform atomic adds to z in global memory across columns. I’m not completely sure if AscendC supports AtomicAdd with zptr, val, and n. 
+
+Alternatively, I could read z into local memory, add values, and write back, but that could cause race conditions due to duplicates across updates. Using atomicAdd for each element seems better. I’ll implement a naive approach where, for each update and each column j, I do an atomic add like z[index*M + j] += val[i, j]. I’ll use DSL's inline loop and AscendC::AtomicAdd for this.**Creating the custom kernel**
+
+I’ll start by cloning the original tensor to ensure that the result matches x. This adds some overhead, but it’s acceptable for our index_add operation, since we need a base from x. In Python_bind, I’ll instantiate a tensor for the result. 
+
+Next, I’ll define the kernel to perform atomic adds into z based on the values provided, while ignoring x since z is already initialized with x’s values. The kernel will handle global memory operations, particularly fetching indices for each update, though this part is a bit tricky. I have to ensure I read indices without causing race conditions. 
+
+Using AscendC, I’ll create a LocalTensor to store indices locally, and I’ll utilize DataCopy to retrieve index values efficiently. Despite the complexity, I can implement a straightforward kernel that handles these operations, using atomic addition through AscendC::AtomicAdd on the global memory addresses, keeping it within the kernel’s specific structure and order. Ultimately, I’ll set the kernel signature to match the requirements of my operator implementation.**Setting up kernel and buffers**
+
+I’ll set up the global memory buffers for x, indices, values, and z. Initially, I’ll copy a chunk of x into z, structuring this based on rows, columns, and the number of blocks. The update process involves loading values and using atomic additions for the index operation.
+
+To reduce complexity, I'm considering the use of TQueues for managing copies from x to z and separately handling value tiles. It seems prudent to allocate local tensors for indices when we need to read their values, utilizing functions like AscendC::Load or potentially DataCopy for efficient data handling.
+
+For better management, I’ll define various fields related to tiling, including determining tile numbers, columns, and sizes. The kernel code itself will encompass essential methods and buffer setups while ensuring that indices are accessed properly through LocalTensors or vectorization as needed. I’m also considering whether to treat indices as an AscendC::GlobalTensor for simpler access. Each component will need careful calibration to fit the execution of the custom kernel.**Implementing atomic add**
+
+I’ll set up the atomic addition in the code with a loop through the current length. I’ll ensure to cast any int64 indices to uint32_t since we’re assuming DTYPE_IDX is int32. In the project settings, int64 is allowed, but within the kernel, we’ll standardize on int32. 
+
+I need to define key macros for DTYPE_X, DTYPE_INDICES, DTYPE_VALUES, and DTYPE_Z, ensuring they match the input types correctly. Since the compilers might define these based on their order, I’m careful about which macros to use—especially for the third input, which is tricky since DTYPE_Z is usually reserved for output. 
+
+Instead of relying on macros, I’ll explicitly declare floating-point types for x, values, and z, along with int32 for the indices. I’ll ensure we convert indices to int32 before passing them to the kernel, which keeps things clean. Now I’ll set up the global tensors and the necessary queues for managing the data flow while keeping track of block copy offsets and dimensions accurately. Let’s wrap this up by coding it all together!

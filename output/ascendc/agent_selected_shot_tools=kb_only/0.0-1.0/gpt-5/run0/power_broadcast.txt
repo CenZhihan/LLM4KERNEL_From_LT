@@ -1,0 +1,310 @@
+project_json_src='''
+[
+    {
+        "op": "PowerBroadcastCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "exponent",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(PowerBroadcastCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(PowerBroadcastCustom, PowerBroadcastCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "power_broadcast_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "kernel_operator.h"
+#include "graph/ge_attr_value.h"
+#include "graph/utils/type_utils.h"
+#include "register/op_impl_registry.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    PowerBroadcastCustomTilingData tiling;
+
+    // x shape: [rows, cols], exponent shape: [cols]
+    uint64_t totalLen = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    uint64_t cols     = context->GetInputShape(1)->GetOriginShape().GetShapeSize();
+    if (cols == 0) {
+        return ge::GRAPH_FAILED;
+    }
+    uint64_t rows     = totalLen / cols;
+
+    // choose block dim <= rows
+    uint32_t maxBlock = 8;
+    uint32_t blockDim = (rows < maxBlock) ? static_cast<uint32_t>(rows) : maxBlock;
+    if (blockDim == 0) blockDim = 1;
+    context->SetBlockDim(blockDim);
+
+    // simple tile num for inner loop over columns
+    const uint32_t TILE_NUM = 8;
+
+    tiling.set_rows(static_cast<uint32_t>(rows));
+    tiling.set_cols(static_cast<uint32_t>(cols));
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // No additional GM workspace required
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class PowerBroadcastCustom : public OpDef {
+public:
+    explicit PowerBroadcastCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("exponent")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(PowerBroadcastCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE_X = float;
+using DTYPE_E = float;
+using DTYPE_Y = float;
+
+constexpr int32_t BUFFER_NUM = 1; // single-buffer for simplicity
+
+class KernelPowerBroadcast {
+public:
+    __aicore__ inline KernelPowerBroadcast() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR exponent, GM_ADDR y, uint32_t rows, uint32_t cols, uint32_t tileNum)
+    {
+        this->rows = rows;
+        this->cols = cols;
+        this->tileNum = (tileNum == 0) ? 1 : tileNum;
+
+        // partition rows across blocks
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t idx = AscendC::GetBlockIdx();
+        uint32_t rowsPerBlock = (rows + blocks - 1) / blocks;
+        uint32_t startRow = rowsPerBlock * idx;
+        uint32_t endRow = startRow + rowsPerBlock;
+        if (endRow > rows) endRow = rows;
+        this->startRow = startRow;
+        this->workRows = (endRow > startRow) ? (endRow - startRow) : 0;
+
+        // choose base tile length along columns
+        this->tileLen = (cols / this->tileNum);
+        if (this->tileLen == 0) {
+            this->tileLen = cols; // in case cols < tileNum
+            this->tileNum = 1;
+        }
+
+        // set global buffers
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + static_cast<uint64_t>(startRow) * cols, static_cast<uint64_t>(workRows) * cols);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + static_cast<uint64_t>(startRow) * cols, static_cast<uint64_t>(workRows) * cols);
+        expGm.SetGlobalBuffer((__gm__ DTYPE_E*)exponent, cols);
+
+        // init local queues
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLen * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueE, BUFFER_NUM, this->tileLen * sizeof(DTYPE_E));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLen * sizeof(DTYPE_Y));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (workRows == 0) return;
+        for (uint32_t r = 0; r < workRows; ++r) {
+            for (uint32_t t = 0; t < tileNum; ++t) {
+                uint32_t offsetCol = t * tileLen;
+                uint32_t curLen = tileLen;
+                if (t == tileNum - 1) {
+                    uint32_t remaining = cols - offsetCol;
+                    if (remaining < curLen) curLen = remaining;
+                }
+                CopyIn(r, offsetCol, curLen);
+                Compute(curLen);
+                CopyOut(r, offsetCol, curLen);
+            }
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t rowIdx, uint32_t colOffset, uint32_t curLen)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_E> eLocal = inQueueE.AllocTensor<DTYPE_E>();
+
+        // GM offsets
+        uint64_t xOffset = static_cast<uint64_t>(rowIdx) * cols + colOffset;
+        AscendC::DataCopy(xLocal, xGm[xOffset], curLen);
+        AscendC::DataCopy(eLocal, expGm[colOffset], curLen);
+
+        inQueueX.EnQue(xLocal);
+        inQueueE.EnQue(eLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t curLen)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_E> eLocal = inQueueE.DeQue<DTYPE_E>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+
+        // element-wise power with specified count
+        AscendC::Power<DTYPE_Y, false>(yLocal, xLocal, eLocal, curLen);
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueE.FreeTensor(eLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t rowIdx, uint32_t colOffset, uint32_t curLen)
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        uint64_t yOffset = static_cast<uint64_t>(rowIdx) * cols + colOffset;
+        AscendC::DataCopy(yGm[yOffset], yLocal, curLen);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueE;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<DTYPE_E> expGm;
+
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t tileNum;
+    uint32_t tileLen;
+
+    uint32_t startRow;
+    uint32_t workRows;
+};
+
+extern "C" __global__ __aicore__ void power_broadcast_custom(GM_ADDR x, GM_ADDR exponent, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelPowerBroadcast op;
+    op.Init(x, exponent, y, tiling_data.rows, tiling_data.cols, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor power_broadcast_custom_impl_npu(const at::Tensor& x, const at::Tensor& exponent) {
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnPowerBroadcastCustom, x, exponent, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("power_broadcast_custom", &power_broadcast_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("power_broadcast_custom", &power_broadcast_custom_impl_npu, "x ** exponent with broadcast on axis 0");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, exponent):
+        return custom_ops_lib.power_broadcast_custom(x, exponent)
+'''

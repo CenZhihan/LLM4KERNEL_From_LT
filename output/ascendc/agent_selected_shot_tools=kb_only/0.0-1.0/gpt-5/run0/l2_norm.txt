@@ -1,0 +1,287 @@
+project_json_src='''
+[
+    {
+        "op":"L2NormCustom",
+        "input_desc":[
+            {
+                "name":"x",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ],
+                "param_type":"required"
+            }
+        ],
+        "output_desc":[
+            {
+                "name":"res_out",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ],
+                "param_type":"required"
+            }
+        ],
+        "attr":[
+            {
+                "name":"epsilon",
+                "type": [
+                    "float"
+                ],
+                "default_value":1e-12,
+                "param_type":"optional"
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(L2NormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, aLength);
+  TILING_DATA_FIELD_DEF(uint32_t, rLength);
+  TILING_DATA_FIELD_DEF(uint32_t, rLengthWithPadding);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+  TILING_DATA_FIELD_DEF(uint32_t, size);
+  TILING_DATA_FIELD_DEF(float, eps);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(L2NormCustom, L2NormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "l2_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 48;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context) {
+  L2NormCustomTilingData tiling;
+  const gert::StorageShape* x_shape = context->GetInputShape(0);
+  const gert::Shape shape = x_shape->GetStorageShape();
+  uint64_t aLen = (shape.GetDimNum() >= 1) ? static_cast<uint64_t>(shape.GetDim(0)) : 1;
+  uint64_t rLen = (shape.GetDimNum() >= 2) ? static_cast<uint64_t>(shape.GetDim(1)) : 1;
+
+  // Align last axis to 32 bytes
+  uint32_t rLength = static_cast<uint32_t>(rLen);
+  uint32_t rLengthWithPadding = static_cast<uint32_t>(((rLength * 4 + 32 - 1) / 32) * 32 / 4);
+
+  const float* epsilonAttr = context->GetAttrs()->GetAttrPointer<float>(0);
+
+  tiling.set_aLength(static_cast<uint32_t>(aLen));
+  tiling.set_rLength(rLength);
+  tiling.set_rLengthWithPadding(rLengthWithPadding);
+  tiling.set_blockDim(BLOCK_DIM);
+  tiling.set_eps(*epsilonAttr);
+
+  // Query temporary buffer size for Sum
+  uint32_t maxValue = 0;
+  uint32_t minValue = 0;
+  AscendC::GetSumMaxMinTmpSize(rLength, 4, false, maxValue, minValue);
+  tiling.set_size(minValue);
+
+  context->SetBlockDim(BLOCK_DIM);
+  tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                      context->GetRawTilingData()->GetCapacity());
+  context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+  context->SetTilingKey(1);
+
+  size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+  currentWorkspace[0] = 0;
+  return ge::GRAPH_SUCCESS;
+}
+}  // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context) {
+  const gert::Shape* x_shape = context->GetInputShape(0);
+  gert::Shape* y_shape = context->GetOutputShape(0);
+  *y_shape = *x_shape;
+  return GRAPH_SUCCESS;
+}
+}  // namespace ge
+
+namespace ops {
+class L2NormCustom : public OpDef {
+ public:
+  explicit L2NormCustom(const char* name) : OpDef(name) {
+    this->Input("x")
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_FLOAT})
+        .Format({ge::FORMAT_ND})
+        .UnknownShapeFormat({ge::FORMAT_ND});
+    this->Output("res_out")
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_FLOAT})
+        .Format({ge::FORMAT_ND})
+        .UnknownShapeFormat({ge::FORMAT_ND});
+    this->Attr("epsilon").AttrType(OPTIONAL).Float(1e-12);
+
+    this->SetInferShape(ge::InferShape);
+
+    this->AICore().SetTiling(optiling::TilingFunc);
+    this->AICore().AddConfig("ascend910b");
+  }
+};
+
+OP_ADD(L2NormCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelL2Norm {
+ public:
+  __aicore__ inline KernelL2Norm() {}
+
+  __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR tiling, GM_ADDR workspace) {
+    GET_TILING_DATA(tiling_data, tiling);
+    aLength = tiling_data.aLength;
+    rLength = tiling_data.rLength;
+    rLengthWithPadding = tiling_data.rLengthWithPadding;
+    blockDim = tiling_data.blockDim;
+    eps = tiling_data.eps;
+    tmpSize = tiling_data.size;
+
+    xGm.SetGlobalBuffer((__gm__ float*)x, aLength * rLengthWithPadding);
+    yGm.SetGlobalBuffer((__gm__ float*)y, aLength * rLengthWithPadding);
+
+    pipe.InitBuffer(inQueueX, BUFFER_NUM, rLengthWithPadding * sizeof(float));
+    pipe.InitBuffer(outQueueY, BUFFER_NUM, rLengthWithPadding * sizeof(float));
+
+    pipe.InitBuffer(bufSq, rLengthWithPadding * sizeof(float));
+    pipe.InitBuffer(sumBuf, 32);     // enough for one float with alignment
+    pipe.InitBuffer(onesBuf, 32);
+
+    // Reserve tmp buffer for Sum as per Sum Tiling guidance
+    pipe.InitBuffer(workQueue, 1, tmpSize);
+  }
+
+  __aicore__ inline void Process() {
+    uint32_t start = AscendC::GetBlockIdx();
+    for (uint32_t row = start; row < aLength; row += blockDim) {
+      CopyIn(row);
+      Compute();
+      CopyOut(row);
+    }
+  }
+
+ private:
+  __aicore__ inline void CopyIn(uint32_t row) {
+    AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+    AscendC::DataCopy(xLocal, xGm[row * rLengthWithPadding], rLengthWithPadding);
+    inQueueX.EnQue(xLocal);
+  }
+
+  __aicore__ inline void Compute() {
+    AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+    AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+    AscendC::LocalTensor<float> sqLocal = bufSq.Get<float>();
+    AscendC::LocalTensor<float> sumLocal = sumBuf.Get<float>();
+    AscendC::LocalTensor<float> onesLocal = onesBuf.Get<float>();
+    AscendC::LocalTensor<uint8_t> workLocal = workQueue.AllocTensor<uint8_t>();
+
+    // squares
+    AscendC::Mul(sqLocal, xLocal, xLocal, rLengthWithPadding);
+
+    // reduce sum of squares over last axis
+    AscendC::SumParams params{1, rLengthWithPadding, rLength};
+    // initialize sumLocal to 0
+    AscendC::Duplicate<float>(sumLocal, 0.0f, 1);
+    AscendC::Sum(sumLocal, sqLocal, params);
+
+    // rcp = 1.0 / sqrt(sum + eps)
+    AscendC::Duplicate<float>(onesLocal, 1.0f, 1);
+    AscendC::Adds(sumLocal, sumLocal, eps, 1);
+    AscendC::Sqrt(sumLocal, sumLocal, 1);
+    AscendC::Div(sumLocal, onesLocal, sumLocal, 1);
+    float rcp = sumLocal.GetValue(0);
+
+    // y = x * rcp
+    AscendC::Muls(yLocal, xLocal, rcp, rLengthWithPadding);
+
+    outQueueY.EnQue(yLocal);
+    workQueue.FreeTensor(workLocal);
+    inQueueX.FreeTensor(xLocal);
+  }
+
+  __aicore__ inline void CopyOut(uint32_t row) {
+    AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+    AscendC::DataCopy(yGm[row * rLengthWithPadding], yLocal, rLengthWithPadding);
+    outQueueY.FreeTensor(yLocal);
+  }
+
+ private:
+  AscendC::TPipe pipe;
+  AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+  AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+  AscendC::TQue<AscendC::QuePosition::VECIN, 1> workQueue;
+
+  AscendC::TBuf<AscendC::QuePosition::VECCALC> bufSq;
+  AscendC::TBuf<AscendC::QuePosition::VECCALC> sumBuf;
+  AscendC::TBuf<AscendC::QuePosition::VECCALC> onesBuf;
+
+  AscendC::GlobalTensor<float> xGm;
+  AscendC::GlobalTensor<float> yGm;
+
+  uint32_t aLength = 0;
+  uint32_t rLength = 0;
+  uint32_t rLengthWithPadding = 0;
+  uint32_t blockDim = 1;
+  uint32_t tmpSize = 0;
+  float eps = 1e-12f;
+};
+
+extern "C" __global__ __aicore__ void l2_norm_custom(GM_ADDR x, GM_ADDR res_out, GM_ADDR workspace, GM_ADDR tiling) {
+  KernelL2Norm op;
+  op.Init(x, res_out, tiling, workspace);
+  if (TILING_KEY_IS(1)) {
+    op.Process();
+  }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor l2_norm_impl_npu(const at::Tensor& x, double epsilon) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnL2NormCustom, x, epsilon, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("l2_norm_custom", &l2_norm_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("l2_norm_custom", &l2_norm_impl_npu, "l2 norm");
+}
+"""
+
+model_src='''
+import torch, torch_npu, custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, epsilon: float = 1e-12):
+        super(ModelNew, self).__init__()
+        self.epsilon = float(epsilon)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.l2_norm_custom(x, self.epsilon)
+'''

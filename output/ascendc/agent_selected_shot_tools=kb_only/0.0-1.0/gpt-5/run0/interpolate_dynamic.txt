@@ -1,0 +1,346 @@
+project_json_src='''
+[
+    {
+        "op": "InterpolateDynamicCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "size",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(InterpolateDynamicCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, hIn);
+  TILING_DATA_FIELD_DEF(uint32_t, wIn);
+  TILING_DATA_FIELD_DEF(uint32_t, totalNC);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(InterpolateDynamicCustom, InterpolateDynamicCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "interpolate_dynamic_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    InterpolateDynamicCustomTilingData tiling;
+    const gert::Shape* xShape = context->GetInputShape(0);
+    // 4-D NCHW
+    uint32_t n = xShape->GetDim(0);
+    uint32_t c = xShape->GetDim(1);
+    uint32_t h = xShape->GetDim(2);
+    uint32_t w = xShape->GetDim(3);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_hIn(h);
+    tiling.set_wIn(w);
+    tiling.set_totalNC(n * c);
+
+    // 并行度：每个block处理若干个(n,c)平面
+    uint32_t blockDim = (n * c) > 0 ? (std::min<uint32_t>(n * c, 32)) : 1;
+    context->SetBlockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 动态大小由运行时传入，这里保守地将输出形状设置为输入形状占位
+    const gert::Shape* xShape = context->GetInputShape(0);
+    gert::Shape* yShape = context->GetOutputShape(0);
+    *yShape = *xShape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class InterpolateDynamicCustom : public OpDef {
+public:
+    explicit InterpolateDynamicCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("size")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(InterpolateDynamicCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include <cmath>
+
+class KernelInterpolateBilinear {
+public:
+    __aicore__ inline KernelInterpolateBilinear() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR size, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+    {
+        // 获取tiling数据
+        GET_TILING_DATA(tilingData, tiling);
+        this->n = tilingData.n();
+        this->c = tilingData.c();
+        this->hIn = tilingData.hIn();
+        this->wIn = tilingData.wIn();
+        this->totalNC = tilingData.totalNC();
+
+        // 绑定GM
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x, static_cast<size_t>(n) * c * hIn * wIn);
+        sizeGm.SetGlobalBuffer((__gm__ int32_t*)size, 2);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z*)y, 0); // 实际大小通过运行时传入，不在此处限定
+
+        // 读取目标H、W
+        // 使用一个小的VECCALC队列作为临时缓冲
+        pipe.InitBuffer(tmpQue, 1, 2 * sizeof(int32_t));
+        AscendC::LocalTensor<int32_t> sizeLocal = tmpQue.AllocTensor<int32_t>();
+        AscendC::DataCopy(sizeLocal, sizeGm, 2);
+        this->hOut = static_cast<uint32_t>(sizeLocal.GetValue(0));
+        this->wOut = static_cast<uint32_t>(sizeLocal.GetValue(1));
+        tmpQue.FreeTensor(sizeLocal);
+
+        // 为行缓冲初始化队列
+        pipe.InitBuffer(inRow0Que, 1, wIn * sizeof(DTYPE_X));
+        pipe.InitBuffer(inRow1Que, 1, wIn * sizeof(DTYPE_X));
+        pipe.InitBuffer(outRowQue, 1, wOut * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // 将(n,c)平面在多核上分片
+        uint32_t coreNum = AscendC::GetBlockNum();
+        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t perCore = (totalNC + coreNum - 1) / coreNum;
+        uint32_t ncStart = coreIdx * perCore;
+        uint32_t ncEnd = ncStart + perCore;
+        if (ncEnd > totalNC) ncEnd = totalNC;
+
+        // 计算缩放因子（align_corners=False）
+        float scaleH = (hOut > 0) ? (static_cast<float>(hIn) / static_cast<float>(hOut)) : 0.0f;
+        float scaleW = (wOut > 0) ? (static_cast<float>(wIn) / static_cast<float>(wOut)) : 0.0f;
+
+        for (uint32_t nc = ncStart; nc < ncEnd; ++nc) {
+            uint32_t nIdx = nc / c;
+            uint32_t cIdx = nc % c;
+
+            for (uint32_t oh = 0; oh < hOut; ++oh) {
+                float inY = (static_cast<float>(oh) + 0.5f) * scaleH - 0.5f;
+                int32_t y0 = static_cast<int32_t>(AscendC::FloorIndex(inY));
+                int32_t y1 = y0 + 1;
+                float wy = inY - static_cast<float>(y0);
+                if (y0 < 0) { y0 = 0; wy = inY - static_cast<float>(y0); }
+                if (y1 >= static_cast<int32_t>(hIn)) y1 = static_cast<int32_t>(hIn) - 1;
+                if (y0 >= static_cast<int32_t>(hIn)) y0 = static_cast<int32_t>(hIn) - 1;
+                if (y1 < 0) y1 = 0;
+                if (wy < 0.0f) wy = 0.0f;
+                if (wy > 1.0f) wy = 1.0f;
+
+                // 读取两条输入行
+                AscendC::LocalTensor<DTYPE_X> row0Local = inRow0Que.AllocTensor<DTYPE_X>();
+                AscendC::LocalTensor<DTYPE_X> row1Local = inRow1Que.AllocTensor<DTYPE_X>();
+
+                size_t baseInY0 = (((static_cast<size_t>(nIdx) * c + cIdx) * hIn + static_cast<size_t>(y0)) * wIn);
+                size_t baseInY1 = (((static_cast<size_t>(nIdx) * c + cIdx) * hIn + static_cast<size_t>(y1)) * wIn);
+
+                AscendC::DataCopy(row0Local, xGm[baseInY0], wIn);
+                AscendC::DataCopy(row1Local, xGm[baseInY1], wIn);
+
+                // 输出行缓冲
+                AscendC::LocalTensor<DTYPE_Z> outRowLocal = outRowQue.AllocTensor<DTYPE_Z>();
+
+                for (uint32_t ow = 0; ow < wOut; ++ow) {
+                    float inX = (static_cast<float>(ow) + 0.5f) * scaleW - 0.5f;
+                    int32_t x0 = static_cast<int32_t>(AscendC::FloorIndex(inX));
+                    int32_t x1 = x0 + 1;
+                    float wx = inX - static_cast<float>(x0);
+                    if (x0 < 0) { x0 = 0; wx = inX - static_cast<float>(x0); }
+                    if (x1 >= static_cast<int32_t>(wIn)) x1 = static_cast<int32_t>(wIn) - 1;
+                    if (x0 >= static_cast<int32_t>(wIn)) x0 = static_cast<int32_t>(wIn) - 1;
+                    if (x1 < 0) x1 = 0;
+                    if (wx < 0.0f) wx = 0.0f;
+                    if (wx > 1.0f) wx = 1.0f;
+
+                    float v00 = static_cast<float>(row0Local.GetValue(static_cast<uint32_t>(x0)));
+                    float v01 = static_cast<float>(row0Local.GetValue(static_cast<uint32_t>(x1)));
+                    float v10 = static_cast<float>(row1Local.GetValue(static_cast<uint32_t>(x0)));
+                    float v11 = static_cast<float>(row1Local.GetValue(static_cast<uint32_t>(x1)));
+
+                    float vx0 = v00 + (v01 - v00) * wx;
+                    float vx1 = v10 + (v11 - v10) * wx;
+                    float v = vx0 + (vx1 - vx0) * wy;
+
+                    outRowLocal.SetValue(ow, static_cast<DTYPE_Z>(v));
+                }
+
+                // 将输出行写回GM
+                size_t baseOut = (((static_cast<size_t>(nIdx) * c + cIdx) * hOut + static_cast<size_t>(oh)) * wOut);
+                AscendC::DataCopy(yGm[baseOut], outRowLocal, wOut);
+
+                outRowQue.FreeTensor(outRowLocal);
+                inRow0Que.FreeTensor(row0Local);
+                inRow1Que.FreeTensor(row1Local);
+            }
+        }
+    }
+
+private:
+    // 简单的地板函数索引（向下取整）
+    __aicore__ inline int32_t FloorIndex(float x) {
+        int32_t xi = static_cast<int32_t>(AscendC::ToFloor(x));
+        return xi;
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inRow0Que, inRow1Que;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outRowQue;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<int32_t> sizeGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    uint32_t n, c, hIn, wIn, totalNC;
+    uint32_t hOut, wOut;
+};
+
+extern "C" __global__ __aicore__ void interpolate_dynamic_custom(GM_ADDR x, GM_ADDR size, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    KernelInterpolateBilinear op;
+    op.Init(x, size, y, workspace, tiling);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline std::vector<int64_t> get_hw_from_size_tensor(const at::Tensor& size) {
+    at::Tensor cpu_size = size.to(at::kCPU);
+    std::vector<int64_t> hw(2, 0);
+    if (cpu_size.scalar_type() == at::kInt || cpu_size.scalar_type() == at::kInt32) {
+        auto p = cpu_size.data_ptr<int32_t>();
+        hw[0] = static_cast<int64_t>(p[0]);
+        hw[1] = static_cast<int64_t>(p[1]);
+    } else {
+        auto p = cpu_size.data_ptr<int64_t>();
+        hw[0] = p[0];
+        hw[1] = p[1];
+    }
+    return hw;
+}
+
+at::Tensor interpolate_dynamic_custom_impl_npu(const at::Tensor& x, const at::Tensor& size) {
+    TORCH_CHECK(size.numel() == 2, "size tensor must have 2 elements [H, W]");
+    std::vector<int64_t> hw = get_hw_from_size_tensor(size);
+    TORCH_CHECK(hw[0] > 0 && hw[1] > 0, "invalid target size");
+
+    at::Tensor y = at::empty({x.size(0), x.size(1), hw[0], hw[1]}, x.options());
+    // 确保size在NPU上
+    at::Tensor size_npu = size.to(x.device(), /*non_blocking*/false, /*copy*/false);
+    EXEC_NPU_CMD(aclnnInterpolateDynamicCustom, x, size_npu, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("interpolate_dynamic_custom", &interpolate_dynamic_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("interpolate_dynamic_custom", &interpolate_dynamic_custom_impl_npu, "bilinear interpolate (align_corners=False)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, target_size):
+        if not torch.is_tensor(target_size):
+            size_tensor = torch.tensor(list(target_size), dtype=torch.int32, device=x.device)
+        else:
+            size_tensor = target_size.to(device=x.device, dtype=torch.int32)
+        return custom_ops_lib.interpolate_dynamic_custom(x, size_tensor)
+'''

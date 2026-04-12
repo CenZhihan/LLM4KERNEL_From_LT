@@ -30,67 +30,54 @@ project_json_src='''
     }
 ]
 '''
-
 host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ProductReductionOverADimensionCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, size);    // Sum临时空间保留值
-  TILING_DATA_FIELD_DEF(uint32_t, outter);  // 外轴长度（除去最后一维后元素个数）
-  TILING_DATA_FIELD_DEF(uint32_t, inner);   // 内轴对齐长度（字节32对齐后，以元素计）
-  TILING_DATA_FIELD_DEF(uint32_t, n);       // 内轴实际元素个数
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, reduceLen);
+  TILING_DATA_FIELD_DEF(uint32_t, lastAxis);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ProductReductionOverADimensionCustom, ProductReductionOverADimensionCustomTilingData)
 }
 """
-
 host_operator_src="""
 #include "product_reduction_over_a_dimension_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
-
-namespace {
-inline uint32_t Align32Elems(uint32_t n, uint32_t dtypeSize) {
-    return ((n * dtypeSize + 32 - 1) / 32) * 32 / dtypeSize;
-}
-}
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ProductReductionOverADimensionCustomTilingData tiling;
-
-    // 获取输入形状并计算outter与n（最后一维为归约维）
-    const gert::Shape* inShape = context->GetInputShape(0);
-    auto dt = context->GetInputTensor(0)->GetDataType();
-    uint32_t dtypesize = (dt == ge::DT_FLOAT16) ? 2 : 4;
-
-    // 获取维度信息
-    uint32_t dimNum = inShape->GetOriginShape().GetDimNum();
-    uint64_t outter = 1;
-    for (uint32_t i = 0; i + 1 < dimNum; ++i) {
-        outter *= static_cast<uint64_t>(inShape->GetOriginShape().GetDim(i));
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin_shape = in_shape->GetOriginShape();
+    int64_t dims = origin_shape.GetDimNum();
+    if (dims != 3) {
+        return ge::GRAPH_FAILED;
     }
-    uint32_t n = static_cast<uint32_t>(inShape->GetOriginShape().GetDim(dimNum - 1));
-    uint32_t inner = Align32Elems(n, dtypesize);
+    uint32_t B = static_cast<uint32_t>(origin_shape.GetDim(0));
+    uint32_t M = static_cast<uint32_t>(origin_shape.GetDim(1));
+    uint32_t N = static_cast<uint32_t>(origin_shape.GetDim(2));
 
-    // Sum API临时空间需求（参考Sum示例）
-    uint32_t maxValue = 0;
-    uint32_t minValue = 0;
-    AscendC::GetSumMaxMinTmpSize(n, dtypesize, false, maxValue, minValue);
-
-    tiling.set_size(minValue);
-    tiling.set_outter(static_cast<uint32_t>(outter));
-    tiling.set_inner(inner);
-    tiling.set_n(n);
-
+    uint32_t totalLength = static_cast<uint32_t>(origin_shape.GetShapeSize());
     context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_batch(B);
+    tiling.set_reduceLen(M);
+    tiling.set_lastAxis(N);
+    tiling.set_tileNum(TILE_NUM);
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -101,21 +88,19 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
-    gert::Shape* y_shape = context->GetOutputShape(0);
-
-    // 输出为去除最后一维的形状
-    auto origin = x_shape->GetOriginShape();
-    uint32_t dimNum = origin.GetDimNum();
-    if (dimNum == 0) {
-        return GRAPH_FAILED;
+    auto origin_shape = x_shape->GetOriginShape();
+    int64_t dims = origin_shape.GetDimNum();
+    if (dims == 3) {
+        // 假定沿轴1进行归约: 输出形状为 [B, N]
+        std::vector<int64_t> out_dims = {origin_shape.GetDim(0), origin_shape.GetDim(2)};
+        gert::Shape* y_shape = context->GetOutputShape(0);
+        y_shape->SetDimNum(2);
+        for (size_t i = 0; i < out_dims.size(); ++i) {
+            y_shape->SetDim(i, out_dims[i]);
+        }
+        return GRAPH_SUCCESS;
     }
-    gert::Shape outShape = origin;
-    outShape.SetDimNum(dimNum - 1);
-    for (uint32_t i = 0; i + 1 < dimNum; ++i) {
-        outShape.SetDim(i, origin.GetDim(i));
-    }
-    *y_shape = outShape;
-    return GRAPH_SUCCESS;
+    return GRAPH_FAILED;
 }
 
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
@@ -143,8 +128,8 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -152,190 +137,156 @@ public:
 OP_ADD(ProductReductionOverADimensionCustom);
 }
 """
-
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "product_reduction_over_a_dimension_custom_tiling_data.h"
 
-// 参考Sum高级API用法与对齐约束（知识库：Sum & TilingData 示例）
-constexpr int32_t IN_BUF_NUM = 1;
-constexpr int32_t OUT_BUF_NUM = 1;
+using DTYPE_X = float;
+using DTYPE_Z = float;
 
-template <typename T>
-class KernelProdReduceLastDim {
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor数
+
+class KernelReduceProd {
 public:
-    __aicore__ inline KernelProdReduceLastDim() {}
-
+    __aicore__ inline KernelReduceProd() {}
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t outter, uint32_t inner, uint32_t n, uint32_t tmpSize)
+                                uint32_t batch, uint32_t reduceLen, uint32_t lastAxis, uint32_t tileNum)
     {
-        this->outter = outter;
-        this->inner = inner;   // 32B对齐后的宽
-        this->n = n;           // 实际宽
+        this->batch = batch;
+        this->reduceLen = reduceLen;
+        this->lastAxis = lastAxis;
+        this->tileNum = tileNum;
 
         uint32_t blockNum = AscendC::GetBlockNum();
         uint32_t blockIdx = AscendC::GetBlockIdx();
+        // 按batch维在多核间划分
+        this->batchesPerBlock = (batch + blockNum - 1) / blockNum;
+        this->blockStartB = blockIdx * this->batchesPerBlock;
+        if (this->blockStartB > batch) this->blockStartB = batch;
+        uint32_t blockEndB = this->blockStartB + this->batchesPerBlock;
+        if (blockEndB > batch) blockEndB = batch;
+        this->blockBatch = blockEndB > this->blockStartB ? (blockEndB - this->blockStartB) : 0;
 
-        // 行切分到block（每个block处理一段行）
-        rowsPerBlock = (outter + blockNum - 1) / blockNum;
-        rowStart = rowsPerBlock * blockIdx;
-        rowEnd = rowStart + rowsPerBlock;
-        if (rowEnd > outter) rowEnd = outter;
-        validRows = (rowEnd > rowStart) ? (rowEnd - rowStart) : 0;
+        // 设置全局内存窗口
+        uint64_t xOffset = static_cast<uint64_t>(this->blockStartB) * this->reduceLen * this->lastAxis;
+        uint64_t yOffset = static_cast<uint64_t>(this->blockStartB) * this->lastAxis;
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + xOffset, this->blockBatch * this->reduceLen * this->lastAxis);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y + yOffset, this->blockBatch * this->lastAxis);
 
-        // 设置全局缓冲（输入是[validRows, inner]连续，输出是[validRows]）
-        xGm.SetGlobalBuffer((__gm__ T*)x + (uint64_t)rowStart * inner, (uint64_t)validRows * inner);
-        yGm.SetGlobalBuffer((__gm__ T*)y + rowStart, validRows);
+        // 计算tileLength，处理尾块
+        uint32_t totalTiles = this->tileNum * BUFFER_NUM;
+        this->tileLength = (this->lastAxis + totalTiles - 1) / totalTiles;
+        if (this->tileLength == 0) this->tileLength = this->lastAxis;
 
-        // 本kernel逐行处理，每次处理1行，输入缓冲按inner对齐大小
-        pipe.InitBuffer(inQueueSrc, IN_BUF_NUM, inner * sizeof(T));
-
-        // 输出局部缓冲对齐到32B，复制到GM时只拷贝1个元素
-        uint32_t outAlignedElems = (AscendC::ONE_BLK_SIZE + sizeof(T) - 1) / sizeof(T);
-        pipe.InitBuffer(outQueueDst, OUT_BUF_NUM, outAlignedElems * sizeof(T));
-
-        // Sum API使用框架分配临时空间时需预留（参见Sum示例）
-        pipe.InitBuffer(workQueue, 1, tmpSize);
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
     }
 
     __aicore__ inline void Process()
     {
-        if (validRows == 0) {
+        if (this->blockBatch == 0) {
             return;
         }
-        for (uint32_t r = 0; r < validRows; ++r) {
-            CopyIn(r);
-            Compute();
-            CopyOut(r);
+        for (uint32_t b = 0; b < this->blockBatch; ++b) {
+            for (uint32_t progress = 0; ; ++progress) {
+                uint32_t nOffset = progress * this->tileLength;
+                if (nOffset >= this->lastAxis) break;
+                uint32_t curLen = this->lastAxis - nOffset;
+                if (curLen > this->tileLength) curLen = this->tileLength;
+
+                // 累乘缓冲
+                AscendC::LocalTensor<DTYPE_Z> accLocal = outQueueY.AllocTensor<DTYPE_Z>();
+                // 首片：复制到累乘缓冲
+                {
+                    AscendC::LocalTensor<DTYPE_X> tmpLocal = inQueueX.AllocTensor<DTYPE_X>();
+                    uint64_t xSliceOff = (static_cast<uint64_t>(b) * this->reduceLen + 0) * this->lastAxis + nOffset;
+                    AscendC::DataCopy(tmpLocal, xGm[xSliceOff], curLen);
+                    // 将首片复制到累乘缓冲
+                    AscendC::DataCopy(accLocal, tmpLocal, curLen);
+                    inQueueX.FreeTensor(tmpLocal);
+                }
+                // 后续片：逐片相乘
+                for (uint32_t m = 1; m < this->reduceLen; ++m) {
+                    AscendC::LocalTensor<DTYPE_X> tmpLocal = inQueueX.AllocTensor<DTYPE_X>();
+                    uint64_t xSliceOff = (static_cast<uint64_t>(b) * this->reduceLen + m) * this->lastAxis + nOffset;
+                    AscendC::DataCopy(tmpLocal, xGm[xSliceOff], curLen);
+                    AscendC::Mul(accLocal, accLocal, tmpLocal, curLen);
+                    inQueueX.FreeTensor(tmpLocal);
+                }
+                outQueueY.EnQue<DTYPE_Z>(accLocal);
+
+                // 写回输出
+                AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+                uint64_t yOff = static_cast<uint64_t>(b) * this->lastAxis + nOffset;
+                AscendC::DataCopy(yGm[yOff], yLocal, curLen);
+                outQueueY.FreeTensor(yLocal);
+            }
         }
-    }
-
-private:
-    __aicore__ inline void CopyIn(uint32_t rowIdxInBlock)
-    {
-        AscendC::LocalTensor<T> srcLocal = inQueueSrc.AllocTensor<T>();
-        AscendC::DataCopy(srcLocal, xGm[(uint64_t)rowIdxInBlock * inner], inner);
-        inQueueSrc.EnQue(srcLocal);
-    }
-
-    __aicore__ inline void Compute()
-    {
-        AscendC::LocalTensor<T> srcLocal = inQueueSrc.DeQue<T>();
-        AscendC::LocalTensor<uint8_t> workLocal = workQueue.AllocTensor<uint8_t>();
-        AscendC::LocalTensor<T> dstLocal = outQueueDst.AllocTensor<T>();
-
-        // 输出局部缓冲对齐填充
-        uint32_t outAlignedElems = (AscendC::ONE_BLK_SIZE + sizeof(T) - 1) / sizeof(T);
-        T zero(0);
-        AscendC::Duplicate<T>(dstLocal, zero, outAlignedElems);
-
-        // 先对输入取对数，再调用Sum在最后一维做归约，最后对结果取指数 -> 实现乘积归约
-        // 注意：SumParams.inner须为32B对齐后的inner，n为实际元素个数
-        // Ln/Exp按元素处理inner个有效数据（对齐部分由Sum的n参数屏蔽）
-        AscendC::Ln<T>(srcLocal, srcLocal, inner);
-
-        AscendC::SumParams params;
-        params.outter = 1;
-        params.inner = inner;
-        params.n = n;
-        AscendC::Sum<T>(dstLocal, srcLocal, params);
-
-        AscendC::Exp<T>(dstLocal, dstLocal, 1);
-
-        outQueueDst.EnQue<T>(dstLocal);
-        workQueue.FreeTensor(workLocal);
-        inQueueSrc.FreeTensor(srcLocal);
-    }
-
-    __aicore__ inline void CopyOut(uint32_t rowIdxInBlock)
-    {
-        AscendC::LocalTensor<T> dstLocal = outQueueDst.DeQue<T>();
-        // 仅拷贝1个结果元素到GM
-        AscendC::DataCopy(yGm[rowIdxInBlock], dstLocal, 1);
-        outQueueDst.FreeTensor(dstLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, IN_BUF_NUM> inQueueSrc;
-    AscendC::TQue<AscendC::TPosition::VECIN, 1> workQueue;
-    AscendC::TQue<AscendC::TPosition::VECOUT, OUT_BUF_NUM> outQueueDst;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
 
-    AscendC::GlobalTensor<T> xGm;
-    AscendC::GlobalTensor<T> yGm;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
 
-    uint32_t outter = 0;
-    uint32_t inner = 0;
-    uint32_t n = 0;
+    uint32_t batch;
+    uint32_t reduceLen;
+    uint32_t lastAxis;
+    uint32_t tileNum;
 
-    uint32_t rowsPerBlock = 0;
-    uint32_t rowStart = 0;
-    uint32_t rowEnd = 0;
-    uint32_t validRows = 0;
+    uint32_t batchesPerBlock;
+    uint32_t blockStartB;
+    uint32_t blockBatch;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void product_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+extern "C" __global__ __aicore__ void product_reduction_over_a_dimension_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
     GET_TILING_DATA(tiling_data, tiling);
-    KernelProdReduceLastDim<DTYPE_X> op;
-    op.Init(x, y, tiling_data.outter, tiling_data.inner, tiling_data.n, tiling_data.size);
+    KernelReduceProd op;
+    op.Init(x, y,
+            tiling_data.batch,
+            tiling_data.reduceLen,
+            tiling_data.lastAxis,
+            tiling_data.tileNum);
     op.Process();
 }
 """
-
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
-#include "pytorch_npu_helper.hpp"
+#include \"pytorch_npu_helper.hpp\"
 #include <torch/extension.h>
 
-at::Tensor product_reduction_over_a_dimension_custom_impl_npu(const at::Tensor& self) {
-    // 输出shape由host侧InferShape确定（去掉最后一维）
-    // 先构造一个占位输出张量：这里用empty_like并在python侧预先permute到最后一维归约
-    // 最终由ACLNN根据InferShape实际分配
-    at::Tensor result;
+at::Tensor product_reduction_over_a_dimension_custom_impl_npu(const at::Tensor& self, int64_t dim) {
+    TORCH_CHECK(self.dim() == 3, \"Only 3D tensor is supported\");
+    TORCH_CHECK(dim == 1, \"Only reduce over dim=1 is supported\");
+    auto options = self.options();
+    at::Tensor result = at::empty({self.size(0), self.size(2)}, options);
     EXEC_NPU_CMD(aclnnProductReductionOverADimensionCustom, self, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("product_reduction_over_a_dimension_custom", &product_reduction_over_a_dimension_custom_impl_npu);
+    m.impl(\"product_reduction_over_a_dimension_custom\", &product_reduction_over_a_dimension_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("product_reduction_over_a_dimension_custom", &product_reduction_over_a_dimension_custom_impl_npu, "prod reduce over last dim");
+    m.def(\"product_reduction_over_a_dimension_custom\", &product_reduction_over_a_dimension_custom_impl_npu, \"prod reduce over dim\");
 }
 """
-
 model_src='''
 import torch
 import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    优化版：通过自定义AscendC算子实现沿某一维的乘法归约。
-    内核仅支持“最后一维”归约，因此在前向中将目标维度permute到最后一维，再调用自定义算子。
-    """
     def __init__(self, dim: int):
         super().__init__()
-        self.dim = dim
+        self.dim = dim  # 仅支持dim=1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 将目标归约维移动到最后一维
-        rank = x.dim()
-        dim = self.dim if self.dim >= 0 else (rank + self.dim)
-        if dim != rank - 1:
-            order = list(range(rank))
-            order.pop(dim)
-            order.append(dim)
-            x_perm = x.permute(order).contiguous()
-        else:
-            x_perm = x
-
-        # 调用自定义AscendC算子（默认在最后一维做归约）
-        y = custom_ops_lib.product_reduction_over_a_dimension_custom(x_perm)
-
-        # 由于输出已等价于“移至最后一维后的输入去除末轴”，其维度顺序与原张量中去除dim后的顺序一致，无需反向permute
-        return y
+        return custom_ops_lib.product_reduction_over_a_dimension_custom(x, self.dim)
 '''

@@ -26,9 +26,11 @@ project_json_src='''
                     "float"
                 ]
             }
-        ]
+        ],
+        "attr": []
     }
 ]
+
 '''
 
 host_tiling_src="""
@@ -48,6 +50,7 @@ host_operator_src="""
 
 #include "tanh_custom_tiling.h"
 #include "register/op_def_registry.h"
+
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
@@ -73,18 +76,19 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext *context)
 {
-    const gert::Shape *x_shape = context->GetInputShape(0);
+    const gert::Shape *x1_shape = context->GetInputShape(0);
     gert::Shape *y_shape = context->GetOutputShape(0);
-    *y_shape = *x_shape;
+    *y_shape = *x1_shape;
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const ge::DataType x_dtype = context->GetInputDataType(0);
-    context->SetOutputDataType(0, x_dtype);
+    const ge::DataType x1_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x1_dtype);
     return GRAPH_SUCCESS;
 }
 } // namespace ge
+
 
 namespace ops {
 class TanhCustom : public OpDef {
@@ -107,6 +111,7 @@ public:
         this->AICore()
             .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
+
     }
 };
 
@@ -117,9 +122,6 @@ OP_ADD(TanhCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "tanh_custom_tiling_data.h"
-
 constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
 class KernelTanh {
@@ -131,15 +133,15 @@ public:
         this->tileNum = tileNum;
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
+        // get start index for current core, core parallel
         xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-
+        // pipe alloc memory to queue, the unit is Bytes
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
         pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float)); // exp(+x) or exp(2x) intermediate
-        pipe.InitBuffer(tmpBuffer2, this->tileLength * sizeof(float)); // exp(-x) intermediate
-        pipe.InitBuffer(tmpBuffer3, this->tileLength * sizeof(float)); // numerator
-        pipe.InitBuffer(tmpBuffer4, this->tileLength * sizeof(float)); // denominator
+        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpBuffer2, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpBuffer3, this->tileLength * sizeof(float));
     }
     __aicore__ inline void Process()
     {
@@ -162,19 +164,20 @@ private:
     {
         AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
         AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        AscendC::LocalTensor<float> tmp1 = tmpBuffer1.Get<float>();
+        AscendC::LocalTensor<float> tmp2 = tmpBuffer2.Get<float>();
+        AscendC::LocalTensor<float> tmp3 = tmpBuffer3.Get<float>();
 
-        AscendC::LocalTensor<float> tmpExpPos = tmpBuffer1.Get<float>();
-        AscendC::LocalTensor<float> tmpExpNeg = tmpBuffer2.Get<float>();
-        AscendC::LocalTensor<float> tmpNum = tmpBuffer3.Get<float>();
-        AscendC::LocalTensor<float> tmpDen = tmpBuffer4.Get<float>();
-
-        // Compute tanh(x) = (e^x - e^{-x}) / (e^x + e^{-x})
-        AscendC::Exp(tmpExpPos, xLocal, this->tileLength);                      // e^x
-        AscendC::Muls(tmpExpNeg, xLocal, -1.0f, this->tileLength);             // -x
-        AscendC::Exp(tmpExpNeg, tmpExpNeg, this->tileLength);                  // e^{-x}
-        AscendC::Sub(tmpNum, tmpExpPos, tmpExpNeg, this->tileLength);          // numerator
-        AscendC::Add(tmpDen, tmpExpPos, tmpExpNeg, this->tileLength);          // denominator
-        AscendC::Div(yLocal, tmpNum, tmpDen, this->tileLength);                // y = num / den
+        // tmp2 = 2 * x
+        AscendC::Muls(tmp2, xLocal, 2.0f, this->tileLength);
+        // tmp2 = exp(tmp2)
+        AscendC::Exp(tmp2, tmp2, this->tileLength);
+        // tmp3 = tmp2 - 1
+        AscendC::Adds(tmp3, tmp2, -1.0f, this->tileLength);
+        // tmp1 = tmp2 + 1
+        AscendC::Adds(tmp1, tmp2, 1.0f, this->tileLength);
+        // y = (tmp2 - 1) / (tmp2 + 1)
+        AscendC::Div(yLocal, tmp3, tmp1, this->tileLength);
 
         outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
@@ -188,7 +191,7 @@ private:
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2, tmpBuffer3, tmpBuffer4;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2, tmpBuffer3;
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::GlobalTensor<float> xGm, yGm;
@@ -230,11 +233,7 @@ model_src='''
 import torch
 import torch_npu
 import custom_ops_lib
-
 class ModelNew(torch.nn.Module):
-    """
-    Optimized model that applies custom Tanh activation using AscendC kernel.
-    """
     def __init__(self):
         super(ModelNew, self).__init__()
     

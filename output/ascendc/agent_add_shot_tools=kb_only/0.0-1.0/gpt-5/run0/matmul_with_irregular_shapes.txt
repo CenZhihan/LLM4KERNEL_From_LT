@@ -5,7 +5,7 @@ project_json_src='''
         "language": "cpp",
         "input_desc": [
             {
-                "name": "a",
+                "name": "A",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -15,7 +15,7 @@ project_json_src='''
                 ]
             },
             {
-                "name": "b",
+                "name": "B",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -27,13 +27,13 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "c",
+                "name": "C",
                 "param_type": "required",
                 "format": [
                     "ND"
                 ],
                 "type": [
-                    "float16"
+                    "float"
                 ]
             }
         ]
@@ -43,13 +43,12 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
-#include "graph/op_desc.h"
-#include "tiling/platform/platform_ascendc.h"
-#include "lib/matmul_tiling_intf.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(MatmulWithIrregularShapesCustomTilingData)
-  TILING_DATA_FIELD_DEF(optiling::TCubeTiling, tiling);
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(MatmulWithIrregularShapesCustom, MatmulWithIrregularShapesCustomTilingData)
@@ -59,56 +58,31 @@ REGISTER_TILING_DATA_CLASS(MatmulWithIrregularShapesCustom, MatmulWithIrregularS
 host_operator_src="""
 #include "matmul_with_irregular_shapes_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "graph/utils/type_utils.h"
-#include "tiling/platform/platform_ascendc.h"
-#include "lib/matmul_tiling_intf.h"
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 1;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 获取输入形状
+    MatmulWithIrregularShapesCustomTilingData tiling;
+
     const gert::Shape* a_shape = context->GetInputShape(0);
     const gert::Shape* b_shape = context->GetInputShape(1);
-    if (a_shape->GetOriginShape().GetDimNum() != 2 || b_shape->GetOriginShape().GetDimNum() != 2) {
-        return ge::GRAPH_FAILED;
-    }
-    uint32_t M = static_cast<uint32_t>(a_shape->GetOriginShape().GetDim(0));
-    uint32_t K = static_cast<uint32_t>(a_shape->GetOriginShape().GetDim(1));
-    uint32_t N = static_cast<uint32_t>(b_shape->GetOriginShape().GetDim(1));
 
-    // 构建平台信息
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    // A: [M, K], B: [K, N]
+    uint32_t m = static_cast<uint32_t>(a_shape->GetDim(0));
+    uint32_t k = static_cast<uint32_t>(a_shape->GetDim(1));
+    uint32_t n = static_cast<uint32_t>(b_shape->GetDim(1));
 
-    // 使用多核Matmul Tiling以获得更优blockDim
-    matmul_tiling::MultiCoreMatmulTiling tiler(ascendcPlatform);
-    tiler.SetDim(1);  // 可按需调整，GetTiling后会给出实际核数
-    tiler.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiler.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    // 输出也使用FP16以便端到端兼容
-    tiler.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiler.SetBias(false);
-    tiler.SetShape(M, N, K);
-    tiler.SetSingleShape(M, N, K);
-    tiler.SetOrgShape(M, N, K);
-    tiler.SetBufferSpace(-1, -1, -1); // 默认使用AI Core可用全部空间
+    context->SetBlockDim(BLOCK_DIM);
 
-    optiling::TCubeTiling tilingData;
-    int ret = tiler.GetTiling(tilingData);
-    if (ret != 0) {
-        return ge::GRAPH_FAILED;
-    }
+    tiling.set_m(m);
+    tiling.set_k(k);
+    tiling.set_n(n);
 
-    // 设置blockDim
-    context->SetBlockDim(tiler.GetCoreNum());
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // 序列化tiling到缓冲区
-    MatmulWithIrregularShapesCustomTilingData td;
-    td.set_tiling(tilingData);
-    td.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
-    context->GetRawTilingData()->SetDataSize(td.GetDataSize());
-
-    // 无需workspace
     size_t *workspace = context->GetWorkspaceSizes(1);
     workspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -120,25 +94,20 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* a_shape = context->GetInputShape(0);
     const gert::Shape* b_shape = context->GetInputShape(1);
-    if (a_shape->GetOriginShape().GetDimNum() != 2 || b_shape->GetOriginShape().GetDimNum() != 2) {
-        return GRAPH_FAILED;
-    }
-    int64_t M = a_shape->GetOriginShape().GetDim(0);
-    int64_t N = b_shape->GetOriginShape().GetDim(1);
     gert::Shape* c_shape = context->GetOutputShape(0);
-    gert::Shape out;
-    out.SetDimNum(2);
-    out.SetDim(0, M);
-    out.SetDim(1, N);
-    c_shape->SetOriginShape(out);
-    c_shape->SetStorageShape(out);
+
+    // A: [M, K], B: [K, N] -> C: [M, N]
+    std::vector<int64_t> y_dims(2);
+    y_dims[0] = a_shape->GetDim(0);
+    y_dims[1] = b_shape->GetDim(1);
+    c_shape->SetDim(y_dims);
     return GRAPH_SUCCESS;
 }
 
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    // 统一输出为FP16以匹配核实现
-    context->SetOutputDataType(0, ge::DT_FLOAT16);
+    // A/B: float16, C: float32
+    context->SetOutputDataType(0, ge::DT_FLOAT);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -148,23 +117,24 @@ class MatmulWithIrregularShapesCustom : public OpDef {
 public:
     explicit MatmulWithIrregularShapesCustom(const char* name) : OpDef(name)
     {
-        this->Input("a")
+        this->Input("A")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("b")
+        this->Input("B")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("c")
+        this->Output("C")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16})
+            .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
@@ -176,72 +146,126 @@ OP_ADD(MatmulWithIrregularShapesCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#include "lib/matmul_intf.h"
-#define __NPU_TILING__
-#include "matmul_with_irregular_shapes_custom_tiling_data.h"
 
-using namespace matmul;
+class KernelMatmulIrregular {
+public:
+    __aicore__ inline KernelMatmulIrregular() {}
+    __aicore__ inline void Init(__gm__ uint8_t* aGm, __gm__ uint8_t* bGm, __gm__ uint8_t* cGm,
+                                uint32_t mInput, uint32_t kInput, uint32_t nInput)
+    {
+        m = mInput;
+        k = kInput;
+        n = nInput;
 
-extern "C" __global__ __aicore__ void matmul_with_irregular_shapes_custom(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
-{
-    // 从GM拷贝TCubeTiling
-    TCubeTiling tiling;
-    auto tgm = (__gm__ uint32_t*)tilingGM;
-    auto tl = (uint32_t*)&tiling;
-    for (int i = 0; i < (int)(sizeof(TCubeTiling) / sizeof(uint32_t)); ++i, ++tgm, ++tl) {
-        *tl = *tgm;
+        // sizes
+        aSize = static_cast<uint32_t>(m) * k;
+        bSize = static_cast<uint32_t>(k) * n;
+        cSize = static_cast<uint32_t>(m) * n;
+
+        // aligned sizes (for output copy)
+        roundm = AscendC::DivCeil(m, 16) * 16;
+        roundn = AscendC::DivCeil(n, 16) * 16;
+        roundk = AscendC::DivCeil(k, c0Size) * c0Size;
+
+        aGlobal.SetGlobalBuffer((__gm__ half*)aGm);
+        bGlobal.SetGlobalBuffer((__gm__ half*)bGm);
+        cGlobal.SetGlobalBuffer((__gm__ float*)cGm);
+
+        // Init queues: copy entire matrices (note: for large shapes, real kernels should tile)
+        pipe.InitBuffer(inQueueA1, 1, aSize * sizeof(half));
+        pipe.InitBuffer(inQueueB1, 1, bSize * sizeof(half));
+        pipe.InitBuffer(outQueueCO1, 1, cSize * sizeof(float));
+        pipe.InitBuffer(outQueueUB, 1, cSize * sizeof(float));
     }
 
-    // 定义Matmul类型：A/B/C均为FP16，NORMAL布局
-    typedef MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half, false, LayoutMode::NORMAL> aType;
-    typedef MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half, false, LayoutMode::NORMAL> bType;
-    typedef MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half, false, LayoutMode::NORMAL> cType;
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyUB();
+        CopyOut();
+    }
 
-    using A_T = typename aType::T;
-    using B_T = typename bType::T;
-    using C_T = typename cType::T;
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<half> aLocal = inQueueA1.AllocTensor<half>();
+        AscendC::LocalTensor<half> bLocal = inQueueB1.AllocTensor<half>();
+        AscendC::DataCopy(aLocal, aGlobal, aSize);
+        AscendC::DataCopy(bLocal, bGlobal, bSize);
+        inQueueA1.EnQue(aLocal);
+        inQueueB1.EnQue(bLocal);
+    }
 
-    // 初始化GM全局Tensor及大小
-    AscendC::GlobalTensor<A_T> aGlobal;
-    AscendC::GlobalTensor<B_T> bGlobal;
-    AscendC::GlobalTensor<C_T> cGlobal;
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<half> aLocal = inQueueA1.DeQue<half>();
+        AscendC::LocalTensor<half> bLocal = inQueueB1.DeQue<half>();
+        AscendC::LocalTensor<float> cLocal = outQueueCO1.AllocTensor<float>();
 
-    int32_t sizeA = tiling.ALayoutInfoB * tiling.singleCoreM * tiling.singleCoreK * sizeof(A_T);
-    int32_t sizeB = tiling.BLayoutInfoB * tiling.singleCoreK * tiling.singleCoreN * sizeof(B_T);
-    int32_t sizeC = tiling.CLayoutInfoB * tiling.singleCoreM * tiling.singleCoreN * sizeof(C_T);
+        AscendC::GemmTiling tiling = AscendC::GetGemmTiling<half>(m, k, n);
+        tiling.loopMode = AscendC::LoopMode::MODE_NM;
 
-    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(aGM), sizeA);
-    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(bGM), sizeB);
-    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(cGM), sizeC);
+        // Single GEMM call: C = A(m,k) * B(k,n), result moved to GM; dst does not need to be initialized
+        AscendC::Gemm(cLocal, aLocal, bLocal, m, k, n, tiling, false, /*initValue*/ 1);
 
-    int offset_a = 0, offset_b = 0, offset_c = 0;
+        outQueueCO1.EnQue<float>(cLocal);
+        inQueueA1.FreeTensor(aLocal);
+        inQueueB1.FreeTensor(bLocal);
+    }
 
-    AscendC::GlobalTensor<A_T> gm_a;
-    gm_a.SetGlobalBuffer(const_cast<__gm__ A_T*>(aGlobal[offset_a].GetPhyAddr()),
-                         tiling.singleCoreM * tiling.singleCoreK);
+    __aicore__ inline void CopyUB()
+    {
+        AscendC::LocalTensor<float> cLocal = outQueueCO1.DeQue<float>();
+        AscendC::LocalTensor<float> cUB = outQueueUB.AllocTensor<float>();
 
-    AscendC::GlobalTensor<B_T> gm_b;
-    gm_b.SetGlobalBuffer(const_cast<__gm__ B_T*>(bGlobal[offset_b].GetPhyAddr()),
-                         tiling.singleCoreK * tiling.singleCoreN);
+        AscendC::DataCopyParams params;
+        params.blockCount = 1;
+        params.blockLen = roundm * roundn * sizeof(float) / 1024;
 
-    AscendC::GlobalTensor<C_T> gm_c;
-    gm_c.SetGlobalBuffer(const_cast<__gm__ C_T*>(cGlobal[offset_c].GetPhyAddr()),
-                         tiling.singleCoreM * tiling.singleCoreN);
+        AscendC::DataCopyEnhancedParams enhanced;
+        enhanced.blockMode = BlockMode::BLOCK_MODE_MATRIX;
 
-    // 创建并初始化Matmul实例
-    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
-    matmul::Matmul<aType, bType, cType, void, MM_CFG> mm;
-    TPipe pipe;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
-    mm.Init(&tiling);
+        AscendC::DataCopy(cUB, cLocal, params, enhanced);
+        outQueueUB.EnQue<float>(cUB);
+        outQueueCO1.FreeTensor(cLocal);
+    }
 
-    // 配置A/B/C张量及工作区
-    mm.SetTensorA(gm_a, 0); // 不转置
-    mm.SetTensorB(gm_b, 0); // 不转置
-    mm.SetWorkspace(workspaceGM, 0);
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<float> cUB = outQueueUB.DeQue<float>();
+        AscendC::DataCopy(cGlobal, cUB, cSize);
+        outQueueUB.FreeTensor(cUB);
+    }
 
-    // 执行一次Batch（等价单次Matmul）
-    mm.IterateBatch(gm_c, 1, 1, false);
+private:
+    AscendC::TPipe pipe;
+
+    AscendC::TQue<AscendC::QuePosition::A1, 1> inQueueA1;
+    AscendC::TQue<AscendC::QuePosition::B1, 1> inQueueB1;
+    AscendC::TQue<AscendC::QuePosition::CO1, 1> outQueueCO1;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueUB;
+
+    AscendC::GlobalTensor<half> aGlobal, bGlobal;
+    AscendC::GlobalTensor<float> cGlobal;
+
+    uint32_t m, k, n;
+    uint32_t aSize, bSize, cSize;
+
+    uint32_t roundm, roundk, roundn;
+    uint32_t c0Size = 16;
+};
+
+extern "C" __global__ __aicore__ void matmul_with_irregular_shapes_custom(__gm__ uint8_t* aGm,
+                                                                          __gm__ uint8_t* bGm,
+                                                                          __gm__ uint8_t* cGm,
+                                                                          GM_ADDR workspace,
+                                                                          GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    KernelMatmulIrregular op;
+    op.Init(aGm, bGm, cGm, tilingData.m, tilingData.k, tilingData.n);
+    op.Process();
 }
 """
 
@@ -251,25 +275,15 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-static at::Tensor to_half_if_needed(const at::Tensor& t) {
-    if (t.scalar_type() == at::kHalf) return t;
-    return t.to(at::kHalf);
-}
-
 at::Tensor matmul_with_irregular_shapes_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
-    // 内部以FP16计算
-    at::Tensor A_h = to_half_if_needed(A);
-    at::Tensor B_h = to_half_if_needed(B);
-    auto out_shape = std::vector<int64_t>{A_h.size(-2), B_h.size(-1)};
-    at::Tensor C_h = at::empty(out_shape, A_h.options().dtype(at::kHalf));
-
-    EXEC_NPU_CMD(aclnnMatmulWithIrregularShapesCustom, A_h, B_h, C_h);
-
-    // 若原始为FP32则回转
-    if (A.scalar_type() == at::kFloat) {
-        return C_h.to(at::kFloat);
-    }
-    return C_h;
+    // 输入转 half，输出 float
+    at::Tensor A_half = A.to(at::kHalf);
+    at::Tensor B_half = B.to(at::kHalf);
+    // 输出 C 使用 float32
+    std::vector<int64_t> out_sizes = {A.size(0), B.size(1)};
+    at::Tensor C_float = at::empty(out_sizes, A.options().dtype(at::kFloat));
+    EXEC_NPU_CMD(aclnnMatmulWithIrregularShapesCustom, A_half, B_half, C_float);
+    return C_float;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -277,7 +291,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_with_irregular_shapes_custom", &matmul_with_irregular_shapes_custom_impl_npu, "Matmul (irregular shapes)");
+    m.def("matmul_with_irregular_shapes_custom", &matmul_with_irregular_shapes_custom_impl_npu, "A @ B (irregular)");
 }
 """
 
@@ -287,9 +301,9 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self):
+        super(ModelNew, self).__init__()
 
-    def forward(self, A, B):
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         return custom_ops_lib.matmul_with_irregular_shapes_custom(A, B)
 '''

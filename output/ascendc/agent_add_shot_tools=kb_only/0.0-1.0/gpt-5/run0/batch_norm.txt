@@ -7,64 +7,40 @@ project_json_src='''
             {
                 "name": "x",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
                 "name": "gamma",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
                 "name": "beta",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ],
         "output_desc": [
             {
                 "name": "y",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
-                "name": "out_mean",
-                "param_type": "optional",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "name": "mean",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
-                "name": "out_var",
-                "param_type": "optional",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "name": "variance",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
             }
         ]
     }
@@ -73,71 +49,115 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
+#include "graph/tensor.h"
+#include "graph/utils/type_utils.h"
 
 namespace optiling {
+
 BEGIN_TILING_DATA_DEF(BatchNormCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, n);
-  TILING_DATA_FIELD_DEF(uint32_t, c);
-  TILING_DATA_FIELD_DEF(uint32_t, h);
-  TILING_DATA_FIELD_DEF(uint32_t, w);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);          // 可选字段，保留
+  TILING_DATA_FIELD_DEF(uint32_t, bLength);          // B 维长度
+  TILING_DATA_FIELD_DEF(uint32_t, sLength);          // S 维长度
+  TILING_DATA_FIELD_DEF(uint32_t, hLength);          // H 维长度
+  TILING_DATA_FIELD_DEF(uint32_t, originalBLength);  // 原始 B 维长度
+  TILING_DATA_FIELD_DEF_STRUCT(BatchNormTiling, batchNormTilingData); // BatchNorm 需要的tiling结构
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(BatchNormCustom, BatchNormCustomTilingData)
-}
+
+} // namespace optiling
 """
 
 host_operator_src="""
 #include "batch_norm_custom_tiling.h"
 #include "register/op_def_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/tiling_api.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 8;
+const uint32_t TILE_NUM = 1;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     BatchNormCustomTilingData tiling;
 
-    const gert::Shape* inShape = context->GetInputShape(0);
-    // Assume NCHW
-    uint32_t n = static_cast<uint32_t>(inShape->GetDim(0));
-    uint32_t c = static_cast<uint32_t>(inShape->GetDim(1));
-    uint32_t h = static_cast<uint32_t>(inShape->GetDim(2));
-    uint32_t w = static_cast<uint32_t>(inShape->GetDim(3));
+    // 假设输入 x 的形状为 [B, S, H]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape origin_x = x_shape->GetOriginShape();
+    std::vector<int64_t> dims = origin_x.GetDims();
 
-    context->SetBlockDim(BLOCK_DIM);
+    if (dims.size() != 3) {
+        // 简化处理：形状必须是3D [B, S, H]
+        return ge::GRAPH_PARAM_INVALID;
+    }
 
-    tiling.set_n(n);
-    tiling.set_c(c);
-    tiling.set_h(h);
-    tiling.set_w(w);
+    uint32_t B = static_cast<uint32_t>(dims[0]);
+    uint32_t S = static_cast<uint32_t>(dims[1]);
+    uint32_t H = static_cast<uint32_t>(dims[2]);
+
+    tiling.set_bLength(B);
+    tiling.set_sLength(S);
+    tiling.set_hLength(H);
+    tiling.set_originalBLength(B);
     tiling.set_tileNum(TILE_NUM);
 
+    // 依据文档获取临时空间范围并生成 tiling 参数
+    std::vector<int64_t> shapeVec = {static_cast<int64_t>(B), static_cast<int64_t>(S), static_cast<int64_t>(H)};
+    std::vector<int64_t> originShapeVec = {static_cast<int64_t>(B), static_cast<int64_t>(S), static_cast<int64_t>(H)};
+    ge::Shape srcShape(shapeVec);
+    ge::Shape originSrcShape(originShapeVec);
+
+    uint32_t minSize = 0;
+    uint32_t maxSize = 0;
+
+    // 获取 BatchNorm 计算所需的临时空间上下限
+    bool ok1 = AscendC::GetBatchNormMaxMinTmpSize(srcShape, originSrcShape, sizeof(float), false, maxSize, minSize, false);
+    if (!ok1) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 基于最小可用空间获取 tiling 信息
+    bool ok2 = AscendC::GetBatchNormNDTilingInfo(srcShape, originSrcShape, minSize, sizeof(float), false, tiling.batchNormTilingData, false);
+    if (!ok2) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 保存 tiling 数据
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+    // 设置 Block 数
+    context->SetBlockDim(BLOCK_DIM);
+
+    // 申请 workspace（本算子不需要）
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
+
     return ge::GRAPH_SUCCESS;
 }
-}
+
+} // namespace optiling
+
 
 namespace ge {
+// y 形状与 x 相同；mean/variance 形状为 [S, H]
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
+    const std::vector<int64_t>& x_dims = x_shape->GetDims();
+    if (x_dims.size() != 3) {
+        return GRAPH_PARAM_INVALID;
+    }
     gert::Shape* y_shape = context->GetOutputShape(0);
+    gert::Shape* mean_shape = context->GetOutputShape(1);
+    gert::Shape* var_shape = context->GetOutputShape(2);
+
     *y_shape = *x_shape;
 
-    // out_mean/out_var are per-channel (C)
-    const int64_t c = context->GetInputShape(0)->GetDim(1);
-    gert::Shape* mean_shape = context->GetOutputShape(1);
-    gert::Shape* var_shape  = context->GetOutputShape(2);
-    mean_shape->SetDimNum(1);
-    mean_shape->SetDim(0, c);
-    var_shape->SetDimNum(1);
-    var_shape->SetDim(0, c);
+    std::vector<int64_t> mv_dims = {x_dims[1], x_dims[2]}; // [S, H]
+    mean_shape->SetDims(mv_dims);
+    var_shape->SetDims(mv_dims);
     return GRAPH_SUCCESS;
 }
 
@@ -149,7 +169,8 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
     context->SetOutputDataType(2, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
-}
+} // namespace ge
+
 
 namespace ops {
 class BatchNormCustom : public OpDef {
@@ -161,11 +182,13 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Input("gamma")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+
         this->Input("beta")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -177,53 +200,164 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("out_mean")
-            .ParamType(OPTIONAL)
+
+        this->Output("mean")
+            .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("out_var")
-            .ParamType(OPTIONAL)
+
+        this->Output("variance")
+            .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .AutoContiguous()   // auto make inputs contiguous if needed
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
 
 OP_ADD(BatchNormCustom);
-}
+} // namespace ops
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "batch_norm_custom_tiling_data.h"
 
-extern "C" __global__ __aicore__ void batch_norm_custom(GM_ADDR inputX_gm,
-                                                        GM_ADDR gamma_gm,
-                                                        GM_ADDR beta_gm,
-                                                        GM_ADDR output_gm,
-                                                        GM_ADDR outputMean_gm,
-                                                        GM_ADDR outputVariance_gm,
-                                                        GM_ADDR tiling)
+template <typename dataType, bool isReuseSource = false, bool isBasicBlock = false>
+class KernelBatchNormCustom {
+public:
+    __aicore__ inline KernelBatchNormCustom() {}
+
+    __aicore__ inline void Init(GM_ADDR xGm, GM_ADDR gammaGm, GM_ADDR betaGm,
+                                GM_ADDR yGm, GM_ADDR meanGm, GM_ADDR varGm,
+                                const TilingData &tiling)
+    {
+        bLength = tiling.bLength;
+        sLength = tiling.sLength;
+        hLength = tiling.hLength;
+        batchNormTiling = tiling.batchNormTilingData;
+        originalBLength = tiling.originalBLength;
+
+        bshLength = bLength * sLength * hLength;
+        shLength = sLength * hLength;
+
+        xGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(xGm), bshLength);
+        gammaGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(gammaGm), hLength);
+        betaGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(betaGm), hLength);
+
+        yGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(yGm), bshLength);
+        meanGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(meanGm), shLength);
+        varGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ dataType *>(varGm), shLength);
+
+        constexpr uint32_t typeSize = sizeof(dataType);
+        pipe.InitBuffer(inQueueX, 1, bshLength * typeSize);
+        pipe.InitBuffer(inQueueGamma, 1, hLength * typeSize);
+        pipe.InitBuffer(inQueueBeta, 1, hLength * typeSize);
+        pipe.InitBuffer(outQueueY, 1, bshLength * typeSize);
+        pipe.InitBuffer(outQueueMean, 1, shLength * typeSize);
+        pipe.InitBuffer(outQueueVar, 1, shLength * typeSize);
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<dataType> xLocal = inQueueX.AllocTensor<dataType>();
+        AscendC::LocalTensor<dataType> gammaLocal = inQueueGamma.AllocTensor<dataType>();
+        AscendC::LocalTensor<dataType> betaLocal = inQueueBeta.AllocTensor<dataType>();
+
+        AscendC::DataCopy(xLocal, xGlobal, bshLength);
+        AscendC::DataCopy(gammaLocal, gammaGlobal, hLength);
+        AscendC::DataCopy(betaLocal, betaGlobal, hLength);
+
+        inQueueX.EnQue(xLocal);
+        inQueueGamma.EnQue(gammaLocal);
+        inQueueBeta.EnQue(betaLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<dataType> xLocal = inQueueX.DeQue<dataType>();
+        AscendC::LocalTensor<dataType> gammaLocal = inQueueGamma.DeQue<dataType>();
+        AscendC::LocalTensor<dataType> betaLocal = inQueueBeta.DeQue<dataType>();
+
+        AscendC::LocalTensor<dataType> yLocal = outQueueY.AllocTensor<dataType>();
+        AscendC::LocalTensor<dataType> meanLocal = outQueueMean.AllocTensor<dataType>();
+        AscendC::LocalTensor<dataType> varLocal = outQueueVar.AllocTensor<dataType>();
+
+        // 使用 AscendC BatchNorm 高级API
+        AscendC::BatchNorm<dataType, isReuseSource, isBasicBlock>(
+            yLocal, meanLocal, varLocal, xLocal, gammaLocal, betaLocal, static_cast<dataType>(epsilon), batchNormTiling);
+
+        outQueueY.EnQue<dataType>(yLocal);
+        outQueueMean.EnQue<dataType>(meanLocal);
+        outQueueVar.EnQue<dataType>(varLocal);
+
+        inQueueX.FreeTensor(xLocal);
+        inQueueGamma.FreeTensor(gammaLocal);
+        inQueueBeta.FreeTensor(betaLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<dataType> yLocal = outQueueY.DeQue<dataType>();
+        AscendC::LocalTensor<dataType> meanLocal = outQueueMean.DeQue<dataType>();
+        AscendC::LocalTensor<dataType> varLocal = outQueueVar.DeQue<dataType>();
+
+        AscendC::DataCopy(yGlobal, yLocal, bshLength);
+        AscendC::DataCopy(meanGlobal, meanLocal, shLength);
+        AscendC::DataCopy(varGlobal, varLocal, shLength);
+
+        outQueueY.FreeTensor(yLocal);
+        outQueueMean.FreeTensor(meanLocal);
+        outQueueVar.FreeTensor(varLocal);
+    }
+
+private:
+    AscendC::GlobalTensor<dataType> xGlobal;
+    AscendC::GlobalTensor<dataType> gammaGlobal;
+    AscendC::GlobalTensor<dataType> betaGlobal;
+
+    AscendC::GlobalTensor<dataType> yGlobal;
+    AscendC::GlobalTensor<dataType> meanGlobal;
+    AscendC::GlobalTensor<dataType> varGlobal;
+
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueGamma;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueBeta;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueMean;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueVar;
+
+    uint32_t bLength;
+    uint32_t sLength;
+    uint32_t hLength;
+    uint32_t originalBLength;
+    uint32_t bshLength;
+    uint32_t shLength;
+
+    dataType epsilon = static_cast<dataType>(1e-5);
+    BatchNormTiling batchNormTiling;
+};
+
+extern "C" __global__ __aicore__ void batch_norm_custom(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta,
+                                                         GM_ADDR y, GM_ADDR mean, GM_ADDR variance,
+                                                         GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tilingData, tiling);
-    // Use high-level BatchNorm API per CANN reference
-    KernelBatchnorm<float, false, false> op;
-    op.Init(inputX_gm, gamma_gm, beta_gm, output_gm, outputMean_gm, outputVariance_gm,
-            tilingData.batchNormTilingData);
-    if (TILING_KEY_IS(1)) {
-        op.Process();
-    } else {
-        op.Process();
-    }
+    KernelBatchNormCustom<float, false, false> op;
+    op.Init(x, gamma, beta, y, mean, variance, tilingData);
+    op.Process();
 }
 """
 
@@ -233,14 +367,16 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor batch_norm_custom_impl_npu(const at::Tensor& x,
-                                      const at::Tensor& gamma,
-                                      const at::Tensor& beta) {
-    auto y = at::empty_like(x);
-    auto c = gamma.numel();
-    at::Tensor out_mean = at::empty({c}, x.options());
-    at::Tensor out_var  = at::empty({c}, x.options());
-    EXEC_NPU_CMD(aclnnBatchNormCustom, x, gamma, beta, y, out_mean, out_var);
+at::Tensor batch_norm_custom_impl_npu(const at::Tensor& x, const at::Tensor& gamma, const at::Tensor& beta) {
+    // x: [B, S, H]
+    at::Tensor y = at::empty_like(x);
+    // mean/var: [S, H]
+    auto S = x.size(1);
+    auto H = x.size(2);
+    at::Tensor mean = at::empty({S, H}, x.options());
+    at::Tensor var = at::empty({S, H}, x.options());
+
+    EXEC_NPU_CMD(aclnnBatchNormCustom, x, gamma, beta, y, mean, var);
     return y;
 }
 
@@ -249,7 +385,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("batch_norm_custom", &batch_norm_custom_impl_npu, "BatchNorm 2D (custom AscendC)");
+    m.def("batch_norm_custom", &batch_norm_custom_impl_npu, "BatchNorm forward (custom AscendC)");
 }
 """
 
@@ -260,15 +396,28 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Optimized model using custom AscendC BatchNorm kernel.
+    使用自定义AscendC算子的BatchNorm前向（仅仿真前向，不维护running stats）
+    约定：
+      - 在调用自定义算子前，将输入由 NCHW 转为 [N, S, H]（S=H*W，H=通道数C），
+        以满足AscendC BatchNorm高阶API的[B,S,H]输入要求。
     """
     def __init__(self, num_features: int):
         super().__init__()
-        # Learnable affine parameters, same as nn.BatchNorm2d affine=True
+        # 将BatchNorm的可训练参数保留为weight/bias
         self.weight = torch.nn.Parameter(torch.ones(num_features))
         self.bias = torch.nn.Parameter(torch.zeros(num_features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Use custom operator: computes per-channel BN with current batch stats internally.
-        return custom_ops_lib.batch_norm_custom(x, self.weight, self.bias)
+        # x: [N, C, H, W] -> [N, H, W, C] -> [N, S, H] (S=H*W, H=C)
+        N, C, Hh, Ww = x.shape
+        x_nhwc = x.permute(0, 2, 3, 1).contiguous()
+        x_3d = x_nhwc.view(N, Hh * Ww, C)
+
+        # 调用自定义算子（只返回y）
+        y_3d = custom_ops_lib.batch_norm_custom(x_3d, self.weight, self.bias)
+
+        # 还原形状: [N, S, H] -> [N, H, W, C] -> [N, C, H, W]
+        y_nhwc = y_3d.view(N, Hh, Ww, C)
+        y = y_nhwc.permute(0, 3, 1, 2).contiguous()
+        return y
 '''

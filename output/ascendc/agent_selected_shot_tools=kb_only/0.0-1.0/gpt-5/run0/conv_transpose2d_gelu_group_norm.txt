@@ -1,0 +1,469 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTranspose2dGeluGroupNormCustom",
+        "language": "cpp",
+        "attr": [
+            {
+                "name": "num_groups",
+                "param_type": "required",
+                "type": "int"
+            }
+        ],
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "gamma",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "beta",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTranspose2dGeluGroupNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint32_t, numGroups);
+  TILING_DATA_FIELD_DEF(uint32_t, cPerGroup);
+  TILING_DATA_FIELD_DEF(uint32_t, hwSize);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLen);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(float, epsilon);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTranspose2dGeluGroupNormCustom, ConvTranspose2dGeluGroupNormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transpose2d_gelu_group_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t GetDimSafe(const gert::Shape* s, size_t idx) {
+    if (s->GetOriginShape().GetDimNum() > idx) {
+        return static_cast<uint32_t>(s->GetOriginShape().GetDim(idx));
+    }
+    return 1;
+}
+}
+
+namespace optiling {
+const uint32_t DEFAULT_BLOCK_DIM = 128;
+const uint32_t DEFAULT_TILE_NUM = 8;
+const uint32_t DEFAULT_TILE_LEN = 4096;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTranspose2dGeluGroupNormCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    uint32_t N = GetDimSafe(in_shape, 0);
+    uint32_t C = GetDimSafe(in_shape, 1);
+    uint32_t H = GetDimSafe(in_shape, 2);
+    uint32_t W = GetDimSafe(in_shape, 3);
+
+    // get attribute num_groups
+    uint32_t numGroups = 1;
+    auto attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        (void)attrs->GetAttr("num_groups", numGroups);
+    }
+    if (numGroups == 0) {
+        numGroups = 1;
+    }
+    uint32_t cPerGroup = C / numGroups;
+    uint32_t hwSize = H * W;
+
+    uint32_t tileLen = DEFAULT_TILE_LEN;
+    if (tileLen == 0) tileLen = 4096;
+    if (tileLen > hwSize) tileLen = hwSize == 0 ? 1 : hwSize;
+    uint32_t tileNum = DEFAULT_TILE_NUM;
+
+    // Use batch-size parallelism
+    uint32_t blockDim = (N > 0) ? N : 1;
+    context->SetBlockDim(blockDim);
+
+    tiling.set_N(N);
+    tiling.set_C(C);
+    tiling.set_H(H);
+    tiling.set_W(W);
+    tiling.set_numGroups(numGroups);
+    tiling.set_cPerGroup(cPerGroup);
+    tiling.set_hwSize(hwSize);
+    tiling.set_tileLen(tileLen);
+    tiling.set_tileNum(tileNum);
+    tiling.set_epsilon(1e-5f);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0; // no workspace needed
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape; // y has the same shape as x (apply GELU + GroupNorm only)
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTranspose2dGeluGroupNormCustom : public OpDef {
+public:
+    explicit ConvTranspose2dGeluGroupNormCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("gamma")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("beta")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("num_groups").Int(1);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTranspose2dGeluGroupNormCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelConvTranspose2dGeluGroupNorm {
+public:
+    __aicore__ inline KernelConvTranspose2dGeluGroupNorm() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y,
+                                uint32_t N, uint32_t C, uint32_t H, uint32_t W,
+                                uint32_t numGroups, uint32_t cPerGroup, uint32_t hwSize,
+                                uint32_t tileLen, uint32_t tileNum, float epsilon)
+    {
+        this->N = N;
+        this->C = C;
+        this->H = H;
+        this->W = W;
+        this->numGroups = numGroups;
+        this->cPerGroup = cPerGroup;
+        this->hwSize = hwSize;
+        this->tileLen = tileLen;
+        this->tileNum = tileNum;
+        this->epsilon = epsilon;
+
+        // one block handles one batch n
+        uint32_t nIdx = AscendC::GetBlockIdx();
+        uint64_t perBatchSize = static_cast<uint64_t>(C) * static_cast<uint64_t>(H) * static_cast<uint64_t>(W);
+
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(x) + perBatchSize * nIdx, perBatchSize);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(y) + perBatchSize * nIdx, perBatchSize);
+        gammaGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(gamma), C);
+        betaGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(beta), C);
+
+        pipe.InitBuffer(inQueue, BUFFER_NUM, this->tileLen * sizeof(DTYPE));
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileLen * sizeof(DTYPE));
+        pipe.InitBuffer(outQueue, BUFFER_NUM, this->tileLen * sizeof(DTYPE));
+
+        // UB buffers for gamma/beta and stats
+        pipe.InitBuffer(gammaUbBuf, C * sizeof(DTYPE));
+        pipe.InitBuffer(betaUbBuf, C * sizeof(DTYPE));
+        pipe.InitBuffer(statsUbBuf, numGroups * 2 * sizeof(DTYPE)); // [means | invstds]
+    }
+
+    __aicore__ inline void Process()
+    {
+        // Copy gamma and beta into UB for reuse
+        CopyGammaBetaToUb();
+
+        // Compute per-(group) mean and invstd on GELU(x)
+        ComputeGroupStatsOnGelu();
+
+        // Normalize GELU(x), then affine with gamma/beta -> y
+        NormalizeAndAffine();
+    }
+
+private:
+    __aicore__ inline void CopyGammaBetaToUb()
+    {
+        AscendC::LocalTensor<DTYPE> gammaUb = gammaUbBuf.template Get<DTYPE>();
+        AscendC::LocalTensor<DTYPE> betaUb  = betaUbBuf.template Get<DTYPE>();
+        AscendC::DataCopy(gammaUb, gammaGm, C);
+        AscendC::DataCopy(betaUb,  betaGm,  C);
+    }
+
+    __aicore__ inline void ComputeGroupStatsOnGelu()
+    {
+        AscendC::LocalTensor<DTYPE> statsUb = statsUbBuf.template Get<DTYPE>(); // first numGroups mean, next numGroups invstd (temp store var)
+
+        for (uint32_t g = 0; g < numGroups; ++g) {
+            float sum = 0.f;
+            float sumsq = 0.f;
+            uint64_t groupStartC = static_cast<uint64_t>(g) * cPerGroup;
+            uint64_t count = static_cast<uint64_t>(cPerGroup) * hwSize;
+
+            for (uint32_t cOff = 0; cOff < cPerGroup; ++cOff) {
+                uint64_t cIdx = groupStartC + cOff;
+                uint64_t cBase = cIdx * hwSize;
+
+                uint32_t tiles = (hwSize + tileLen - 1) / tileLen;
+                for (uint32_t t = 0; t < tiles; ++t) {
+                    uint32_t offset = t * tileLen;
+                    uint32_t curLen = (offset + tileLen <= hwSize) ? tileLen : (hwSize - offset);
+
+                    AscendC::LocalTensor<DTYPE> xLocal = inQueue.AllocTensor<DTYPE>();
+                    AscendC::LocalTensor<DTYPE> geluLocal = tmpQueue.AllocTensor<DTYPE>();
+                    AscendC::DataCopy(xLocal, xGm[cBase + offset], curLen);
+
+                    // GELU
+                    AscendC::Gelu(geluLocal, xLocal, curLen);
+
+                    // accumulate
+                    for (uint32_t i = 0; i < curLen; ++i) {
+                        float v = geluLocal.GetValue(i);
+                        sum += v;
+                        sumsq += v * v;
+                    }
+
+                    inQueue.EnQue(xLocal);
+                    tmpQueue.EnQue<DTYPE>(geluLocal);
+
+                    // free immediately
+                    AscendC::LocalTensor<DTYPE> xL = inQueue.DeQue<DTYPE>();
+                    inQueue.FreeTensor(xL);
+                    AscendC::LocalTensor<DTYPE> gL = tmpQueue.DeQue<DTYPE>();
+                    tmpQueue.FreeTensor(gL);
+                }
+            }
+
+            float mean = (count > 0) ? (sum / static_cast<float>(count)) : 0.f;
+            float var = (count > 0) ? (sumsq / static_cast<float>(count) - mean * mean) : 0.f;
+            float invstd = rsqrtf(var + epsilon);
+
+            statsUb.SetValue(g, mean);
+            statsUb.SetValue(numGroups + g, invstd);
+        }
+    }
+
+    __aicore__ inline void NormalizeAndAffine()
+    {
+        AscendC::LocalTensor<DTYPE> gammaUb = gammaUbBuf.template Get<DTYPE>();
+        AscendC::LocalTensor<DTYPE> betaUb  = betaUbBuf.template Get<DTYPE>();
+        AscendC::LocalTensor<DTYPE> statsUb = statsUbBuf.template Get<DTYPE>();
+
+        for (uint32_t g = 0; g < numGroups; ++g) {
+            float mean = statsUb.GetValue(g);
+            float invstd = statsUb.GetValue(numGroups + g);
+
+            uint64_t groupStartC = static_cast<uint64_t>(g) * cPerGroup;
+
+            for (uint32_t cOff = 0; cOff < cPerGroup; ++cOff) {
+                uint64_t cIdx = groupStartC + cOff;
+                float gamma = gammaUb.GetValue(static_cast<uint32_t>(cIdx));
+                float beta  = betaUb.GetValue(static_cast<uint32_t>(cIdx));
+
+                uint64_t cBase = cIdx * hwSize;
+
+                uint32_t tiles = (hwSize + tileLen - 1) / tileLen;
+                for (uint32_t t = 0; t < tiles; ++t) {
+                    uint32_t offset = t * tileLen;
+                    uint32_t curLen = (offset + tileLen <= hwSize) ? tileLen : (hwSize - offset);
+
+                    AscendC::LocalTensor<DTYPE> xLocal = inQueue.AllocTensor<DTYPE>();
+                    AscendC::LocalTensor<DTYPE> geluLocal = tmpQueue.AllocTensor<DTYPE>();
+                    AscendC::LocalTensor<DTYPE> yLocal = outQueue.AllocTensor<DTYPE>();
+
+                    AscendC::DataCopy(xLocal, xGm[cBase + offset], curLen);
+
+                    // GELU
+                    AscendC::Gelu(geluLocal, xLocal, curLen);
+
+                    // y = (gelu - mean) * invstd * gamma + beta
+                    for (uint32_t i = 0; i < curLen; ++i) {
+                        float v = geluLocal.GetValue(i);
+                        float norm = (v - mean) * invstd;
+                        float outv = norm * gamma + beta;
+                        yLocal.SetValue(i, outv);
+                    }
+
+                    AscendC::DataCopy(yGm[cBase + offset], yLocal, curLen);
+
+                    inQueue.EnQue(xLocal);
+                    tmpQueue.EnQue<DTYPE>(geluLocal);
+                    outQueue.EnQue<DTYPE>(yLocal);
+
+                    // free immediately
+                    AscendC::LocalTensor<DTYPE> xL = inQueue.DeQue<DTYPE>();
+                    inQueue.FreeTensor(xL);
+                    AscendC::LocalTensor<DTYPE> gL = tmpQueue.DeQue<DTYPE>();
+                    tmpQueue.FreeTensor(gL);
+                    AscendC::LocalTensor<DTYPE> yL = outQueue.DeQue<DTYPE>();
+                    outQueue.FreeTensor(yL);
+                }
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueue;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+
+    AscendC::TBuf<AscendC::TPosition::A1> gammaUbBuf;
+    AscendC::TBuf<AscendC::TPosition::A1> betaUbBuf;
+    AscendC::TBuf<AscendC::TPosition::A1> statsUbBuf;
+
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+    AscendC::GlobalTensor<DTYPE> gammaGm;
+    AscendC::GlobalTensor<DTYPE> betaGm;
+
+    uint32_t N, C, H, W;
+    uint32_t numGroups, cPerGroup, hwSize;
+    uint32_t tileLen, tileNum;
+    float epsilon;
+};
+
+extern "C" __global__ __aicore__ void conv_transpose2d_gelu_group_norm_custom(
+    GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+
+    KernelConvTranspose2dGeluGroupNorm op;
+    op.Init(
+        x, gamma, beta, y,
+        tiling_data.N, tiling_data.C, tiling_data.H, tiling_data.W,
+        tiling_data.numGroups, tiling_data.cPerGroup, tiling_data.hwSize,
+        tiling_data.tileLen, tiling_data.tileNum, tiling_data.epsilon
+    );
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_transpose2d_gelu_group_norm_custom_impl_npu(const at::Tensor& x,
+                                                            const at::Tensor& gamma,
+                                                            const at::Tensor& beta,
+                                                            int64_t num_groups) {
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnConvTranspose2dGeluGroupNormCustom, x, gamma, beta, num_groups, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transpose2d_gelu_group_norm_custom", &conv_transpose2d_gelu_group_norm_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transpose2d_gelu_group_norm_custom", &conv_transpose2d_gelu_group_norm_custom_impl_npu,
+          "GELU + GroupNorm (after ConvTranspose2d)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Keep ConvTranspose2d in PyTorch, fuse GELU + GroupNorm into one custom AscendC op.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, groups, num_groups):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride)
+        # Reuse PyTorch GroupNorm parameters (gamma/beta) but compute in custom kernel
+        self.group_norm = torch.nn.GroupNorm(num_groups=num_groups, num_channels=out_channels)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        # fused: GELU + GroupNorm using custom AscendC kernel
+        x = custom_ops_lib.conv_transpose2d_gelu_group_norm_custom(x, self.group_norm.weight, self.group_norm.bias, self.group_norm.num_groups)
+        return x
+'''

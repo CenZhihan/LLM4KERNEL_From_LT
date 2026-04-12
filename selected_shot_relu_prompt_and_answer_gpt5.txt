@@ -1,0 +1,572 @@
+================================================================================
+LLM4KERNEL_From_LT 非 Agent 管道：selected_shot + ascendc + relu
+说明：prompt 由 prompt_generators/ascendc_selected_shot.py + ascendc_template 生成；
+      直接模式调用时 messages = [system: You are a helpful assistant, user: prompt]
+生成：本文件中的 prompt 为当前仓库代码对 relu 即时生成；
+答案：来自 output/ascendc/selected_shot/0.0-1.0/gpt-5/run0/relu.txt
+================================================================================
+
+================================================================================
+PART 1 — 完整 USER PROMPT（发给 LLM 的 user 内容，不含 system）
+================================================================================
+
+You are an expert in writing custom AscendC kernels to optimize PyTorch architectures by replacing specific operators for performance gains.
+
+    Here is an example to illustrate the expected transformation using custom AscendC operators. **Original architecture with kernel name `leaky_relu_custom`:**
+
+    ```python 
+
+    import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def __init__(self, negative_slope: float = 0.1):
+        super(Model, self).__init__()
+        self.negative_slope = negative_slope
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.leaky_relu(x, negative_slope=self.negative_slope)
+
+def get_inputs():
+    x = torch.randn(8, 200, 1024)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+    ``` 
+
+    Transformed version using custom AscendC kernels:
+    This transformation includes six embedded Python strings: `project_json_src`, `host_tiling_src`, `host_operator_src`, `kernel_src`, `python_bind_src` and `model_src`.
+    The kernel function name in `kernel_src` must exactly match the provided kernel name. The operator definition in `project_json_src` and `host_operator_src` should also correspond to the kernel name, but follow PascalCase naming: 
+    ```python
+    project_json_src='''
+[
+    {
+        "op": "LeakyReluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "attr": [
+            {
+                "name": "negative_slope",
+                "param_type": "optional",
+                "type": "float",
+                "default_value": "0.1"
+            }
+        ]
+    }
+]
+
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(LeakyReluCustomTilingData)
+TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+TILING_DATA_FIELD_DEF(float, negativeSlope);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(LeakyReluCustom, LeakyReluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+
+#include "leaky_relu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 16;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    LeakyReluCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    const float *negativeSlope = attrs->GetAttrPointer<float>(0);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_negativeSlope(*negativeSlope);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x1_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x1_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x1_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x1_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+
+namespace ops {
+class LeakyReluCustom : public OpDef {
+public:
+    explicit LeakyReluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Attr("negative_slope").AttrType(OPTIONAL).Float(0.1);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+
+    }
+};
+
+OP_ADD(LeakyReluCustom);
+}
+
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+class KernelLeakyRelu {
+public:
+    __aicore__ inline KernelLeakyRelu() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum, float negativeSlope)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->negativeSlope = static_cast<float>(negativeSlope);
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        // get start index for current core, core parallel
+        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        // pipe alloc memory to queue, the unit is Bytes
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpBuffer1, this->tileLength * sizeof(float));
+        pipe.InitBuffer(tmpBuffer2, this->tileLength * sizeof(float));
+    }
+    __aicore__ inline void Process()
+    {
+        // loop count need to be doubled, due to double buffer
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        // tiling strategy, pipeline parallel
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        // alloc tensor from queue memory
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        // copy progress_th tile from global tensor to local tensor
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        // enque input tensors to VECIN queue
+        inQueueX.EnQue(xLocal);
+    }
+    __aicore__ inline void Compute(int32_t progress)
+    {
+        // deque input tensors from VECIN queue
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        AscendC::LocalTensor<float> tmpTensor1 = tmpBuffer1.Get<float>();
+        AscendC::LocalTensor<float> tmpTensor2 = tmpBuffer2.Get<float>();
+        float inputVal = 0.0;
+        AscendC::Maxs(tmpTensor1, xLocal, inputVal, this->tileLength);
+        AscendC::Mins(tmpTensor2, xLocal, inputVal, this->tileLength);
+        AscendC::Muls(tmpTensor2, tmpTensor2, this->negativeSlope, this->tileLength);
+        AscendC::Add(yLocal, tmpTensor1, tmpTensor2, this->tileLength);
+        // enque the output tensor to VECOUT queue
+        outQueueY.EnQue<float>(yLocal);
+        // free input tensors for reuse
+        inQueueX.FreeTensor(xLocal);
+    }
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        // deque output tensor from VECOUT queue
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        // copy progress_th tile from local tensor to global tensor
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        // free output tensor for reuse
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuffer1, tmpBuffer2;
+    // create queues for input, in this case depth is equal to buffer num
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    // create queue for output, in this case depth is equal to buffer num
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<float> xGm, yGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+    float negativeSlope;
+};
+
+extern "C" __global__ __aicore__ void leaky_relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelLeakyRelu op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum, tiling_data.negativeSlope);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor leaky_relu_impl_npu(const at::Tensor& self, double negative_slope) {
+    // float argument not supported now, so use double negative_slope
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnLeakyReluCustom, self, negative_slope, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("leaky_relu_custom", &leaky_relu_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("leaky_relu_custom", &leaky_relu_impl_npu, "LeakyReLU activation");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+class ModelNew(torch.nn.Module):
+    def __init__(self, negative_slope: float = 0.1):
+        super(ModelNew, self).__init__()
+        self.negative_slope = negative_slope
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.leaky_relu_custom(x, self.negative_slope)
+'''
+
+    ``` 
+
+    
+    Now, you are given the following architecture with kernel name relu_custom(PascalCase: ReluCustom): 
+
+    ```python
+    import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a ReLU activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies ReLU activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with ReLU applied, same shape as input.
+        """
+        return torch.relu(x)
+
+# batch_size = 4096
+# dim = 393216
+batch_size = 512
+dim = 32768
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+    ```
+        
+Your task: Replace relevant PyTorch operators in the architecture named Model with custom AscendC kernels. Generate an optimized version named ModelNew, including the six Python strings listed above. Just output the code, no other text, and NO testing code!
+
+
+
+================================================================================
+PART 2 — LLM 完整回答（gpt-5 输出，即 relu.txt 原文）
+================================================================================
+
+project_json_src='''
+[
+    {
+        "op": "ReluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ReluCustomTilingData)
+TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ReluCustom, ReluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "relu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 16;
+
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    ReluCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext *context)
+{
+    const gert::Shape *x_shape = context->GetInputShape(0);
+    gert::Shape *y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const ge::DataType x_dtype = context->GetInputDataType(0);
+    context->SetOutputDataType(0, x_dtype);
+    return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class ReluCustom : public OpDef {
+public:
+    explicit ReluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ReluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+class KernelRelu {
+public:
+    __aicore__ inline KernelRelu() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        float zeroVal = 0.0f;
+        AscendC::Maxs(yLocal, xLocal, zeroVal, this->tileLength);
+        outQueueY.EnQue<float>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<float> xGm, yGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void relu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelRelu op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor relu_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnReluCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("relu_custom", &relu_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("relu_custom", &relu_impl_npu, "ReLU activation");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.relu_custom(x)
+'''

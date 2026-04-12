@@ -1,0 +1,355 @@
+project_json_src='''
+[
+    {
+        "op": "GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmLogSumExpLeakyReluLeakyReluGeluGeluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batchSize);
+  TILING_DATA_FIELD_DEF(uint32_t, inFeatures);
+  TILING_DATA_FIELD_DEF(uint32_t, outFeatures);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom, GemmLogSumExpLeakyReluLeakyReluGeluGeluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GemmLogSumExpLeakyReluLeakyReluGeluGeluCustomTilingData tiling;
+
+    uint32_t batchSize = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetDim(0));
+    uint32_t inFeatures = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetDim(1));
+    // weight is [inFeatures, outFeatures] (transposed linear.weight)
+    uint32_t outFeatures = static_cast<uint32_t>(context->GetInputShape(1)->GetOriginShape().GetDim(1));
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_batchSize(batchSize);
+    tiling.set_inFeatures(inFeatures);
+    tiling.set_outFeatures(outFeatures);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    // Output is [batchSize, 1] after LogSumExp along dim=1 with keepdim=True
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, x_shape->GetDim(0));
+    y_shape->SetDim(1, 1);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom : public OpDef {
+public:
+    explicit GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include <cmath>
+
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelGemmLogSumExpLeakyReluLeakyReluGeluGelu {
+public:
+    __aicore__ inline KernelGemmLogSumExpLeakyReluLeakyReluGeluGelu() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                uint32_t batchSize, uint32_t inFeatures, uint32_t outFeatures, uint32_t tileNum)
+    {
+        this->batchSize = batchSize;
+        this->inFeatures = inFeatures;
+        this->outFeatures = outFeatures;
+        this->tileNum = tileNum;
+
+        // rows per block
+        this->rowsPerBlock = batchSize / AscendC::GetBlockNum();
+        if (this->rowsPerBlock == 0) { this->rowsPerBlock = batchSize; }
+        this->tileLength = 1; // process 1 row per iteration
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + AscendC::GetBlockIdx() * this->rowsPerBlock * this->inFeatures,
+                            this->rowsPerBlock * this->inFeatures);
+        wGm.SetGlobalBuffer((__gm__ DTYPE_W *)w, this->inFeatures * this->outFeatures);
+        bGm.SetGlobalBuffer((__gm__ DTYPE_B *)b, this->outFeatures);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y + AscendC::GetBlockIdx() * this->rowsPerBlock,
+                            this->rowsPerBlock);
+
+        // local buffer to hold one input row
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->inFeatures * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->rowsPerBlock;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline float gelu(float x) {
+        const float c0 = 0.044715f;
+        const float sqrt2_over_pi = 0.7978845608028654f; // sqrt(2/pi)
+        float x3 = x * x * x;
+        float inner = sqrt2_over_pi * (x + c0 * x3);
+        float t = tanhf(inner);
+        return 0.5f * x * (1.0f + t);
+    }
+
+    __aicore__ inline float leaky_relu(float x, float alpha) {
+        return x >= 0.0f ? x : alpha * x;
+    }
+
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        // copy one row of length inFeatures
+        AscendC::DataCopy(xLocal, xGm[progress * this->inFeatures], this->inFeatures);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t progress)
+    {
+        const float alpha = 0.01f;
+
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
+
+        // Compute GEMM row -> outFeatures values, then LogSumExp over j
+        // First pass: compute max
+        float max_val = -INFINITY;
+        for (uint32_t j = 0; j < outFeatures; ++j) {
+            float acc = static_cast<float>(bGm[j]);
+            for (uint32_t k = 0; k < inFeatures; ++k) {
+                float xv = static_cast<float>(xLocal.GetValue(k));
+                float wv = static_cast<float>(wGm[k * outFeatures + j]); // weight_t[k][j]
+                acc += xv * wv;
+            }
+            if (acc > max_val) { max_val = acc; }
+        }
+
+        // Second pass: compute sum(exp(output - max))
+        float sumexp = 0.0f;
+        for (uint32_t j = 0; j < outFeatures; ++j) {
+            float acc = static_cast<float>(bGm[j]);
+            for (uint32_t k = 0; k < inFeatures; ++k) {
+                float xv = static_cast<float>(xLocal.GetValue(k));
+                float wv = static_cast<float>(wGm[k * outFeatures + j]); // weight_t[k][j]
+                acc += xv * wv;
+            }
+            sumexp += expf(acc - max_val);
+        }
+
+        float lse = max_val + logf(sumexp);
+
+        // Two LeakyReLU (idempotent with same alpha)
+        float act = leaky_relu(lse, alpha);
+        act = leaky_relu(act, alpha);
+
+        // Two GELU
+        act = gelu(act);
+        act = gelu(act);
+
+        // store scalar result for this row
+        yLocal.SetValue(0, static_cast<DTYPE_Z>(act));
+
+        outQueueY.EnQue<DTYPE_Z>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[progress], yLocal, 1);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_W> wGm;
+    AscendC::GlobalTensor<DTYPE_B> bGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    uint32_t batchSize;
+    uint32_t inFeatures;
+    uint32_t outFeatures;
+    uint32_t tileNum;
+    uint32_t rowsPerBlock;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGemmLogSumExpLeakyReluLeakyReluGeluGelu op;
+    op.Init(x, w, b, y,
+            tiling_data.batchSize,
+            tiling_data.inFeatures,
+            tiling_data.outFeatures,
+            tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_impl_npu(const at::Tensor& x,
+                                                                           const at::Tensor& weight_t,
+                                                                           const at::Tensor& bias) {
+    // Output shape [batch, 1]
+    auto batch = x.size(0);
+    at::Tensor result = at::empty({batch, 1}, x.options());
+    EXEC_NPU_CMD(aclnnGemmLogSumExpLeakyReluLeakyReluGeluGeluCustom, x, weight_t, bias, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom", &gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom",
+          &gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_impl_npu,
+          "Fused GEMM + LogSumExp + LeakyReLU + LeakyReLU + GELU + GELU");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model that fuses Linear (Gemm) + LogSumExp + LeakyReLU + LeakyReLU + GELU + GELU
+    into a single custom AscendC kernel.
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = torch.nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        # weight_t is [in_features, out_features] to match kernel's expectation
+        weight_t = self.linear.weight.t()
+        bias = self.linear.bias if self.linear.bias is not None else torch.zeros(weight_t.size(1), device=weight_t.device, dtype=weight_t.dtype)
+        return custom_ops_lib.gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom(x, weight_t, bias)
+'''

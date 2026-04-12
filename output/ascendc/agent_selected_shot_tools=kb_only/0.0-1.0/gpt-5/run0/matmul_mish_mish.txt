@@ -1,0 +1,379 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulMishMishCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "b",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulMishMishCustomTilingData)
+  // 保留占位，具体Matmul的TCubeTiling由框架API写入RawTilingData
+  TILING_DATA_FIELD_DEF(uint32_t, dummy);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulMishMishCustom, MatmulMishMishCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+#include "lib/matmul_intf.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 从输入形状获取 M, K, N
+    const auto *x_shape = context->GetInputShape(0); // [M, K]
+    const auto *w_shape = context->GetInputShape(1); // 传入为 [K, N]（在Python侧已转置并contiguous）
+    if (x_shape->GetOriginShape().GetDimNum() != 2 || w_shape->GetOriginShape().GetDimNum() != 2) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    uint64_t M = static_cast<uint64_t>(x_shape->GetOriginShape().GetDim(0));
+    uint64_t K = static_cast<uint64_t>(x_shape->GetOriginShape().GetDim(1));
+    uint64_t K2 = static_cast<uint64_t>(w_shape->GetOriginShape().GetDim(0));
+    uint64_t N = static_cast<uint64_t>(w_shape->GetOriginShape().GetDim(1));
+    if (K != K2) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+
+    // 配置Matmul NORMAL布局，单批
+    constexpr bool aTranspose = false;
+    constexpr bool bTranspose = false; // 我们传入的是[K, N]，无需在内核再转置
+    constexpr bool c2Ub = false;
+    constexpr matmul::BatchMode batchMode = matmul::BatchMode::BATCH_LESS_THAN_L1;
+    constexpr auto MM_CFG = matmul::GetNormalConfig(aTranspose, bTranspose, c2Ub, batchMode);
+
+    // 让框架计算并下发TCubeTiling到RawTilingData
+    // 这里使用框架提供的接口将tiling直接保存到RawTilingData
+    auto *raw = context->GetRawTilingData();
+    uint8_t *buf = raw->GetData();
+    uint32_t cap = raw->GetCapacity();
+
+    matmul::MatmulApiTilingInput tilingIn;
+    tilingIn.m = static_cast<uint32_t>(M);
+    tilingIn.n = static_cast<uint32_t>(N);
+    tilingIn.k = static_cast<uint32_t>(K);
+    tilingIn.isTransA = aTranspose;
+    tilingIn.isTransB = bTranspose;
+    tilingIn.layout = matmul::LayoutMode::NORMAL;
+    tilingIn.aType = ge::DT_FLOAT;
+    tilingIn.bType = ge::DT_FLOAT;
+    tilingIn.cType = ge::DT_FLOAT;
+    tilingIn.withBias = true;
+
+    matmul::GetMatmulApiTiling(MM_CFG, tilingIn, buf, cap);
+
+    // 设置BlockDim和Workspace
+    context->SetBlockDim(8);
+    raw->SetDataSize(raw->GetCapacity()); // 直接占满（由框架填充的实际大小会设置）
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    if (x_shape->GetOriginShape().GetDimNum() != 2 || w_shape->GetOriginShape().GetDimNum() != 2) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+    int64_t M = x_shape->GetOriginShape().GetDim(0);
+    int64_t N = w_shape->GetOriginShape().GetDim(1);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    gert::SmallVector<int64_t, 4> out_shape = {M, N};
+    z_shape->SetDimNum(2);
+    z_shape->SetDim(0, M);
+    z_shape->SetDim(1, N);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MatmulMishMishCustom : public OpDef {
+public:
+    explicit MatmulMishMishCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("b")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(MatmulMishMishCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+// 简单的Mish实现：mish(x) = x * tanh(softplus(x)), softplus(x)=log(1+exp(x))
+template<typename T>
+__aicore__ inline void MishInplace(const AscendC::LocalTensor<T>& dst, const AscendC::LocalTensor<T>& src, int32_t len)
+{
+    // 分配中间局部tensor
+    AscendC::LocalTensor<T> tmpExp = dst;        // 复用dst的空间
+    AscendC::LocalTensor<T> tmpSp  = src;        // 复用src的空间
+    AscendC::LocalTensor<T> tmpTanh = dst;       // 复用
+    // e = exp(x)
+    AscendC::Exp(tmpExp, src, len);
+    // ones
+    AscendC::LocalTensor<T> ones = dst;
+    T oneV(1);
+    AscendC::Duplicate<T>(ones, oneV, len);
+    // sp = log(1 + e)
+    AscendC::Add(tmpSp, tmpExp, ones, len);
+    AscendC::Ln(tmpSp, tmpSp, len);
+    // t = tanh(sp)
+    AscendC::Tanh(tmpTanh, tmpSp, len);
+    // y = x * t
+    AscendC::Mul(dst, src, tmpTanh, len);
+}
+
+class KernelMatmulMishMish {
+public:
+    __aicore__ inline KernelMatmulMishMish() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR z, GM_ADDR tilingGM, GM_ADDR workspaceGM)
+    {
+        // 读取TCubeTiling
+        auto tempTilingGM = (__gm__ uint32_t*)tilingGM;
+        auto tempTiling = (uint32_t*)&tiling_;
+        for (int i = 0; i < (int)(sizeof(tiling_) / sizeof(int32_t)); ++i, ++tempTilingGM, ++tempTiling) {
+            *tempTiling = *tempTilingGM;
+        }
+
+        // 初始化GM
+        aGlobal.SetGlobalBuffer((__gm__ DTYPE_X*)x, tiling_.ALayoutInfoB * tiling_.singleCoreM * tiling_.singleCoreK);
+        bGlobal.SetGlobalBuffer((__gm__ DTYPE_W*)w, tiling_.BLayoutInfoB * tiling_.singleCoreK * tiling_.singleCoreN);
+        cGlobal.SetGlobalBuffer((__gm__ DTYPE_Z*)z, tiling_.CLayoutInfoB * tiling_.singleCoreM * tiling_.singleCoreN);
+        biasGlobal.SetGlobalBuffer((__gm__ DTYPE_B*)b, tiling_.CLayoutInfoB * tiling_.singleCoreN);
+
+        // Matmul实例
+        constexpr auto MM_CFG = matmul::GetNormalConfig(false, false, false, matmul::BatchMode::BATCH_LESS_THAN_L1);
+        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm_);
+        mm_.Init(&tiling_);
+        mm_.SetWorkspace(workspaceGM, 0);
+
+        // 设置Tensor A/B/偏置
+        gm_a.SetGlobalBuffer(const_cast<__gm__ DTYPE_X*>(aGlobal[0].GetPhyAddr()), tiling_.singleCoreM * tiling_.singleCoreK);
+        gm_b.SetGlobalBuffer(const_cast<__gm__ DTYPE_W*>(bGlobal[0].GetPhyAddr()), tiling_.singleCoreK * tiling_.singleCoreN);
+        gm_c.SetGlobalBuffer(const_cast<__gm__ DTYPE_Z*>(cGlobal[0].GetPhyAddr()), tiling_.singleCoreM * tiling_.singleCoreN);
+        gm_bias.SetGlobalBuffer(const_cast<__gm__ DTYPE_B*>(biasGlobal[0].GetPhyAddr()), tiling_.singleCoreN);
+
+        mm_.SetTensorA(gm_a, false);
+        mm_.SetTensorB(gm_b, false);
+        mm_.SetBias(gm_bias);
+
+        // UB缓冲为后续Mish双次激活准备
+        totalMN_ = tiling_.singleCoreM * tiling_.singleCoreN;
+        // 将整个C分块处理
+        tileLen_ = totalMN_ / AscendC::GetBlockNum();
+        tileLen_ = tileLen_ / BUFFER_NUM; // 每队列缓存大小
+        if (tileLen_ == 0) {
+            tileLen_ = totalMN_;
+        }
+        pipe.InitBuffer(inQueueC_, BUFFER_NUM, tileLen_ * sizeof(DTYPE_Z));
+        pipe.InitBuffer(outQueueZ_, BUFFER_NUM, tileLen_ * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // 先进行Matmul：C = A * B + bias
+        mm_.IterateBatch(gm_c, 1, 1, false);
+
+        // 对C执行两次Mish并输出到Z（原地）
+        int32_t loopCount = (totalMN_ + tileLen_ - 1) / tileLen_;
+        for (int32_t i = 0; i < loopCount; i++) {
+            int32_t cur = (i < loopCount - 1) ? tileLen_ : (totalMN_ - i * tileLen_);
+            CopyIn(i, cur);
+            Compute(i, cur);
+            CopyOut(i, cur);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress, int32_t curLen)
+    {
+        AscendC::LocalTensor<DTYPE_Z> cLocal = inQueueC_.AllocTensor<DTYPE_Z>();
+        AscendC::DataCopy(cLocal, gm_c[progress * tileLen_], curLen);
+        inQueueC_.EnQue(cLocal);
+    }
+    __aicore__ inline void Compute(int32_t progress, int32_t curLen)
+    {
+        AscendC::LocalTensor<DTYPE_Z> cLocal = inQueueC_.DeQue<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ_.AllocTensor<DTYPE_Z>();
+
+        // 第一次Mish
+        MishInplace<DTYPE_Z>(zLocal, cLocal, curLen);
+        // 第二次Mish：输入为上一步输出，输出仍写回zLocal
+        MishInplace<DTYPE_Z>(zLocal, zLocal, curLen);
+
+        outQueueZ_.EnQue<DTYPE_Z>(zLocal);
+        inQueueC_.FreeTensor(cLocal);
+    }
+    __aicore__ inline void CopyOut(int32_t progress, int32_t curLen)
+    {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ_.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(gm_c[progress * tileLen_], zLocal, curLen);
+        outQueueZ_.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+
+    // Matmul相关
+    TCubeTiling tiling_;
+    AscendC::GlobalTensor<DTYPE_X> aGlobal;
+    AscendC::GlobalTensor<DTYPE_W> bGlobal;
+    AscendC::GlobalTensor<DTYPE_Z> cGlobal;
+    AscendC::GlobalTensor<DTYPE_B> biasGlobal;
+
+    AscendC::GlobalTensor<DTYPE_X> gm_a;
+    AscendC::GlobalTensor<DTYPE_W> gm_b;
+    AscendC::GlobalTensor<DTYPE_Z> gm_c;
+    AscendC::GlobalTensor<DTYPE_B> gm_bias;
+
+    typedef matmul::Matmul<
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, DTYPE_X, false, LayoutMode::NORMAL>,
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, DTYPE_W, false, LayoutMode::NORMAL>,
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, DTYPE_Z, false, LayoutMode::NORMAL>,
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, DTYPE_B, false, LayoutMode::NORMAL>
+    > MatmulT;
+    MatmulT mm_;
+
+    // Mish流水
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM>  inQueueC_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ_;
+    int32_t totalMN_{0};
+    int32_t tileLen_{0};
+};
+
+extern "C" __global__ __aicore__ void matmul_mish_mish_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    KernelMatmulMishMish op;
+    op.Init(x, w, b, z, tiling, workspace);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_mish_mish_custom_impl_npu(const at::Tensor& x, const at::Tensor& w_k_n, const at::Tensor& b) {
+    // x: [M, K], w_k_n: [K, N] (Python侧已 weight.t().contiguous())
+    auto M = x.size(0);
+    auto N = w_k_n.size(1);
+    at::Tensor result = at::empty({M, N}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulMishMishCustom, x, w_k_n, b, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_mish_mish_custom", &matmul_mish_mish_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_mish_mish_custom", &matmul_mish_mish_custom_impl_npu, "Matmul + Mish + Mish fused");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear = torch.nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        # 将权重在Python侧转置为[K, N]，避免在内核中额外转置
+        w_k_n = self.linear.weight.t().contiguous()
+        b = self.linear.bias
+        return custom_ops_lib.matmul_mish_mish_custom(x, w_k_n, b)
+'''

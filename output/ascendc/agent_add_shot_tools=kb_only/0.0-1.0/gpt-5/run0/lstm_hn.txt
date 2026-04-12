@@ -17,7 +17,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "hn_out",
+                "name": "out",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -30,7 +30,6 @@ project_json_src='''
     }
 ]
 '''
-
 host_tiling_src="""
 #include "register/tilingdata_base.h"
 
@@ -43,7 +42,6 @@ END_TILING_DATA_DEF;
 REGISTER_TILING_DATA_CLASS(LstmHnCustom, LstmHnCustomTilingData)
 }
 """
-
 host_operator_src="""
 #include "lstm_hn_custom_tiling.h"
 #include "register/op_def_registry.h"
@@ -75,12 +73,11 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
     *out_shape = *in_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
-    return ge::GRAPH_SUCCESS;
+    return GRAPH_SUCCESS;
 }
 }
 
@@ -94,7 +91,7 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("hn_out")
+        this->Output("out")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -111,30 +108,26 @@ public:
 OP_ADD(LstmHnCustom);
 }
 """
-
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "lstm_hn_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2;
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
-class KernelHnCopy {
+class KernelLstmHn {
 public:
-    __aicore__ inline KernelHnCopy() {}
-    __aicore__ inline void Init(GM_ADDR hn, GM_ADDR hn_out, uint32_t totalLength, uint32_t tileNum)
+    __aicore__ inline KernelLstmHn() {}
+    __aicore__ inline void Init(GM_ADDR in, GM_ADDR out, uint32_t totalLength, uint32_t tileNum)
     {
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        inGm.SetGlobalBuffer((__gm__ DTYPE_X *)hn + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        outGm.SetGlobalBuffer((__gm__ DTYPE_Z *)hn_out + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        inGm.SetGlobalBuffer((__gm__ float *)in + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        outGm.SetGlobalBuffer((__gm__ float *)out + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+        pipe.InitBuffer(inQueue, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueue, BUFFER_NUM, this->tileLength * sizeof(float));
     }
-
     __aicore__ inline void Process()
     {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
@@ -148,46 +141,43 @@ public:
 private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueue.AllocTensor<DTYPE_X>();
-        AscendC::DataCopy(xLocal, inGm[progress * this->tileLength], this->tileLength);
-        inQueue.EnQue(xLocal);
+        AscendC::LocalTensor<float> inLocal = inQueue.AllocTensor<float>();
+        AscendC::DataCopy(inLocal, inGm[progress * this->tileLength], this->tileLength);
+        inQueue.EnQue(inLocal);
     }
-
     __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueue.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueue.AllocTensor<DTYPE_Z>();
-        AscendC::DataCopy(zLocal, xLocal, this->tileLength);
-        outQueue.EnQue<DTYPE_Z>(zLocal);
-        inQueue.FreeTensor(xLocal);
+        AscendC::LocalTensor<float> inLocal = inQueue.DeQue<float>();
+        AscendC::LocalTensor<float> outLocal = outQueue.AllocTensor<float>();
+        AscendC::DataCopy(outLocal, inLocal, this->tileLength);
+        outQueue.EnQue<float>(outLocal);
+        inQueue.FreeTensor(inLocal);
     }
-
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueue.DeQue<DTYPE_Z>();
-        AscendC::DataCopy(outGm[progress * this->tileLength], zLocal, this->tileLength);
-        outQueue.FreeTensor(zLocal);
+        AscendC::LocalTensor<float> outLocal = outQueue.DeQue<float>();
+        AscendC::DataCopy(outGm[progress * this->tileLength], outLocal, this->tileLength);
+        outQueue.FreeTensor(outLocal);
     }
 
 private:
     AscendC::TPipe pipe;
     AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueue;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
-    AscendC::GlobalTensor<DTYPE_X> inGm;
-    AscendC::GlobalTensor<DTYPE_Z> outGm;
+    AscendC::GlobalTensor<float> inGm;
+    AscendC::GlobalTensor<float> outGm;
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void lstm_hn_custom(GM_ADDR hn, GM_ADDR hn_out, GM_ADDR workspace, GM_ADDR tiling) {
+extern "C" __global__ __aicore__ void lstm_hn_custom(GM_ADDR in, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelHnCopy op;
-    op.Init(hn, hn_out, tiling_data.totalLength, tiling_data.tileNum);
+    KernelLstmHn op;
+    op.Init(in, out, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
-
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
@@ -205,10 +195,9 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("lstm_hn_custom", &lstm_hn_custom_impl_npu, "copy hn");
+    m.def("lstm_hn_custom", &lstm_hn_custom_impl_npu, "identity copy of LSTM hn");
 }
 """
-
 model_src='''
 import torch
 import torch_npu
@@ -216,12 +205,13 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
-        super(ModelNew, self).__init__()
+        super().__init__()
         self.lstm = torch.nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout, bidirectional=False)
         self.fc = torch.nn.Linear(hidden_size, output_size)
 
     def forward(self, x, h0, c0):
         out, state = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
-        return custom_ops_lib.lstm_hn_custom(state[0])
+        _ = self.fc(out[:, -1, :])  # keep same computation path for consistency, though output is not used
+        hn = state[0]
+        return custom_ops_lib.lstm_hn_custom(hn)
 '''

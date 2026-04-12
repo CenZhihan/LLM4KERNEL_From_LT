@@ -11,19 +11,29 @@ project_json_src='''
                     "ND"
                 ],
                 "type": [
-                    "float"
+                    "float16"
                 ]
-            }
-        ],
-        "output_desc": [
+            },
             {
-                "name": "y",
+                "name": "mask",
                 "param_type": "required",
                 "format": [
                     "ND"
                 ],
                 "type": [
-                    "float"
+                    "float16"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float16"
                 ]
             }
         ]
@@ -47,34 +57,21 @@ REGISTER_TILING_DATA_CLASS(ReluSelfAttentionCustom, ReluSelfAttentionCustomTilin
 host_operator_src="""
 #include "relu_self_attention_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/platform/platform_ascendc.h"
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    uint64_t ub_size = 0, l1_size = 0;
-    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub_size);
-    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::L1, l1_size);
-    auto aicNum = ascendcPlatform.GetCoreNumAic();
-    auto aivNum = ascendcPlatform.GetCoreNumAiv();
-
-    // set block dim based on platform info
-    context->SetBlockDim(ascendcPlatform.CalcTschBlockDim(aivNum, aicNum, aivNum));
-
     ReluSelfAttentionCustomTilingData tiling;
-    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
-
-    // simple tiling: split equally with fixed tile num
-    const uint32_t TILE_NUM = 8;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
-    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
-    workspaceSizes[0] = 0;
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -83,11 +80,10 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    *y_shape = *x_shape;
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    *z_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -103,13 +99,17 @@ public:
     {
         this->Input("x")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
+            .DataType({ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Output("y")
+        this->Input("mask")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
@@ -127,85 +127,83 @@ OP_ADD(ReluSelfAttentionCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "relu_self_attention_custom_tiling_data.h"
 
-// Use Relu API per CANN Ascend C reference (4.1.1.8 Relu)
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的双缓冲块数
 
-constexpr int32_t BUFFER_NUM = 2; // ping-pong buffer
-
-class KernelRelu {
+class KernelReluSelfAttention {
 public:
-    __aicore__ inline KernelRelu() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
+    __aicore__ inline KernelReluSelfAttention() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR mask, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
     {
-        this->blockLength = (totalLength + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
-        this->blockLength = AscendC::Min(this->blockLength, totalLength - this->blockLength * AscendC::GetBlockIdx());
-        this->tileNum = tileNum > 0 ? tileNum : 1;
-        this->tileLength = AscendC::Max(1u, this->blockLength / (this->tileNum * BUFFER_NUM));
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + ((uint64_t)AscendC::GetBlockIdx()) * ((uint64_t)this->blockLength), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + ((uint64_t)AscendC::GetBlockIdx()) * ((uint64_t)this->blockLength), this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        mGm.SetGlobalBuffer((__gm__ DTYPE_Y *)mask + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
         pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(inQueueM, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
     }
-
     __aicore__ inline void Process()
     {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
-        uint32_t processed = 0;
-        for (int32_t i = 0; i < loopCount; ++i) {
-            uint32_t curr = AscendC::Min(this->tileLength, this->blockLength - processed);
-            if (curr == 0) break;
-            CopyIn(i, curr);
-            Compute(i, curr);
-            CopyOut(i, curr);
-            processed += curr;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress, uint32_t len)
+    __aicore__ inline void CopyIn(int32_t progress)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], len);
+        AscendC::LocalTensor<DTYPE_Y> mLocal = inQueueM.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(mLocal, mGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
+        inQueueM.EnQue(mLocal);
     }
-
-    __aicore__ inline void Compute(int32_t progress, uint32_t len)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
-        // Element-wise ReLU as per API: y = Relu(x)
-        AscendC::Relu(yLocal, xLocal, (int32_t)len);
-        outQueueY.EnQue<DTYPE_Y>(yLocal);
-        inQueueX.FreeTensor(xLocal);
-    }
+        AscendC::LocalTensor<DTYPE_Y> mLocal = inQueueM.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
 
-    __aicore__ inline void CopyOut(int32_t progress, uint32_t len)
+        // 先对x进行ReLU，再与mask按元素相乘，实现 masked ReLU
+        AscendC::Relu(zLocal, xLocal, this->tileLength);
+        AscendC::Mul(zLocal, zLocal, mLocal, this->tileLength);
+
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueM.FreeTensor(mLocal);
+    }
+    __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, len);
-        outQueueY.FreeTensor(yLocal);
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueM;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
     AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<DTYPE_Y> mGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void relu_self_attention_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void relu_self_attention_custom(GM_ADDR x, GM_ADDR mask, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelRelu op;
-    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum);
+    KernelReluSelfAttention op;
+    op.Init(x, mask, z, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -216,10 +214,9 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor relu_self_attention_custom_impl_npu(const at::Tensor& self) {
-    at::Tensor result = at::empty_like(self);
-    // Call the custom NPU kernel
-    EXEC_NPU_CMD(aclnnReluSelfAttentionCustom, self, result);
+at::Tensor relu_self_attention_custom_impl_npu(const at::Tensor& x, const at::Tensor& mask) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnReluSelfAttentionCustom, x, mask, result);
     return result;
 }
 
@@ -228,17 +225,16 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("relu_self_attention_custom", &relu_self_attention_custom_impl_npu, "ReLU for self-attention");
+    m.def("relu_self_attention_custom", &relu_self_attention_custom_impl_npu, "masked ReLU for self-attention");
 }
 """
 
 model_src='''
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
 import torch_npu
 import custom_ops_lib
+import math
+import torch.nn as nn
 
 class NewGELU(nn.Module):
     def __init__(self):
@@ -246,32 +242,33 @@ class NewGELU(nn.Module):
     def forward(self, x):
         return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
-class ModelNew(nn.Module):
+class ModelNew(torch.nn.Module):
     def __init__(self, n_embd, n_head, max_seqlen):
         super().__init__()
         assert n_embd % n_head == 0
         self.c_attn = nn.Linear(n_embd, 3 * n_embd)
         self.c_proj = nn.Linear(n_embd, n_embd)
         self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
-                                      .view(1, 1, max_seqlen, max_seqlen))
+                                     .view(1, 1, max_seqlen, max_seqlen))
         self.n_head = n_head
         self.n_embd = n_embd
 
     def forward(self, x):
         B, T, C = x.size()
-
         q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
 
-        # Replace F.relu with custom AscendC kernel op
-        att = custom_ops_lib.relu_self_attention_custom(att)
+        # 使用自定义AscendC算子：对att做ReLU并按掩码置零（等价于原 masked_fill(-inf) 后 ReLU）
+        mask_fp16 = self.bias[:, :, :T, :T].expand(B, self.n_head, T, T).contiguous().to(torch.float16)
+        att_fp16 = att.to(torch.float16)
+        att_relu_masked_fp16 = custom_ops_lib.relu_self_attention_custom(att_fp16, mask_fp16)
+        att_relu_masked = att_relu_masked_fp16.to(att.dtype)
 
-        y = att @ v
+        y = att_relu_masked @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return y
 '''

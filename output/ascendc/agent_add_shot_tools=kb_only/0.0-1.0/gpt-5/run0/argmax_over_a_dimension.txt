@@ -3,20 +3,34 @@ project_json_src='''
     {
         "op": "ArgmaxOverADimensionCustom",
         "language": "cpp",
+        "attr_desc": [
+            {
+                "name": "dim",
+                "type": "int"
+            }
+        ],
         "input_desc": [
             {
                 "name": "x",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ],
         "output_desc": [
             {
                 "name": "indices",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["int32"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
             }
         ]
     }
@@ -24,17 +38,115 @@ project_json_src='''
 '''
 
 host_tiling_src="""
+#include <vector>
 #include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
 
 namespace optiling {
+
 BEGIN_TILING_DATA_DEF(ArgmaxOverADimensionCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, outter);
-  TILING_DATA_FIELD_DEF(uint32_t, inner);
-  TILING_DATA_FIELD_DEF(uint32_t, tileRows);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(int32_t, outter);
+  TILING_DATA_FIELD_DEF(int32_t, inner);
+  TILING_DATA_FIELD_DEF(int32_t, n);
+  TILING_DATA_FIELD_DEF(int32_t, k);
+  TILING_DATA_FIELD_DEF(bool, islargest);
+  TILING_DATA_FIELD_DEF(bool, isinitindex);
+  TILING_DATA_FIELD_DEF(uint32_t, tmpsize);
+  TILING_DATA_FIELD_DEF(int32_t, dim);
+  TILING_DATA_FIELD_DEF_STRUCT(TopkTiling, topkTilingData);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ArgmaxOverADimensionCustom, ArgmaxOverADimensionCustomTilingData)
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ArgmaxOverADimensionCustomTilingData tiling;
+
+    // Input shape info
+    const gert::Shape* inShape = context->GetInputShape(0);
+    uint32_t totalLength = static_cast<uint32_t>(inShape->GetOriginShape().GetShapeSize());
+    int64_t rank = inShape->GetOriginShape().GetDimNum();
+
+    // Read attr dim if available, default to 1
+    int64_t dimAttr = 1;
+    // Depending on runtime, attribute retrieval may differ; default used if not present.
+    // try get attr "dim"
+    if (context->HasAttr("dim")) {
+        dimAttr = context->GetAttr<int64_t>("dim");
+    }
+    // Normalize negative dims
+    if (dimAttr < 0) {
+        dimAttr += rank;
+    }
+    if (dimAttr < 0) dimAttr = 0;
+    if (dimAttr >= rank) dimAttr = rank > 0 ? (rank - 1) : 0;
+
+    // Compute inner/outter
+    int64_t inner = inShape->GetOriginShape().GetDim(dimAttr);
+    int64_t outter = (inner == 0) ? 0 : (inShape->GetOriginShape().GetShapeSize() / inner);
+
+    // Fill tiling base fields
+    tiling.set_totalLength(totalLength);
+    tiling.set_inner(static_cast<int32_t>(inner));
+    tiling.set_outter(static_cast<int32_t>(outter));
+    tiling.set_n(static_cast<int32_t>(inner));
+    tiling.set_k(1);
+    tiling.set_islargest(true);
+    // For simplicity, pass isinitindex=true to align with KernelTopK template below
+    tiling.set_isinitindex(true);
+    tiling.set_dim(static_cast<int32_t>(dimAttr));
+
+    // Platform info and TopK tiling
+    auto platformInfo = context->GetPlatformInfo();
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
+
+    uint32_t maxsize = 0;
+    uint32_t minsize = 0;
+    // Input dtype float => dataTypeSize=4
+    const uint32_t dtypesize = 4;
+
+    // Get tiling for TopK (k=1 argmax)
+    // Note: mode uses TOPK_NORMAL; isLargest=true
+    AscendC::TopKTilingFunc(ascendcPlatform,
+                            tiling.inner(),
+                            tiling.outter(),
+                            tiling.k(),
+                            dtypesize,
+                            tiling.isinitindex(),
+                            AscendC::TopKMode::TOPK_NORMAL,
+                            tiling.islargest(),
+                            tiling.topkTilingData());
+
+    AscendC::GetTopKMaxMinTmpSize(ascendcPlatform,
+                                  tiling.inner(),
+                                  tiling.outter(),
+                                  /*isReuseSource*/false,
+                                  tiling.isinitindex(),
+                                  AscendC::TopKMode::TOPK_NORMAL,
+                                  tiling.islargest(),
+                                  dtypesize,
+                                  maxsize,
+                                  minsize);
+
+    // Choose minimal tmp size that guarantees correctness
+    tiling.set_tmpsize(minsize);
+
+    // Set block dim
+    const uint32_t BLOCK_DIM = 8;
+    context->SetBlockDim(BLOCK_DIM);
+
+    // Save tiling
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // No extra workspace requested here (kernel will reuse provided workspace)
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
 }
+
+} // namespace optiling
 """
 
 host_operator_src="""
@@ -42,71 +154,51 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 
 namespace optiling {
-static ge::graphStatus TilingFunc(gert::TilingContext* context)
-{
-    // 本算子在内核侧实现“沿最后一维求argmax”，因此在PyTorch侧将把dim维换到最后一维再调用本算子。
-    ArgmaxOverADimensionCustomTilingData tiling;
-
-    const gert::StorageShape *x_shape = context->GetInputShape(0);
-    const auto &shape = x_shape->GetStorageShape();
-    int64_t dims = shape.GetStorageShape().GetDimNum();
-    if (dims < 1) {
-        return ge::GRAPH_FAILED;
-    }
-
-    uint32_t inner = static_cast<uint32_t>(shape.GetDim(dims - 1));
-    uint32_t outter = 1;
-    for (int64_t i = 0; i < dims - 1; ++i) {
-        outter *= static_cast<uint32_t>(shape.GetDim(i));
-    }
-
-    // 简单设定每个Block处理的行切分，以及每次处理的tile行数
-    // 这里选择tileRows为一个经验值，实际可根据UB大小、inner等做更精细计算
-    const uint32_t BLOCK_DIM = 8;
-    context->SetBlockDim(BLOCK_DIM);
-    uint32_t tileRows = 8;
-    if (tileRows > outter) tileRows = outter;
-
-    tiling.set_outter(outter);
-    tiling.set_inner(inner);
-    tiling.set_tileRows(tileRows);
-
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
-    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
-    return ge::GRAPH_SUCCESS;
+extern ge::graphStatus TilingFunc(gert::TilingContext* context);
 }
-} // namespace optiling
-
 
 namespace ge {
+
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 输出形状为输入形状去掉最后一维
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    const auto &origin = x_shape->GetOriginShape();
-    std::vector<int64_t> out_dims;
-    out_dims.reserve(origin.GetDimNum() > 0 ? origin.GetDimNum() - 1 : 0);
-    for (size_t i = 0; i + 1 < origin.GetDimNum(); ++i) {
-        out_dims.push_back(origin.GetDim(i));
+    // Get input shape and attr dim
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+
+    int64_t rank = in_shape->GetOriginShape().GetDimNum();
+    int64_t dimAttr = 1;
+    if (context->HasAttr("dim")) {
+        dimAttr = context->GetAttr<int64_t>("dim");
     }
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    y_shape->SetDim(out_dims);
+    if (dimAttr < 0) dimAttr += rank;
+    if (dimAttr < 0) dimAttr = 0;
+    if (dimAttr >= rank) dimAttr = rank > 0 ? (rank - 1) : 0;
+
+    // Build output dims by removing the specified dimension
+    std::vector<int64_t> outDims;
+    outDims.reserve(rank > 0 ? (rank - 1) : 0);
+    for (int64_t i = 0; i < rank; ++i) {
+        if (i == dimAttr) continue;
+        outDims.push_back(in_shape->GetOriginShape().GetDim(i));
+    }
+    out_shape->SetDimNum(outDims.size());
+    for (size_t i = 0; i < outDims.size(); ++i) {
+        out_shape->SetDim(i, outDims[i]);
+    }
     return GRAPH_SUCCESS;
 }
 
-static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
 {
-    // indices输出为int32
+    // Argmax outputs indices; set to INT32
     context->SetOutputDataType(0, ge::DT_INT32);
     return ge::GRAPH_SUCCESS;
 }
-}
 
+} // namespace ge
 
 namespace ops {
+
 class ArgmaxOverADimensionCustom : public OpDef {
 public:
     explicit ArgmaxOverADimensionCustom(const char* name) : OpDef(name)
@@ -116,12 +208,13 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("indices")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+        // Attribute: dim
+        this->Attr("dim").SetInt(1);
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
@@ -130,155 +223,46 @@ public:
 };
 
 OP_ADD(ArgmaxOverADimensionCustom);
-}
+
+} // namespace ops
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "argmax_over_a_dimension_custom_tiling_data.h"
 
-using DTYPE_X = float;
-using DTYPE_IDX = int32_t;
+// Use TopK high-level API with k=1 to implement Argmax.
 
-constexpr int32_t BUFFER_NUM = 2;
-
-// 内核实现：对输入按行（最后一维长度为inner）做argmax，输出每行的最大值位置（int32）
-class KernelArgmaxLastDim {
-public:
-    __aicore__ inline KernelArgmaxLastDim() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR indices,
-                                uint32_t outter, uint32_t inner, uint32_t tileRows)
-    {
-        this->outter = outter;
-        this->inner = inner;
-        this->tileRows = tileRows;
-
-        // 每个Block处理的行范围
-        uint32_t blocks = AscendC::GetBlockNum();
-        uint32_t blockId = AscendC::GetBlockIdx();
-        this->rowsPerBlock = (outter + blocks - 1) / blocks;
-        this->rowStart = blockId * this->rowsPerBlock;
-        if (this->rowStart > outter) this->rowStart = outter;
-        this->rowEnd = this->rowStart + this->rowsPerBlock;
-        if (this->rowEnd > outter) this->rowEnd = outter;
-        this->blockRows = (this->rowEnd > this->rowStart) ? (this->rowEnd - this->rowStart) : 0;
-
-        // 每个tile处理的元素数量
-        this->rowsPerTile = (this->tileRows == 0) ? 1 : this->tileRows;
-        if (this->rowsPerTile > this->blockRows) this->rowsPerTile = this->blockRows;
-        this->elemsPerTile = this->rowsPerTile * this->inner;
-
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + static_cast<uint64_t>(this->rowStart) * this->inner,
-                            static_cast<uint64_t>(this->blockRows) * this->inner);
-        idxGm.SetGlobalBuffer((__gm__ DTYPE_IDX*)indices + this->rowStart,
-                              this->blockRows);
-
-        // 初始化队列Buffer
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->elemsPerTile * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueIdx, BUFFER_NUM, this->rowsPerTile * sizeof(DTYPE_IDX));
-    }
-
-    __aicore__ inline void Process()
-    {
-        if (this->blockRows == 0) return;
-        // 计算循环次数：每次处理rowsPerTile行
-        uint32_t totalTiles = (this->blockRows + this->rowsPerTile - 1) / this->rowsPerTile;
-        uint32_t loopCount = totalTiles * BUFFER_NUM;
-        for (uint32_t i = 0; i < loopCount; ++i) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
-        }
-    }
-
-private:
-    __aicore__ inline void CopyIn(uint32_t progress)
-    {
-        uint32_t tileIdx = progress % ((this->blockRows + this->rowsPerTile - 1) / this->rowsPerTile);
-        uint32_t rowOffset = tileIdx * this->rowsPerTile;
-        uint32_t validRows = this->rowsPerTile;
-        if (rowOffset + validRows > this->blockRows) {
-            validRows = this->blockRows - rowOffset;
-        }
-        uint32_t validElems = validRows * this->inner;
-
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::DataCopy(xLocal, xGm[rowOffset * this->inner], validElems);
-        inQueueX.EnQue(xLocal);
-
-        // 记录当前tile的有效行数
-        currentValidRows = validRows;
-    }
-
-    __aicore__ inline void Compute(uint32_t /*progress*/)
-    {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_IDX> idxLocal = outQueueIdx.AllocTensor<DTYPE_IDX>();
-
-        // 对每一行做argmax（最后一维大小为inner，局部内存中按行连续）
-        // 简单标量遍历以保证正确性
-        for (uint32_t r = 0; r < currentValidRows; ++r) {
-            uint32_t base = r * inner;
-            // 初始化
-            float maxv = xLocal.GetValue(base + 0);
-            int32_t maxIdx = 0;
-            for (uint32_t c = 1; c < inner; ++c) {
-                float v = xLocal.GetValue(base + c);
-                if (v > maxv) {
-                    maxv = v;
-                    maxIdx = static_cast<int32_t>(c);
-                }
-            }
-            // 写入该行的argmax索引
-            idxLocal.SetValue(r, maxIdx);
-        }
-
-        outQueueIdx.EnQue(idxLocal);
-        inQueueX.FreeTensor(xLocal);
-    }
-
-    __aicore__ inline void CopyOut(uint32_t progress)
-    {
-        uint32_t tileIdx = progress % ((this->blockRows + this->rowsPerTile - 1) / this->rowsPerTile);
-        uint32_t rowOffset = tileIdx * this->rowsPerTile;
-        uint32_t validRows = this->rowsPerTile;
-        if (rowOffset + validRows > this->blockRows) {
-            validRows = this->blockRows - rowOffset;
-        }
-
-        AscendC::LocalTensor<DTYPE_IDX> idxLocal = outQueueIdx.DeQue<DTYPE_IDX>();
-        AscendC::DataCopy(idxGm[rowOffset], idxLocal, validRows);
-        outQueueIdx.FreeTensor(idxLocal);
-    }
-
-private:
-    AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueIdx;
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_IDX> idxGm;
-
-    uint32_t outter;
-    uint32_t inner;
-    uint32_t tileRows;
-
-    uint32_t rowsPerBlock;
-    uint32_t rowStart;
-    uint32_t rowEnd;
-    uint32_t blockRows;
-
-    uint32_t rowsPerTile;
-    uint32_t elemsPerTile;
-    uint32_t currentValidRows;
-};
-
-extern "C" __global__ __aicore__ void argmax_over_a_dimension_custom(GM_ADDR x, GM_ADDR indices, GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void argmax_over_a_dimension_custom(GM_ADDR x,
+                                                                      GM_ADDR indices,
+                                                                      GM_ADDR workspace,
+                                                                      GM_ADDR tiling)
 {
-    (void)workspace;
-    GET_TILING_DATA(tiling_data, tiling);
-    KernelArgmaxLastDim op;
-    op.Init(x, indices, tiling_data.outter, tiling_data.inner, tiling_data.tileRows);
+    GET_TILING_DATA(tilingData, tiling);
+
+    // Template params follow TopK example: <T, isReuseSrc, isInitIndex, keepTopKIdx, sorted, Mode>
+    KernelTopK<float, false, true, false, false, AscendC::TopKMode::TOPK_NORMAL> op;
+
+    // Partition workspace for required GM buffers (srcIdx, finishLocal, dstVal)
+    // Use tmpsize as a safe segment size.
+    __gm__ uint8_t* ws_base = reinterpret_cast<__gm__ uint8_t*>(workspace);
+    GM_ADDR srcIdx      = reinterpret_cast<GM_ADDR>(ws_base);
+    GM_ADDR finishLocal = reinterpret_cast<GM_ADDR>(ws_base + tilingData.tmpsize);
+    GM_ADDR dstVal      = reinterpret_cast<GM_ADDR>(ws_base + tilingData.tmpsize * 2);
+
+    // Initialize and run TopK with k=1 (argmax)
+    op.Init(x,
+            srcIdx,
+            finishLocal,
+            dstVal,
+            indices,
+            tilingData.k(),            // 1
+            tilingData.islargest(),    // true
+            tilingData.tmpsize(),      // tmp size
+            tilingData.outter(),       // outer axis length
+            tilingData.inner(),        // inner axis length
+            tilingData.n(),            // same as inner
+            tilingData.topkTilingData());
+
     op.Process();
 }
 """
@@ -286,28 +270,36 @@ extern "C" __global__ __aicore__ void argmax_over_a_dimension_custom(GM_ADDR x, 
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
-#include "pytorch_npu_helper.hpp"
+#include \"pytorch_npu_helper.hpp\"
 #include <torch/extension.h>
 
-at::Tensor argmax_over_a_dimension_custom_impl_npu(const at::Tensor& self) {
-    // 输出形状 = 输入去掉最后一维
-    auto in_sizes = self.sizes();
-    TORCH_CHECK(in_sizes.size() >= 1, \\"input rank must be >=1\\");
-    std::vector<int64_t> out_sizes(in_sizes.begin(), in_sizes.end() - 1);
-    if (out_sizes.size() == 0) {
-        out_sizes.push_back(1); // 标量视作1维
+at::Tensor argmax_over_a_dimension_custom_impl_npu(const at::Tensor& self, int64_t dim) {
+    // Normalize dim
+    int64_t rank = self.dim();
+    if (dim < 0) dim += rank;
+    if (dim < 0) dim = 0;
+    if (dim >= rank) dim = rank > 0 ? (rank - 1) : 0;
+
+    // Build output shape (remove 'dim')
+    std::vector<int64_t> out_sizes;
+    out_sizes.reserve(rank > 0 ? (rank - 1) : 0);
+    for (int64_t i = 0; i < rank; ++i) {
+        if (i == dim) continue;
+        out_sizes.push_back(self.size(i));
     }
+
     at::Tensor result = at::empty(out_sizes, self.options().dtype(at::kInt));
-    EXEC_NPU_CMD(aclnnArgmaxOverADimensionCustom, self, result);
+
+    EXEC_NPU_CMD(aclnnArgmaxOverADimensionCustom, self, dim, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("argmax_over_a_dimension_custom", &argmax_over_a_dimension_custom_impl_npu);
+    m.impl(\"argmax_over_a_dimension_custom\", &argmax_over_a_dimension_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("argmax_over_a_dimension_custom", &argmax_over_a_dimension_custom_impl_npu, "argmax over last dim");
+    m.def(\"argmax_over_a_dimension_custom\", &argmax_over_a_dimension_custom_impl_npu, \"Argmax over a dimension\");
 }
 """
 
@@ -317,42 +309,10 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    使用自定义AscendC算子，按指定维度做Argmax。
-    内核只实现“沿最后一维”的argmax，
-    这里在Python侧将dim维移到最后，再调用内核，最后把结果维度移回原顺序（去掉了该维）。
-    """
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dim = self.dim % x.dim()
-        # 将目标维移到最后
-        if dim != x.dim() - 1:
-            perm = [i for i in range(x.dim()) if i != dim] + [dim]
-            x_perm = x.permute(perm).contiguous()
-        else:
-            perm = list(range(x.dim()))
-            x_perm = x
-
-        # 调用自定义算子（沿最后一维）
-        idx = custom_ops_lib.argmax_over_a_dimension_custom(x_perm)
-
-        # 将输出(去掉最后一维)移回原顺序
-        # perm把dim挪到了末尾，输出idx的维度是perm[:-1]
-        # 需要求perm[:-1]的逆置换
-        if len(perm) > 1:
-            # 构造perm去掉最后一维后的逆置换
-            kept = perm[:-1]
-            inv = [0] * len(kept)
-            for i, p in enumerate(kept):
-                inv[p if p < len(kept) else len(kept)-1] = i  # 防御性写法
-            # 实际逆置换是根据kept的相对次序恢复到原索引顺序[0..dim-1, dim+1..]
-            # 更稳妥的求法：
-            inv = [kept.index(i) for i in range(len(kept))]
-            if len(inv) > 1:
-                idx = idx.permute(inv).contiguous()
-
-        return idx
+        return custom_ops_lib.argmax_over_a_dimension_custom(x, self.dim)
 '''

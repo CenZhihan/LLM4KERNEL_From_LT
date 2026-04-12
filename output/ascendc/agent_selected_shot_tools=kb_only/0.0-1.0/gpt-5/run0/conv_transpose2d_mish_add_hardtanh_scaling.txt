@@ -1,0 +1,318 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTranspose2dMishAddHardtanhScalingCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "attr_desc": [
+            {
+                "name": "add_value",
+                "type": "float"
+            },
+            {
+                "name": "min_val",
+                "type": "float"
+            },
+            {
+                "name": "max_val",
+                "type": "float"
+            },
+            {
+                "name": "scale",
+                "type": "float"
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTranspose2dMishAddHardtanhScalingCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(float, addValue);
+  TILING_DATA_FIELD_DEF(float, minVal);
+  TILING_DATA_FIELD_DEF(float, maxVal);
+  TILING_DATA_FIELD_DEF(float, scale);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTranspose2dMishAddHardtanhScalingCustom, ConvTranspose2dMishAddHardtanhScalingCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transpose2d_mish_add_hardtanh_scaling_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTranspose2dMishAddHardtanhScalingCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+
+    const gert::RuntimeAttrs* attrs = context->GetAttrs();
+    float addValue = *(attrs->GetAttrPointer<float>(0));
+    float minVal   = *(attrs->GetAttrPointer<float>(1));
+    float maxVal   = *(attrs->GetAttrPointer<float>(2));
+    float scale    = *(attrs->GetAttrPointer<float>(3));
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_addValue(addValue);
+    tiling.set_minVal(minVal);
+    tiling.set_maxVal(maxVal);
+    tiling.set_scale(scale);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTranspose2dMishAddHardtanhScalingCustom : public OpDef {
+public:
+    explicit ConvTranspose2dMishAddHardtanhScalingCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("add_value").AttrType(REQUIRED).Float(0.0);
+        this->Attr("min_val").AttrType(REQUIRED).Float(-1.0);
+        this->Attr("max_val").AttrType(REQUIRED).Float(1.0);
+        this->Attr("scale").AttrType(REQUIRED).Float(1.0);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTranspose2dMishAddHardtanhScalingCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+// 本算子实现对输入张量执行 Mish -> +add_value -> HardTanh(min_val,max_val) -> *scale 的融合
+// 注意：转置卷积由上层PyTorch模块执行，本算子仅对其输出进行后处理
+
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的tensor数量
+
+class KernelConvTranspose2dMishAddHardtanhScaling {
+public:
+    __aicore__ inline KernelConvTranspose2dMishAddHardtanhScaling() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum,
+                                float addValue, float minVal, float maxVal, float scale)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        this->addValue = addValue;
+        this->minVal = minVal;
+        this->maxVal = maxVal;
+        this->scale = scale;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X)); // 中间缓冲
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_X> tmpLocal = tmpQueue.AllocTensor<DTYPE_X>();
+
+        // tmp = exp(x)
+        AscendC::Exp(tmpLocal, xLocal, this->tileLength);
+        // tmp = ln(1 + tmp)
+        AscendC::Adds(tmpLocal, tmpLocal, static_cast<DTYPE_X>(1.0f), this->tileLength);
+        AscendC::Ln(tmpLocal, tmpLocal, this->tileLength);
+        // tmp = tanh(tmp)
+        AscendC::Tanh(tmpLocal, tmpLocal, this->tileLength);
+        // y = x * tmp  (Mish)
+        AscendC::Mul(yLocal, xLocal, tmpLocal, this->tileLength);
+        // y = y + add_value
+        AscendC::Adds(yLocal, yLocal, static_cast<DTYPE_Y>(this->addValue), this->tileLength);
+        // y = clamp(y, min_val, max_val)  先与下界比较取大，再与上界比较取小
+        AscendC::Maxs(yLocal, yLocal, static_cast<DTYPE_Y>(this->minVal), this->tileLength);
+        AscendC::Mins(yLocal, yLocal, static_cast<DTYPE_Y>(this->maxVal), this->tileLength);
+        // y = y * scale
+        AscendC::Muls(yLocal, yLocal, static_cast<DTYPE_Y>(this->scale), this->tileLength);
+
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        tmpQueue.FreeTensor(tmpLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+
+    float addValue;
+    float minVal;
+    float maxVal;
+    float scale;
+};
+
+extern "C" __global__ __aicore__ void conv_transpose2d_mish_add_hardtanh_scaling_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConvTranspose2dMishAddHardtanhScaling op;
+    op.Init(x, y,
+            tiling_data.totalLength,
+            tiling_data.tileNum,
+            tiling_data.addValue,
+            tiling_data.minVal,
+            tiling_data.maxVal,
+            tiling_data.scale);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_transpose2d_mish_add_hardtanh_scaling_custom_impl_npu(const at::Tensor& x,
+                                                                      double add_value,
+                                                                      double scale) {
+    at::Tensor result = at::empty_like(x);
+    double min_val = -1.0;
+    double max_val = 1.0;
+    EXEC_NPU_CMD(aclnnConvTranspose2dMishAddHardtanhScalingCustom, x, add_value, min_val, max_val, scale, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transpose2d_mish_add_hardtanh_scaling_custom", &conv_transpose2d_mish_add_hardtanh_scaling_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transpose2d_mish_add_hardtanh_scaling_custom", &conv_transpose2d_mish_add_hardtanh_scaling_custom_impl_npu,
+          "Fused Mish+Add+Hardtanh+Scale");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    优化版本：保留 PyTorch 的 ConvTranspose2d（转置卷积），
+    将后续 Mish -> 加常数 -> Hardtanh -> 缩放 的流水线融合为自定义 AscendC 算子。
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, output_padding)
+        self.add_value = float(add_value)
+        self.scale = float(scale)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        # 融合 Mish -> +add_value -> Hardtanh([-1,1]) -> *scale
+        x = custom_ops_lib.conv_transpose2d_mish_add_hardtanh_scaling_custom(x, self.add_value, self.scale)
+        return x
+'''

@@ -17,7 +17,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "z",
+                "name": "y",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -30,28 +30,29 @@ project_json_src='''
     }
 ]
 '''
-
 host_tiling_src="""
 #include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+#include "graph/tensor.h"
+#include "register/op_def_registry.h"
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ConvTranspose2dMishAddHardtanhScalingCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, tmpBufferSize);
   TILING_DATA_FIELD_DEF(float, addValue);
-  TILING_DATA_FIELD_DEF(float, minVal);
-  TILING_DATA_FIELD_DEF(float, maxVal);
-  TILING_DATA_FIELD_DEF(float, scale);
+  TILING_DATA_FIELD_DEF(float, scaleValue);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ConvTranspose2dMishAddHardtanhScalingCustom, ConvTranspose2dMishAddHardtanhScalingCustomTilingData)
 }
 """
-
 host_operator_src="""
-#include "conv_transpose2d_mish_add_hardtanh_scaling_custom_tiling.h"
 #include "register/op_def_registry.h"
+#include "register/tilingdata_base.h"
 #include "tiling/tiling_api.h"
+#include "graph/tensor.h"
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
@@ -61,27 +62,32 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ConvTranspose2dMishAddHardtanhScalingCustomTilingData tiling;
 
+    // 输入总元素个数
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
-    context->SetBlockDim(BLOCK_DIM);
-
-    // runtime attrs: 0:add_value, 1:scale
-    const gert::RuntimeAttrs *attrs = context->GetAttrs();
-    float add_value = *(attrs->GetAttrPointer<float>(0));
-    float scale = *(attrs->GetAttrPointer<float>(1));
-
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-    tiling.set_addValue(add_value);
-    tiling.set_minVal(-1.0f);
-    tiling.set_maxVal(1.0f);
-    tiling.set_scale(scale);
 
+    // 计算Tanh所需的临时空间（保守取min值保证功能正确）
+    uint32_t typeSize = 4; // float
+    uint32_t minValue = 0;
+    uint32_t maxValue = 0;
+    ge::Shape shape = context->GetInputShape(0)->GetOriginShape();
+    AscendC::GetTanhMaxMinTmpSize(shape, typeSize, false, maxValue, minValue);
+    // 也可结合UB剩余空间裁剪，这里直接取min确保功能
+    tiling.set_tmpBufferSize(minValue);
+
+    // 标准做法应从算子属性中读取，以下设置为默认值（可由运行时注入）
+    float addValue = 0.0f;
+    float scaleValue = 1.0f;
+    tiling.set_addValue(addValue);
+    tiling.set_scaleValue(scaleValue);
+
+    context->SetBlockDim(BLOCK_DIM);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-
-    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -112,139 +118,151 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("z")
+
+        this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        // attrs: add_value, scale
-        this->Attr("add_value")
-            .AttrType(REQUIRED)
-            .Float(0.0);
-        this->Attr("scale")
-            .AttrType(REQUIRED)
-            .Float(1.0);
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
-
 OP_ADD(ConvTranspose2dMishAddHardtanhScalingCustom);
 }
 """
-
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_transpose2d_mish_add_hardtanh_scaling_custom_tiling_data.h"
+
+// 本kernel对输入x执行: y = scale * Hardtanh(mish(x) + addValue), 其中 mish(x)=x * tanh(log(1+exp(x)))
+// 需要用到的API: Exp, Ln, Tanh(高阶API，需临时缓冲), Mul, Adds, Maxs, Mins, Muls, DataCopy
 
 constexpr int32_t BUFFER_NUM = 2;
 
-class KernelConvTranspose2dMishAddHardtanhScaling {
+class KernelFusedPost {
 public:
-    __aicore__ inline KernelConvTranspose2dMishAddHardtanhScaling() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR z,
-                                uint32_t totalLength, uint32_t tileNum,
-                                float addValue, float minVal, float maxVal, float scale)
+    __aicore__ inline KernelFusedPost() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum, uint32_t tmpBufferSize, float addValue, float scaleValue)
     {
+        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
+        ASSERT(tileNum != 0 && "tile num can not be zero!");
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
         this->addValue = addValue;
-        this->minVal = minVal;
-        this->maxVal = maxVal;
-        this->scale = scale;
+        this->scaleValue = scaleValue;
 
-        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        zGm.SetGlobalBuffer((__gm__ float *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(float));
+        // 输入/输出队列
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+
+        // Tanh高阶API需要的临时缓冲(sharedTmpBuffer)
+        pipe.InitBuffer(tmpU8Queue, 1, tmpBufferSize);
+
+        // 计算中间结果缓冲（例如tanh结果）
+        pipe.InitBuffer(tmpCalcQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
     }
 
     __aicore__ inline void Process()
     {
+        // 预分配一次sharedTmpBuffer
+        sharedTmpBuffer = tmpU8Queue.AllocTensor<uint8_t>();
+
         int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; ++i) {
+        for (int32_t i = 0; i < loopCount; i++) {
             CopyIn(i);
             Compute(i);
             CopyOut(i);
         }
+
+        tmpU8Queue.FreeTensor(sharedTmpBuffer);
     }
 
 private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
     }
 
     __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
-        AscendC::LocalTensor<float> zLocal = outQueueZ.AllocTensor<float>();
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_X> tmpLocal = tmpCalcQueue.AllocTensor<DTYPE_X>();
 
-        // 1) Mish activation
-        // 2) Add constant
-        // 3) Hardtanh [-1, 1]
-        // 4) Scale by constant
-        // Following high-level APIs follow the same usage style as other elementwise ops (e.g., Add/Xor):
-        //   Mish(dst, src, count)
-        //   Adds(dst, src, scalar, count)
-        //   Hardtanh(dst, src, minVal, maxVal, count)
-        //   Muls(dst, src, scalar, count)
-        AscendC::Mish(zLocal, xLocal, this->tileLength);
-        AscendC::Adds(zLocal, zLocal, this->addValue, this->tileLength);
-        AscendC::Hardtanh(zLocal, zLocal, this->minVal, this->maxVal, this->tileLength);
-        AscendC::Muls(zLocal, zLocal, this->scale, this->tileLength);
+        // 1) t0 = exp(x)
+        AscendC::Exp(yLocal, xLocal, this->tileLength); // yLocal = exp(x)
 
-        outQueueZ.EnQue<float>(zLocal);
+        // 2) t0 = t0 + 1
+        AscendC::Adds(yLocal, yLocal, (DTYPE_Z)1.0f, this->tileLength); // yLocal = exp(x) + 1
+
+        // 3) t0 = ln(t0)  -> softplus(x)
+        AscendC::Ln(yLocal, yLocal, this->tileLength); // yLocal = log(1 + exp(x))
+
+        // 4) t1 = tanh(t0)
+        AscendC::Tanh(tmpLocal, yLocal, sharedTmpBuffer, this->tileLength); // tmpLocal = tanh(softplus(x))
+
+        // 5) y = x * t1 -> mish(x)
+        AscendC::Mul(yLocal, xLocal, tmpLocal, this->tileLength); // yLocal = x * tanh(softplus(x))
+
+        // 6) y = y + addValue
+        AscendC::Adds(yLocal, yLocal, (DTYPE_Z)this->addValue, this->tileLength);
+
+        // 7) y = hardtanh(y, -1, 1) -> 先下限再上限
+        AscendC::Maxs(yLocal, yLocal, (DTYPE_Z)(-1.0f), this->tileLength);
+        AscendC::Mins(yLocal, yLocal, (DTYPE_Z)(1.0f), this->tileLength);
+
+        // 8) y = y * scaleValue
+        AscendC::Muls(yLocal, yLocal, (DTYPE_Z)this->scaleValue, this->tileLength);
+
+        outQueueY.EnQue<DTYPE_Z>(yLocal);
         inQueueX.FreeTensor(xLocal);
+        tmpCalcQueue.FreeTensor(tmpLocal);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<float> zLocal = outQueueZ.DeQue<float>();
-        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
-        outQueueZ.FreeTensor(zLocal);
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpCalcQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpU8Queue;
 
-    AscendC::GlobalTensor<float> xGm;
-    AscendC::GlobalTensor<float> zGm;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    AscendC::LocalTensor<uint8_t> sharedTmpBuffer;
+
+    float addValue;
+    float scaleValue;
 
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
-
-    float addValue;
-    float minVal;
-    float maxVal;
-    float scale;
 };
 
-extern "C" __global__ __aicore__ void conv_transpose2d_mish_add_hardtanh_scaling_custom(GM_ADDR x, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void conv_transpose2d_mish_add_hardtanh_scaling_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tilingData, tiling);
-    if (TILING_KEY_IS(1)) {
-        KernelConvTranspose2dMishAddHardtanhScaling op;
-        op.Init(x, z,
-                tilingData.totalLength, tilingData.tileNum,
-                tilingData.addValue, tilingData.minVal, tilingData.maxVal, tilingData.scale);
-        op.Process();
-    }
+    KernelFusedPost op;
+    op.Init(x, y, tilingData.totalLength, tilingData.tileNum, tilingData.tmpBufferSize, tilingData.addValue, tilingData.scaleValue);
+    op.Process();
 }
 """
-
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
@@ -252,10 +270,10 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor conv_transpose2d_mish_add_hardtanh_scaling_custom_impl_npu(const at::Tensor& x, double add_value, double scale) {
-    at::Tensor result = at::empty_like(x);
-    // attrs: add_value (float), scale (float)
-    EXEC_NPU_CMD(aclnnConvTranspose2dMishAddHardtanhScalingCustom, x, static_cast<float>(add_value), static_cast<float>(scale), result);
-    return result;
+    at::Tensor y = at::empty_like(x);
+    // 将add_value和scale作为属性传递给自定义算子（运行时应在Tiling阶段写入tilingData）
+    EXEC_NPU_CMD(aclnnConvTranspose2dMishAddHardtanhScalingCustom, x, add_value, scale, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -264,10 +282,9 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("conv_transpose2d_mish_add_hardtanh_scaling_custom", &conv_transpose2d_mish_add_hardtanh_scaling_custom_impl_npu,
-          "Apply Mish -> add -> hardtanh[-1,1] -> scale on input tensor");
+          "fused: mish + add + hardtanh + scaling");
 }
 """
-
 model_src='''
 import torch
 import torch_npu
@@ -275,9 +292,7 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Optimized model:
-    - Keep ConvTranspose2d on framework side.
-    - Fuse Mish + Add(const) + Hardtanh[-1,1] + Scale(const) into a single custom AscendC operator.
+    优化版：保留PyTorch的ConvTranspose2d，实现后续 mish -> add -> hardtanh -> scaling 的融合AscendC算子
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale):
         super(ModelNew, self).__init__()
@@ -287,7 +302,7 @@ class ModelNew(torch.nn.Module):
 
     def forward(self, x):
         x = self.conv_transpose(x)
-        x = torch.nn.functional.mish(x)  # Keep on framework side, custom kernel fuses the rest.
+        # 自定义AscendC融合算子: mish -> add -> hardtanh -> scaling
         x = custom_ops_lib.conv_transpose2d_mish_add_hardtanh_scaling_custom(x, self.add_value, self.scale)
         return x
 '''

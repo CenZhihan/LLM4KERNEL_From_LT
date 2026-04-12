@@ -1,0 +1,420 @@
+project_json_src='''
+[
+    {
+        "op": "ConvDepthwiseSeparable2dCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "dw_weight",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "pw_weight",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvDepthwiseSeparable2dCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, outc);
+  TILING_DATA_FIELD_DEF(uint32_t, kh);
+  TILING_DATA_FIELD_DEF(uint32_t, kw);
+  TILING_DATA_FIELD_DEF(uint32_t, stride);
+  TILING_DATA_FIELD_DEF(uint32_t, padding);
+  TILING_DATA_FIELD_DEF(uint32_t, dilation);
+  TILING_DATA_FIELD_DEF(uint32_t, hout);
+  TILING_DATA_FIELD_DEF(uint32_t, wout);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvDepthwiseSeparable2dCustom, ConvDepthwiseSeparable2dCustomTilingData)
+}
+"""
+host_operator_src="""
+#include "conv_depthwise_separable_2d_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvDepthwiseSeparable2dCustomTilingData tiling;
+
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    const gert::Shape* dw_shape = context->GetInputShape(1);
+    const gert::Shape* pw_shape = context->GetInputShape(2);
+
+    auto in_origin = in_shape->GetOriginShape();
+    auto dw_origin = dw_shape->GetOriginShape();
+    auto pw_origin = pw_shape->GetOriginShape();
+
+    uint32_t n = static_cast<uint32_t>(in_origin.GetDim(0));
+    uint32_t c = static_cast<uint32_t>(in_origin.GetDim(1));
+    uint32_t h = static_cast<uint32_t>(in_origin.GetDim(2));
+    uint32_t w = static_cast<uint32_t>(in_origin.GetDim(3));
+
+    uint32_t kh = static_cast<uint32_t>(dw_origin.GetDim(2));
+    uint32_t kw = static_cast<uint32_t>(dw_origin.GetDim(3));
+    uint32_t outc = static_cast<uint32_t>(pw_origin.GetDim(0));
+
+    // 默认支持 stride=1, dilation=1；padding 根据kernel size推导(同torch默认保持尺寸)
+    uint32_t stride = 1;
+    uint32_t dilation = 1;
+    uint32_t padding = (kh > 0 ? (kh - 1) / 2 : 0);
+
+    uint32_t hout = static_cast<uint32_t>((static_cast<int>(h) + 2 * static_cast<int>(padding) - static_cast<int>(dilation) * (static_cast<int>(kh) - 1) - 1) / static_cast<int>(stride) + 1);
+    uint32_t wout = static_cast<uint32_t>((static_cast<int>(w) + 2 * static_cast<int>(padding) - static_cast<int>(dilation) * (static_cast<int>(kw) - 1) - 1) / static_cast<int>(stride) + 1);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_outc(outc);
+    tiling.set_kh(kh);
+    tiling.set_kw(kw);
+    tiling.set_stride(stride);
+    tiling.set_padding(padding);
+    tiling.set_dilation(dilation);
+    tiling.set_hout(hout);
+    tiling.set_wout(wout);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // workspace: 存储depthwise中间结果 (n * c * hout * wout * sizeof(float))
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = static_cast<size_t>(n) * static_cast<size_t>(c) * static_cast<size_t>(hout) * static_cast<size_t>(wout) * sizeof(float);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    const gert::Shape* dw_shape = context->GetInputShape(1);
+    const gert::Shape* pw_shape = context->GetInputShape(2);
+
+    auto in_origin = in_shape->GetOriginShape();
+    auto dw_origin = dw_shape->GetOriginShape();
+    auto pw_origin = pw_shape->GetOriginShape();
+
+    int64_t n = in_origin.GetDim(0);
+    int64_t c = in_origin.GetDim(1);
+    int64_t h = in_origin.GetDim(2);
+    int64_t w = in_origin.GetDim(3);
+
+    int64_t kh = dw_origin.GetDim(2);
+    int64_t kw = dw_origin.GetDim(3);
+    int64_t outc = pw_origin.GetDim(0);
+
+    int64_t stride = 1;
+    int64_t dilation = 1;
+    int64_t padding = (kh > 0 ? (kh - 1) / 2 : 0);
+
+    int64_t hout = (h + 2 * padding - dilation * (kh - 1) - 1) / stride + 1;
+    int64_t wout = (w + 2 * padding - dilation * (kw - 1) - 1) / stride + 1;
+
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    out_shape->SetDimNum(4);
+    out_shape->SetDim(0, n);
+    out_shape->SetDim(1, outc);
+    out_shape->SetDim(2, hout);
+    out_shape->SetDim(3, wout);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvDepthwiseSeparable2dCustom : public OpDef {
+public:
+    explicit ConvDepthwiseSeparable2dCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("dw_weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("pw_weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvDepthwiseSeparable2dCustom);
+}
+"""
+kernel_src="""
+#include "kernel_operator.h"
+
+using dtype = float;
+
+class KernelDepthwiseSeparable2D {
+public:
+    __aicore__ inline KernelDepthwiseSeparable2D() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR dw_w, GM_ADDR pw_w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+    {
+        GET_TILING_DATA(tilingData, tiling);
+        this->n = tilingData.n();
+        this->c = tilingData.c();
+        this->h = tilingData.h();
+        this->w = tilingData.w();
+        this->outc = tilingData.outc();
+        this->kh = tilingData.kh();
+        this->kw = tilingData.kw();
+        this->stride = tilingData.stride();
+        this->padding = tilingData.padding();
+        this->dilation = tilingData.dilation();
+        this->hout = tilingData.hout();
+        this->wout = tilingData.wout();
+
+        xGm.SetGlobalBuffer((__gm__ dtype*)x, (uint64_t)n * c * h * w);
+        dwWGm.SetGlobalBuffer((__gm__ dtype*)dw_w, (uint64_t)c * kh * kw);                       // [C,1,Kh,Kw] -> flatten per C:(Kh*Kw)
+        pwWGm.SetGlobalBuffer((__gm__ dtype*)pw_w, (uint64_t)outc * c);                          // [OutC, C, 1, 1] -> flatten (OutC*C)
+        yGm.SetGlobalBuffer((__gm__ dtype*)y, (uint64_t)n * outc * hout * wout);
+        dwOutGm.SetGlobalBuffer((__gm__ dtype*)workspace, (uint64_t)n * c * hout * wout);        // intermediate
+
+        // 为了简化，按plane(H*W)或(hout*wout)大小申请UB队列
+        pipe.InitBuffer(inQueuePlane, 1, (uint32_t)(h * w * sizeof(dtype)));
+        pipe.InitBuffer(inQueueDWK, 1, (uint32_t)(kh * kw * sizeof(dtype)));
+        pipe.InitBuffer(outQueueDWPlane, 1, (uint32_t)(hout * wout * sizeof(dtype)));
+        pipe.InitBuffer(tmpQueuePlane, 1, (uint32_t)(hout * wout * sizeof(dtype)));
+        pipe.InitBuffer(outQueueYPlane, 1, (uint32_t)(hout * wout * sizeof(dtype)));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // 1) Depthwise：对每个batch、每个通道做独立卷积，写入workspace
+        for (uint32_t bn = 0; bn < n; ++bn) {
+            for (uint32_t cc = 0; cc < c; ++cc) {
+                // Load input plane [H*W]
+                AscendC::LocalTensor<dtype> xLocal = inQueuePlane.AllocTensor<dtype>();
+                AscendC::DataCopy(xLocal, xGm[(((uint64_t)bn * c + cc) * h) * w], h * w);
+
+                // Load depthwise kernel [Kh*Kw] for this channel
+                AscendC::LocalTensor<dtype> kLocal = inQueueDWK.AllocTensor<dtype>();
+                AscendC::DataCopy(kLocal, dwWGm[((uint64_t)cc) * kh * kw], kh * kw);
+
+                // Compute depthwise conv -> outLocal [hout*wout]
+                AscendC::LocalTensor<dtype> outLocal = outQueueDWPlane.AllocTensor<dtype>();
+                AscendC::Duplicate(outLocal, (dtype)0, hout * wout);
+
+                for (uint32_t oh = 0; oh < hout; ++oh) {
+                    for (uint32_t ow = 0; ow < wout; ++ow) {
+                        float acc = 0.f;
+                        for (uint32_t r = 0; r < kh; ++r) {
+                            int32_t ih = (int32_t)oh * (int32_t)stride + (int32_t)r * (int32_t)dilation - (int32_t)padding;
+                            if (ih < 0 || ih >= (int32_t)h) continue;
+                            for (uint32_t s = 0; s < kw; ++s) {
+                                int32_t iw = (int32_t)ow * (int32_t)stride + (int32_t)s * (int32_t)dilation - (int32_t)padding;
+                                if (iw < 0 || iw >= (int32_t)w) continue;
+                                uint32_t in_idx = (uint32_t)ih * w + (uint32_t)iw;
+                                uint32_t k_idx = r * kw + s;
+                                acc += xLocal.GetValue(in_idx) * kLocal.GetValue(k_idx);
+                            }
+                        }
+                        outLocal.SetValue(oh * wout + ow, acc);
+                    }
+                }
+
+                // write depthwise plane to workspace
+                AscendC::DataCopy(dwOutGm[(((uint64_t)bn * c + cc) * hout) * wout], outLocal, hout * wout);
+
+                inQueuePlane.FreeTensor(xLocal);
+                inQueueDWK.FreeTensor(kLocal);
+                outQueueDWPlane.EnQue(outLocal);
+                AscendC::LocalTensor<dtype> outLocalDeque = outQueueDWPlane.DeQue<dtype>();
+                outQueueDWPlane.FreeTensor(outLocalDeque);
+            }
+        }
+
+        // 2) Pointwise：y[bn, oc, :, :] = sum_c ( dwOut[bn, c, :, :] * pwW[oc, c] )
+        for (uint32_t bn = 0; bn < n; ++bn) {
+            for (uint32_t oc = 0; oc < outc; ++oc) {
+                // yLocal accumulator
+                AscendC::LocalTensor<dtype> yLocal = outQueueYPlane.AllocTensor<dtype>();
+                AscendC::Duplicate(yLocal, (dtype)0, hout * wout);
+
+                for (uint32_t cc = 0; cc < c; ++cc) {
+                    // load dwOut plane (hout*wout)
+                    AscendC::LocalTensor<dtype> dwPlane = tmpQueuePlane.AllocTensor<dtype>();
+                    AscendC::DataCopy(dwPlane, dwOutGm[(((uint64_t)bn * c + cc) * hout) * wout], hout * wout);
+
+                    // load scalar pw weight[oc, cc]
+                    // 将一行pw权重按C复制一次以便读取(简单做法：整行复制再读)
+                    // 这里直接从GM按标量读取，通过临时LocalTensor承载长度1
+                    AscendC::LocalTensor<dtype> pwScalarLocal = inQueueDWK.AllocTensor<dtype>(); // 重用队列容量，长度1
+                    AscendC::DataCopy(pwScalarLocal, pwWGm[(uint64_t)oc * c + cc], 1);
+                    float w_scalar = pwScalarLocal.GetValue(0);
+
+                    // tmp = dwPlane * w_scalar
+                    AscendC::LocalTensor<dtype> tmpMul = outQueueDWPlane.AllocTensor<dtype>();
+                    AscendC::Muls(tmpMul, dwPlane, (dtype)w_scalar, hout * wout);
+
+                    // yLocal += tmp
+                    AscendC::Add(yLocal, yLocal, tmpMul, hout * wout);
+
+                    tmpQueuePlane.FreeTensor(dwPlane);
+                    inQueueDWK.FreeTensor(pwScalarLocal);
+                    outQueueDWPlane.EnQue(tmpMul);
+                    AscendC::LocalTensor<dtype> tmpDeque = outQueueDWPlane.DeQue<dtype>();
+                    outQueueDWPlane.FreeTensor(tmpDeque);
+                }
+
+                // store yLocal -> yGm
+                AscendC::DataCopy(yGm[(((uint64_t)bn * outc + oc) * hout) * wout], yLocal, hout * wout);
+
+                outQueueYPlane.EnQue(yLocal);
+                AscendC::LocalTensor<dtype> yDeque = outQueueYPlane.DeQue<dtype>();
+                outQueueYPlane.FreeTensor(yDeque);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueuePlane;      // input plane
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueDWK;         // depthwise kernel / reuse for scalar
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueDWPlane;   // tmp planes
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> tmpQueuePlane;      // reuse for tmp load
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueYPlane;    // y plane
+
+    AscendC::GlobalTensor<dtype> xGm;
+    AscendC::GlobalTensor<dtype> dwWGm;
+    AscendC::GlobalTensor<dtype> pwWGm;
+    AscendC::GlobalTensor<dtype> yGm;
+    AscendC::GlobalTensor<dtype> dwOutGm;
+
+    uint32_t n, c, h, w, outc, kh, kw, stride, padding, dilation, hout, wout;
+};
+
+extern "C" __global__ __aicore__ void conv_depthwise_separable_2d_custom(GM_ADDR x, GM_ADDR dw_weight, GM_ADDR pw_weight, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    KernelDepthwiseSeparable2D op;
+    op.Init(x, dw_weight, pw_weight, y, workspace, tiling);
+    op.Process();
+}
+"""
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_depthwise_separable_2d_custom_impl_npu(const at::Tensor& x,
+                                                       const at::Tensor& dw_weight,
+                                                       const at::Tensor& pw_weight) {
+    // 输出张量形状推断在InferShape中完成，这里仅分配与推断一致的空tensor
+    // 直接调用自定义算子
+    auto n = x.size(0);
+    auto h = x.size(2);
+    auto w = x.size(3);
+    auto kh = dw_weight.size(2);
+    auto padding = (kh - 1) / 2;
+    auto hout = (h + 2 * padding - (kh - 1) - 1) + 1; // stride=1, dilation=1
+    auto wout = (w + 2 * padding - (dw_weight.size(3) - 1) - 1) + 1;
+    auto outc = pw_weight.size(0);
+
+    at::Tensor y = at::empty({n, outc, hout, wout}, x.options());
+
+    EXEC_NPU_CMD(aclnnConvDepthwiseSeparable2dCustom, x, dw_weight, pw_weight, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_depthwise_separable_2d_custom", &conv_depthwise_separable_2d_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_depthwise_separable_2d_custom", &conv_depthwise_separable_2d_custom_impl_npu, "DepthwiseSeparableConv2D");
+}
+"""
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    使用自定义AscendC核实现深度可分离2D卷积：先depthwise，再pointwise(1x1)。
+    仅支持float, ND格式；stride=1, dilation=1；padding由kernel size推导为same。
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super().__init__()
+        # 仍复用PyTorch的权重管理与初始化
+        self.depthwise = torch.nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=in_channels, bias=bias)
+        self.pointwise = torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 直接调用自定义算子，传入权重
+        return custom_ops_lib.conv_depthwise_separable_2d_custom(x, self.depthwise.weight, self.pointwise.weight)
+'''

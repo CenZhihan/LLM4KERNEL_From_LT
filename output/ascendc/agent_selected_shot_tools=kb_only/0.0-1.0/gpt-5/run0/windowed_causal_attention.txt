@@ -1,0 +1,444 @@
+project_json_src='''
+[
+    {
+        "op": "WindowedCausalAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "k",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["int32"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(WindowedCausalAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, B);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, Dh);
+  TILING_DATA_FIELD_DEF(uint64_t, totalTokens);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(WindowedCausalAttentionCustom, WindowedCausalAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "windowed_causal_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t GetDimSafe(const ge::Shape& s, size_t idx, uint32_t def=1) {
+    if (idx < s.GetDimNum()) {
+        auto d = s.GetDim(idx);
+        return d > 0 ? static_cast<uint32_t>(d) : def;
+    }
+    return def;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    auto* in0 = context->GetInputShape(0);
+    const ge::Shape& qShape = in0->GetOriginShape(); // expect [B,H,N,Dh]
+
+    uint32_t B  = GetDimSafe(qShape, 0, 1);
+    uint32_t H  = GetDimSafe(qShape, 1, 1);
+    uint32_t N  = GetDimSafe(qShape, 2, 1);
+    uint32_t Dh = GetDimSafe(qShape, 3, 1);
+
+    WindowedCausalAttentionCustomTilingData tiling;
+    tiling.set_B(B);
+    tiling.set_H(H);
+    tiling.set_N(N);
+    tiling.set_Dh(Dh);
+    tiling.set_totalTokens(static_cast<uint64_t>(B) * H * N);
+    tiling.set_tileNum(TILE_NUM);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *q_shape; // output [B,H,N,Dh]
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto dt = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dt);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class WindowedCausalAttentionCustom : public OpDef {
+public:
+    explicit WindowedCausalAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("k")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("v")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("out")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(WindowedCausalAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include <cmath>
+
+constexpr int32_t BUFFER_NUM = 1;
+
+template <typename T>
+__aicore__ inline uint32_t AlignUpTo(const T x, const T a) {
+    return static_cast<uint32_t>(((x + a - 1) / a) * a);
+}
+
+class KernelWindowedCausalAttention {
+public:
+    __aicore__ inline KernelWindowedCausalAttention() {}
+
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR w, GM_ADDR out,
+                                uint32_t B, uint32_t H, uint32_t N, uint32_t Dh,
+                                uint32_t tileNum)
+    {
+        this->B = B; this->H = H; this->N = N; this->Dh = Dh;
+        this->tileNum = tileNum;
+        this->tokensPerBlock = (static_cast<uint64_t>(B) * H * N) / AscendC::GetBlockNum();
+
+        // Set GM buffers; element count = B*H*N*Dh per block
+        uint64_t blockTokenBase = this->tokensPerBlock * AscendC::GetBlockIdx();
+        uint64_t blockElemBase = blockTokenBase * Dh;
+
+        qGm.SetGlobalBuffer((__gm__ float*)q + blockElemBase, this->tokensPerBlock * Dh);
+        kGm.SetGlobalBuffer((__gm__ float*)k + blockElemBase, this->tokensPerBlock * Dh);
+        vGm.SetGlobalBuffer((__gm__ float*)v + blockElemBase, this->tokensPerBlock * Dh);
+        outGm.SetGlobalBuffer((__gm__ float*)out + blockElemBase, this->tokensPerBlock * Dh);
+
+        // Read window size (int32 scalar) from GM
+        pipe.InitBuffer(intBuf, 1, sizeof(int32_t));
+        AscendC::LocalTensor<int32_t> wLocal = intBuf.AllocTensor<int32_t>();
+        AscendC::GlobalTensor<int32_t> wGm;
+        wGm.SetGlobalBuffer((__gm__ int32_t*)w, 1);
+        AscendC::DataCopy(wLocal, wGm, 1);
+        intBuf.EnQue(wLocal);
+        AscendC::LocalTensor<int32_t> wLocal2 = intBuf.DeQue<int32_t>();
+        this->W = static_cast<uint32_t>(wLocal2.GetValue(0));
+        intBuf.FreeTensor(wLocal2);
+
+        // UB buffers
+        pipe.InitBuffer(qBuf, BUFFER_NUM, this->Dh * sizeof(float));
+        pipe.InitBuffer(kBuf, BUFFER_NUM, this->Dh * sizeof(float));
+        pipe.InitBuffer(vBuf, BUFFER_NUM, this->Dh * sizeof(float));
+        pipe.InitBuffer(outBuf, BUFFER_NUM, this->Dh * sizeof(float));
+
+        // Max window length is W+1; pad last axis to 32-byte (8 floats) alignment
+        uint32_t maxL = this->W + 1;
+        paddedL = AlignUpTo<uint32_t>(maxL, 8);
+        pipe.InitBuffer(scoresBuf, BUFFER_NUM, paddedL * sizeof(float));
+        pipe.InitBuffer(workBuf, BUFFER_NUM, paddedL * sizeof(float)); // for exp/weights temp
+    }
+
+    __aicore__ inline void Process()
+    {
+        float invSqrtDh = 1.0f / sqrtf(static_cast<float>(this->Dh));
+
+        for (uint64_t p = 0; p < this->tokensPerBlock; ++p) {
+            // Map linear p in this block to (b,h,i)
+            uint64_t g = p + this->tokensPerBlock * AscendC::GetBlockIdx();
+            uint32_t tokensPerBH = this->N;
+            uint32_t bh = static_cast<uint32_t>(g % (static_cast<uint64_t>(this->B) * this->H));
+            uint32_t i = static_cast<uint32_t>(g % this->N);
+            uint32_t h = static_cast<uint32_t>(bh % this->H);
+            uint32_t b = static_cast<uint32_t>(bh / this->H);
+
+            uint64_t baseBH = (static_cast<uint64_t>(b) * this->H + h) * this->N;
+
+            // Load Q[b,h,i,:]
+            AscendC::LocalTensor<float> qLocal = qBuf.AllocTensor<float>();
+            uint64_t qOff = (baseBH + i) * this->Dh;
+            AscendC::DataCopy(qLocal, qGm[qOff], this->Dh);
+            qBuf.EnQue(qLocal);
+            AscendC::LocalTensor<float> qVec = qBuf.DeQue<float>();
+
+            // Prepare out accumulator
+            AscendC::LocalTensor<float> outLocal = outBuf.AllocTensor<float>();
+            float zero = 0.0f;
+            AscendC::Duplicate(outLocal, zero, this->Dh);
+
+            // Scores buffer
+            AscendC::LocalTensor<float> scoresLocal = scoresBuf.AllocTensor<float>();
+            scoresLocal.SetSize(paddedL); // in elements
+
+            // Compute start and effective length
+            uint32_t start = (i > this->W) ? (i - this->W) : 0U;
+            uint32_t L = i - start + 1U; // inclusive of i
+
+            // Compute scaled dot-product scores
+            float neg_large = -1.0e9f;
+            for (uint32_t t = 0; t < paddedL; ++t) {
+                scoresLocal.SetValue(t, neg_large);
+            }
+
+            for (uint32_t t = 0; t < L; ++t) {
+                uint32_t j = start + t; // key index
+                // Load K[b,h,j,:]
+                AscendC::LocalTensor<float> kLocal = kBuf.AllocTensor<float>();
+                uint64_t kOff = (baseBH + j) * this->Dh;
+                AscendC::DataCopy(kLocal, kGm[kOff], this->Dh);
+                kBuf.EnQue(kLocal);
+                AscendC::LocalTensor<float> kVec = kBuf.DeQue<float>();
+
+                // dot = sum(q * k)
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < this->Dh; ++d) {
+                    float qv = qVec.GetValue(d);
+                    float kv = kVec.GetValue(d);
+                    dot += qv * kv;
+                }
+                dot *= invSqrtDh;
+                scoresLocal.SetValue(t, dot);
+
+                kBuf.FreeTensor(kVec);
+            }
+
+            // Softmax over first L elements (scoresLocal[0..L-1])
+            // Find max
+            float smax = -1.0e30f;
+            for (uint32_t t = 0; t < L; ++t) {
+                float v = scoresLocal.GetValue(t);
+                if (v > smax) smax = v;
+            }
+
+            // Subtract max and exponentiate
+            AscendC::LocalTensor<float> expLocal = workBuf.AllocTensor<float>();
+            expLocal.SetSize(paddedL);
+            for (uint32_t t = 0; t < L; ++t) {
+                float v = scoresLocal.GetValue(t) - smax;
+                // elementwise exp for scalar
+                float ev = expf(v);
+                expLocal.SetValue(t, ev);
+            }
+            for (uint32_t t = L; t < paddedL; ++t) {
+                expLocal.SetValue(t, 0.0f);
+            }
+
+            // Sum exp
+            float ssum = 0.0f;
+            for (uint32_t t = 0; t < L; ++t) {
+                ssum += expLocal.GetValue(t);
+            }
+            float invSum = ssum > 0.0f ? (1.0f / ssum) : 0.0f;
+
+            // Compute weighted sum: out = sum_t weights[t] * V[b,h,start+t,:]
+            for (uint32_t t = 0; t < L; ++t) {
+                float w = expLocal.GetValue(t) * invSum;
+
+                // Load V[b,h,j,:]
+                AscendC::LocalTensor<float> vLocal = vBuf.AllocTensor<float>();
+                uint64_t vOff = (baseBH + (start + t)) * this->Dh;
+                AscendC::DataCopy(vLocal, vGm[vOff], this->Dh);
+                vBuf.EnQue(vLocal);
+                AscendC::LocalTensor<float> vVec = vBuf.DeQue<float>();
+
+                // out += w * vVec
+                for (uint32_t d = 0; d < this->Dh; ++d) {
+                    float acc = outLocal.GetValue(d);
+                    float vv  = vVec.GetValue(d);
+                    acc += w * vv;
+                    outLocal.SetValue(d, acc);
+                }
+
+                vBuf.FreeTensor(vVec);
+            }
+
+            // Write out
+            AscendC::DataCopy(outGm[qOff], outLocal, this->Dh);
+
+            // free locals
+            workBuf.FreeTensor(expLocal);
+            scoresBuf.FreeTensor(scoresLocal);
+            outBuf.FreeTensor(outLocal);
+            qBuf.FreeTensor(qVec);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    // GM
+    AscendC::GlobalTensor<float> qGm, kGm, vGm, outGm;
+    // Queues
+    AscendC::TQue<AscendC::QuePosition::VECIN,  BUFFER_NUM> qBuf, kBuf, vBuf;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outBuf;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> scoresBuf, workBuf;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> intBuf;
+
+    uint32_t B, H, N, Dh, W;
+    uint32_t tileNum;
+    uint64_t tokensPerBlock;
+    uint32_t paddedL;
+};
+
+extern "C" __global__ __aicore__ void windowed_causal_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR w, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelWindowedCausalAttention op;
+    op.Init(q, k, v, w, out,
+            tiling_data.B, tiling_data.H, tiling_data.N, tiling_data.Dh,
+            tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor windowed_causal_attention_custom_impl_npu(const at::Tensor& q_bhnd,
+                                                     const at::Tensor& k_bhnd,
+                                                     const at::Tensor& v_bhnd,
+                                                     int64_t window_size) {
+    TORCH_CHECK(q_bhnd.device().type() == at::kPrivateUse1, "q must be on NPU");
+    TORCH_CHECK(k_bhnd.device().type() == at::kPrivateUse1, "k must be on NPU");
+    TORCH_CHECK(v_bhnd.device().type() == at::kPrivateUse1, "v must be on NPU");
+    TORCH_CHECK(q_bhnd.sizes() == k_bhnd.sizes() && q_bhnd.sizes() == v_bhnd.sizes(), "q,k,v shape mismatch");
+
+    at::Tensor out = at::empty_like(q_bhnd);
+
+    // prepare window size tensor on NPU
+    auto opts_i32 = at::TensorOptions().dtype(at::kInt).device(q_bhnd.device());
+    at::Tensor w = at::empty({1}, opts_i32);
+    w.fill_(static_cast<int>(window_size));
+
+    EXEC_NPU_CMD(aclnnWindowedCausalAttentionCustom, q_bhnd, k_bhnd, v_bhnd, w, out);
+    return out;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("windowed_causal_attention_custom", &windowed_causal_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("windowed_causal_attention_custom", &windowed_causal_attention_custom_impl_npu,
+          "Windowed Causal Attention (local attention)");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    """
+    使用自定义AscendC核实现滑动窗口因果注意力（局部注意力）。
+    接口期望输入Q/K/V为[B, H, N, d_h]布局，因此在调用前进行维度重排。
+    """
+    def __init__(self, d_model=1024, num_heads=16, window_size=256):
+        super().__init__()
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.num_heads = num_heads
+        self.window_size = window_size
+
+    def forward(self, x):
+        B, N, D = x.shape
+        H = self.num_heads
+        d_h = D // H
+
+        # 生成Q/K/V并转为[B, H, N, d_h]，以匹配自定义算子预期布局
+        Q = self.q_proj(x).view(B, N, H, d_h).permute(0, 2, 1, 3).contiguous()
+        K = self.k_proj(x).view(B, N, H, d_h).permute(0, 2, 1, 3).contiguous()
+        V = self.v_proj(x).view(B, N, H, d_h).permute(0, 2, 1, 3).contiguous()
+
+        # 调用自定义窗口注意力核：输出仍为[B, H, N, d_h]
+        attn_out_bhnd = custom_ops_lib.windowed_causal_attention_custom(Q, K, V, self.window_size)
+
+        # 还原回[B, N, D]
+        attn_out = attn_out_bhnd.permute(0, 2, 1, 3).contiguous().view(B, N, D)
+        return self.out_proj(attn_out)
+'''

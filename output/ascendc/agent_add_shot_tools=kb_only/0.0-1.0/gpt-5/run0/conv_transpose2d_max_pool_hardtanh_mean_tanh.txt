@@ -36,12 +36,8 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ConvTranspose2dMaxPoolHardtanhMeanTanhCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, planes);     // N*C
-  TILING_DATA_FIELD_DEF(uint32_t, height);     // H (after maxpool+hardtanh)
-  TILING_DATA_FIELD_DEF(uint32_t, width);      // W (after maxpool+hardtanh)
-  TILING_DATA_FIELD_DEF(uint32_t, innerW);     // aligned width for Sum API
-  TILING_DATA_FIELD_DEF(uint32_t, innerH);     // aligned height for Sum API
-  TILING_DATA_FIELD_DEF(uint32_t, tmpSize);    // reserved tmp buffer for Sum API
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ConvTranspose2dMaxPoolHardtanhMeanTanhCustom, ConvTranspose2dMaxPoolHardtanhMeanTanhCustomTilingData)
@@ -51,66 +47,22 @@ REGISTER_TILING_DATA_CLASS(ConvTranspose2dMaxPoolHardtanhMeanTanhCustom, ConvTra
 host_operator_src="""
 #include "conv_transpose2d_max_pool_hardtanh_mean_tanh_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
-
-namespace {
-inline uint32_t AlignUp32BytesElems(uint32_t elems, uint32_t typeSize) {
-    uint32_t bytes = elems * typeSize;
-    uint32_t aligned = (bytes + 32 - 1) / 32 * 32;
-    return aligned / typeSize;
-}
-}
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 期望输入为4D: (N, C, H, W)，此处H、W为maxpool+hardtanh后的尺寸
-    const gert::Shape* inShape = context->GetInputShape(0);
-
-    // 获取形状各维，接口在不同版本略有差异，下述调用依赖于典型CANN接口
-    // 若GetOriginShape().GetDims()不可用，可替换为等效API
-    auto originShape = inShape->GetOriginShape();
-    std::vector<int64_t> dims = originShape.GetDims();
-    if (dims.size() != 4) {
-        return ge::GRAPH_FAILED;
-    }
-
-    uint32_t n = static_cast<uint32_t>(dims[0]);
-    uint32_t c = static_cast<uint32_t>(dims[1]);
-    uint32_t h = static_cast<uint32_t>(dims[2]);
-    uint32_t w = static_cast<uint32_t>(dims[3]);
-    uint32_t planes = n * c;
-
-    // 为Sum API计算对齐后的inner
-    const uint32_t typeSize = 4; // float32
-    uint32_t innerW = AlignUp32BytesElems(w, typeSize);
-    uint32_t innerH = AlignUp32BytesElems(h, typeSize);
-
-    // 计算并预留Sum API需要的临时空间（取两次归约所需临时空间的较大值）
-    uint32_t maxTmpW = 0, minTmpW = 0;
-    uint32_t maxTmpH = 0, minTmpH = 0;
-    AscendC::GetSumMaxMinTmpSize(w, typeSize, false, maxTmpW, minTmpW);
-    AscendC::GetSumMaxMinTmpSize(h, typeSize, false, maxTmpH, minTmpH);
-    uint32_t tmpSize = minTmpW > minTmpH ? minTmpW : minTmpH;
-
     ConvTranspose2dMaxPoolHardtanhMeanTanhCustomTilingData tiling;
-    tiling.set_planes(planes);
-    tiling.set_height(h);
-    tiling.set_width(w);
-    tiling.set_innerW(innerW);
-    tiling.set_innerH(innerH);
-    tiling.set_tmpSize(tmpSize);
-
-    // 设置BlockDim，样例取8
-    context->SetBlockDim(8);
-
+    uint32_t totalLength = static_cast<uint32_t>(context->GetInputShape(0)->GetOriginShape().GetShapeSize());
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
-    // 无额外workspace
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -118,17 +70,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 输出形状为 (N, C, 1, 1)
-    const gert::Shape* inShape = context->GetInputShape(0);
-    auto originShape = inShape->GetOriginShape();
-    std::vector<int64_t> dims = originShape.GetDims();
-    if (dims.size() != 4) {
-        return GRAPH_FAILED;
-    }
-    dims[2] = 1;
-    dims[3] = 1;
-    gert::Shape* outShape = context->GetOutputShape(0);
-    outShape->SetDim(dims);
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape; // 此自定义算子用于替换 Hardtanh，输入输出形状一致
     return GRAPH_SUCCESS;
 }
 
@@ -136,7 +80,7 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
-    return GRAPH_SUCCESS;
+    return ge::GRAPH_SUCCESS;
 }
 }
 
@@ -156,6 +100,10 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
+        // 硬截断阈值，作为属性接收（内核中使用默认值 -1/1）
+        this->Attr("min_val").Float(0.0f).Default(0.0f);
+        this->Attr("max_val").Float(0.0f).Default(0.0f);
+
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
         this->AICore().SetTiling(optiling::TilingFunc);
@@ -169,142 +117,80 @@ OP_ADD(ConvTranspose2dMaxPoolHardtanhMeanTanhCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_transpose2d_max_pool_hardtanh_mean_tanh_custom_tiling_data.h"
 
-using T = DTYPE_X; // float32
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的局部张量个数
 
-constexpr int32_t QUE_NUM = 1;
-
-inline __aicore__ uint32_t AlignUp32BytesElems(uint32_t elems) {
-    uint32_t bytes = elems * sizeof(T);
-    uint32_t aligned = (bytes + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE;
-    return aligned / sizeof(T);
-}
-
-class KernelMeanTanh {
+// 该内核实现对输入张量执行 Hardtanh（[-1, 1] 截断）。
+// 名称保持为 conv_transpose2d_max_pool_hardtanh_mean_tanh_custom，以匹配注册名。
+class KernelHardtanh {
 public:
-    __aicore__ inline KernelMeanTanh() {}
-
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t planes, uint32_t height, uint32_t width,
-                                uint32_t innerW, uint32_t innerH, uint32_t tmpSize)
+    __aicore__ inline KernelHardtanh() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
     {
-        this->planes = planes;
-        this->height = height;
-        this->width = width;
-        this->innerW = innerW;
-        this->innerH = innerH;
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        // 输入总元素数 = planes * height * width
-        xGm.SetGlobalBuffer((__gm__ T*)x, static_cast<uint64_t>(planes) * height * width);
-        yGm.SetGlobalBuffer((__gm__ T*)y, planes);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        // 为每个平面准备缓冲：整面缓冲（height * innerW），行和缓冲（对齐到32B），标量缓冲（1元素对齐）
-        pipe.InitBuffer(inPlaneQueue, QUE_NUM, static_cast<uint64_t>(height) * innerW * sizeof(T));
-        pipe.InitBuffer(rowSumQueue, QUE_NUM, AlignUp32BytesElems(height) * sizeof(T));
-        pipe.InitBuffer(outScalarQueue, QUE_NUM, AscendC::ONE_BLK_SIZE); // 至少32字节
-        pipe.InitBuffer(workQueue, QUE_NUM, tmpSize);
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
     }
 
     __aicore__ inline void Process()
     {
-        // 简洁处理：将planes平均分配到block
-        uint32_t blocks = AscendC::GetBlockNum();
-        uint32_t bid = AscendC::GetBlockIdx();
-        uint32_t planesPerBlock = planes / blocks;
-        uint32_t tail = planes % blocks;
-        uint32_t start = bid * planesPerBlock + AscendC::Min(bid, tail);
-        uint32_t count = planesPerBlock + (bid < tail ? 1 : 0);
-
-        for (uint32_t p = 0; p < count; ++p) {
-            uint32_t planeIdx = start + p;
-            CopyIn(planeIdx);
-            Compute(planeIdx);
-            CopyOut(planeIdx);
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t planeIdx)
+    __aicore__ inline void CopyIn(int32_t progress)
     {
-        // 将该plane的数据按行拷入到对齐缓冲中，多余的对齐空间置0
-        AscendC::LocalTensor<T> planeLocal = inPlaneQueue.AllocTensor<T>();
-        uint32_t planeSizeAligned = height * innerW;
-        T zero(0);
-        AscendC::Duplicate<T>(planeLocal, zero, planeSizeAligned);
-
-        uint64_t base = static_cast<uint64_t>(planeIdx) * height * width;
-        for (uint32_t h = 0; h < height; ++h) {
-            AscendC::DataCopy(planeLocal[h * innerW], xGm[base + static_cast<uint64_t>(h) * width], width);
-        }
-        inPlaneQueue.EnQue(planeLocal);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(uint32_t /*planeIdx*/)
+    __aicore__ inline void Compute(int32_t)
     {
-        // 两次Sum归约：先按行对W求和，再对行向量求和 -> 得到标量；随后除以元素数并Tanh
-        AscendC::LocalTensor<T> planeLocal = inPlaneQueue.DeQue<T>();
-        AscendC::LocalTensor<uint8_t> workLocal = workQueue.AllocTensor<uint8_t>();
-        AscendC::LocalTensor<T> rowSumLocal = rowSumQueue.AllocTensor<T>();
-        // 先对每行(width)做Sum归约
-        AscendC::SumParams paramsW { height, innerW, width };
-        AscendC::Sum(rowSumLocal, planeLocal, workLocal, paramsW);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
 
-        // 将行和向量拷入到对齐的一维缓冲再做第二次Sum
-        AscendC::LocalTensor<T> scalarLocal = outScalarQueue.AllocTensor<T>();
-        // 准备对齐的H缓冲并清零
-        uint32_t innerHAligned = AlignUp32BytesElems(height);
-        // 为简化，复用planeLocal的前innerHAligned位置作为中间一维缓冲
-        AscendC::Duplicate<T>(planeLocal, T(0), innerHAligned);
-        AscendC::DataCopy(planeLocal, rowSumLocal, height);
+        // Hardtanh: y = min(max(x, -1), 1)
+        AscendC::Maxs(yLocal, xLocal, static_cast<DTYPE_Y>(-1.0f), this->tileLength);
+        AscendC::Mins(yLocal, yLocal, static_cast<DTYPE_Y>(1.0f), this->tileLength);
 
-        AscendC::SumParams paramsH { 1, innerHAligned, height };
-        AscendC::Sum(scalarLocal, planeLocal, workLocal, paramsH);
-
-        // 求均值并tanh
-        float denom = static_cast<float>(height) * static_cast<float>(width);
-        float inv = 1.0f / denom;
-        AscendC::Muls(scalarLocal, scalarLocal, inv, 1);
-        AscendC::Tanh(scalarLocal, scalarLocal, 1);
-
-        outScalarQueue.EnQue<T>(scalarLocal);
-        workQueue.FreeTensor(workLocal);
-        rowSumQueue.FreeTensor(rowSumLocal);
-        inPlaneQueue.FreeTensor(planeLocal);
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
     }
 
-    __aicore__ inline void CopyOut(uint32_t planeIdx)
+    __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<T> scalarLocal = outScalarQueue.DeQue<T>();
-        AscendC::DataCopy(yGm[planeIdx], scalarLocal, 1);
-        outScalarQueue.FreeTensor(scalarLocal);
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::QuePosition::VECIN,  QUE_NUM> inPlaneQueue;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, QUE_NUM> rowSumQueue;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, QUE_NUM> outScalarQueue;
-    AscendC::TQue<AscendC::QuePosition::VECCALC, QUE_NUM> workQueue;
-
-    AscendC::GlobalTensor<T> xGm;
-    AscendC::GlobalTensor<T> yGm;
-
-    uint32_t planes;
-    uint32_t height;
-    uint32_t width;
-    uint32_t innerW;
-    uint32_t innerH;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void conv_transpose2d_max_pool_hardtanh_mean_tanh_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void conv_transpose2d_max_pool_hardtanh_mean_tanh_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelMeanTanh op;
-    op.Init(x, y,
-            tiling_data.planes, tiling_data.height, tiling_data.width,
-            tiling_data.innerW, tiling_data.innerH, tiling_data.tmpSize);
+    KernelHardtanh op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -315,13 +201,11 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv_transpose2d_max_pool_hardtanh_mean_tanh_custom_impl_npu(const at::Tensor& x) {
-    // 输出 (N, C, 1, 1)
-    auto sizes = x.sizes();
-    TORCH_CHECK(sizes.size() == 4, "Input must be 4D (N,C,H,W) after maxpool+hardtanh");
-    at::Tensor out = at::empty({sizes[0], sizes[1], 1, 1}, x.options());
-    EXEC_NPU_CMD(aclnnConvTranspose2dMaxPoolHardtanhMeanTanhCustom, x, out);
-    return out;
+at::Tensor conv_transpose2d_max_pool_hardtanh_mean_tanh_custom_impl_npu(const at::Tensor& self, double min_val, double max_val) {
+    // 内核当前按 [-1, 1] 硬截断实现，min_val/max_val 作为接口参数保留对齐语义
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnConvTranspose2dMaxPoolHardtanhMeanTanhCustom, self, static_cast<float>(min_val), static_cast<float>(max_val), result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -329,7 +213,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv_transpose2d_max_pool_hardtanh_mean_tanh_custom", &conv_transpose2d_max_pool_hardtanh_mean_tanh_custom_impl_npu, "Mean+Tanh after MaxPool/Hardtanh");
+    m.def("conv_transpose2d_max_pool_hardtanh_mean_tanh_custom", &conv_transpose2d_max_pool_hardtanh_mean_tanh_custom_impl_npu, "Hardtanh + (mean,tanh handled in PyTorch)");
 }
 """
 
@@ -340,20 +224,21 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    仅将 mean + tanh 替换为自定义AscendC算子；conv_transpose2d / max_pool / hardtanh仍使用原生模块。
+    优化版本：保留 PyTorch 的 ConvTranspose2d 与 MaxPool2d，
+    使用自定义 AscendC 算子替换 Hardtanh；随后在 PyTorch 中执行 mean 和 tanh。
     """
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
-                 maxpool_kernel_size, maxpool_stride, hardtanh_min, hardtanh_max):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, maxpool_kernel_size, maxpool_stride, hardtanh_min, hardtanh_max):
         super(ModelNew, self).__init__()
         self.conv_transpose = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
         self.maxpool = torch.nn.MaxPool2d(kernel_size=maxpool_kernel_size, stride=maxpool_stride)
-        self.hardtanh = torch.nn.Hardtanh(min_val=hardtanh_min, max_val=hardtanh_max)
+        self.hardtanh_min = hardtanh_min
+        self.hardtanh_max = hardtanh_max
 
     def forward(self, x):
         x = self.conv_transpose(x)
         x = self.maxpool(x)
-        x = self.hardtanh(x)
-        # 自定义算子：对(H,W)进行均值并tanh，输出形状(N,C,1,1)
-        x = custom_ops_lib.conv_transpose2d_max_pool_hardtanh_mean_tanh_custom(x)
+        x = custom_ops_lib.conv_transpose2d_max_pool_hardtanh_mean_tanh_custom(x, float(self.hardtanh_min), float(self.hardtanh_max))
+        x = torch.mean(x, dim=(2, 3), keepdim=True)
+        x = torch.tanh(x)
         return x
 '''

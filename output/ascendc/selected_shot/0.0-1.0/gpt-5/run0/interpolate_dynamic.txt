@@ -1,0 +1,310 @@
+project_json_src='''
+[
+    {
+        "op": "InterpolateDynamicCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "attr_desc": [
+            {
+                "name": "out_h",
+                "param_type": "required",
+                "type": "int"
+            },
+            {
+                "name": "out_w",
+                "param_type": "required",
+                "type": "int"
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(InterpolateDynamicCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h_in);
+  TILING_DATA_FIELD_DEF(uint32_t, w_in);
+  TILING_DATA_FIELD_DEF(uint32_t, h_out);
+  TILING_DATA_FIELD_DEF(uint32_t, w_out);
+  TILING_DATA_FIELD_DEF(uint32_t, totalOut);
+  TILING_DATA_FIELD_DEF(uint32_t, chunkLen);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(InterpolateDynamicCustom, InterpolateDynamicCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "interpolate_dynamic_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    InterpolateDynamicCustomTilingData tiling;
+
+    uint32_t n = context->GetInputShape(0)->GetOriginShape().GetDim(0);
+    uint32_t c = context->GetInputShape(0)->GetOriginShape().GetDim(1);
+    uint32_t h_in = context->GetInputShape(0)->GetOriginShape().GetDim(2);
+    uint32_t w_in = context->GetInputShape(0)->GetOriginShape().GetDim(3);
+
+    // read attributes out_h and out_w
+    int64_t out_h = 0;
+    int64_t out_w = 0;
+    auto attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        attrs->GetInt("out_h", out_h);
+        attrs->GetInt("out_w", out_w);
+    }
+
+    uint32_t h_out = static_cast<uint32_t>(out_h);
+    uint32_t w_out = static_cast<uint32_t>(out_w);
+
+    uint64_t totalOut64 = static_cast<uint64_t>(n) * static_cast<uint64_t>(c) * static_cast<uint64_t>(h_out) * static_cast<uint64_t>(w_out);
+    uint32_t totalOut = static_cast<uint32_t>(totalOut64);
+    uint32_t chunkLen = (totalOut + BLOCK_DIM - 1) / BLOCK_DIM;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_h_in(h_in);
+    tiling.set_w_in(w_in);
+    tiling.set_h_out(h_out);
+    tiling.set_w_out(w_out);
+    tiling.set_totalOut(totalOut);
+    tiling.set_chunkLen(chunkLen);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    // read attrs
+    int64_t out_h = 0;
+    int64_t out_w = 0;
+    auto attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        attrs->GetInt("out_h", out_h);
+        attrs->GetInt("out_w", out_w);
+    }
+
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    std::vector<int64_t> dims = {
+        in_shape->GetDim(0),
+        in_shape->GetDim(1),
+        static_cast<int64_t>(out_h),
+        static_cast<int64_t>(out_w)
+    };
+    out_shape->SetDimNum(dims.size());
+    for (size_t i = 0; i < dims.size(); ++i) {
+        out_shape->SetDim(i, dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class InterpolateDynamicCustom : public OpDef {
+public:
+    explicit InterpolateDynamicCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // attributes
+        this->Attr("out_h").SetInt();
+        this->Attr("out_w").SetInt();
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(InterpolateDynamicCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include <cmath>
+
+extern "C" __global__ __aicore__ void interpolate_dynamic_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+
+    const uint32_t N = tiling_data.n;
+    const uint32_t C = tiling_data.c;
+    const uint32_t H_IN = tiling_data.h_in;
+    const uint32_t W_IN = tiling_data.w_in;
+    const uint32_t H_OUT = tiling_data.h_out;
+    const uint32_t W_OUT = tiling_data.w_out;
+    const uint32_t totalOut = tiling_data.totalOut;
+    const uint32_t chunkLen = tiling_data.chunkLen;
+
+    const uint32_t blockIdx = AscendC::GetBlockIdx();
+    uint32_t start = blockIdx * chunkLen;
+    if (start >= totalOut) {
+        return;
+    }
+    uint32_t len = chunkLen;
+    if (start + len > totalOut) {
+        len = totalOut - start;
+    }
+
+    __gm__ DTYPE_X* in = reinterpret_cast<__gm__ DTYPE_X*>(x);
+    __gm__ DTYPE_Z* out = reinterpret_cast<__gm__ DTYPE_Z*>(y);
+
+    const float scale_h = (H_OUT > 0) ? (static_cast<float>(H_IN) / static_cast<float>(H_OUT)) : 0.0f;
+    const float scale_w = (W_OUT > 0) ? (static_cast<float>(W_IN) / static_cast<float>(W_OUT)) : 0.0f;
+
+    for (uint32_t i = 0; i < len; ++i) {
+        uint32_t idx = start + i;
+
+        // unravel index to n, c, oh, ow
+        uint32_t ow = idx % W_OUT;
+        uint32_t tmp = idx / W_OUT;
+        uint32_t oh = tmp % H_OUT;
+        tmp /= H_OUT;
+        uint32_t c = tmp % C;
+        uint32_t n = tmp / C;
+
+        float in_h_f = (static_cast<float>(oh) + 0.5f) * scale_h - 0.5f;
+        float in_w_f = (static_cast<float>(ow) + 0.5f) * scale_w - 0.5f;
+
+        if (in_h_f < 0.0f) in_h_f = 0.0f;
+        if (in_w_f < 0.0f) in_w_f = 0.0f;
+
+        int32_t h0 = static_cast<int32_t>(floorf(in_h_f));
+        int32_t w0 = static_cast<int32_t>(floorf(in_w_f));
+
+        int32_t h1 = h0 + 1;
+        int32_t w1 = w0 + 1;
+
+        if (h0 < 0) h0 = 0;
+        if (w0 < 0) w0 = 0;
+        if (h1 >= static_cast<int32_t>(H_IN)) h1 = static_cast<int32_t>(H_IN) - 1;
+        if (w1 >= static_cast<int32_t>(W_IN)) w1 = static_cast<int32_t>(W_IN) - 1;
+
+        float lh = in_h_f - static_cast<float>(h0);
+        float lw = in_w_f - static_cast<float>(w0);
+        if (lh < 0.0f) lh = 0.0f;
+        if (lh > 1.0f) lh = 1.0f;
+        if (lw < 0.0f) lw = 0.0f;
+        if (lw > 1.0f) lw = 1.0f;
+
+        uint64_t base_nc = (static_cast<uint64_t>(n) * C + c);
+        uint64_t offset00 = ((base_nc * H_IN + static_cast<uint64_t>(h0)) * W_IN + static_cast<uint64_t>(w0));
+        uint64_t offset01 = ((base_nc * H_IN + static_cast<uint64_t>(h0)) * W_IN + static_cast<uint64_t>(w1));
+        uint64_t offset10 = ((base_nc * H_IN + static_cast<uint64_t>(h1)) * W_IN + static_cast<uint64_t>(w0));
+        uint64_t offset11 = ((base_nc * H_IN + static_cast<uint64_t>(h1)) * W_IN + static_cast<uint64_t>(w1));
+
+        float v00 = static_cast<float>(in[offset00]);
+        float v01 = static_cast<float>(in[offset01]);
+        float v10 = static_cast<float>(in[offset10]);
+        float v11 = static_cast<float>(in[offset11]);
+
+        float w00 = (1.0f - lh) * (1.0f - lw);
+        float w01 = (1.0f - lh) * lw;
+        float w10 = lh * (1.0f - lw);
+        float w11 = lh * lw;
+
+        float res = v00 * w00 + v01 * w01 + v10 * w10 + v11 * w11;
+
+        uint64_t out_offset = ((base_nc * H_OUT + static_cast<uint64_t>(oh)) * W_OUT + static_cast<uint64_t>(ow));
+        out[out_offset] = static_cast<DTYPE_Z>(res);
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor interpolate_dynamic_custom_impl_npu(const at::Tensor& self, int64_t out_h, int64_t out_w) {
+    auto sizes = self.sizes();
+    at::Tensor result = at::empty({sizes[0], sizes[1], out_h, out_w}, self.options());
+    EXEC_NPU_CMD(aclnnInterpolateDynamicCustom, self, (int64_t)out_h, (int64_t)out_w, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("interpolate_dynamic_custom", &interpolate_dynamic_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("interpolate_dynamic_custom", &interpolate_dynamic_custom_impl_npu, "Bilinear Interpolate (align_corners=False)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, target_size):
+        # target_size is (out_h, out_w)
+        return custom_ops_lib.interpolate_dynamic_custom(x, int(target_size[0]), int(target_size[1]))
+'''

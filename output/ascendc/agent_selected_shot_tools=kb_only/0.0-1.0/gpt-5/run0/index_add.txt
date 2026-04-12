@@ -1,0 +1,295 @@
+project_json_src='''
+[
+    {
+        "op": "IndexAddCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "indices",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            },
+            {
+                "name": "values",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(IndexAddCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, xRows);
+  TILING_DATA_FIELD_DEF(uint32_t, colSize);
+  TILING_DATA_FIELD_DEF(uint32_t, updates);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(IndexAddCustom, IndexAddCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "index_add_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t GetDim0(const gert::Shape* s) {
+    if (s->GetOriginShape().GetDimNum() == 0) return 1;
+    return static_cast<uint32_t>(s->GetOriginShape().GetDim(0));
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    IndexAddCustomTilingData tiling;
+
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* indices_shape = context->GetInputShape(1);
+
+    uint64_t totalLen = x_shape->GetOriginShape().GetShapeSize();
+    uint32_t xRows = GetDim0(x_shape);
+    uint32_t colSize = (xRows == 0) ? 0 : static_cast<uint32_t>(totalLen / xRows);
+    uint32_t updates = static_cast<uint32_t>(indices_shape->GetOriginShape().GetShapeSize());
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_xRows(xRows);
+    tiling.set_colSize(colSize);
+    tiling.set_updates(updates);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    *z_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class IndexAddCustom : public OpDef {
+public:
+    explicit IndexAddCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("indices")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("values")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(IndexAddCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+class KernelIndexAdd {
+public:
+    __aicore__ inline KernelIndexAdd() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR indices, GM_ADDR values, GM_ADDR z,
+                                uint32_t xRows, uint32_t colSize, uint32_t updates)
+    {
+        this->xRows = xRows;
+        this->colSize = colSize;
+        this->updates = updates;
+
+        uint64_t xSize = static_cast<uint64_t>(xRows) * static_cast<uint64_t>(colSize);
+        uint64_t vSize = static_cast<uint64_t>(updates) * static_cast<uint64_t>(colSize);
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x, xSize);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z*)z, xSize);
+        indicesGm.SetGlobalBuffer((__gm__ int32_t*)indices, updates);
+        valuesGm.SetGlobalBuffer((__gm__ DTYPE_X*)values, vSize);
+
+        pipe.InitBuffer(inQueueVal, 1, this->colSize * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueIdx, 1, sizeof(int32_t));
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyXtoZByBlock();
+        ScatterAddByBlock();
+    }
+
+private:
+    __aicore__ inline void CopyXtoZByBlock()
+    {
+        uint32_t bn = AscendC::GetBlockNum();
+        uint32_t bi = AscendC::GetBlockIdx();
+
+        uint32_t base = (this->xRows / bn) * bi + AscendC::Min(bi, this->xRows % bn);
+        uint32_t rows = (this->xRows / bn) + ((bi < (this->xRows % bn)) ? 1 : 0);
+
+        for (uint32_t r = 0; r < rows; ++r) {
+            uint32_t rowId = base + r;
+            AscendC::LocalTensor<DTYPE_X> rowLocal = inQueueVal.AllocTensor<DTYPE_X>();
+            AscendC::DataCopy(rowLocal, xGm[rowId * this->colSize], this->colSize);
+            AscendC::DataCopy(zGm[rowId * this->colSize], rowLocal, this->colSize);
+            inQueueVal.FreeTensor(rowLocal);
+        }
+    }
+
+    __aicore__ inline void ScatterAddByBlock()
+    {
+        uint32_t bn = AscendC::GetBlockNum();
+        uint32_t bi = AscendC::GetBlockIdx();
+
+        uint32_t base = (this->updates / bn) * bi + AscendC::Min(bi, this->updates % bn);
+        uint32_t cnt  = (this->updates / bn) + ((bi < (this->updates % bn)) ? 1 : 0);
+
+        for (uint32_t k = 0; k < cnt; ++k) {
+            uint32_t idxPos = base + k;
+
+            AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.AllocTensor<int32_t>();
+            AscendC::DataCopy(idxLocal, indicesGm[idxPos], 1);
+            // 假设LocalTensor提供GetValue接口读取标量索引
+            int32_t rowIdx = idxLocal.GetValue(0);
+            inQueueIdx.FreeTensor(idxLocal);
+
+            AscendC::LocalTensor<DTYPE_X> valLocal = inQueueVal.AllocTensor<DTYPE_X>();
+            AscendC::DataCopy(valLocal, valuesGm[idxPos * this->colSize], this->colSize);
+
+            AscendC::SetAtomicAdd<DTYPE_Z>();
+            AscendC::DataCopy(zGm[rowIdx * this->colSize], valLocal, this->colSize);
+            AscendC::SetAtomicNone();
+
+            inQueueVal.FreeTensor(valLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueVal;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueIdx;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+    AscendC::GlobalTensor<int32_t> indicesGm;
+    AscendC::GlobalTensor<DTYPE_X> valuesGm;
+
+    uint32_t xRows;
+    uint32_t colSize;
+    uint32_t updates;
+};
+
+extern "C" __global__ __aicore__ void index_add_custom(GM_ADDR x, GM_ADDR indices, GM_ADDR values, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelIndexAdd op;
+    op.Init(x, indices, values, z, tiling_data.xRows, tiling_data.colSize, tiling_data.updates);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor index_add_custom_impl_npu(const at::Tensor& x, const at::Tensor& indices, const at::Tensor& values) {
+    at::Tensor result = at::empty_like(x);
+    // Ascend内核期望int32索引，如为int64则转换
+    at::Tensor indices_i32 = indices.dtype() == at::kInt ? indices : indices.to(at::kInt);
+    EXEC_NPU_CMD(aclnnIndexAddCustom, x, indices_i32, values, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("index_add_custom", &index_add_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("index_add_custom", &index_add_custom_impl_npu, "index_add along dim=0");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, indices, values):
+        return custom_ops_lib.index_add_custom(x, indices, values)
+'''

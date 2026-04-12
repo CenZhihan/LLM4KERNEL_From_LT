@@ -1,0 +1,469 @@
+project_json_src='''
+[
+    {
+        "op": "GemmBiasAddHardtanhMishGroupNormCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "bias_linear",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "bias_extra",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "gamma",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "beta",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "attr": [
+            {
+                "name": "num_groups",
+                "type": "int"
+            },
+            {
+                "name": "min_val",
+                "type": "float"
+            },
+            {
+                "name": "max_val",
+                "type": "float"
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmBiasAddHardtanhMishGroupNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, M);               // batch size
+  TILING_DATA_FIELD_DEF(uint32_t, K);               // in_features
+  TILING_DATA_FIELD_DEF(uint32_t, O);               // out_features
+  TILING_DATA_FIELD_DEF(uint32_t, numGroups);       // number of groups
+  TILING_DATA_FIELD_DEF(uint32_t, channelsPerGroup);
+  TILING_DATA_FIELD_DEF(uint32_t, rowsPerBlock);
+  TILING_DATA_FIELD_DEF(float, minVal);
+  TILING_DATA_FIELD_DEF(float, maxVal);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmBiasAddHardtanhMishGroupNormCustom, GemmBiasAddHardtanhMishGroupNormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gemm_bias_add_hardtanh_mish_group_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GemmBiasAddHardtanhMishGroupNormCustomTilingData tiling;
+
+    const auto* x_shape = context->GetInputShape(0);
+    const auto* w_shape = context->GetInputShape(1);
+
+    uint32_t M = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t K = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    uint32_t O = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(0));
+    // w expected shape: (O, K)
+
+    // get attributes
+    int64_t numGroupsAttr = 1;
+    float minValAttr = -1.0f;
+    float maxValAttr = 1.0f;
+
+    auto* ngAttr = context->GetAttr("num_groups");
+    if (ngAttr != nullptr) {
+        numGroupsAttr = ngAttr->GetInt();
+    }
+    auto* minAttr = context->GetAttr("min_val");
+    if (minAttr != nullptr) {
+        minValAttr = static_cast<float>(minAttr->GetFloat());
+    }
+    auto* maxAttr = context->GetAttr("max_val");
+    if (maxAttr != nullptr) {
+        maxValAttr = static_cast<float>(maxAttr->GetFloat());
+    }
+
+    uint32_t numGroups = static_cast<uint32_t>(numGroupsAttr);
+    if (numGroups == 0) numGroups = 1;
+    uint32_t channelsPerGroup = (O + numGroups - 1) / numGroups;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    uint32_t blockNum = BLOCK_DIM;
+    uint32_t rowsPerBlock = (M + blockNum - 1) / blockNum;
+
+    tiling.set_M(M);
+    tiling.set_K(K);
+    tiling.set_O(O);
+    tiling.set_numGroups(numGroups);
+    tiling.set_channelsPerGroup(channelsPerGroup);
+    tiling.set_rowsPerBlock(rowsPerBlock);
+    tiling.set_minVal(minValAttr);
+    tiling.set_maxVal(maxValAttr);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* workspaces = context->GetWorkspaceSizes(1);
+    workspaces[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0); // (M, K)
+    const gert::Shape* w_shape = context->GetInputShape(1); // (O, K)
+    gert::Shape* y_shape = context->GetOutputShape(0);      // (M, O)
+
+    std::vector<int64_t> out_dims;
+    out_dims.push_back(x_shape->GetDim(0));
+    out_dims.push_back(w_shape->GetDim(0));
+    y_shape->SetDimNum(2);
+    y_shape->Update(out_dims.data(), out_dims.size());
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GemmBiasAddHardtanhMishGroupNormCustom : public OpDef {
+public:
+    explicit GemmBiasAddHardtanhMishGroupNormCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias_linear")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias_extra")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("gamma")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("beta")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("num_groups").Int(1);
+        this->Attr("min_val").Float(-1.0f);
+        this->Attr("max_val").Float(1.0f);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmBiasAddHardtanhMishGroupNormCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include <cmath>
+
+using DTYPE = float;
+
+constexpr float EPS = 1e-5f;
+
+class KernelGemmBiasAddHardtanhMishGroupNorm {
+public:
+    __aicore__ inline KernelGemmBiasAddHardtanhMishGroupNorm() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR bias_linear, GM_ADDR bias_extra,
+                                GM_ADDR gamma, GM_ADDR beta, GM_ADDR y,
+                                uint32_t M, uint32_t K, uint32_t O,
+                                uint32_t numGroups, uint32_t channelsPerGroup,
+                                uint32_t rowsPerBlock, float minVal, float maxVal)
+    {
+        this->M = M;
+        this->K = K;
+        this->O = O;
+        this->numGroups = numGroups;
+        this->channelsPerGroup = channelsPerGroup;
+        this->rowsPerBlock = rowsPerBlock;
+        this->minVal = minVal;
+        this->maxVal = maxVal;
+
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t rowStart = blockIdx * rowsPerBlock;
+        uint32_t rowCount = rowsPerBlock;
+        if (rowStart + rowCount > M) {
+            rowCount = (M > rowStart) ? (M - rowStart) : 0;
+        }
+        this->rowStart = rowStart;
+        this->rowCount = rowCount;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE*)x + (uint64_t)rowStart * K, (uint64_t)rowCount * K);
+        wGm.SetGlobalBuffer((__gm__ DTYPE*)w, (uint64_t)O * K);
+        bias0Gm.SetGlobalBuffer((__gm__ DTYPE*)bias_linear, O);
+        bias1Gm.SetGlobalBuffer((__gm__ DTYPE*)bias_extra, O);
+        gammaGm.SetGlobalBuffer((__gm__ DTYPE*)gamma, O);
+        betaGm.SetGlobalBuffer((__gm__ DTYPE*)beta, O);
+        yGm.SetGlobalBuffer((__gm__ DTYPE*)y + (uint64_t)rowStart * O, (uint64_t)rowCount * O);
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = 0; r < rowCount; ++r) {
+            ComputeRow(r);
+        }
+    }
+
+private:
+    __aicore__ inline void ComputeRow(uint32_t rLocal)
+    {
+        // local scratch buffers in UB (conceptual)
+        // Load x row r
+        // For simplicity, load element-wise from GM during dot product
+
+        // Temporary store for post-activation vector before groupnorm
+        // We'll write out to GM after GroupNorm
+        for (uint32_t o = 0; o < O; ++o) {
+            // GEMM: y_val = dot(x_row, w[o, :])
+            DTYPE acc = 0.0f;
+            for (uint32_t k = 0; k < K; ++k) {
+                DTYPE xv = xGm[rLocal * K + k];
+                DTYPE wv = wGm[o * K + k]; // w shape (O, K)
+                acc += xv * wv;
+            }
+            // Bias add (linear bias + extra bias)
+            acc += bias0Gm[o];
+            acc += bias1Gm[o];
+
+            // Hardtanh
+            if (acc < minVal) acc = minVal;
+            if (acc > maxVal) acc = maxVal;
+
+            // Mish: x * tanh(softplus(x)), softplus(x)=log(1+exp(x))
+            DTYPE sp = log1pf(expf(acc));
+            DTYPE mish = acc * tanhf(sp);
+
+            // temporarily store back into yGm buffer; we'll normalize in-place
+            yGm[rLocal * O + o] = mish;
+        }
+
+        // GroupNorm per row
+        uint32_t G = numGroups;
+        uint32_t C = O;
+        uint32_t Cpg = channelsPerGroup;
+        if (Cpg * G > C) {
+            Cpg = (C + G - 1) / G; // ensure coverage
+        }
+
+        for (uint32_t g = 0; g < G; ++g) {
+            uint32_t cStart = g * Cpg;
+            if (cStart >= C) break;
+            uint32_t cEnd = cStart + Cpg;
+            if (cEnd > C) cEnd = C;
+            uint32_t count = cEnd - cStart;
+
+            // mean
+            DTYPE mean = 0.0f;
+            for (uint32_t c = cStart; c < cEnd; ++c) {
+                mean += yGm[rLocal * O + c];
+            }
+            mean /= (DTYPE)count;
+
+            // var
+            DTYPE var = 0.0f;
+            for (uint32_t c = cStart; c < cEnd; ++c) {
+                DTYPE v = yGm[rLocal * O + c] - mean;
+                var += v * v;
+            }
+            var /= (DTYPE)count;
+            DTYPE invStd = rsqrtf(var + EPS);
+
+            // normalize and affine
+            for (uint32_t c = cStart; c < cEnd; ++c) {
+                DTYPE v = yGm[rLocal * O + c];
+                DTYPE norm = (v - mean) * invStd;
+                DTYPE outv = norm * gammaGm[c] + betaGm[c];
+                yGm[rLocal * O + c] = outv;
+            }
+        }
+    }
+
+private:
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> wGm;
+    AscendC::GlobalTensor<DTYPE> bias0Gm;
+    AscendC::GlobalTensor<DTYPE> bias1Gm;
+    AscendC::GlobalTensor<DTYPE> gammaGm;
+    AscendC::GlobalTensor<DTYPE> betaGm;
+    AscendC::GlobalTensor<DTYPE> yGm;
+
+    uint32_t M;
+    uint32_t K;
+    uint32_t O;
+    uint32_t numGroups;
+    uint32_t channelsPerGroup;
+    uint32_t rowsPerBlock;
+    uint32_t rowStart;
+    uint32_t rowCount;
+    float minVal;
+    float maxVal;
+};
+
+extern "C" __global__ __aicore__ void gemm_bias_add_hardtanh_mish_group_norm_custom(
+    GM_ADDR x, GM_ADDR w, GM_ADDR bias_linear, GM_ADDR bias_extra,
+    GM_ADDR gamma, GM_ADDR beta, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGemmBiasAddHardtanhMishGroupNorm op;
+    op.Init(x, w, bias_linear, bias_extra, gamma, beta, y,
+            tiling_data.M, tiling_data.K, tiling_data.O,
+            tiling_data.numGroups, tiling_data.channelsPerGroup,
+            tiling_data.rowsPerBlock, tiling_data.minVal, tiling_data.maxVal);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gemm_bias_add_hardtanh_mish_group_norm_custom_impl_npu(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& bias_linear,
+    const at::Tensor& bias_extra,
+    const at::Tensor& gamma,
+    const at::Tensor& beta,
+    int64_t num_groups,
+    double min_val,
+    double max_val) {
+
+    TORCH_CHECK(x.dtype() == at::kFloat, "Only float32 is supported");
+    TORCH_CHECK(weight.dtype() == at::kFloat, "Only float32 is supported");
+    TORCH_CHECK(bias_linear.dtype() == at::kFloat, "Only float32 is supported");
+    TORCH_CHECK(bias_extra.dtype() == at::kFloat, "Only float32 is supported");
+    TORCH_CHECK(gamma.dtype() == at::kFloat, "Only float32 is supported");
+    TORCH_CHECK(beta.dtype() == at::kFloat, "Only float32 is supported");
+
+    // x: (M, K), weight: (O, K)
+    at::Tensor result = at::empty({x.size(0), weight.size(0)}, x.options());
+
+    // Pass attributes (num_groups, min_val, max_val) to runtime along with tensors
+    EXEC_NPU_CMD(aclnnGemmBiasAddHardtanhMishGroupNormCustom,
+                 x, weight, bias_linear, bias_extra, gamma, beta,
+                 num_groups, static_cast<float>(min_val), static_cast<float>(max_val),
+                 result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_bias_add_hardtanh_mish_group_norm_custom", &gemm_bias_add_hardtanh_mish_group_norm_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_bias_add_hardtanh_mish_group_norm_custom",
+          &gemm_bias_add_hardtanh_mish_group_norm_custom_impl_npu,
+          "Fused GEMM + BiasAdd + Hardtanh + Mish + GroupNorm");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_features, out_features, bias_shape, num_groups):
+        super(ModelNew, self).__init__()
+        self.gemm = torch.nn.Linear(in_features, out_features)
+        self.bias = torch.nn.Parameter(torch.randn(bias_shape))
+        self.hardtanh = torch.nn.Hardtanh()
+        self.mish = torch.nn.Mish()
+        self.groupnorm = torch.nn.GroupNorm(num_groups=num_groups, num_channels=out_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Call fused custom operator
+        # weight expected shape: (out_features, in_features)
+        return custom_ops_lib.gemm_bias_add_hardtanh_mish_group_norm_custom(
+            x,
+            self.gemm.weight,
+            self.gemm.bias,
+            self.bias,
+            self.groupnorm.weight,
+            self.groupnorm.bias,
+            self.groupnorm.num_groups,
+            float(self.hardtanh.min_val),
+            float(self.hardtanh.max_val),
+        )
+'''

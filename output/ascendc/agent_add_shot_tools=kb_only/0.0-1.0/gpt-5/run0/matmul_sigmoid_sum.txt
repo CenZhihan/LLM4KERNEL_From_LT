@@ -53,91 +53,71 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulSigmoidSumCustomTilingData)
+  // 仅用于占位，实际使用RawTilingData传递TCubeTiling
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulSigmoidSumCustom, MatmulSigmoidSumCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "matmul_sigmoid_sum_custom_tiling.h"
+#include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "optiling/tilingdata_utils.h"
-#include "lib/matmul_tiling_intf.h"
-#include <cstring>
+#include "tiling/tiling_api.h"
 
 namespace optiling {
 
-static constexpr uint32_t MAX_WORKSPACE_NUM = 1;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // Input0: x [B, M], Input1: weight [N, M], Input2: bias [N]
-    const auto *xShape = context->GetInputShape(0);
-    const auto *wShape = context->GetInputShape(1);
-    if (xShape == nullptr || wShape == nullptr) {
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+
+    // 解析输入形状
+    const auto *x_shape = context->GetInputShape(0);
+    const auto *w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    // x: [B, K], weight: [N, K] (线性层参数为[out, in]，在kernel中对B进行转置处理)
+    uint64_t B = static_cast<uint64_t>(x_shape->GetOriginShape().GetDim(0));
+    uint64_t K = static_cast<uint64_t>(x_shape->GetOriginShape().GetDim(1));
+    uint64_t N = static_cast<uint64_t>(w_shape->GetOriginShape().GetDim(0));
+
+    // 设置BlockDim（根据实际硬件可微调）
+    const uint32_t BLOCK_DIM = 8;
+    context->SetBlockDim(BLOCK_DIM);
+
+    // 使用Matmul单核tiling API生成TCubeTiling
+    matmul_tiling::MatmulApiTiling tiling(ascendcPlatform);
+    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetShape(static_cast<uint32_t>(B), static_cast<uint32_t>(N), static_cast<uint32_t>(K));
+    tiling.SetOrgShape(static_cast<uint32_t>(B), static_cast<uint32_t>(N), static_cast<uint32_t>(K));
+    tiling.SetBias(true);
+    tiling.SetBufferSpace(-1, -1, -1);
+
+    optiling::TCubeTiling tilingData;
+    int ret = tiling.GetTiling(tilingData);
+    if (ret == -1) {
         return ge::GRAPH_FAILED;
     }
 
-    // ND layout assumed: dims [B, M] and [N, M]
-    const int64_t B = (xShape->GetOriginShape().GetDimNum() >= 1) ? xShape->GetOriginShape().GetDim(0) : 1;
-    const int64_t M = (xShape->GetOriginShape().GetDimNum() >= 2) ? xShape->GetOriginShape().GetDim(1) : 1;
-    const int64_t N = (wShape->GetOriginShape().GetDimNum() >= 1) ? wShape->GetOriginShape().GetDim(0) : 1;
-
-    // Infer output shape: [B, 1]
-    auto *yShape = context->GetOutputShape(0);
-    if (yShape != nullptr) {
-        gert::Shape y;
-        y.SetDimNum(2);
-        y.SetDim(0, B);
-        y.SetDim(1, 1);
-        *yShape = y;
-    }
-
-    // Prepare Matmul tiling for NORMAL layout
-    auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    matmul_tiling::MatmulApiTiling mmTiling(platform);
-    mmTiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    // B is transposed at compute time, weight is [N, M], so use transposeB = true
-    mmTiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mmTiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mmTiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mmTiling.EnableBias(true);
-    // single M, N, K
-    mmTiling.SetShape(static_cast<int32_t>(M), static_cast<int32_t>(N), static_cast<int32_t>(M));
-    // org M, N, Ka, Kb
-    mmTiling.SetOrgShape(static_cast<int32_t>(M), static_cast<int32_t>(N), static_cast<int32_t>(M));
-    // Use full AI Core memory
-    mmTiling.SetBufferSpace(-1, -1, -1);
-
-    optiling::TCubeTiling cubeTiling;
-    int ret = mmTiling.GetTiling(cubeTiling);
-    if (ret != 0) {
+    // 将TCubeTiling序列化到RawTilingData
+    auto *raw = context->GetRawTilingData();
+    if (raw == nullptr || raw->GetCapacity() < sizeof(optiling::TCubeTiling)) {
         return ge::GRAPH_FAILED;
     }
+    std::memcpy(raw->GetData(), &tilingData, sizeof(optiling::TCubeTiling));
+    raw->SetDataSize(sizeof(optiling::TCubeTiling));
 
-    // Fill raw tiling buffer: [B, M, N, reserved] + TCubeTiling bytes
-    // Header: 4 x uint32_t
-    const uint32_t headerCount = 4;
-    const uint32_t headerBytes = headerCount * sizeof(uint32_t);
-    const uint32_t cubeBytes = sizeof(optiling::TCubeTiling);
-    const uint32_t totalBytes = headerBytes + cubeBytes;
-
-    auto rawBuf = context->GetRawTilingData();
-    if (rawBuf->GetCapacity() < totalBytes) {
-        return ge::GRAPH_FAILED;
-    }
-    uint8_t *buf = reinterpret_cast<uint8_t*>(rawBuf->GetData());
-    uint32_t *hdr = reinterpret_cast<uint32_t*>(buf);
-    hdr[0] = static_cast<uint32_t>(B);
-    hdr[1] = static_cast<uint32_t>(M);
-    hdr[2] = static_cast<uint32_t>(N);
-    hdr[3] = 1; // isTransposeB = true
-
-    // Copy TCubeTiling after header
-    std::memcpy(buf + headerBytes, reinterpret_cast<void*>(&cubeTiling), cubeBytes);
-    rawBuf->SetDataSize(totalBytes);
-
-    // Set block dim (can be tuned). Use min(B, 8)
-    const uint32_t blockDim = static_cast<uint32_t>((B > 8) ? 8 : (B > 0 ? B : 1));
-    context->SetBlockDim(blockDim);
-
-    // Workspace requirement:
-    // 1) temp C buffer for matmul result: B * N * sizeof(float)
-    size_t *wk = context->GetWorkspaceSizes(1);
-    wk[0] = static_cast<size_t>(B) * static_cast<size_t>(N) * sizeof(float);
+    // 设置workspace：存放C = Matmul结果 (B x N)
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = static_cast<size_t>(B * N * sizeof(float));
 
     return ge::GRAPH_SUCCESS;
 }
@@ -145,32 +125,31 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 } // namespace optiling
 
 
-#include "register/op_def_registry.h"
-
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* xShape = context->GetInputShape(0);
-    const gert::Shape* wShape = context->GetInputShape(1);
-    if (xShape == nullptr || wShape == nullptr) {
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    if (x_shape == nullptr) {
         return GRAPH_FAILED;
     }
-    const int64_t B = (xShape->GetOriginShape().GetDimNum() >= 1) ? xShape->GetOriginShape().GetDim(0) : 1;
-
-    gert::Shape* yShape = context->GetOutputShape(0);
-    yShape->SetDimNum(2);
-    yShape->SetDim(0, B);
-    yShape->SetDim(1, 1);
+    // 输出形状为 [B, 1]
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    gert::Shape out;
+    out.SetDim(0, x_shape->GetOriginShape().GetDim(0));
+    out.SetDim(1, 1);
+    out.SetOriginShape(out);
+    *y_shape = out;
     return GRAPH_SUCCESS;
 }
 
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    auto inputDataType = context->GetInputDataType(0);
+    const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
-    return GRAPH_SUCCESS;
+    return ge::GRAPH_SUCCESS;
 }
-}
+} // namespace ge
+
 
 namespace ops {
 class MatmulSigmoidSumCustom : public OpDef {
@@ -203,114 +182,125 @@ public:
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(MatmulSigmoidSumCustom);
 }
-"""
-
-host_operator_src="""
-#include "register/op_def_registry.h"
-#include "graph/debug/ge_attr_define.h"
-#include "graph/utils/type_utils.h"
-
-namespace optiling {
-// The real tiling implementation is provided in host_tiling_src via TilingFunc.
-// This file only needs to reference the op via registry above.
-}
-
 """
 
 kernel_src="""
 #include "kernel_operator.h"
 #include "lib/matmul_intf.h"
 
-using A_T = float;
-using B_T = float;
-using C_T = float;
+using A_T = float;   // x
+using B_T = float;   // weight
+using C_T = float;   // matmul result
+using BiasT = float; // bias
 
-// A: x [B, M], B: weight [N, M], compute with transposeB(true) so effective B^T is [M, N].
-// Output temp C: [B, N], then apply Sigmoid and reduce-sum over N to [B,1].
+// 简单Sigmoid实现：dst = 1 / (1 + exp(-src))
+__aicore__ inline void SigmoidLocal(const AscendC::LocalTensor<float>& dst, const AscendC::LocalTensor<float>& src, uint32_t len) {
+    // 使用高阶API，如果Sigmoid不可用可替换为近似实现
+    AscendC::Sigmoid(dst, src, len);
+}
 
-extern "C" __global__ __aicore__ void matmul_sigmoid_sum_custom(
-    GM_ADDR xGM, GM_ADDR weightGM, GM_ADDR biasGM, GM_ADDR yGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+extern "C" __global__ __aicore__ void matmul_sigmoid_sum_custom(GM_ADDR xGM, GM_ADDR wGM, GM_ADDR yGM, GM_ADDR biasGM, GM_ADDR tilingGM, GM_ADDR workspaceGM)
 {
-    // Read header [B, M, N, isTransposeB]
-    auto hdrGM = (__gm__ uint32_t*)tilingGM;
-    uint32_t B = hdrGM[0];
-    uint32_t M = hdrGM[1];
-    uint32_t N = hdrGM[2];
-    uint32_t isTransposeBIn = hdrGM[3];
+    set_atomic_none();
 
-    // Copy TCubeTiling from GM after header
-    optiling::TCubeTiling tiling;
-    auto srcTiling = reinterpret_cast<__gm__ uint32_t*>(hdrGM + 4);
-    auto dstTiling = reinterpret_cast<uint32_t*>(&tiling);
-    for (uint32_t i = 0; i < sizeof(optiling::TCubeTiling) / sizeof(uint32_t); ++i) {
-        dstTiling[i] = srcTiling[i];
+    // 读取TCubeTiling
+    TCubeTiling tiling;
+    auto tempTilingGM = (__gm__ uint32_t*)tilingGM;
+    auto tempTiling = (uint32_t*)&tiling;
+    for (int i = 0; i < sizeof(TCubeTiling) / sizeof(int32_t); ++i, ++tempTilingGM, ++tempTiling) {
+        *tempTiling = *tempTilingGM;
     }
 
-    // Prepare GM tensors for inputs
+    // 构造GM张量
     AscendC::GlobalTensor<A_T> aGlobal;
     AscendC::GlobalTensor<B_T> bGlobal;
-    AscendC::GlobalTensor<C_T> cTempGlobal; // temp C buffer at workspace
-    AscendC::GlobalTensor<C_T> biasGlobal;
+    AscendC::GlobalTensor<C_T> cGlobal;
+    AscendC::GlobalTensor<BiasT> biasGlobal;
     AscendC::GlobalTensor<C_T> yGlobal;
 
-    // Set buffers
-    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(xGM), B * M);
-    bGlobal.SetGlobalBuffer(reinterpret_cast__gm__ B_T*>(weightGM), N * M);
-    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(biasGM), N);
-    cTempGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(workspaceGM), B * N);
-    yGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(yGM), B * 1);
+    // NORMAL布局：x: [B, K], w: [N, K], c: [B, N], bias: [N], y: [B, 1]
+    int32_t sizeA = tiling.ALayoutInfoB * tiling.singleCoreM * tiling.singleCoreK * sizeof(A_T);
+    int32_t sizeB = tiling.BLayoutInfoB * tiling.singleCoreK * tiling.singleCoreN * sizeof(B_T);
+    int32_t sizeC = tiling.CLayoutInfoB * tiling.singleCoreM * tiling.singleCoreN * sizeof(C_T);
+    int32_t sizeBias = tiling.CLayoutInfoB * tiling.singleCoreN * sizeof(BiasT);
+    int32_t sizeY = tiling.CLayoutInfoB * tiling.singleCoreM * sizeof(C_T);
 
-    // Define Matmul types for NORMAL layout
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL> bType;
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
-    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T> biasType;
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(xGM), sizeA);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(wGM), sizeB);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(workspaceGM), sizeC); // 中间结果存workspace
+    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(biasGM), sizeBias);
+    yGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(yGM), sizeY);
 
+    // 创建Matmul实例（NORMAL）
     constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
-    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
+    // PyTorch Linear的权重为[out, in]，将B设置为转置使其参与计算为KxN
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true, LayoutMode::NORMAL> bType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, BiasT> biasType;
+
     AscendC::TPipe pipe;
+    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm;
     REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
     mm.Init(&tiling);
-
-    // Set A/B/C/Bias tensors
-    // For NORMAL: A [B, M], B [N, M] with transposeBIn=true
     mm.SetTensorA(aGlobal, false);
-    mm.SetTensorB(bGlobal, isTransposeBIn);
+    mm.SetTensorB(bGlobal, true);
     mm.SetWorkspace(workspaceGM, 0);
-    mm.SetBias(biasGlobal);
+    if (tiling.isBias) {
+        mm.SetBias(biasGlobal);
+    }
+    // 执行单次批处理Matmul
+    mm.IterateBatch(cGlobal, 1, 1, false);
 
-    // Execute multi-batch matmul over batch dimension: batchA = B, batchB = 1
-    mm.IterateBatch(cTempGlobal, B, 1, false);
+    // 后处理：对每个样本行做Sigmoid并按列求和 => 输出[B, 1]
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> tmpQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue;
+    pipe.InitBuffer(inQueue, 1, tiling.singleCoreN * sizeof(C_T));
+    pipe.InitBuffer(tmpQueue, 1, tiling.singleCoreN * sizeof(C_T));
+    pipe.InitBuffer(outQueue, 1, sizeof(C_T)); // 每次输出一个标量
 
-    // Post-processing: y = sum(sigmoid(C), dim=1, keepdim=True)
-    // Process per row
-    // We assume N is 32-byte aligned in elements for float (multiple of 8), as in docs.
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQ;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQ;
-    pipe.InitBuffer(inQ, 1, N * sizeof(C_T));
-    pipe.InitBuffer(outQ, 1, 1 * sizeof(C_T));
+    for (uint32_t row = 0; row < tiling.singleCoreM; ++row) {
+        // 从C的第row行读取到Local
+        AscendC::LocalTensor<C_T> rowLocal = inQueue.AllocTensor<C_T>();
+        // 通过workspaceGM指针计算行起始位置
+        __gm__ C_T* cBase = reinterpret_cast<__gm__ C_T*>(workspaceGM);
+        __gm__ C_T* rowPtr = cBase + row * tiling.singleCoreN;
+        AscendC::GlobalTensor<C_T> rowGlobal;
+        rowGlobal.SetGlobalBuffer(rowPtr, tiling.singleCoreN);
+        AscendC::DataCopy(rowLocal, rowGlobal, tiling.singleCoreN);
+        inQueue.EnQue(rowLocal);
 
-    for (uint32_t b = 0; b < B; ++b) {
-        AscendC::LocalTensor<C_T> rowLocal = inQ.AllocTensor<C_T>();
-        AscendC::DataCopy(rowLocal, cTempGlobal[b * N], N);
-        inQ.EnQue(rowLocal);
+        // Sigmoid
+        AscendC::LocalTensor<C_T> rowLocalIn = inQueue.DeQue<C_T>();
+        AscendC::LocalTensor<C_T> rowLocalOut = tmpQueue.AllocTensor<C_T>();
+        SigmoidLocal(rowLocalOut, rowLocalIn, tiling.singleCoreN);
 
-        // Compute sigmoid and reduce-sum
-        AscendC::LocalTensor<C_T> rowLocalIn = inQ.DeQue<C_T>();
-        // In-place sigmoid
-        AscendC::Sigmoid(rowLocalIn, rowLocalIn, N);
+        // ReduceSum得到标量
+        AscendC::LocalTensor<C_T> reduceWork = tmpQueue.AllocTensor<C_T>();
+        AscendC::LocalTensor<C_T> reduceDst = outQueue.AllocTensor<C_T>(); // 作为占位符
+        AscendC::ReduceSum(reduceDst, rowLocalOut, reduceWork, tiling.singleCoreN);
+        C_T acc = AscendC::GetAccVal<C_T>();
 
-        AscendC::LocalTensor<C_T> sumLocal = outQ.AllocTensor<C_T>();
-        AscendC::ReduceSum(sumLocal, rowLocalIn, N);
+        // 写回结果到y的第row个元素
+        AscendC::LocalTensor<C_T> yScalarLocal = outQueue.AllocTensor<C_T>();
+        // 将标量写入Local，再拷贝到GM
+        // 这里假设LocalTensor支持直接索引赋值
+        yScalarLocal.SetValue(0, acc);
+        AscendC::GlobalTensor<C_T> yRowGlobal;
+        __gm__ C_T* yBase = reinterpret_cast<__gm__ C_T*>(yGM);
+        yRowGlobal.SetGlobalBuffer(yBase + row, 1);
+        AscendC::DataCopy(yRowGlobal, yScalarLocal, 1);
 
-        inQ.FreeTensor(rowLocalIn);
-        outQ.EnQue(sumLocal);
-
-        AscendC::LocalTensor<C_T> sumOut = outQ.DeQue<C_T>();
-        AscendC::DataCopy(yGlobal[b], sumOut, 1);
-        outQ.FreeTensor(sumOut);
+        // 释放队列资源
+        inQueue.FreeTensor(rowLocalIn);
+        tmpQueue.FreeTensor(rowLocalOut);
+        tmpQueue.FreeTensor(reduceWork);
+        outQueue.FreeTensor(reduceDst);
+        outQueue.FreeTensor(yScalarLocal);
     }
 }
 """
@@ -321,28 +311,24 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor matmul_sigmoid_sum_custom_impl_npu(const at::Tensor& x,
-                                              const at::Tensor& weight,
-                                              const at::Tensor& bias) {
-    TORCH_CHECK(x.dim() == 2, "x must be 2D [B, M]");
-    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [N, M]");
-    TORCH_CHECK(bias.dim() == 1, "bias must be 1D [N]");
+at::Tensor matmul_sigmoid_sum_custom_impl_npu(const at::Tensor& x, const at::Tensor& weight, const at::Tensor& bias) {
+    TORCH_CHECK(x.dim() == 2, \"x must be 2D\");
+    TORCH_CHECK(weight.dim() == 2, \"weight must be 2D\");
+    TORCH_CHECK(bias.dim() == 1, \"bias must be 1D\");
+
     auto B = x.size(0);
     at::Tensor y = at::empty({B, 1}, x.options());
+
     EXEC_NPU_CMD(aclnnMatmulSigmoidSumCustom, x, weight, bias, y);
     return y;
 }
 
-TORCH_LIBRARY(myops, m) {
-    m.def("matmul_sigmoid_sum_custom(Tensor x, Tensor weight, Tensor bias) -> Tensor");
-}
-
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("matmul_sigmoid_sum_custom", &matmul_sigmoid_sum_custom_impl_npu);
+    m.impl(\"matmul_sigmoid_sum_custom\", &matmul_sigmoid_sum_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_sigmoid_sum_custom", &matmul_sigmoid_sum_custom_impl_npu, "Matmul + Sigmoid + Sum");
+    m.def(\"matmul_sigmoid_sum_custom\", &matmul_sigmoid_sum_custom_impl_npu, \"matmul + sigmoid + rowwise sum\");
 }
 """
 
@@ -352,15 +338,13 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    """
-    Optimized model: x @ W^T + b -> sigmoid -> sum(dim=1, keepdim=True)
-    The matmul + sigmoid + sum are fused into a single custom AscendC kernel.
-    """
     def __init__(self, input_size, hidden_size):
         super(ModelNew, self).__init__()
-        # Reuse a Linear layer for parameter management (initialization, state_dict compatibility).
-        self.linear = torch.nn.Linear(input_size, hidden_size)
+        # 与原始Linear等价的参数定义
+        self.weight = torch.nn.Parameter(torch.randn(hidden_size, input_size))
+        self.bias = torch.nn.Parameter(torch.randn(hidden_size))
 
     def forward(self, x):
-        return custom_ops_lib.matmul_sigmoid_sum_custom(x, self.linear.weight, self.linear.bias)
+        # 自定义融合算子：输出形状为 [B, 1]
+        return custom_ops_lib.matmul_sigmoid_sum_custom(x, self.weight, self.bias)
 '''

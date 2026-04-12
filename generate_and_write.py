@@ -31,7 +31,12 @@ def generate_and_write_single(prompt, client, out_dir, op, model):
     answer_content = ""  # 完整回复
     is_answering = False  # 是否进入回复阶段
     for chunk in response:
+        # 部分兼容网关会推送 choices 为空的 chunk（如结束包），避免 choices[0] 越界
+        if not chunk.choices:
+            continue
         delta = chunk.choices[0].delta
+        if delta is None:
+            continue
         if hasattr(delta, "reasoning_content") and delta.reasoning_content is not None:
             reasoning_content += delta.reasoning_content
         if hasattr(delta, "content") and delta.content:

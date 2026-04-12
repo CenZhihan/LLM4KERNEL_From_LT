@@ -36,8 +36,13 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(RegnetCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, W);
+  TILING_DATA_FIELD_DEF(uint32_t, NC);
+  TILING_DATA_FIELD_DEF(uint32_t, HW);
+  TILING_DATA_FIELD_DEF(uint32_t, groupsPerBlock);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(RegnetCustom, RegnetCustomTilingData)
@@ -47,19 +52,36 @@ REGISTER_TILING_DATA_CLASS(RegnetCustom, RegnetCustomTilingData)
 host_operator_src="""
 #include "regnet_custom_tiling.h"
 #include "register/op_def_registry.h"
+#include <algorithm>
+#include <vector>
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 8;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    RegnetCustomTilingData tiling;
-    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    // Assume NCHW
+    uint32_t N = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(0));
+    uint32_t C = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(1));
+    uint32_t H = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(2));
+    uint32_t W = static_cast<uint32_t>(in_shape->GetOriginShape().GetDim(3));
 
-    context->SetBlockDim(BLOCK_DIM);
-    tiling.set_totalLength(totalLength);
-    tiling.set_tileNum(TILE_NUM);
+    uint32_t NC = N * C;
+    uint32_t HW = H * W;
+    uint32_t blockDim = std::min<uint32_t>(NC, 8);
+    if (blockDim == 0) {
+        blockDim = 1;
+    }
+    context->SetBlockDim(blockDim);
+    uint32_t groupsPerBlock = (NC + blockDim - 1) / blockDim;
+
+    RegnetCustomTilingData tiling;
+    tiling.set_N(N);
+    tiling.set_C(C);
+    tiling.set_H(H);
+    tiling.set_W(W);
+    tiling.set_NC(NC);
+    tiling.set_HW(HW);
+    tiling.set_groupsPerBlock(groupsPerBlock);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
@@ -73,9 +95,17 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    *y_shape = *x_shape;
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    int64_t n = in_shape->GetOriginShape().GetDim(0);
+    int64_t c = in_shape->GetOriginShape().GetDim(1);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+
+    // Set output shape to [N, C]
+    std::vector<int64_t> dims = {n, c};
+    out_shape->SetDimNum(static_cast<uint32_t>(dims.size()));
+    for (size_t i = 0; i < dims.size(); ++i) {
+        out_shape->SetDim(i, dims[i]);
+    }
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
@@ -116,34 +146,46 @@ OP_ADD(RegnetCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "regnet_custom_tiling_data.h"
 
-// This kernel implements element-wise ReLU using AscendC::Relu API.
-// Referenced API: CANN Ascend C API Reference - 4.1.1.8 Relu (Basic API).
+// 全局平均池化 (GAP): 输入 [N, C, H, W]，输出 [N, C]，每个 (n,c) 对应 H*W 上的均值
+constexpr int32_t IN_BUF_NUM = 1;
+constexpr int32_t TMP_BUF_NUM = 1;
+constexpr int32_t OUT_BUF_BYTES = 32; // 按框架要求对齐
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
-
-class KernelRegnet {
+class KernelRegnetGap {
 public:
-    __aicore__ inline KernelRegnet() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
+    __aicore__ inline KernelRegnetGap() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t N, uint32_t C, uint32_t H, uint32_t W,
+                                uint32_t NC, uint32_t HW, uint32_t groupsPerBlock)
     {
-        this->blockLength = totalLength / AscendC::GetBlockNum();
-        this->tileNum = tileNum;
-        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->N = N;
+        this->C = C;
+        this->H = H;
+        this->W = W;
+        this->NC = NC;
+        this->HW = HW;
+        this->groupsPerBlock = groupsPerBlock;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint64_t xOffset = static_cast<uint64_t>(blockIdx) * static_cast<uint64_t>(groupsPerBlock) * static_cast<uint64_t>(HW);
+        uint64_t yOffset = static_cast<uint64_t>(blockIdx) * static_cast<uint64_t>(groupsPerBlock);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + xOffset, groupsPerBlock * HW);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + yOffset, groupsPerBlock);
+
+        // 初始化本地缓冲队列
+        pipe.InitBuffer(inQueueX, IN_BUF_NUM, this->HW * sizeof(DTYPE_X));
+        pipe.InitBuffer(tmpQue, TMP_BUF_NUM, this->HW * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, 1, OUT_BUF_BYTES);
     }
 
     __aicore__ inline void Process()
     {
-        int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; i++) {
+        for (uint32_t i = 0; i < groupsPerBlock; ++i) {
+            uint64_t globalGroupIdx = static_cast<uint64_t>(AscendC::GetBlockIdx()) * static_cast<uint64_t>(groupsPerBlock) + i;
+            if (globalGroupIdx >= NC) {
+                break;
+            }
             CopyIn(i);
             Compute(i);
             CopyOut(i);
@@ -151,44 +193,60 @@ public:
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress)
+    __aicore__ inline void CopyIn(uint32_t progress)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        // 每个 (n,c) 的数据是连续的 HW 段
+        AscendC::DataCopy(xLocal, xGm[progress * this->HW], this->HW);
         inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/)
+    __aicore__ inline void Compute(uint32_t /*progress*/)
     {
         AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> workLocal = tmpQue.AllocTensor<DTYPE_X>();
         AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
-        AscendC::Relu(yLocal, xLocal, static_cast<int32_t>(this->tileLength));
+
+        // ReduceSum 计算 HW 个元素的和，然后通过 GetAccVal 读取累加器的结果
+        AscendC::ReduceSum(yLocal, xLocal, workLocal, this->HW);
+        DTYPE_Y sumVal = AscendC::GetAccVal<DTYPE_Y>();
+        DTYPE_Y meanVal = sumVal / static_cast<DTYPE_Y>(this->HW);
+
+        // 将标量 meanVal 写入本地缓冲的第一个元素
+        AscendC::Duplicate(yLocal, meanVal, 1);
+
         outQueueY.EnQue<DTYPE_Y>(yLocal);
         inQueueX.FreeTensor(xLocal);
+        tmpQue.FreeTensor(workLocal);
     }
 
-    __aicore__ inline void CopyOut(int32_t progress)
+    __aicore__ inline void CopyOut(uint32_t progress)
     {
         AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        AscendC::DataCopy(yGm[progress], yLocal, 1);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, IN_BUF_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECCALC, TMP_BUF_NUM> tmpQue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueY;
+
     AscendC::GlobalTensor<DTYPE_X> xGm;
     AscendC::GlobalTensor<DTYPE_Y> yGm;
-    uint32_t blockLength;
-    uint32_t tileNum;
-    uint32_t tileLength;
+
+    uint32_t N, C, H, W;
+    uint32_t NC, HW;
+    uint32_t groupsPerBlock;
 };
 
 extern "C" __global__ __aicore__ void regnet_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelRegnet op;
-    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum);
+    KernelRegnetGap op;
+    op.Init(x, y,
+            tiling_data.N, tiling_data.C, tiling_data.H, tiling_data.W,
+            tiling_data.NC, tiling_data.HW, tiling_data.groupsPerBlock);
     op.Process();
 }
 """
@@ -199,10 +257,13 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor regnet_custom_impl_npu(const at::Tensor& self) {
-    at::Tensor result = at::empty_like(self);
-    EXEC_NPU_CMD(aclnnRegnetCustom, self, result);
-    return result;
+at::Tensor regnet_custom_impl_npu(const at::Tensor& x) {
+    // 输出形状应为 [N, C]
+    TORCH_CHECK(x.dim() == 4, "regnet_custom expects 4D tensor [N, C, H, W]");
+    auto sizes = x.sizes();
+    at::Tensor y = at::empty({sizes[0], sizes[1]}, x.options());
+    EXEC_NPU_CMD(aclnnRegnetCustom, x, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -210,7 +271,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("regnet_custom", &regnet_custom_impl_npu, "ReLU (custom AscendC)");
+    m.def("regnet_custom", &regnet_custom_impl_npu, "Global Average Pooling (N, C, H, W) -> (N, C)");
 }
 """
 
@@ -218,44 +279,36 @@ model_src='''
 import torch
 import torch_npu
 import custom_ops_lib
-import torch.nn as nn
 
-class StageBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = custom_ops_lib.regnet_custom(x)  # Replaces ReLU with custom AscendC kernel
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = custom_ops_lib.regnet_custom(x)  # Replaces ReLU with custom AscendC kernel
-        x = self.pool(x)
-        return x
-
-class ModelNew(nn.Module):
+class ModelNew(torch.nn.Module):
     def __init__(self, input_channels, stages, block_widths, output_classes):
-        super(ModelNew, self).__init__()
+        super().__init__()
         self.stages = stages
         self.block_widths = block_widths
 
         layers = []
         current_channels = input_channels
         for i in range(stages):
-            layers.append(StageBlock(current_channels, block_widths[i]))
+            layers.append(self._make_stage(current_channels, block_widths[i]))
             current_channels = block_widths[i]
-        self.feature_extractor = nn.Sequential(*layers)
-        self.fc = nn.Linear(block_widths[-1], output_classes)
+        self.feature_extractor = torch.nn.Sequential(*layers)
+        self.fc = torch.nn.Linear(block_widths[-1], output_classes)
+
+    def _make_stage(self, in_channels, out_channels):
+        return torch.nn.Sequential(
+            torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(out_channels),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(out_channels),
+            torch.nn.ReLU(),
+            torch.nn.MaxPool2d(kernel_size=2, stride=2)
+        )
 
     def forward(self, x):
         x = self.feature_extractor(x)
-        x = torch.mean(x, dim=[2, 3])  # Global Average Pooling
+        # 使用自定义AscendC内核实现全局平均池化 (N, C, H, W) -> (N, C)
+        x = custom_ops_lib.regnet_custom(x)
         x = self.fc(x)
         return x
 '''

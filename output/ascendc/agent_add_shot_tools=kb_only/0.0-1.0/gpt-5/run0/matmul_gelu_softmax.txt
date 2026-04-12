@@ -11,21 +11,21 @@ project_json_src='''
                     "ND"
                 ],
                 "type": [
-                    "float"
+                    "half"
                 ]
             },
             {
-                "name": "weight",
+                "name": "w",
                 "param_type": "required",
                 "format": [
                     "ND"
                 ],
                 "type": [
-                    "float"
+                    "half"
                 ]
             },
             {
-                "name": "bias",
+                "name": "b",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -52,99 +52,73 @@ project_json_src='''
 '''
 
 host_tiling_src="""
-#include <cstring>
-#include "register/op_def_registry.h"
 #include "register/tilingdata_base.h"
-#include "tiling/platform/platform_ascendc.h"
-#include "tiling/matmul/matmul_tiling.h"
-#include "tiling/op_tiling.h"
 
 namespace optiling {
-// 仅用于注册占位，真实传递的是 TCubeTiling 的原始字节
 BEGIN_TILING_DATA_DEF(MatmulGeluSoftmaxCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, reserved);
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
 END_TILING_DATA_DEF;
+
 REGISTER_TILING_DATA_CLASS(MatmulGeluSoftmaxCustom, MatmulGeluSoftmaxCustomTilingData)
-} // namespace optiling
+}
+"""
+
+host_operator_src="""
+#include "matmul_gelu_softmax_custom_tiling.h"
+#include "register/op_def_registry.h"
 
 namespace optiling {
-// 依据文档：通过 MultiCoreMatmulTiling 获取 TCubeTiling 并原样下发
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 输入0: x [M, K], 输入1: weight [N, K] (PyTorch Linear 权重为 [N, K])
-    auto xShape = context->GetInputShape(0)->GetOriginShape();
-    auto wShape = context->GetInputShape(1)->GetOriginShape();
-    if (xShape.GetDimNum() != 2 || wShape.GetDimNum() != 2) {
-        return ge::GRAPH_PARAM_INVALID;
-    }
-    uint32_t M = static_cast<uint32_t>(xShape.GetDim(0));
-    uint32_t K = static_cast<uint32_t>(xShape.GetDim(1));
-    uint32_t N = static_cast<uint32_t>(wShape.GetDim(0)); // weight: [N, K]
+    MatmulGeluSoftmaxCustomTilingData tiling;
 
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
-    tiling.SetDim(1);
-    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    // 依据文档 SetShape/SetSingleShape/SetOrgShape
-    tiling.SetShape(M, N, K);
-    tiling.SetSingleShape(M, N, K);
-    tiling.SetOrgShape(M, N, K);
-    tiling.SetBias(true);
-    tiling.SetBufferSpace(-1, -1, -1);
+    // x: [m, k], w: [k, n] (ensure weight is transposed on Python side)
+    const auto* x_shape = context->GetInputShape(0);
+    const auto* w_shape = context->GetInputShape(1);
 
-    optiling::TCubeTiling cubeTiling;
-    int ret = tiling.GetTiling(cubeTiling);
-    if (ret == -1) {
-        return ge::GRAPH_FAILED;
-    }
+    uint32_t m = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t k = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    uint32_t n = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(1));
 
-    // 设置 blockDim
-    int32_t blockDim = tiling.GetCoreNum();
-    if (blockDim <= 0) { blockDim = 1; }
-    context->SetBlockDim(static_cast<uint32_t>(blockDim));
+    context->SetBlockDim(8);
+    tiling.set_m(m);
+    tiling.set_k(k);
+    tiling.set_n(n);
 
-    // 将 TCubeTiling 的原始字节下发
-    auto raw = context->GetRawTilingData();
-    if (raw->GetCapacity() < sizeof(optiling::TCubeTiling)) {
-        return ge::GRAPH_FAILED;
-    }
-    std::memcpy(raw->GetData(), &cubeTiling, sizeof(optiling::TCubeTiling));
-    raw->SetDataSize(sizeof(optiling::TCubeTiling));
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // 无需工作空间
-    size_t *workspace = context->GetWorkspaceSizes(1);
-    workspace[0] = 0;
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
-} // namespace optiling
+}
 
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 输出形状为 [M, N]
-    const gert::Shape* x_shape = context->GetInputShape(0);   // [M, K]
-    const gert::Shape* w_shape = context->GetInputShape(1);   // [N, K]
-    if (x_shape->GetDimNum() != 2 || w_shape->GetDimNum() != 2) {
-        return GRAPH_PARAM_INVALID;
-    }
+    // Output y has shape [m, n]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
     gert::Shape* y_shape = context->GetOutputShape(0);
-    std::vector<int64_t> dims(2);
-    dims[0] = x_shape->GetDim(0);
-    dims[1] = w_shape->GetDim(0);
-    y_shape->SetDim(dims);
+
+    std::vector<int64_t> out_dim(2);
+    out_dim[0] = x_shape->GetDim(0);
+    out_dim[1] = w_shape->GetDim(1); // w is [k, n]
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, out_dim[0]);
+    y_shape->SetDim(1, out_dim[1]);
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const auto dt = context->GetInputDataType(0);
-    context->SetOutputDataType(0, dt);
+    // Input x/w are half, output y is float
+    context->SetOutputDataType(0, ge::DT_FLOAT);
     return ge::GRAPH_SUCCESS;
 }
-} // namespace ge
+}
 
 namespace ops {
 class MatmulGeluSoftmaxCustom : public OpDef {
@@ -153,15 +127,15 @@ public:
     {
         this->Input("x")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
+            .DataType({ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("weight")
+        this->Input("w")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
+            .DataType({ge::DT_FLOAT16})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("bias")
+        this->Input("b")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -177,107 +151,136 @@ public:
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(MatmulGeluSoftmaxCustom);
-} // namespace ops
-"""
-
-host_operator_src="""
-#include <cstring>
-#include "register/op_def_registry.h"
-#include "register/tilingdata_base.h"
-#include "tiling/platform/platform_ascendc.h"
-#include "tiling/matmul/matmul_tiling.h"
-#include "tiling/op_tiling.h"
-
-// 该文件中的算子定义与 Tiling 逻辑见 host_tiling_src
-// 已在 host_tiling_src 中完成注册与推理，这里无需重复实现。
+}
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#include "lib/matmul_intf.h"
 
-using A_T = float;
-using B_T = float;
-using C_T = float;
-using BiasT = float;
+using AType = half;   // x
+using BType = half;   // w
+using CType = float;  // y
 
-// 依据文档：使用 LayoutMode::NORMAL 的 Matmul 高级 API
-// B 设为转置以适配 PyTorch Linear 的权重布局 [N, K]
-typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
-typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL> bType;
-typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
-typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, BiasT> biasType;
+class KernelMatmulGeluSoftmax {
+public:
+    __aicore__ inline KernelMatmulGeluSoftmax() {}
 
-extern "C" __global__ __aicore__ void matmul_gelu_softmax_custom(GM_ADDR xGM, GM_ADDR wGM, GM_ADDR bGM, GM_ADDR yGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
-{
-    // 从 GM 读取 TCubeTiling（参考文档示例）
-    TCubeTiling tiling;
-    auto tempTilingGM = (__gm__ uint32_t*)tilingGM;
-    auto tempTiling = (uint32_t*)&tiling;
-    for (int i = 0; i < (int)(sizeof(TCubeTiling) / sizeof(int32_t)); ++i, ++tempTilingGM, ++tempTiling) {
-        *tempTiling = *tempTilingGM;
+    __aicore__ inline void Init(GM_ADDR x_gm, GM_ADDR w_gm, GM_ADDR b_gm, GM_ADDR y_gm,
+                                uint32_t m_in, uint32_t k_in, uint32_t n_in)
+    {
+        m = m_in;
+        k = k_in;
+        n = n_in;
+
+        xGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ AType*>(x_gm), m * k);
+        wGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BType*>(w_gm), k * n);
+        bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ CType*>(b_gm), n);
+        yGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ CType*>(y_gm), m * n);
+
+        // Queues for GEMM
+        pipe.InitBuffer(inQueueA1, 1, m * k * sizeof(AType));
+        pipe.InitBuffer(inQueueB1, 1, k * n * sizeof(BType));
+        pipe.InitBuffer(outQueueCO1, 1, m * n * sizeof(CType));
+        // Additional buffer for UB processing
+        pipe.InitBuffer(vecTmp, 1, m * n * sizeof(CType));
+        pipe.InitBuffer(biasBuf, 1, n * sizeof(CType));
     }
 
-    // 初始化 GM Tensor（参考 NORMAL 示例）
-    AscendC::GlobalTensor<A_T> aGlobal;
-    AscendC::GlobalTensor<B_T> bGlobal;
-    AscendC::GlobalTensor<C_T> cGlobal;
-    AscendC::GlobalTensor<BiasT> biasGlobal;
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
 
-    int32_t sizeA = tiling.ALayoutInfoB * tiling.singleCoreM * tiling.singleCoreK * sizeof(A_T);
-    int32_t sizeB = tiling.BLayoutInfoB * tiling.singleCoreK * tiling.singleCoreN * sizeof(B_T);
-    int32_t sizeC = tiling.CLayoutInfoB * tiling.singleCoreM * tiling.singleCoreN * sizeof(C_T);
-    int32_t sizeBias = tiling.CLayoutInfoB * tiling.singleCoreN * sizeof(BiasT);
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<AType> aLocal = inQueueA1.AllocTensor<AType>();
+        AscendC::LocalTensor<BType> bLocal = inQueueB1.AllocTensor<BType>();
+        AscendC::DataCopy(aLocal, xGlobal, m * k);
+        AscendC::DataCopy(bLocal, wGlobal, k * n);
+        inQueueA1.EnQue(aLocal);
+        inQueueB1.EnQue(bLocal);
 
-    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(xGM), sizeA);
-    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(wGM), sizeB);
-    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(yGM), sizeC);
-    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(bGM), sizeBias);
+        // Copy bias (length n) into local once
+        AscendC::LocalTensor<CType> bLocalRow = biasBuf.AllocTensor<CType>();
+        AscendC::DataCopy(bLocalRow, bGlobal, n);
+        biasBuf.EnQue(bLocalRow);
+    }
 
-    // L1/L0C/UB 共享配置（与文档示例保持一致）
-    tiling.shareMode = 0;
-    tiling.shareL1Size = 512 * 1024;
-    tiling.shareL0CSize = 128 * 1024;
-    tiling.shareUbSize = 0;
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<AType> aLocal = inQueueA1.DeQue<AType>();
+        AscendC::LocalTensor<BType> bLocal = inQueueB1.DeQue<BType>();
+        AscendC::LocalTensor<CType> cLocal = outQueueCO1.AllocTensor<CType>();
 
-    int offset_a = 0, offset_b = 0, offset_c = 0, offset_bias = 0;
+        // GEMM: [m,k] x [k,n] -> [m,n], dst is float
+        AscendC::GemmTiling tilling = AscendC::GetGemmTiling<AType>(m, k, n);
+        // move result to cLocal
+        AscendC::Gemm(cLocal, aLocal, bLocal, m, k, n, tilling, false, /*initValue*/0);
 
-    AscendC::GlobalTensor<A_T> gm_a;
-    gm_a.SetGlobalBuffer(const_cast<__gm__ A_T*>(aGlobal[offset_a].GetPhyAddr()),
-                         tiling.singleCoreM * tiling.singleCoreK);
+        // Add bias per row
+        AscendC::LocalTensor<CType> biasLocal = biasBuf.DeQue<CType>();
+        // Row-wise add bias
+        // Process by contiguous row tiles
+        for (uint32_t row = 0; row < m; ++row) {
+            // allocate a temp row buffer
+            AscendC::LocalTensor<CType> rowTmp = vecTmp.AllocTensor<CType>();
+            // copy one row out
+            AscendC::DataCopy(rowTmp, cLocal[row * n], n);
+            // z = row + bias
+            AscendC::Add(rowTmp, rowTmp, biasLocal, n);
+            // write back
+            AscendC::DataCopy(cLocal[row * n], rowTmp, n);
+            vecTmp.FreeTensor(rowTmp);
+        }
+        biasBuf.FreeTensor(biasLocal);
 
-    AscendC::GlobalTensor<B_T> gm_b;
-    gm_b.SetGlobalBuffer(const_cast<__gm__ B_T*>(bGlobal[offset_b].GetPhyAddr()),
-                         tiling.singleCoreK * tiling.singleCoreN);
+        // GELU in place
+        AscendC::Gelu(cLocal, cLocal, m * n);
 
-    AscendC::GlobalTensor<C_T> gm_c;
-    gm_c.SetGlobalBuffer(const_cast<__gm__ C_T*>(cGlobal[offset_c].GetPhyAddr()),
-                         tiling.singleCoreM * tiling.singleCoreN);
+        // SoftMax along last axis (n), on [m,n]
+        // Use default config; let API check tiling internally
+        AscendC::SoftMax(cLocal, cLocal, /*tiling*/AscendC::SoftMaxTiling{}, /*shape*/{});
 
-    AscendC::GlobalTensor<BiasT> gm_bias;
-    gm_bias.SetGlobalBuffer(const_cast<__gm__ BiasT*>(biasGlobal[offset_bias].GetPhyAddr()),
-                            tiling.singleCoreN);
+        outQueueCO1.EnQue<CType>(cLocal);
+        inQueueA1.FreeTensor(aLocal);
+        inQueueB1.FreeTensor(bLocal);
+    }
 
-    // 创建 Matmul 实例并初始化（参考文档：REGIST_MATMUL_OBJ, Init, IterateBatch）
-    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
-    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm1;
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<CType> cLocal = outQueueCO1.DeQue<CType>();
+        AscendC::DataCopy(yGlobal, cLocal, m * n);
+        outQueueCO1.FreeTensor(cLocal);
+    }
+
+private:
+    uint32_t m, k, n;
+
     AscendC::TPipe pipe;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm1);
-    mm1.Init(&tiling);
+    AscendC::TQue<AscendC::QuePosition::A1, 1> inQueueA1;
+    AscendC::TQue<AscendC::QuePosition::B1, 1> inQueueB1;
+    AscendC::TQue<AscendC::QuePosition::CO1, 1> outQueueCO1;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> vecTmp;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> biasBuf;
 
-    // A 不转置，B 转置（PyTorch Linear 权重为 [N, K]）
-    mm1.SetTensorA(gm_a, false);
-    mm1.SetTensorB(gm_b, true);
-    mm1.SetWorkspace(workspaceGM, 0);
-    if (tiling.isBias) {
-        mm1.SetBias(gm_bias);
-    }
+    AscendC::GlobalTensor<AType> xGlobal;
+    AscendC::GlobalTensor<BType> wGlobal;
+    AscendC::GlobalTensor<CType> bGlobal;
+    AscendC::GlobalTensor<CType> yGlobal;
+};
 
-    // 单批次计算
-    mm1.IterateBatch(gm_c, 1, 1, false);
-
-    // 说明：本内核完成 MatMul(+Bias)。后续 GELU + Softmax 在上层 PyTorch 继续处理。
+extern "C" __global__ __aicore__ void matmul_gelu_softmax_custom(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
+                                                                 GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulGeluSoftmax op;
+    op.Init(x, w, b, y, tiling_data.m, tiling_data.k, tiling_data.n);
+    op.Process();
 }
 """
 
@@ -287,15 +290,13 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-// NPU 实现：调用自定义 AscendC 算子完成 MatMul(+Bias)
-at::Tensor matmul_gelu_softmax_custom_impl_npu(const at::Tensor& x,
-                                               const at::Tensor& weight,
-                                               const at::Tensor& bias) {
-    // 输出形状 [M, N] = [x.size(0), weight.size(0)]
-    auto opts = x.options();
-    at::Tensor result = at::empty({x.size(0), weight.size(0)}, opts);
-    EXEC_NPU_CMD(aclnnMatmulGeluSoftmaxCustom, x, weight, bias, result);
-    return result;
+at::Tensor matmul_gelu_softmax_custom_impl_npu(const at::Tensor& x, const at::Tensor& w, const at::Tensor& b) {
+    // x: [m,k] half, w: [k,n] half, b: [n] float, y: [m,n] float
+    auto m = x.size(0);
+    auto n = w.size(1);
+    at::Tensor y = at::empty({m, n}, x.options().dtype(at::kFloat));
+    EXEC_NPU_CMD(aclnnMatmulGeluSoftmaxCustom, x, w, b, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -303,26 +304,35 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_gelu_softmax_custom", &matmul_gelu_softmax_custom_impl_npu, "Matmul + Bias (GELU+Softmax on PyTorch)");
+    m.def("matmul_gelu_softmax_custom", &matmul_gelu_softmax_custom_impl_npu, "fused matmul+gelu+softmax");
 }
 """
 
 model_src='''
 import torch
 import torch_npu
-import torch.nn.functional as F
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     def __init__(self, in_features, out_features):
         super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
         self.linear = torch.nn.Linear(in_features, out_features)
 
     def forward(self, x):
-        # 使用自定义 AscendC 算子替换 Linear 的 MatMul(+Bias)
-        y = custom_ops_lib.matmul_gelu_softmax_custom(x, self.linear.weight, self.linear.bias)
-        # 其后在 PyTorch 中继续完成 GELU + Softmax
-        y = F.gelu(y)
-        y = F.softmax(y, dim=1)
-        return y
+        # Prepare inputs: weight must be [k,n]; bias is [n]
+        w_t = self.linear.weight.t().contiguous()
+        # Cast to match kernel expectation: x,w in half; bias in float; output float
+        return custom_ops_lib.matmul_gelu_softmax_custom(x.to(torch.float16), w_t.to(torch.float16), self.linear.bias.to(torch.float))
+
+def get_inputs():
+    batch_size = 1024
+    in_features = 8192
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    in_features = 8192
+    out_features = 8192
+    return [in_features, out_features]
 '''

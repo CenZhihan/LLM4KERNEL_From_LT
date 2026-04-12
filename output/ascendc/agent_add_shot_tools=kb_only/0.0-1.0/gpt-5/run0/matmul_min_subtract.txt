@@ -7,34 +7,54 @@ project_json_src='''
             {
                 "name": "x",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             },
             {
                 "name": "weight",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             },
             {
                 "name": "bias",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             },
             {
                 "name": "constant",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ],
         "output_desc": [
             {
                 "name": "y",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ]
     }
@@ -43,121 +63,92 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
-#include "tiling/platform/platform_ascendc.h"
-#include "lib/matmul_intf.h"
 
 namespace optiling {
-
 BEGIN_TILING_DATA_DEF(MatmulMinSubtractCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, M);
   TILING_DATA_FIELD_DEF(uint32_t, N);
   TILING_DATA_FIELD_DEF(uint32_t, K);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, cubeTiling);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(MatmulMinSubtractCustom, MatmulMinSubtractCustomTilingData)
-
 }
 """
 
 host_operator_src="""
 #include "matmul_min_subtract_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/platform/platform_ascendc.h"
-#include "lib/matmul_intf.h"
-
-namespace {
-inline uint32_t GetDimSafe(const gert::Shape* shape, size_t idx) {
-    if (shape->GetOriginShape().GetDimNum() > idx) {
-        return static_cast<uint32_t>(shape->GetOriginShape().GetDim(idx));
-    }
-    return 1;
-}
-}
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    // 输入0: x [M, K]
+    // 输入1: weight [N, K]
+    // 输入2: bias [N]
+    // 输入3: constant [1] 或标量Tensor
+    const auto* x_shape = context->GetInputShape(0);
+    const auto* w_shape = context->GetInputShape(1);
 
-    // 读取输入形状
-    const gert::Shape* xShape = context->GetInputShape(0);      // [M, K]
-    const gert::Shape* wShape = context->GetInputShape(1);      // [N, K]
-    uint32_t M = GetDimSafe(xShape, 0);
-    uint32_t K = GetDimSafe(xShape, 1);
-    uint32_t N = GetDimSafe(wShape, 0);
-
-    // 配置Matmul多核tiling
-    matmul_tiling::MultiCoreMatmulTiling mmTiling(ascendcPlatform);
-    mmTiling.SetDim(1);
-    // A: float16, B: float16, C: float32, Bias: float32
-    mmTiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    mmTiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    mmTiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mmTiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    mmTiling.SetBias(true);
-    mmTiling.SetShape(M, N, K);
-    mmTiling.SetSingleShape(M, N, K);
-    mmTiling.SetOrgShape(M, N, K);
-    mmTiling.SetBufferSpace(-1, -1, -1);
-
-    optiling::TCubeTiling cubeTiling;
-    int ret = mmTiling.GetTiling(cubeTiling);
-    if (ret == -1) {
-        return ge::GRAPH_FAILED;
+    uint64_t m = 1;
+    if (x_shape->GetOriginShape().GetDimNum() == 2) {
+        m = x_shape->GetOriginShape().GetDim(0);
+    } else {
+        // 兜底：按最后一维为K，其余展平为M
+        uint64_t total = x_shape->GetOriginShape().GetShapeSize();
+        uint64_t k = x_shape->GetOriginShape().GetDim(x_shape->GetOriginShape().GetDimNum() - 1);
+        m = total / k;
     }
+    uint64_t k = x_shape->GetOriginShape().GetDim(x_shape->GetOriginShape().GetDimNum() - 1);
+    uint64_t n = w_shape->GetOriginShape().GetDim(0); // weight: [N, K]
 
-    // 设置blockDim为tiling计算得到的核心数
-    context->SetBlockDim(mmTiling.GetCoreNum());
+    MatmulMinSubtractCustomTilingData tiling;
+    tiling.set_M(static_cast<uint32_t>(m));
+    tiling.set_N(static_cast<uint32_t>(n));
+    tiling.set_K(static_cast<uint32_t>(k));
+    tiling.set_tileNum(TILE_NUM);
 
-    // 组织自定义TilingData
-    MatmulMinSubtractCustomTilingData td;
-    td.set_M(M);
-    td.set_N(N);
-    td.set_K(K);
-    td.set_tileNum(8); // 简单设定一个Tile数量
-    td.set_cubeTiling(cubeTiling);
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // 将tiling写入缓冲
-    td.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
-    context->GetRawTilingData()->SetDataSize(td.GetDataSize());
-
-    // 工作空间（本算子不需额外workspace）
-    size_t* ws = context->GetWorkspaceSizes(1);
-    ws[0] = 0;
-
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0; // 本例不需要额外workspace
     return ge::GRAPH_SUCCESS;
 }
-
-} // namespace optiling
+}
 
 namespace ge {
-
-// 输出形状推导：y = [M, N]
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* xShape = context->GetInputShape(0);
-    const gert::Shape* wShape = context->GetInputShape(1);
+    const gert::Shape* x_shape = context->GetInputShape(0);  // [M, K]
+    const gert::Shape* w_shape = context->GetInputShape(1);  // [N, K]
+    gert::Shape* y_shape = context->GetOutputShape(0);
 
-    gert::Shape* yShape = context->GetOutputShape(0);
-    gert::Shape origin;
-    origin.SetDimNum(2);
-    origin.SetDim(0, xShape->GetOriginShape().GetDim(0));
-    origin.SetDim(1, wShape->GetOriginShape().GetDim(0));
-    *yShape = origin;
+    uint64_t m = 1;
+    if (x_shape->GetOriginShape().GetDimNum() == 2) {
+        m = x_shape->GetOriginShape().GetDim(0);
+    } else {
+        uint64_t total = x_shape->GetOriginShape().GetShapeSize();
+        uint64_t k = x_shape->GetOriginShape().GetDim(x_shape->GetOriginShape().GetDimNum() - 1);
+        m = total / k;
+    }
+    uint64_t n = w_shape->GetOriginShape().GetDim(0);
 
-    return ge::GRAPH_SUCCESS;
+    gert::Shape out_origin({(int64_t)m, (int64_t)n});
+    *y_shape = gert::Shape(out_origin);
+    return GRAPH_SUCCESS;
 }
 
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    // 输出使用float32
-    context->SetOutputDataType(0, ge::DT_FLOAT);
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
-
 }
 
 namespace ops {
@@ -170,25 +161,21 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Input("weight")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Input("bias")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Input("constant")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -196,177 +183,160 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
-
 OP_ADD(MatmulMinSubtractCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#include "lib/matmul_intf.h"
-#define __NPU_TILING__
-#include "matmul_min_subtract_custom_tiling_data.h"
 
-using A_T = half;   // 输入A/权重B采用FP16以配合Matmul高性能路径
-using B_T = half;
-using C_T = float;  // C与Bias使用FP32
+using DTYPE_X = float;
+using DTYPE_W = float;
+using DTYPE_B = float;
+using DTYPE_Y = float;
 
-constexpr int32_t BUFFER_NUM = 2; // elementwise阶段的双缓冲
+constexpr int32_t BUFFER_NUM = 2;
 
 class KernelMatmulMinSubtract {
 public:
     __aicore__ inline KernelMatmulMinSubtract() {}
-
-    __aicore__ inline void Init(GM_ADDR aGM, GM_ADDR wGM, GM_ADDR bGM, GM_ADDR constGM,
-                                GM_ADDR yGM, GM_ADDR workspaceGM,
-                                const optiling::MatmulMinSubtractCustomTilingData& td)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR cst, GM_ADDR y,
+                                uint32_t M, uint32_t N, uint32_t K, uint32_t tileNum)
     {
-        this->M = td.M;
-        this->N = td.N;
-        this->K = td.K;
-        this->tileNum = td.tileNum;
-        this->cubeTiling = td.cubeTiling;
+        this->M = M;
+        this->N = N;
+        this->K = K;
+        this->tileNum = tileNum;
 
-        // GM张量绑定
-        aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(aGM), this->cubeTiling.ALayoutInfoB * this->cubeTiling.singleCoreM * this->cubeTiling.singleCoreK);
-        bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(wGM), this->cubeTiling.BLayoutInfoB * this->cubeTiling.singleCoreK * this->cubeTiling.singleCoreN);
-        cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(yGM), this->cubeTiling.CLayoutInfoB * this->cubeTiling.singleCoreM * this->cubeTiling.singleCoreN);
-        biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(bGM), this->cubeTiling.CLayoutInfoB * this->cubeTiling.singleCoreN);
-        constGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(constGM), 1);
+        // 按block划分输出工作量
+        this->blockLength = (M * N) / AscendC::GetBlockNum();
+        this->tileLength = (this->blockLength / (tileNum * BUFFER_NUM));
 
-        // elementwise阶段(对C做min和减常数)的分块
-        this->totalLength = this->M * this->N;
-        this->blockLength = this->totalLength / AscendC::GetBlockNum();
-        if (this->blockLength == 0) {
-            this->blockLength = this->totalLength; // 兜底
-        }
-        this->tileLength = this->blockLength / this->tileNum / BUFFER_NUM;
-        if (this->tileLength == 0) {
-            this->tileLength = this->blockLength; // 兜底
-        }
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_X *>(x), M * K);
+        wGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_W *>(w), N * K);
+        bGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_B *>(b), N);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_Y *>(y), M * N);
 
-        yGm.SetGlobalBuffer((__gm__ C_T*)yGM + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-
-        // 初始化pipe与队列
-        pipe.InitBuffer(inQueueC, BUFFER_NUM, this->tileLength * sizeof(C_T));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(C_T));
+        constPtr = reinterpret_cast<__gm__ DTYPE_Y *>(cst);
+        pipe.InitBuffer(inQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
     }
 
     __aicore__ inline void Process()
     {
-        // 1) Matmul + Bias
-        DoMatmul();
-
-        // 2) Elementwise: y = min(y, const) - const
+        // 采用简单块循环: 每块处理连续tileLength个输出元素
         int32_t loopCount = this->tileNum * BUFFER_NUM;
-        C_T cVal = *(constGlobal.GetPhyAddr()); // 读取常数（示例写法）
-
         for (int32_t i = 0; i < loopCount; ++i) {
-            CopyIn(i);
-            Compute(i, cVal);
-            CopyOut(i);
+            ComputeTile(i);
+            PostProcessTile(i);
+            StoreTile(i);
         }
     }
 
 private:
-    __aicore__ inline void DoMatmul()
+    __aicore__ inline void ComputeTile(int32_t progress)
     {
-        // MatmulType定义（NORMAL布局）
-        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
-        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL> bType; // B转置以适配Linear的weight形状[N, K]
-        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
-        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T> biasType;
+        // 计算输出线性区间
+        uint32_t blockOffset = this->blockLength * AscendC::GetBlockIdx();
+        uint32_t startIdx = blockOffset + progress * this->tileLength;
 
-        matmul::Matmul<aType, bType, cType, biasType> mm1;
-        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm1);
+        // 分配本地缓冲
+        AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.AllocTensor<DTYPE_Y>();
 
-        // 复制TCubeTiling
-        TCubeTiling tiling = this->cubeTiling;
+        // 逐元素计算: y[idx] = sum_k x[i,k] * w[j,k] + b[j]
+        for (uint32_t t = 0; t < this->tileLength; ++t) {
+            uint32_t idx = startIdx + t;
+            if (idx >= M * N) {
+                yLocal.SetValue(t, static_cast<DTYPE_Y>(0));
+                continue;
+            }
+            uint32_t i = idx / N;
+            uint32_t j = idx % N;
 
-        // 绑定GM
-        AscendC::GlobalTensor<A_T> gm_a;
-        AscendC::GlobalTensor<B_T> gm_b;
-        AscendC::GlobalTensor<C_T> gm_c;
-        AscendC::GlobalTensor<C_T> gm_bias;
-        gm_a.SetGlobalBuffer(const_cast<__gm__ A_T*>(aGlobal[0].GetPhyAddr()), tiling.singleCoreM * tiling.singleCoreK);
-        gm_b.SetGlobalBuffer(const_cast<__gm__ B_T*>(bGlobal[0].GetPhyAddr()), tiling.singleCoreK * tiling.singleCoreN);
-        gm_c.SetGlobalBuffer(const_cast<__gm__ C_T*>(cGlobal[0].GetPhyAddr()), tiling.singleCoreM * tiling.singleCoreN);
-        gm_bias.SetGlobalBuffer(const_cast<__gm__ C_T*>(biasGlobal[0].GetPhyAddr()), tiling.singleCoreN);
+            DTYPE_Y acc = static_cast<DTYPE_Y>(0);
+            // 加bias
+            acc += bGm.GetValue(j);
 
-        // 初始化与执行
-        mm1.Init(&tiling);
-        mm1.SetTensorA(gm_a, false);
-        mm1.SetTensorB(gm_b, true);   // 对weight进行转置以实现 A(M,K) x W^T(K,N)
-        mm1.SetWorkspace(nullptr, 0);
-        if (tiling.isBias) {
-            mm1.SetBias(gm_bias);
+            // x[i, k] * w[j, k] 的内积
+            uint32_t xBase = i * K;
+            uint32_t wBase = j * K;
+            for (uint32_t k = 0; k < K; ++k) {
+                DTYPE_X xv = xGm.GetValue(xBase + k);
+                DTYPE_W wv = wGm.GetValue(wBase + k);
+                acc += xv * wv;
+            }
+            yLocal.SetValue(t, acc);
         }
-        mm1.IterateBatch(gm_c, 1, 1, false); // 单次BMM
+        inQueueY.EnQue(yLocal);
     }
 
-    __aicore__ inline void CopyIn(int32_t progress)
+    __aicore__ inline void PostProcessTile(int32_t)
     {
-        AscendC::LocalTensor<C_T> cLocal = inQueueC.AllocTensor<C_T>();
-        AscendC::DataCopy(cLocal, yGm[progress * this->tileLength], this->tileLength);
-        inQueueC.EnQue(cLocal);
+        // 从队列取出，执行逐元素 min(y, c) - c
+        AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Y> yOutLocal = outQueueY.AllocTensor<DTYPE_Y>();
+
+        DTYPE_Y c = *constPtr; // 常量标量
+
+        for (uint32_t t = 0; t < this->tileLength; ++t) {
+            DTYPE_Y v = yLocal.GetValue(t);
+            if (v > c) v = c;
+            v = v - c;
+            yOutLocal.SetValue(t, v);
+        }
+
+        outQueueY.EnQue<DTYPE_Y>(yOutLocal);
+        inQueueY.FreeTensor(yLocal);
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/, C_T cVal)
+    __aicore__ inline void StoreTile(int32_t progress)
     {
-        AscendC::LocalTensor<C_T> cLocal = inQueueC.DeQue<C_T>();
-        AscendC::LocalTensor<C_T> yLocal = outQueueY.AllocTensor<C_T>();
-        AscendC::LocalTensor<C_T> kLocal = outQueueY.AllocTensor<C_T>(); // 复用队列缓存存放常数向量
-        AscendC::Dup(kLocal, cVal, this->tileLength);
-        AscendC::Min(yLocal, cLocal, kLocal, this->tileLength);
-        AscendC::Sub(yLocal, yLocal, kLocal, this->tileLength);
-        outQueueY.EnQue(yLocal);
-        outQueueY.FreeTensor(kLocal);
-        inQueueC.FreeTensor(cLocal);
-    }
+        // 将结果写回GM
+        AscendC::LocalTensor<DTYPE_Y> yOutLocal = outQueueY.DeQue<DTYPE_Y>();
+        uint32_t blockOffset = this->blockLength * AscendC::GetBlockIdx();
+        uint32_t startIdx = blockOffset + progress * this->tileLength;
 
-    __aicore__ inline void CopyOut(int32_t progress)
-    {
-        AscendC::LocalTensor<C_T> yLocal = outQueueY.DeQue<C_T>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
-        outQueueY.FreeTensor(yLocal);
+        // 顺序写回
+        for (uint32_t t = 0; t < this->tileLength; ++t) {
+            uint32_t idx = startIdx + t;
+            if (idx < M * N) {
+                yGm.SetValue(idx, yOutLocal.GetValue(t));
+            }
+        }
+        outQueueY.FreeTensor(yOutLocal);
     }
 
 private:
-    // GM tensors for Matmul
-    AscendC::GlobalTensor<A_T> aGlobal;
-    AscendC::GlobalTensor<B_T> bGlobal;
-    AscendC::GlobalTensor<C_T> cGlobal;
-    AscendC::GlobalTensor<C_T> biasGlobal;
-    AscendC::GlobalTensor<C_T> constGlobal;
-
-    // Elementwise queues
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueC;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueY;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::GlobalTensor<C_T> yGm;
 
-    // Shapes and tiling
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_W> wGm;
+    AscendC::GlobalTensor<DTYPE_B> bGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    __gm__ DTYPE_Y* constPtr;
+
     uint32_t M;
     uint32_t N;
     uint32_t K;
     uint32_t tileNum;
-    uint32_t totalLength;
     uint32_t blockLength;
     uint32_t tileLength;
-    TCubeTiling cubeTiling;
 };
 
-extern "C" __global__ __aicore__ void matmul_min_subtract_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR bias, GM_ADDR constant, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(td, tiling);
+extern "C" __global__ __aicore__ void matmul_min_subtract_custom(GM_ADDR x, GM_ADDR weight, GM_ADDR bias,
+                                                                 GM_ADDR constant, GM_ADDR y,
+                                                                 GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
     KernelMatmulMinSubtract op;
-    op.Init(x, weight, bias, constant, y, workspace, td);
+    op.Init(x, weight, bias, constant, y,
+            tiling_data.M, tiling_data.N, tiling_data.K, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -381,11 +351,14 @@ at::Tensor matmul_min_subtract_custom_impl_npu(const at::Tensor& x,
                                                const at::Tensor& weight,
                                                const at::Tensor& bias,
                                                const at::Tensor& constant) {
-    // 输出为float32
-    auto out_sizes = std::vector<int64_t>{x.size(0), weight.size(0)};
-    at::Tensor result = at::empty(out_sizes, x.options().dtype(at::kFloat));
-    EXEC_NPU_CMD(aclnnMatmulMinSubtractCustom, x, weight, bias, constant, result);
-    return result;
+    // 输出形状 [M, N]
+    at::IntArrayRef x_sizes = x.sizes();
+    TORCH_CHECK(x_sizes.size() == 2, "x must be 2D");
+    int64_t M = x_sizes[0];
+    int64_t N = weight.size(0);
+    at::Tensor y = at::empty({M, N}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulMinSubtractCustom, x, weight, bias, constant, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -393,7 +366,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_min_subtract_custom", &matmul_min_subtract_custom_impl_npu, "Fused Matmul + Min + Subtract");
+    m.def("matmul_min_subtract_custom", &matmul_min_subtract_custom_impl_npu, "matmul + min(const) - const");
 }
 """
 
@@ -403,12 +376,18 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
+    """
+    Fused: y = (x @ W^T + b).clamp_max(constant) - constant
+    """
     def __init__(self, in_features, out_features, constant):
         super().__init__()
         self.linear = torch.nn.Linear(in_features, out_features)
-        self.constant = torch.nn.Parameter(torch.tensor(constant, dtype=torch.float))
+        # 将常量保持为参数以便与原模型一致
+        self.constant = torch.nn.Parameter(torch.tensor(constant, dtype=torch.float32))
 
     def forward(self, x):
-        # 融合算子：y = min(x @ W^T + b, c) - c
-        return custom_ops_lib.matmul_min_subtract_custom(x, self.linear.weight, self.linear.bias, self.constant)
+        # 使用自定义融合算子: 输入 x, weight, bias, constant
+        # constant 作为 1 元素张量传入
+        const_tensor = self.constant
+        return custom_ops_lib.matmul_min_subtract_custom(x, self.linear.weight, self.linear.bias, const_tensor)
 '''

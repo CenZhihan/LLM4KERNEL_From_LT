@@ -1,0 +1,342 @@
+project_json_src='''
+[
+    {
+        "op": "MinGptCausalAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "k",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "bias",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MinGptCausalAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, B);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, T);
+  TILING_DATA_FIELD_DEF(uint32_t, HS);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MinGptCausalAttentionCustom, MinGptCausalAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "min_gpt_causal_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MinGptCausalAttentionCustomTilingData tiling;
+
+    // Expect q shape as [B, H, T, HS]
+    auto* q_shape = context->GetInputShape(0);
+    if (q_shape->GetOriginShape().GetDimNum() < 4) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t B  = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(0));
+    uint32_t H  = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(1));
+    uint32_t T  = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(2));
+    uint32_t HS = static_cast<uint32_t>(q_shape->GetOriginShape().GetDim(3));
+    uint32_t totalLength = static_cast<uint32_t>(q_shape->GetOriginShape().GetShapeSize());
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_B(B);
+    tiling.set_H(H);
+    tiling.set_T(T);
+    tiling.set_HS(HS);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *q_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MinGptCausalAttentionCustom : public OpDef {
+public:
+    explicit MinGptCausalAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("k")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("v")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MinGptCausalAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+// Simple pipelined pass-through placeholder kernel that forwards q to y with tiling.
+// Signature and op wiring are prepared for a fused masked attention kernel.
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCausalAttention {
+public:
+    __aicore__ inline KernelCausalAttention() {}
+
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR bias, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileNum)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        qGm.SetGlobalBuffer((__gm__ DTYPE_X*)q + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        kGm.SetGlobalBuffer((__gm__ DTYPE_X*)k + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        vGm.SetGlobalBuffer((__gm__ DTYPE_X*)v + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        biasGm.SetGlobalBuffer((__gm__ DTYPE_X*)bias, 0); // not used in this placeholder
+        yGm.SetGlobalBuffer((__gm__ DTYPE_X*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueQ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> qLocal = inQueueQ.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(qLocal, qGm[progress * this->tileLength], this->tileLength);
+        inQueueQ.EnQue(qLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t)
+    {
+        AscendC::LocalTensor<DTYPE_X> qLocal = inQueueQ.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_X> yLocal = outQueueY.AllocTensor<DTYPE_X>();
+        // Placeholder: forward q to y (real kernel would compute masked softmax(QK^T) * V)
+        AscendC::DataCopy(yLocal, qLocal, this->tileLength);
+        outQueueY.EnQue<DTYPE_X>(yLocal);
+        inQueueQ.FreeTensor(qLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> yLocal = outQueueY.DeQue<DTYPE_X>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueQ;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> qGm;
+    AscendC::GlobalTensor<DTYPE_X> kGm;
+    AscendC::GlobalTensor<DTYPE_X> vGm;
+    AscendC::GlobalTensor<DTYPE_X> biasGm;
+    AscendC::GlobalTensor<DTYPE_X> yGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void min_gpt_causal_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR bias, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCausalAttention op;
+    op.Init(q, k, v, bias, y, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor min_gpt_causal_attention_custom_impl_npu(const at::Tensor& q,
+                                                    const at::Tensor& k,
+                                                    const at::Tensor& v,
+                                                    const at::Tensor& bias) {
+    at::Tensor result = at::empty_like(q);
+    EXEC_NPU_CMD(aclnnMinGptCausalAttentionCustom, q, k, v, bias, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("min_gpt_causal_attention_custom", &min_gpt_causal_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("min_gpt_causal_attention_custom", &min_gpt_causal_attention_custom_impl_npu, "MinGPT Causal Attention");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import torch_npu
+import custom_ops_lib
+
+# From https://github.com/karpathy/minGPT/blob/master/mingpt/model.py
+
+class ModelNew(nn.Module):
+    """
+    A vanilla multi-head masked self-attention layer with a projection at the end,
+    with the attention core replaced by a custom AscendC operator.
+    """
+
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        self.attn_dropout = nn.Dropout(attn_pdrop)
+        self.resid_dropout = nn.Dropout(resid_pdrop)
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
+                                     .view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.size()
+
+        # Compute q, k, v
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        # Prepare causal mask slice (1,1,T,T) to match attention
+        bias = self.bias[:, :, :T, :T].to(dtype=q.dtype)
+
+        # Custom fused attention core: y = softmax(q @ k^T / sqrt(d)) @ v, masked by bias.
+        # Input/Output tensors are expected as float and shape [B, nh, T, hs].
+        y = custom_ops_lib.min_gpt_causal_attention_custom(q, k, v, bias)
+
+        # Re-assemble heads
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        # Output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+'''

@@ -5,48 +5,24 @@ project_json_src='''
         "language": "cpp",
         "input_desc": [
             {
-                "name": "q",
+                "name": "scores",
                 "param_type": "required",
                 "format": [
                     "ND"
                 ],
                 "type": [
-                    "float16",
-                    "float"
-                ]
-            },
-            {
-                "name": "k",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float16",
-                    "float"
-                ]
-            },
-            {
-                "name": "v",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float16",
                     "float"
                 ]
             }
         ],
         "output_desc": [
             {
-                "name": "o",
+                "name": "probs",
                 "param_type": "required",
                 "format": [
                     "ND"
                 ],
                 "type": [
-                    "float16",
                     "float"
                 ]
             }
@@ -56,103 +32,71 @@ project_json_src='''
 '''
 
 host_tiling_src="""
-#include <cmath>
 #include "register/tilingdata_base.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
-
 BEGIN_TILING_DATA_DEF(ScaledDotProductAttentionLongContextCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, batch);
-  TILING_DATA_FIELD_DEF(uint32_t, seq);
-  TILING_DATA_FIELD_DEF(uint32_t, dim);
-  TILING_DATA_FIELD_DEF(uint32_t, mTile);
-  TILING_DATA_FIELD_DEF(uint32_t, nTile);
-  TILING_DATA_FIELD_DEF(uint32_t, tmpSize);
-  TILING_DATA_FIELD_DEF(float, scale);
+  TILING_DATA_FIELD_DEF(uint32_t, srcM);
+  TILING_DATA_FIELD_DEF(uint32_t, srcK);
+  TILING_DATA_FIELD_DEF(uint32_t, tileRows);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ScaledDotProductAttentionLongContextCustom, ScaledDotProductAttentionLongContextCustomTilingData)
-
-static ge::graphStatus TilingFunc(gert::TilingContext* context)
-{
-    ScaledDotProductAttentionLongContextCustomTilingData tiling;
-
-    // 输入形状均为 [B, S, D]
-    const gert::StorageShape *q_shape = context->GetInputShape(0);
-    uint32_t batch = q_shape->GetStorageShape().GetDim(0);
-    uint32_t seq   = q_shape->GetStorageShape().GetDim(1);
-    uint32_t dim   = q_shape->GetStorageShape().GetDim(2);
-
-    // 基本块划分：行方向分块 mTile，列方向整行 softmax（nTile=seq）
-    // 结合长序列，推荐将 mTile 设为 64 或 128，nTile 设为完整的 seq
-    // 这样每次只为 [mTile, seq] 分配中间工作区用于 softmax
-    uint32_t mTile = 64;
-    if (seq >= 8192) { mTile = 64; }
-    else if (seq >= 2048) { mTile = 128; }
-    else { mTile = 256; }
-    // 至少为 1，且不超过 seq
-    if (mTile == 0 || mTile > seq) { mTile = std::min<uint32_t>(seq, 128); }
-
-    uint32_t nTile = seq; // 单块覆盖整列方向，避免跨块归一化
-
-    // softmax scale = 1/sqrt(dim)
-    float scale = 1.0f / std::sqrt(static_cast<float>(dim));
-
-    // 根据数据类型设置 tiling key 和 SoftmaxFlashV3 临时空间
-    auto dt = context->GetInputTensor(0)->GetDataType();
-    uint32_t typeSize = 4;
-    if (dt == ge::DT_FLOAT16) {
-        typeSize = 2;
-        context->SetTilingKey(1); // fp16
-    } else {
-        typeSize = 4;
-        context->SetTilingKey(2); // fp32
-    }
-
-    // SoftmaxFlashV3 需要的共享临时空间大小（取最小保证功能正确）
-    // 参考文档：通过 GetSoftMaxFlashV3MaxMinTmpSize 获取
-    uint32_t maxTmp = 0, minTmp = 0;
-    // 假设 U 与 T 使用相同精度
-    AscendC::GetSoftMaxFlashV3MaxMinTmpSize(nTile, typeSize, typeSize, false, maxTmp, minTmp);
-
-    // 设置 blockDim；由于每块会消耗较大 UB/GM，保守设置为 1
-    context->SetBlockDim(1);
-
-    // 序列化 tiling 数据
-    tiling.set_batch(batch);
-    tiling.set_seq(seq);
-    tiling.set_dim(dim);
-    tiling.set_mTile(mTile);
-    tiling.set_nTile(nTile);
-    tiling.set_tmpSize(minTmp);
-    tiling.set_scale(scale);
-
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
-    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
-    // 申请工作区：用于存放每块 [mTile, nTile] 的 logits/softmax（以 float 计算）
-    // 注意：此处仅示例，框架会为 workspace 分配 DDR 空间，核函数从该地址切片使用。
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    size_t bytesPerBlock = static_cast<size_t>(mTile) * static_cast<size_t>(nTile) * sizeof(float);
-    currentWorkspace[0] = bytesPerBlock;
-
-    return ge::GRAPH_SUCCESS;
 }
-
-} // namespace optiling
 """
 
 host_operator_src="""
 #include "scaled_dot_product_attention_long_context_custom_tiling.h"
 #include "register/op_def_registry.h"
 
+namespace {
+static inline uint64_t ProductExceptLast(const gert::Shape &shape) {
+    uint64_t prod = 1;
+    auto dims = shape.GetOriginShape().GetDims();
+    if (dims.size() == 0) { return 1; }
+    for (size_t i = 0; i + 1 < dims.size(); ++i) {
+        prod *= static_cast<uint64_t>(dims[i]);
+    }
+    return prod;
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin = in_shape->GetOriginShape();
+    auto dims = origin.GetDims();
+    if (dims.size() == 0) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t srcK = static_cast<uint32_t>(dims.back());
+    uint32_t srcM = static_cast<uint32_t>(ProductExceptLast(*in_shape));
+
+    ScaledDotProductAttentionLongContextCustomTilingData td;
+    td.set_srcM(srcM);
+    td.set_srcK(srcK);
+    // 为了通用性，这里按行处理，每次处理1行
+    td.set_tileRows(1);
+
+    context->SetBlockDim(BLOCK_DIM);
+    td.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(td.GetDataSize());
+
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0; // 无额外workspace
+    return ge::GRAPH_SUCCESS;
+}
+}
+
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* q_shape = context->GetInputShape(0);
-    gert::Shape* o_shape = context->GetOutputShape(0);
-    *o_shape = *q_shape; // 输出形状与 Q 相同 [B,S,D]
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
@@ -163,33 +107,19 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 }
 }
 
-namespace optiling {
-extern ge::graphStatus TilingFunc(gert::TilingContext* context);
-}
-
 namespace ops {
 class ScaledDotProductAttentionLongContextCustom : public OpDef {
 public:
     explicit ScaledDotProductAttentionLongContextCustom(const char* name) : OpDef(name)
     {
-        this->Input("q")
+        this->Input("scores")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
+            .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("k")
+        this->Output("probs")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("v")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("o")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16, ge::DT_FLOAT})
+            .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
@@ -207,232 +137,127 @@ OP_ADD(ScaledDotProductAttentionLongContextCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "scaled_dot_product_attention_long_context_custom_tiling_data.h"
-#include "lib/matmul_intf.h"
 
-using AscendC::GlobalTensor;
-using AscendC::LocalTensor;
+using dtype_t = float;
 
-template<typename T, typename AccT>
-class KernelSDPALongContext {
+// 简化版：对输入scores按行执行softmax（适用于长序列场景），输出probs
+// 使用SoftmaxFlashV2完成按行softmax（先计算exp和sum，再归一化）。
+class KernelScaledDotProductAttentionLongContextCustom {
 public:
-    __aicore__ inline KernelSDPALongContext() {}
+    __aicore__ inline KernelScaledDotProductAttentionLongContextCustom() {}
 
-    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o,
-                                uint32_t batch, uint32_t seq, uint32_t dim,
-                                uint32_t mTile, uint32_t nTile,
-                                float scale,
-                                uint32_t softmaxTmpSize,
-                                GM_ADDR workspace)
+    __aicore__ inline void Init(GM_ADDR scores, GM_ADDR probs, uint32_t srcM, uint32_t srcK, uint32_t tileRows)
     {
-        this->B = batch;
-        this->S = seq;
-        this->D = dim;
-        this->MT = mTile;
-        this->NT = nTile;
-        this->scale = scale;
-        this->softmaxTmpSize = softmaxTmpSize;
+        this->srcM = srcM;
+        this->srcK = srcK;
+        this->rowsPerBlock = srcM / AscendC::GetBlockNum();
+        this->rowStart = this->rowsPerBlock * AscendC::GetBlockIdx();
+        this->tileRows = tileRows;
 
-        qGm.SetGlobalBuffer((__gm__ T*)q, (size_t)B * S * D);
-        kGm.SetGlobalBuffer((__gm__ T*)k, (size_t)B * S * D);
-        vGm.SetGlobalBuffer((__gm__ T*)v, (size_t)B * S * D);
-        oGm.SetGlobalBuffer((__gm__ T*)o, (size_t)B * S * D);
+        scoresGm.SetGlobalBuffer((__gm__ dtype_t *)scores + (uint64_t)rowStart * srcK, (uint64_t)rowsPerBlock * srcK);
+        probsGm.SetGlobalBuffer((__gm__ dtype_t *)probs + (uint64_t)rowStart * srcK, (uint64_t)rowsPerBlock * srcK);
 
-        // 工作区：存放每块 logits 或 softmax 权重（以 float 计算）
-        // 大小由 host tiling 申请：MT * NT * sizeof(float)
-        logitsGm.SetGlobalBuffer((__gm__ float*)workspace, (size_t)MT * NT);
+        // 输入行缓冲与输出行缓冲
+        uint32_t rowBytes = srcK * sizeof(dtype_t);
+        pipe.InitBuffer(inQueueScores, 1, rowBytes);
+        pipe.InitBuffer(outQueueProbs, 1, rowBytes);
 
-        // 初始化队列/缓冲
-        pipe.InitBuffer(qIn, 1, MT * D * sizeof(T));
-        pipe.InitBuffer(kIn, 1, NT * D * sizeof(T)); // 以 K^T 形式使用时按 [NT, D] 读
-        pipe.InitBuffer(vIn, 1, NT * D * sizeof(T));
-        pipe.InitBuffer(oOut, 1, MT * D * sizeof(T));
-
-        // Softmax 相关临时缓冲（UB）
-        if (softmaxTmpSize > 0) {
-            pipe.InitBuffer(tmpBuf, softmaxTmpSize);
-        }
+        // Softmax需要的临时tensor：exp(sum)/max缓冲区
+        // 对于float类型，广播后的最后一维长度固定为32字节，即8个float。
+        uint32_t brcElems = 32 / sizeof(dtype_t);
+        pipe.InitBuffer(sumQueue, 1, brcElems * sizeof(dtype_t) * tileRows);
+        pipe.InitBuffer(maxQueue, 1, brcElems * sizeof(dtype_t) * tileRows);
+        // expMax只在update=true时使用，这里准备占位（大小与sum/max一致，按需分配）
+        pipe.InitBuffer(expMaxQueue, 1, brcElems * sizeof(dtype_t) * tileRows);
+        // inSum/inMax作为占位输入（isUpdate=false时不使用）
+        pipe.InitBuffer(inSumQueue, 1, brcElems * sizeof(dtype_t) * tileRows);
+        pipe.InitBuffer(inMaxQueue, 1, brcElems * sizeof(dtype_t) * tileRows);
     }
 
     __aicore__ inline void Process()
     {
-        // 仅支持 blockDim=1 的单核示例
-        for (uint32_t b = 0; b < B; ++b) {
-            for (uint32_t mStart = 0; mStart < S; mStart += MT) {
-                uint32_t curM = AscendC::Min(MT, S - mStart);
-
-                // 读取 Q 子块 [curM, D]
-                LocalTensor<T> qLocal = qIn.AllocTensor<T>();
-                AscendC::DataCopy(qLocal, qGm[(b*S + mStart) * D], (size_t)curM * D);
-                qIn.EnQue(qLocal);
-
-                // 初始化输出累加区 O 子块 [curM, D] 为 0
-                LocalTensor<T> oLocal = oOut.AllocTensor<T>();
-                AscendC::InitLocalMem(oLocal, 0, (size_t)curM * D * sizeof(T));
-                oOut.EnQue(oLocal);
-
-                // 读取 V 全列 [S, D] 分块到 [NT, D]，同时使用 Softmax 对 [curM, NT] 行做归一化并右乘 V 分块累加
-                // 为避免跨列分块的数值一致性问题，nTile = seq，即一次覆盖整列方向
-                uint32_t nStart = 0;
-                uint32_t curN = AscendC::Min(NT, S - nStart);
-
-                // 读取 K 子块 [curN, D]
-                LocalTensor<T> kLocal = kIn.AllocTensor<T>();
-                AscendC::DataCopy(kLocal, kGm[(b*S + nStart) * D], (size_t)curN * D);
-                kIn.EnQue(kLocal);
-
-                // 计算 logits = Q[curM, D] @ K[curN, D]^T -> [curM, curN]，写入 workspace logitsGm(float)
-                qLocal = qIn.DeQue<T>();
-                kLocal = kIn.DeQue<T>();
-
-                // 将 logits 以 float 精度存入 GM 工作区
-                // 简化处理：使用 Matmul 高级 API（C = A x B^T）
-                typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, T> aType;
-                typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, T, true> bType; // 视作转置
-                typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float> cType;
-                typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float> biasType;
-                matmul::Matmul<aType, bType, cType, biasType> mm_qk;
-
-                // 准备 GM 视图：Q[curM,D], K[curN,D], logits[curM,curN]
-                GlobalTensor<T> qSub;
-                qSub.SetGlobalBuffer(qGm[(b*S + mStart) * D].GetPhyAddr(), (size_t)curM * D);
-                GlobalTensor<T> kSub;
-                kSub.SetGlobalBuffer(kGm[(b*S + nStart) * D].GetPhyAddr(), (size_t)curN * D);
-                GlobalTensor<float> logitsSub;
-                logitsSub.SetGlobalBuffer(logitsGm[0].GetPhyAddr(), (size_t)curM * curN);
-
-                REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm_qk);
-                mm_qk.SetTensorA(qSub[0], false);
-                mm_qk.SetTensorB(kSub[0], true);
-                mm_qk.SetTensorC(logitsSub[0]);
-                mm_qk.SetBias(nullptr);
-                mm_qk.IterateNBatch<true>(1, 1, 1, true); // 单批示例
-
-                // 对 logits 缩放并按行 Softmax，输出仍写回 logitsSub（float）
-                LocalTensor<uint8_t> sharedTmp;
-                if (softmaxTmpSize > 0) {
-                    sharedTmp = tmpBuf.Get<uint8_t>();
-                }
-                // 读取 logits 到本地，逐元素缩放
-                LocalTensor<float> logitsLocal = pipe.AllocTensor<float>(AscendC::TPosition::VECCALC, (size_t)curM * curN);
-                AscendC::DataCopy(logitsLocal, logitsSub, (size_t)curM * curN);
-                AscendC::Muls(logitsLocal, logitsLocal, scale, (size_t)curM * curN);
-
-                // 为 SoftmaxFlashV3 构造必要张量
-                LocalTensor<float> meanTensor = pipe.AllocTensor<float>(AscendC::TPosition::VECCALC, curM * 8); // 对齐占位
-                LocalTensor<float> expSumTensor = pipe.AllocTensor<float>(AscendC::TPosition::VECCALC, curM * 8);
-                LocalTensor<float> maxTensor = pipe.AllocTensor<float>(AscendC::TPosition::VECCALC, curM * 8);
-                LocalTensor<float> inMeanTensor, inExpSumTensor, inMaxTensor; // 不更新场景传空
-                LocalTensor<float> expMaxTensor = pipe.AllocTensor<float>(AscendC::TPosition::VECCALC, curM * 8);
-
-                SoftMaxTiling smTiling; // 使用默认构造
-                SoftMaxParams smParams; // 使用默认构造
-                // 直接一次性完成一整行 softmax（update=false）
-                AscendC::SoftmaxFlashV3<float, float, false, false, false, false>(
-                    logitsLocal, meanTensor, expSumTensor, maxTensor,
-                    logitsLocal, expMaxTensor,
-                    inMeanTensor, inExpSumTensor, inMaxTensor,
-                    sharedTmp, smTiling, smParams);
-
-                // 归一化：dst(logitsLocal) 现在为 exp(x - max)。按 x_sum 归一化
-                // 将 expSumTensor 中的每行和广播除到 logitsLocal
-                // 简化实现：按行循环
-                for (uint32_t i = 0; i < curM; ++i) {
-                    // 每行长度 curN，偏移 i*curN
-                    LocalTensor<float> row = logitsLocal[i * curN];
-                    LocalTensor<float> sumRow = expSumTensor[i * 8]; // 取该行 reduce sum 所在 32B 块
-                    // 取出标量 x_sum
-                    float x_sum = 0.0f;
-                    AscendC::GetAccVal(x_sum); // 简化：占位，实际应从 sumRow 读取
-                    float inv_sum = 1.0f / x_sum;
-                    AscendC::Muls(row, row, inv_sum, curN);
-                }
-
-                // 计算 O 子块 += softmax[curM,curN] @ V[curN,D]
-                LocalTensor<T> vLocal = vIn.AllocTensor<T>();
-                AscendC::DataCopy(vLocal, vGm[(b*S + nStart) * D], (size_t)curN * D);
-                vIn.EnQue(vLocal);
-
-                vLocal = vIn.DeQue<T>();
-                oLocal = oOut.DeQue<T>();
-
-                // Matmul 软权重(float) 与 V(T) 相乘，累加到 oLocal(T)
-                typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float> aTypeW;
-                typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, T> bTypeV;
-                typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, T> cTypeO;
-                typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, T> biasTypeO;
-
-                matmul::Matmul<aTypeW, bTypeV, cTypeO, biasTypeO> mm_pv;
-
-                GlobalTensor<float> wSub;
-                wSub.SetGlobalBuffer(logitsSub[0].GetPhyAddr(), (size_t)curM * curN); // 使用 logitsSub 保存的 softmax 权重
-                GlobalTensor<T> vSub;
-                vSub.SetGlobalBuffer(vGm[(b*S + nStart) * D].GetPhyAddr(), (size_t)curN * D);
-                GlobalTensor<T> oSub;
-                oSub.SetGlobalBuffer(oGm[(b*S + mStart) * D].GetPhyAddr(), (size_t)curM * D);
-
-                REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm_pv);
-                mm_pv.SetTensorA(wSub[0], false);
-                mm_pv.SetTensorB(vSub[0], false);
-                mm_pv.SetTensorC(oSub[0]);
-                mm_pv.SetBias(nullptr);
-                mm_pv.IterateNBatch<true>(1, 1, 1, true);
-
-                // 写回 O 子块
-                AscendC::DataCopy(oGm[(b*S + mStart) * D], oSub, (size_t)curM * D);
-
-                // 释放本地张量
-                oOut.FreeTensor(oLocal);
-                // logitsLocal/mean/expSum/max/expMax 等由 VECCALC 池自动管理
-            }
+        for (uint32_t r = 0; r < rowsPerBlock; r += tileRows) {
+            CopyIn(r);
+            Compute(r);
+            CopyOut(r);
         }
     }
 
 private:
+    __aicore__ inline void CopyIn(uint32_t rowOffset)
+    {
+        AscendC::LocalTensor<dtype_t> scoresLocal = inQueueScores.AllocTensor<dtype_t>();
+        // 每次处理tileRows行（此处tileRows=1）
+        AscendC::DataCopy(scoresLocal, scoresGm[rowOffset * srcK], srcK * tileRows);
+        inQueueScores.EnQue(scoresLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t rowOffset)
+    {
+        AscendC::LocalTensor<dtype_t> scoresLocal = inQueueScores.DeQue<dtype_t>();
+        AscendC::LocalTensor<dtype_t> probsLocal = outQueueProbs.AllocTensor<dtype_t>();
+
+        // SoftmaxFlashV2需要sum/max缓冲区（广播到32字节）
+        AscendC::LocalTensor<dtype_t> sumLocal = sumQueue.AllocTensor<dtype_t>();
+        AscendC::LocalTensor<dtype_t> maxLocal = maxQueue.AllocTensor<dtype_t>();
+        AscendC::LocalTensor<dtype_t> expMaxLocal = expMaxQueue.AllocTensor<dtype_t>();
+        AscendC::LocalTensor<dtype_t> inSumLocal = inSumQueue.AllocTensor<dtype_t>();
+        AscendC::LocalTensor<dtype_t> inMaxLocal = inMaxQueue.AllocTensor<dtype_t>();
+
+        // 形状信息：按行（m=tileRows，n=srcK）
+        AscendC::SoftMaxShapeInfo shapeInfo = {tileRows, srcK, tileRows, srcK};
+        // 在核内重新计算tiling
+        auto tiling = AscendC::SoftMaxFlashV2TilingFunc(shapeInfo, sizeof(dtype_t), sizeof(dtype_t), 0, false, false, false, false);
+
+        // 先用SoftmaxFlashV2计算 exp(scores - max) 和 sum
+        AscendC::SoftmaxFlashV2<dtype_t, false>(probsLocal, sumLocal, maxLocal, scoresLocal, expMaxLocal, inSumLocal, inMaxLocal, tiling, shapeInfo);
+
+        // 再进行归一化：probs = exp / sum
+        AscendC::Div(probsLocal, probsLocal, sumLocal, srcK * tileRows);
+
+        outQueueProbs.EnQue<dtype_t>(probsLocal);
+
+        // 释放本次使用的本地tensor
+        sumQueue.FreeTensor(sumLocal);
+        maxQueue.FreeTensor(maxLocal);
+        expMaxQueue.FreeTensor(expMaxLocal);
+        inSumQueue.FreeTensor(inSumLocal);
+        inMaxQueue.FreeTensor(inMaxLocal);
+        inQueueScores.FreeTensor(scoresLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t rowOffset)
+    {
+        AscendC::LocalTensor<dtype_t> probsLocal = outQueueProbs.DeQue<dtype_t>();
+        AscendC::DataCopy(probsGm[rowOffset * srcK], probsLocal, srcK * tileRows);
+        outQueueProbs.FreeTensor(probsLocal);
+    }
+
+private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, 1> qIn, kIn, vIn;
-    AscendC::TQue<AscendC::TPosition::VECOUT, 1> oOut;
-    AscendC::TBuf<AscendC::TPosition::VECCALC> tmpBuf;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueScores;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueProbs;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> sumQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> maxQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> expMaxQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> inSumQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> inMaxQueue;
 
-    GlobalTensor<T> qGm, kGm, vGm, oGm;
-    GlobalTensor<float> logitsGm;
+    AscendC::GlobalTensor<dtype_t> scoresGm;
+    AscendC::GlobalTensor<dtype_t> probsGm;
 
-    uint32_t B, S, D;
-    uint32_t MT, NT;
-    float scale;
-    uint32_t softmaxTmpSize;
+    uint32_t srcM;
+    uint32_t srcK;
+    uint32_t tileRows;
+    uint32_t rowsPerBlock;
+    uint32_t rowStart;
 };
 
-extern "C" __global__ __aicore__ void scaled_dot_product_attention_long_context_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void scaled_dot_product_attention_long_context_custom(GM_ADDR scores, GM_ADDR probs, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-
-    if (TILING_KEY_IS(1)) { // fp16
-        KernelSDPALongContext<half, float> op;
-        op.Init(q, k, v, o,
-                tiling_data.batch(),
-                tiling_data.seq(),
-                tiling_data.dim(),
-                tiling_data.mTile(),
-                tiling_data.nTile(),
-                tiling_data.scale(),
-                tiling_data.tmpSize(),
-                workspace);
-        op.Process();
-    } else { // fp32
-        KernelSDPALongContext<float, float> op;
-        op.Init(q, k, v, o,
-                tiling_data.batch(),
-                tiling_data.seq(),
-                tiling_data.dim(),
-                tiling_data.mTile(),
-                tiling_data.nTile(),
-                tiling_data.scale(),
-                tiling_data.tmpSize(),
-                workspace);
-        op.Process();
-    }
+    KernelScaledDotProductAttentionLongContextCustom op;
+    op.Init(scores, probs, tiling_data.srcM, tiling_data.srcK, tiling_data.tileRows);
+    op.Process();
 }
 """
 
@@ -442,12 +267,10 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor scaled_dot_product_attention_long_context_custom_impl_npu(const at::Tensor& q,
-                                                                     const at::Tensor& k,
-                                                                     const at::Tensor& v) {
-    auto out = at::empty_like(q);
-    EXEC_NPU_CMD(aclnnScaledDotProductAttentionLongContextCustom, q, k, v, out);
-    return out;
+at::Tensor scaled_dot_product_attention_long_context_custom_impl_npu(const at::Tensor& scores) {
+    at::Tensor probs = at::empty_like(scores);
+    EXEC_NPU_CMD(aclnnScaledDotProductAttentionLongContextCustom, scores, probs);
+    return probs;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -455,9 +278,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("scaled_dot_product_attention_long_context_custom",
-          &scaled_dot_product_attention_long_context_custom_impl_npu,
-          "Scaled Dot-Product Attention (Long Context) Custom");
+    m.def("scaled_dot_product_attention_long_context_custom", &scaled_dot_product_attention_long_context_custom_impl_npu, "softmax over scores for long context");
 }
 """
 
@@ -465,11 +286,19 @@ model_src='''
 import torch
 import torch_npu
 import custom_ops_lib
+import math
 
 class ModelNew(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
     def forward(self, Q, K, V):
-        return custom_ops_lib.scaled_dot_product_attention_long_context_custom(Q, K, V)
+        # 先在PyTorch侧计算缩放点积注意力的分数矩阵
+        scale = 1.0 / math.sqrt(Q.size(-1))
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * scale
+        # 使用自定义AscendC核对长序列进行高效softmax
+        probs = custom_ops_lib.scaled_dot_product_attention_long_context_custom(scores)
+        # 再与V相乘得到输出
+        output = torch.matmul(probs, V)
+        return output
 '''

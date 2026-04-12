@@ -7,28 +7,44 @@ project_json_src='''
             {
                 "name": "x",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             },
             {
                 "name": "w",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             },
             {
                 "name": "b",
-                "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "param_type": "optional",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ],
         "output_desc": [
             {
                 "name": "y",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ]
     }
@@ -40,18 +56,13 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ConvStandard2dSquareInputSquareKernelCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, N);
-  TILING_DATA_FIELD_DEF(uint32_t, Cin);
-  TILING_DATA_FIELD_DEF(uint32_t, H);
-  TILING_DATA_FIELD_DEF(uint32_t, W);
-  TILING_DATA_FIELD_DEF(uint32_t, Cout);
-  TILING_DATA_FIELD_DEF(uint32_t, K);        // kernel size (square)
-  TILING_DATA_FIELD_DEF(uint32_t, stride);   // assume square stride
-  TILING_DATA_FIELD_DEF(uint32_t, pad);      // assume square pad
-  TILING_DATA_FIELD_DEF(uint32_t, outH);
-  TILING_DATA_FIELD_DEF(uint32_t, outW);
-  TILING_DATA_FIELD_DEF(uint64_t, totalOut); // N * Cout * outH * outW
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, oc);
+  TILING_DATA_FIELD_DEF(uint32_t, oh);
+  TILING_DATA_FIELD_DEF(uint32_t, ow);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ConvStandard2dSquareInputSquareKernelCustom, ConvStandard2dSquareInputSquareKernelCustomTilingData)
@@ -61,105 +72,103 @@ REGISTER_TILING_DATA_CLASS(ConvStandard2dSquareInputSquareKernelCustom, ConvStan
 host_operator_src="""
 #include "conv_standard_2d_square_input_square_kernel_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace {
-inline uint32_t GetDimSafe(const gert::Shape* s, int idx) {
-    return static_cast<uint32_t>(s->GetOriginShape().GetDim(idx));
-}
+constexpr int32_t KERNEL_H = 11;
+constexpr int32_t KERNEL_W = 11;
+constexpr int32_t STRIDE   = 4;
+constexpr int32_t PADDING  = 2;
 }
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 1; // naive kernel, process per-block
+const uint32_t BLOCK_DIM = 32;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    ConvStandard2dSquareInputSquareKernelCustomTilingData tiling;
-
-    // Input shapes: x [N, Cin, H, W], w [Cout, Cin, K, K], b [Cout]
+    // x: [N,C,H,W], w: [OC,C,KH,KW], b: [OC] (optional)
     const gert::Shape* x_shape = context->GetInputShape(0);
     const gert::Shape* w_shape = context->GetInputShape(1);
 
-    uint32_t N   = GetDimSafe(x_shape, 0);
-    uint32_t Cin = GetDimSafe(x_shape, 1);
-    uint32_t H   = GetDimSafe(x_shape, 2);
-    uint32_t W   = GetDimSafe(x_shape, 3);
+    if (x_shape->GetDimNum() != 4 || w_shape->GetDimNum() != 4) {
+        return ge::GRAPH_FAILED;
+    }
 
-    uint32_t Cout = GetDimSafe(w_shape, 0);
-    uint32_t K    = GetDimSafe(w_shape, 2); // square kernel
+    uint32_t N  = static_cast<uint32_t>(x_shape->GetDim(0));
+    uint32_t C  = static_cast<uint32_t>(x_shape->GetDim(1));
+    uint32_t H  = static_cast<uint32_t>(x_shape->GetDim(2));
+    uint32_t W  = static_cast<uint32_t>(x_shape->GetDim(3));
 
-    // Fixed params for this standard conv (from the given PyTorch model)
-    uint32_t stride = 4;
-    uint32_t pad    = 2;
-    uint32_t dilation = 1; // not used further
+    uint32_t OC = static_cast<uint32_t>(w_shape->GetDim(0));
+    uint32_t KH = static_cast<uint32_t>(w_shape->GetDim(2));
+    uint32_t KW = static_cast<uint32_t>(w_shape->GetDim(3));
 
-    // Output size (square)
-    uint32_t outH = (H + 2 * pad - dilation * (K - 1) - 1) / stride + 1;
-    uint32_t outW = (W + 2 * pad - dilation * (K - 1) - 1) / stride + 1;
+    if (KH != KERNEL_H || KW != KERNEL_W) {
+        return ge::GRAPH_FAILED;
+    }
 
-    uint64_t totalOut = static_cast<uint64_t>(N) * Cout * outH * outW;
+    uint32_t OH = static_cast<uint32_t>((static_cast<int32_t>(H) + 2 * PADDING - KERNEL_H) / STRIDE + 1);
+    uint32_t OW = static_cast<uint32_t>((static_cast<int32_t>(W) + 2 * PADDING - KERNEL_W) / STRIDE + 1);
+
+    optiling::ConvStandard2dSquareInputSquareKernelCustomTilingData tiling;
+    tiling.set_n(N);
+    tiling.set_c(C);
+    tiling.set_h(H);
+    tiling.set_w(W);
+    tiling.set_oc(OC);
+    tiling.set_oh(OH);
+    tiling.set_ow(OW);
 
     context->SetBlockDim(BLOCK_DIM);
-
-    tiling.set_N(N);
-    tiling.set_Cin(Cin);
-    tiling.set_H(H);
-    tiling.set_W(W);
-    tiling.set_Cout(Cout);
-    tiling.set_K(K);
-    tiling.set_stride(stride);
-    tiling.set_pad(pad);
-    tiling.set_outH(outH);
-    tiling.set_outW(outW);
-    tiling.set_totalOut(totalOut);
-    tiling.set_tileNum(TILE_NUM);
-
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
-    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
-    workspaceSizes[0] = 0;
-
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
-} // namespace optiling
+}
 
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // x [N, Cin, H, W], w [Cout, Cin, K, K], pad=2, stride=4
     const gert::Shape* x_shape = context->GetInputShape(0);
     const gert::Shape* w_shape = context->GetInputShape(1);
 
-    uint32_t N   = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
-    uint32_t H   = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(2));
-    uint32_t W   = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(3));
-    uint32_t Cout= static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(0));
-    uint32_t K   = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(2));
+    if (x_shape->GetDimNum() != 4 || w_shape->GetDimNum() != 4) {
+        return GRAPH_FAILED;
+    }
 
-    // fixed params for this model
-    uint32_t pad = 2;
-    uint32_t stride = 4;
-    uint32_t dilation = 1;
+    constexpr int32_t STRIDE = 4;
+    constexpr int32_t PAD = 2;
+    constexpr int32_t KH = 11;
+    constexpr int32_t KW = 11;
 
-    uint32_t outH = (H + 2 * pad - dilation * (K - 1) - 1) / stride + 1;
-    uint32_t outW = (W + 2 * pad - dilation * (K - 1) - 1) / stride + 1;
+    int64_t N = x_shape->GetDim(0);
+    int64_t C = x_shape->GetDim(1);
+    int64_t H = x_shape->GetDim(2);
+    int64_t W = x_shape->GetDim(3);
+
+    (void)C; // unused directly here
+    int64_t OC = w_shape->GetDim(0);
+
+    int64_t OH = (H + 2 * PAD - KH) / STRIDE + 1;
+    int64_t OW = (W + 2 * PAD - KW) / STRIDE + 1;
 
     gert::Shape* y_shape = context->GetOutputShape(0);
-    y_shape->SetOriginShape(ge::Shape({(int64_t)N, (int64_t)Cout, (int64_t)outH, (int64_t)outW}));
-    y_shape->SetStorageShape(ge::Shape({(int64_t)N, (int64_t)Cout, (int64_t)outH, (int64_t)outW}));
-    y_shape->SetUnknownShape(false);
+    y_shape->SetDimNum(4);
+    y_shape->SetDim(0, N);
+    y_shape->SetDim(1, OC);
+    y_shape->SetDim(2, OH);
+    y_shape->SetDim(3, OW);
     return GRAPH_SUCCESS;
 }
 
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const auto dt = context->GetInputDataType(0);
-    context->SetOutputDataType(0, dt);
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
-} // namespace ge
+}
 
 namespace ops {
 class ConvStandard2dSquareInputSquareKernelCustom : public OpDef {
@@ -171,19 +180,16 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Input("w")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Input("b")
-            .ParamType(REQUIRED)
+            .ParamType(OPTIONAL)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -202,117 +208,75 @@ OP_ADD(ConvStandard2dSquareInputSquareKernelCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_standard_2d_square_input_square_kernel_custom_tiling_data.h"
 
-using f32 = float;
-
-class KernelConv2dNaive {
-public:
-    __aicore__ inline KernelConv2dNaive() {}
-
-    __aicore__ inline void Init(
-        GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y,
-        uint32_t N, uint32_t Cin, uint32_t H, uint32_t W,
-        uint32_t Cout, uint32_t K, uint32_t stride, uint32_t pad,
-        uint32_t outH, uint32_t outW, uint64_t totalOut)
-    {
-        // Store gm pointers
-        xPtr = reinterpret_cast<__gm__ f32*>(x);
-        wPtr = reinterpret_cast<__gm__ f32*>(w);
-        bPtr = reinterpret_cast<__gm__ f32*>(b);
-        yPtr = reinterpret_cast<__gm__ f32*>(y);
-
-        this->N = N; this->Cin = Cin; this->H = H; this->W = W;
-        this->Cout = Cout; this->K = K; this->stride = stride; this->pad = pad;
-        this->outH = outH; this->outW = outW; this->totalOut = totalOut;
-
-        // Per-block work distribution
-        uint32_t blkNum = AscendC::GetBlockNum();
-        uint32_t blkIdx = AscendC::GetBlockIdx();
-
-        uint64_t basePerBlock = totalOut / blkNum;
-        uint64_t remain = totalOut % blkNum;
-
-        // Round-robin the tail
-        blockStart = basePerBlock * blkIdx + (blkIdx < remain ? blkIdx : remain);
-        blockLen = basePerBlock + (blkIdx < remain ? 1 : 0);
-    }
-
-    __aicore__ inline void Process()
-    {
-        // Naive NCHW convolution, single-core per-block loop
-        for (uint64_t p = 0; p < blockLen; ++p) {
-            uint64_t gIdx = blockStart + p;
-
-            // Unravel gIdx -> (n, oc, oh, ow)
-            uint64_t spanOW = outW;
-            uint64_t spanOHOW = (uint64_t)outH * outW;
-            uint64_t spanOC = (uint64_t)Cout * spanOHOW;
-
-            uint32_t n  = (uint32_t)(gIdx / spanOC);
-            uint64_t r1 = gIdx % spanOC;
-            uint32_t oc = (uint32_t)(r1 / spanOHOW);
-            uint64_t r2 = r1 % spanOHOW;
-            uint32_t oh = (uint32_t)(r2 / spanOW);
-            uint32_t ow = (uint32_t)(r2 % spanOW);
-
-            int32_t ih0 = (int32_t)oh * (int32_t)stride - (int32_t)pad;
-            int32_t iw0 = (int32_t)ow * (int32_t)stride - (int32_t)pad;
-
-            f32 acc = 0.0f;
-
-            for (uint32_t ci = 0; ci < Cin; ++ci) {
-                for (uint32_t kh = 0; kh < K; ++kh) {
-                    int32_t ih = ih0 + (int32_t)kh;
-                    if (ih < 0 || ih >= (int32_t)H) continue;
-
-                    for (uint32_t kw = 0; kw < K; ++kw) {
-                        int32_t iw = iw0 + (int32_t)kw;
-                        if (iw < 0 || iw >= (int32_t)W) continue;
-
-                        // x index: ((n*Cin + ci)*H + ih)*W + iw
-                        uint64_t xIndex = (((uint64_t)n * Cin + ci) * H + (uint32_t)ih) * W + (uint32_t)iw;
-
-                        // w index: ((oc*Cin + ci)*K + kh)*K + kw
-                        uint64_t wIndex = (((uint64_t)oc * Cin + ci) * K + kh) * K + kw;
-
-                        acc += xPtr[xIndex] * wPtr[wIndex];
-                    }
-                }
-            }
-
-            acc += bPtr[oc];
-
-            // y index: ((n*Cout + oc)*outH + oh)*outW + ow
-            uint64_t yIndex = (((uint64_t)n * Cout + oc) * outH + oh) * outW + ow;
-            yPtr[yIndex] = acc;
-        }
-    }
-
-private:
-    __gm__ f32* xPtr;
-    __gm__ f32* wPtr;
-    __gm__ f32* bPtr;
-    __gm__ f32* yPtr;
-
-    uint32_t N, Cin, H, W, Cout, K, stride, pad, outH, outW;
-    uint64_t totalOut;
-    uint64_t blockStart;
-    uint64_t blockLen;
-};
+namespace {
+constexpr int32_t KERNEL_H = 11;
+constexpr int32_t KERNEL_W = 11;
+constexpr int32_t STRIDE   = 4;
+constexpr int32_t PADDING  = 2;
+}
 
 extern "C" __global__ __aicore__ void conv_standard_2d_square_input_square_kernel_custom(
     GM_ADDR x, GM_ADDR w, GM_ADDR b, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelConv2dNaive op;
-    op.Init(
-        x, w, b, y,
-        tiling_data.N, tiling_data.Cin, tiling_data.H, tiling_data.W,
-        tiling_data.Cout, tiling_data.K, tiling_data.stride, tiling_data.pad,
-        tiling_data.outH, tiling_data.outW, tiling_data.totalOut);
-    op.Process();
+
+    const uint32_t N  = tiling_data.n;
+    const uint32_t C  = tiling_data.c;
+    const uint32_t H  = tiling_data.h;
+    const uint32_t W  = tiling_data.w;
+    const uint32_t OC = tiling_data.oc;
+    const uint32_t OH = tiling_data.oh;
+    const uint32_t OW = tiling_data.ow;
+
+    __gm__ float* x_gm = reinterpret_cast<__gm__ float*>(x);
+    __gm__ float* w_gm = reinterpret_cast<__gm__ float*>(w);
+    __gm__ float* b_gm = reinterpret_cast<__gm__ float*>(b);
+    __gm__ float* y_gm = reinterpret_cast<__gm__ float*>(y);
+
+    const uint64_t totalOut = static_cast<uint64_t>(N) * OC * OH * OW;
+    const uint64_t blockNum = AscendC::GetBlockNum();
+    const uint64_t blockIdx = AscendC::GetBlockIdx();
+
+    const uint64_t base = (totalOut / blockNum) * blockIdx;
+    const uint64_t tail = (blockIdx == (blockNum - 1)) ? totalOut : (base + totalOut / blockNum);
+
+    for (uint64_t linearIdx = base; linearIdx < tail; ++linearIdx) {
+        uint64_t t = linearIdx;
+        const uint32_t ow = static_cast<uint32_t>(t % OW); t /= OW;
+        const uint32_t oh = static_cast<uint32_t>(t % OH); t /= OH;
+        const uint32_t oc = static_cast<uint32_t>(t % OC); t /= OC;
+        const uint32_t n  = static_cast<uint32_t>(t);
+
+        float acc = 0.0f;
+        if (b_gm != nullptr) {
+            acc = b_gm[oc];
+        }
+
+        const int32_t in_h_base = static_cast<int32_t>(oh) * STRIDE - PADDING;
+        const int32_t in_w_base = static_cast<int32_t>(ow) * STRIDE - PADDING;
+
+        for (uint32_t c0 = 0; c0 < C; ++c0) {
+            for (int32_t kh = 0; kh < KERNEL_H; ++kh) {
+                const int32_t ih = in_h_base + kh;
+                if (ih < 0 || ih >= static_cast<int32_t>(H)) {
+                    continue;
+                }
+                for (int32_t kw = 0; kw < KERNEL_W; ++kw) {
+                    const int32_t iw = in_w_base + kw;
+                    if (iw < 0 || iw >= static_cast<int32_t>(W)) {
+                        continue;
+                    }
+                    const uint64_t x_idx = (((static_cast<uint64_t>(n) * C + c0) * H + static_cast<uint32_t>(ih)) * W + static_cast<uint32_t>(iw));
+                    const uint64_t w_idx = (((static_cast<uint64_t>(oc) * C + c0) * KERNEL_H + kh) * KERNEL_W + kw);
+                    acc += x_gm[x_idx] * w_gm[w_idx];
+                }
+            }
+        }
+
+        const uint64_t y_idx = (((static_cast<uint64_t>(n) * OC + oc) * OH + oh) * OW + ow);
+        y_gm[y_idx] = acc;
+    }
 }
 """
 
@@ -322,13 +286,26 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv_standard_2d_square_input_square_kernel_custom_impl_npu(
-    const at::Tensor& x, const at::Tensor& w, const at::Tensor& b) {
-    // Output tensor shape inferred by kernel
-    // Create an empty tensor with the same device and dtype as x
-    // The runtime will resize according to InferShape
-    at::Tensor y = at::empty({0}, x.options());
-    EXEC_NPU_CMD(aclnnConvStandard2dSquareInputSquareKernelCustom, x, w, b, y);
+static at::Tensor to_contiguous_if_needed(const at::Tensor& t) {
+    return t.is_contiguous() ? t : t.contiguous();
+}
+
+at::Tensor conv_standard_2d_square_input_square_kernel_custom_impl_npu(const at::Tensor& x,
+                                                                       const at::Tensor& w,
+                                                                       c10::optional<at::Tensor> b_opt) {
+    at::Tensor x_c = to_contiguous_if_needed(x);
+    at::Tensor w_c = to_contiguous_if_needed(w);
+    at::Tensor y = at::empty({x.size(0), w.size(0),
+                              (x.size(2) + 2 * 2 - 11) / 4 + 1,
+                              (x.size(3) + 2 * 2 - 11) / 4 + 1},
+                              x.options());
+    if (b_opt.has_value() && b_opt.value().defined()) {
+        at::Tensor b_c = to_contiguous_if_needed(b_opt.value());
+        EXEC_NPU_CMD(aclnnConvStandard2dSquareInputSquareKernelCustom, x_c, w_c, b_c, y);
+    } else {
+        // Pass an undefined tensor for optional bias
+        EXEC_NPU_CMD(aclnnConvStandard2dSquareInputSquareKernelCustom, x_c, w_c, at::Tensor(), y);
+    }
     return y;
 }
 
@@ -339,7 +316,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("conv_standard_2d_square_input_square_kernel_custom",
           &conv_standard_2d_square_input_square_kernel_custom_impl_npu,
-          "Standard 2D Conv (square input, square kernel) custom AscendC kernel");
+          "Conv2d 11x11 s=4 p=2 (custom AscendC)");
 }
 """
 
@@ -351,10 +328,10 @@ import custom_ops_lib
 class ModelNew(torch.nn.Module):
     def __init__(self, num_classes=1000):
         super(ModelNew, self).__init__()
-        # keep a Conv2d module just to hold parameters (weight/bias shapes and initialization)
+        # Keep parameters for state dict compatibility
         self.conv1 = torch.nn.Conv2d(in_channels=3, out_channels=96, kernel_size=11, stride=4, padding=2, bias=True)
 
     def forward(self, x):
-        # Call the custom AscendC operator with x, weight, bias
+        # Replace with custom NPU kernel: hard-coded 11x11, stride=4, padding=2
         return custom_ops_lib.conv_standard_2d_square_input_square_kernel_custom(x, self.conv1.weight, self.conv1.bias)
 '''

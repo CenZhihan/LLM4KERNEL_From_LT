@@ -36,11 +36,11 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(MambaReturnFinalStateCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);      // B * H * P * N
-  TILING_DATA_FIELD_DEF(uint32_t, perBatchLength);   // H * P * N
-  TILING_DATA_FIELD_DEF(uint32_t, batchSize);        // B
-  TILING_DATA_FIELD_DEF(uint32_t, zLen);             // Z
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);          // tiles per batch
+  TILING_DATA_FIELD_DEF(uint32_t, B);
+  TILING_DATA_FIELD_DEF(uint32_t, C);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, PN);     // P * N
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(MambaReturnFinalStateCustom, MambaReturnFinalStateCustomTilingData)
@@ -52,27 +52,27 @@ host_operator_src="""
 #include "register/op_def_registry.h"
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 8;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // input x shape: [B, Z, H, P, N]
-    auto inShape = context->GetInputShape(0)->GetStorageShape();
-    uint32_t B = (inShape.GetDimNum() >= 1) ? static_cast<uint32_t>(inShape.GetDim(0)) : 1;
-    uint32_t Z = (inShape.GetDimNum() >= 2) ? static_cast<uint32_t>(inShape.GetDim(1)) : 1;
-    uint32_t H = (inShape.GetDimNum() >= 3) ? static_cast<uint32_t>(inShape.GetDim(2)) : 1;
-    uint32_t P = (inShape.GetDimNum() >= 4) ? static_cast<uint32_t>(inShape.GetDim(3)) : 1;
-    uint32_t N = (inShape.GetDimNum() >= 5) ? static_cast<uint32_t>(inShape.GetDim(4)) : 1;
+    auto inShape = context->GetInputShape(0)->GetOriginShape();
+    if (inShape.GetDimNum() != 5) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t B = static_cast<uint32_t>(inShape.GetDim(0));
+    uint32_t C = static_cast<uint32_t>(inShape.GetDim(1));
+    uint32_t H = static_cast<uint32_t>(inShape.GetDim(2));
+    uint32_t P = static_cast<uint32_t>(inShape.GetDim(3));
+    uint32_t N = static_cast<uint32_t>(inShape.GetDim(4));
+    uint32_t PN = P * N;
 
-    uint32_t perBatchLength = H * P * N;           // elements in last z-slice per batch
-    uint32_t totalLength    = B * perBatchLength;  // output elements
+    const uint32_t BLOCK_DIM = 8;
+    const uint32_t TILE_NUM = 8;
 
     MambaReturnFinalStateCustomTilingData tiling;
-    tiling.set_totalLength(totalLength);
-    tiling.set_perBatchLength(perBatchLength);
-    tiling.set_batchSize(B);
-    tiling.set_zLen(Z);
+    tiling.set_B(B);
+    tiling.set_C(C);
+    tiling.set_H(H);
+    tiling.set_PN(PN);
     tiling.set_tileNum(TILE_NUM);
 
     context->SetBlockDim(BLOCK_DIM);
@@ -88,23 +88,20 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // x: [B, Z, H, P, N] -> y: [B, H, P, N]
     const gert::Shape* x_shape = context->GetInputShape(0);
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    // Best effort: if rank >= 5, drop the second dimension
-    auto x_dim = x_shape->GetStorageShape();
-    if (x_dim.GetDimNum() >= 5) {
-        gert::StorageShape out;
-        out.SetDimNum(4);
-        out.SetDim(0, x_dim.GetDim(0)); // B
-        out.SetDim(1, x_dim.GetDim(2)); // H
-        out.SetDim(2, x_dim.GetDim(3)); // P
-        out.SetDim(3, x_dim.GetDim(4)); // N
-        y_shape->SetStorageShape(out);
-    } else {
-        // fallback
-        *y_shape = *x_shape;
+    if (x_shape->GetOriginShape().GetDimNum() != 5) {
+        return GRAPH_FAILED;
     }
+    auto in = x_shape->GetOriginShape();
+    int64_t B = in.GetDim(0);
+    int64_t C = in.GetDim(1);
+    (void)C;
+    int64_t H = in.GetDim(2);
+    int64_t P = in.GetDim(3);
+    int64_t N = in.GetDim(4);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetOriginShape({B, H, P, N});
+    y_shape->SetShape({B, H, P, N});
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
@@ -132,10 +129,7 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
-        // Note: replace with actual SoC if needed
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -146,126 +140,105 @@ OP_ADD(MambaReturnFinalStateCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "mamba_return_final_state_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 1; // single buffer is enough for pure copy
+constexpr int32_t BUFFER_NUM = 1;
 
 class KernelMambaReturnFinalState {
 public:
     __aicore__ inline KernelMambaReturnFinalState() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t perBatchLength,
-                                uint32_t batchSize, uint32_t zLen, uint32_t tileNum)
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t B, uint32_t C, uint32_t H, uint32_t PN, uint32_t tileNum)
     {
-        this->totalLength = totalLength;         // B * H * P * N
-        this->perBatchLen = perBatchLength;      // H * P * N
-        this->batchSize   = batchSize;           // B
-        this->zLen        = zLen;                // Z
-        this->tilesPerB   = tileNum;             // tiles per batch
+        this->B = B;
+        this->C = C;
+        this->H = H;
+        this->PN = PN;
+        this->tileNum = tileNum;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, (uint32_t)0);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y, (uint32_t)0);
+        // 分块到各个核心：以 (B*H) 为并行维度
+        totalBH = B * H;
+        coreNum = AscendC::GetBlockNum();
+        coreIdx = AscendC::GetBlockIdx();
+        bhPerCore = (totalBH + coreNum - 1) / coreNum;
+        bhStart = coreIdx * bhPerCore;
+        bhEnd = bhStart + bhPerCore;
+        if (bhEnd > totalBH) bhEnd = totalBH;
 
-        // Tile length inside a batch slice
-        this->tileLen = this->perBatchLen / this->tilesPerB;
-        if (this->tileLen == 0) { this->tileLen = this->perBatchLen; this->tilesPerB = 1; }
+        // 计算每块的 tile 长度
+        tileLen = (PN + tileNum - 1) / tileNum;
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLen * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLen * sizeof(DTYPE_Y));
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(x));  // [B, C, H, P, N]
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(y));  // [B, H, P, N]
+
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, tileLen * sizeof(float));
+        pipe.InitBuffer(accQueue, BUFFER_NUM, tileLen * sizeof(float));
+        pipe.InitBuffer(outQueue, BUFFER_NUM, tileLen * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        // total tiles to process = B * tilesPerB
-        uint32_t loopCount = this->batchSize * this->tilesPerB;
-        for (uint32_t i = 0; i < loopCount; i++) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
+        for (uint32_t bh = bhStart; bh < bhEnd; ++bh) {
+            uint32_t b = bh / H;
+            uint32_t h = bh % H;
+
+            for (uint32_t t = 0; t < tileNum; ++t) {
+                uint32_t offsetPN = t * tileLen;
+                if (offsetPN >= PN) break;
+                uint32_t curLen = (offsetPN + tileLen <= PN) ? tileLen : (PN - offsetPN);
+
+                // 累加器：读取 c=0 切片初始化
+                AscendC::LocalTensor<float> accLocal = accQueue.AllocTensor<float>();
+                {
+                    uint64_t srcOffset = ((((uint64_t)b) * C + 0) * H + h) * PN + offsetPN;
+                    AscendC::DataCopy(accLocal, xGm[srcOffset], curLen);
+                }
+
+                // 对后续 c 进行累加
+                for (uint32_t c = 1; c < C; ++c) {
+                    AscendC::LocalTensor<float> tmpLocal = tmpQueue.AllocTensor<float>();
+                    uint64_t srcOffset = ((((uint64_t)b) * C + c) * H + h) * PN + offsetPN;
+                    AscendC::DataCopy(tmpLocal, xGm[srcOffset], curLen);
+                    // 矢量加法：accLocal += tmpLocal
+                    AscendC::Add(accLocal, accLocal, tmpLocal, curLen);
+                    tmpQueue.FreeTensor(tmpLocal);
+                }
+
+                // 写回输出 y[b, h, :, :] 当前 tile
+                AscendC::LocalTensor<float> outLocal = outQueue.AllocTensor<float>();
+                AscendC::DataCopy(outLocal, accLocal, curLen);
+                outQueue.EnQue<float>(outLocal);
+                accQueue.FreeTensor(accLocal);
+
+                AscendC::LocalTensor<float> outLocal2 = outQueue.DeQue<float>();
+                uint64_t dstOffset = ((((uint64_t)b) * H + h) * PN) + offsetPN;
+                AscendC::DataCopy(yGm[dstOffset], outLocal2, curLen);
+                outQueue.FreeTensor(outLocal2);
+            }
         }
-    }
-
-private:
-    __aicore__ inline uint32_t GetCalLen(uint32_t tileIdxInBatch) const
-    {
-        if (tileIdxInBatch < (this->tilesPerB - 1)) {
-            return this->tileLen;
-        } else {
-            uint32_t done = this->tileLen * (this->tilesPerB - 1);
-            return this->perBatchLen - done;
-        }
-    }
-
-    __aicore__ inline void CopyIn(uint32_t progress)
-    {
-        // map progress -> batch b and tile index t
-        uint32_t b = progress / this->tilesPerB;
-        uint32_t t = progress % this->tilesPerB;
-
-        uint32_t calLen = GetCalLen(t);
-        uint32_t offsetInBatch = t * this->tileLen;
-
-        // x layout: [B, Z, H, P, N], contiguous
-        // last z slice offset for batch b
-        uint64_t srcBase = (uint64_t)b * (uint64_t)(this->zLen * this->perBatchLen)
-                         + (uint64_t)(this->zLen - 1) * (uint64_t)this->perBatchLen
-                         + (uint64_t)offsetInBatch;
-
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::DataCopy(xLocal, xGm[srcBase], calLen);
-        inQueueX.EnQue(xLocal);
-    }
-
-    __aicore__ inline void Compute(uint32_t /*progress*/)
-    {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
-        // Pure copy from VECIN to VECOUT
-        AscendC::Copy(yLocal, xLocal, xLocal.GetSize());
-        outQueueY.EnQue<DTYPE_Y>(yLocal);
-        inQueueX.FreeTensor(xLocal);
-    }
-
-    __aicore__ inline void CopyOut(uint32_t progress)
-    {
-        uint32_t b = progress / this->tilesPerB;
-        uint32_t t = progress % this->tilesPerB;
-
-        uint32_t calLen = GetCalLen(t);
-        uint32_t offsetInBatch = t * this->tileLen;
-
-        // y layout: [B, H, P, N], contiguous
-        uint64_t dstBase = (uint64_t)b * (uint64_t)this->perBatchLen + (uint64_t)offsetInBatch;
-
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
-        AscendC::DataCopy(yGm[dstBase], yLocal, calLen);
-        outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> accQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueue;
 
-    uint32_t totalLength;
-    uint32_t perBatchLen;
-    uint32_t batchSize;
-    uint32_t zLen;
-    uint32_t tilesPerB;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+
+    uint32_t B, C, H, PN;
+    uint32_t tileNum;
     uint32_t tileLen;
+
+    uint32_t totalBH, coreNum, coreIdx, bhPerCore, bhStart, bhEnd;
 };
 
-extern "C" __global__ __aicore__ void mamba_return_final_state_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+extern "C" __global__ __aicore__ void mamba_return_final_state_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
     GET_TILING_DATA(tiling_data, tiling);
     KernelMambaReturnFinalState op;
-    op.Init(x, y,
-            tiling_data.totalLength,
-            tiling_data.perBatchLength,
-            tiling_data.batchSize,
-            tiling_data.zLen,
-            tiling_data.tileNum);
+    op.Init(x, y, tiling_data.B, tiling_data.C, tiling_data.H, tiling_data.PN, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -273,40 +246,35 @@ extern "C" __global__ __aicore__ void mamba_return_final_state_custom(GM_ADDR x,
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
-#include \"pytorch_npu_helper.hpp\"
+#include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor mamba_return_final_state_custom_impl_npu(const at::Tensor& new_states) {
-    // new_states: [B, Z, H, P, N]
-    TORCH_CHECK(new_states.dim() == 5, \"Input must be rank-5 [B, Z, H, P, N]\");
-    auto sizes = new_states.sizes();
-    int64_t B = sizes[0];
-    int64_t H = sizes[2];
-    int64_t P = sizes[3];
-    int64_t N = sizes[4];
-
-    auto result = at::empty({B, H, P, N}, new_states.options());
-    EXEC_NPU_CMD(aclnnMambaReturnFinalStateCustom, new_states, result);
-    return result;
+at::Tensor mamba_return_final_state_custom_impl_npu(const at::Tensor& x) {
+    // x: [B, C, H, P, N], float32
+    TORCH_CHECK(x.is_npu(), "Input must be on NPU");
+    at::Tensor y = at::empty({x.size(0), x.size(2), x.size(3), x.size(4)}, x.options());
+    EXEC_NPU_CMD(aclnnMambaReturnFinalStateCustom, x, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl(\"mamba_return_final_state_custom\", &mamba_return_final_state_custom_impl_npu);
+    m.impl("mamba_return_final_state_custom", &mamba_return_final_state_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def(\"mamba_return_final_state_custom\", &mamba_return_final_state_custom_impl_npu, \"Take last z slice of new_states\");
+    m.def("mamba_return_final_state_custom", &mamba_return_final_state_custom_impl_npu, "sum over c dim after weighting, return final state");
 }
 """
 
 model_src='''
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
 import torch_npu
 import custom_ops_lib
-from einops import rearrange
-import torch.nn.functional as F
 
-class ModelNew(torch.nn.Module):
+class ModelNew(nn.Module):
     def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
         super(ModelNew, self).__init__()
         assert seq_length % block_len == 0, "Sequence length must be divisible by block length"
@@ -317,9 +285,9 @@ class ModelNew(torch.nn.Module):
         self.d_state = d_state
         self.block_len = block_len
 
-        self.A = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
-        self.B = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
-        self.C = torch.nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
 
     def segsum(self, x):
         T = x.size(-1)
@@ -330,29 +298,39 @@ class ModelNew(torch.nn.Module):
         return x_segsum
 
     def forward(self, X, initial_states=None):
+        # 块重排
         X_blocks, A_blocks, B_blocks, C_blocks = [
-            rearrange(x, "b (c l) ... -> b c l ...", l=self.block_len)
+            rearrange(x, "b (c l) ... -> b c l ...", l=self.block_len).contiguous()
             for x in (X, self.A, self.B, self.C)
         ]
 
-        A_blocks = rearrange(A_blocks, "b c l h -> b h c l")
+        A_blocks = rearrange(A_blocks, "b c l h -> b h c l").contiguous()
         A_cumsum = torch.cumsum(A_blocks, dim=-1)
 
+        # 对角块输出（保留与原实现一致，便于与上游兼容）
         L = torch.exp(self.segsum(A_blocks))
-        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp",
-                              C_blocks, B_blocks, L, X_blocks)
+        _ = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp",
+                         C_blocks, B_blocks, L, X_blocks)
 
+        # 块内状态
         decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
-        states = torch.einsum("bclhn,bhcl,bclhp->bchpn",
-                              B_blocks, decay_states, X_blocks)
+        states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B_blocks, decay_states, X_blocks).contiguous()
+        # states: [B, C, H, P, N]
 
+        # 跨块递归衰减矩阵（只需要最后一行 z = Z-1）
         if initial_states is None:
             initial_states = torch.zeros_like(states[:, :1])
-        states = torch.cat([initial_states, states], dim=1)
+        states = torch.cat([initial_states, states], dim=1).contiguous()  # [B, C, H, P, N]，此处 C 已包含初始状态
 
-        decay_chunk = torch.exp(self.segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
-        new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+        decay_chunk = torch.exp(self.segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0)))).contiguous()  # [B, H, Z, C]
+        # 仅取 z = Z-1 行，得到权重向量 w_last: [B, H, C]
+        w_last = decay_chunk[:, :, -1, :].contiguous()
 
-        # Use custom kernel to take last z slice efficiently.
-        return custom_ops_lib.mamba_return_final_state_custom(new_states)
+        # 预权重后按 C 维求和：将 w_last 扩展到 [B, C, H, 1, 1] 与 states 相乘
+        w_last_bc = w_last.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1).contiguous()  # [B, C, H, 1, 1]
+        weighted_states = states * w_last_bc  # [B, C, H, P, N]
+
+        # 自定义 AscendC Kernel：沿 C 维度归约，输出最终状态 [B, H, P, N]
+        final_state = custom_ops_lib.mamba_return_final_state_custom(weighted_states)
+        return final_state
 '''

@@ -36,9 +36,8 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(GemmLogSumExpLeakyReluLeakyReluGeluGeluCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, rows);
-  TILING_DATA_FIELD_DEF(uint32_t, cols);
-  TILING_DATA_FIELD_DEF(uint32_t, tileRows);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom, GemmLogSumExpLeakyReluLeakyReluGeluGeluCustomTilingData)
@@ -51,28 +50,19 @@ host_operator_src="""
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     GemmLogSumExpLeakyReluLeakyReluGeluGeluCustomTilingData tiling;
-
-    // 输入 x 形状：[rows, cols]
-    auto xShape = context->GetInputShape(0)->GetOriginShape();
-    uint32_t rows = static_cast<uint32_t>(xShape.GetDim(0));
-    uint32_t cols = static_cast<uint32_t>(xShape.GetDim(1));
-
-    // 简单按行分块
-    const uint32_t tileRows = 64;  // 每个tile处理的行数，按UB容量自行调整
-
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
     context->SetBlockDim(BLOCK_DIM);
-    tiling.set_rows(rows);
-    tiling.set_cols(cols);
-    tiling.set_tileRows(tileRows);
-
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
-    size_t* wk = context->GetWorkspaceSizes(1);
-    wk[0] = 0;
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -80,25 +70,16 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // 输入 [N, M]，LogSumExp 按 dim=1，keepdim=True，输出 [N, 1]
-    const gert::Shape* in = context->GetInputShape(0);
-    std::vector<int64_t> outDims = in->GetDimSizes();
-    if (outDims.size() < 2) {
-        // 默认作为二维
-        if (outDims.empty()) outDims.push_back(1);
-        outDims.resize(2, 1);
-    }
-    outDims[1] = 1;
-    gert::Shape* out = context->GetOutputShape(0);
-    out->SetDimSizes(outDims);
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    auto dt = context->GetInputDataType(0);
-    context->SetOutputDataType(0, dt);
-    return GRAPH_SUCCESS;
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
 }
 }
 
@@ -120,8 +101,7 @@ public:
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
 
-        this->AICore()
-            .SetTiling(optiling::TilingFunc);
+        this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -132,135 +112,99 @@ OP_ADD(GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_tiling_data.h"
 
-using DTYPE_X = float;
-using DTYPE_Y = float;
+// 本自定义算子实现：对输入张量逐元素执行 LeakyReLU -> LeakyReLU -> GELU -> GELU 的链式计算。
+// 注：GEMM 与 LogSumExp 在 PyTorch 侧完成，本核对其输出进行进一步非线性加速。
+constexpr int32_t BUFFER_NUM = 2; // 每个队列中的张量数量，双缓冲
 
-constexpr int32_t IN_BUFF_NUM = 2;
-constexpr int32_t OUT_BUFF_NUM = 2;
-
-class KernelFused {
+class KernelFusedAct {
 public:
-    __aicore__ inline KernelFused() {}
-
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t rows, uint32_t cols, uint32_t tileRows)
+    __aicore__ inline KernelFusedAct() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
     {
-        this->rows = rows;
-        this->cols = cols;
-        this->tileRows = tileRows;
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        // 每个AI Core的分块再细分为 tileNum * BUFFER_NUM 片
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        // 基于block划分行区间
-        uint32_t blocks = AscendC::GetBlockNum();
-        uint32_t blockIdx = AscendC::GetBlockIdx();
-        this->rowsPerBlock = (rows + blocks - 1) / blocks; // ceil
-        this->startRow = this->rowsPerBlock * blockIdx;
-        // 实际有效行数
-        this->validRows = (startRow + rowsPerBlock <= rows) ? rowsPerBlock : (rows > startRow ? rows - startRow : 0);
+        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + (uint64_t)startRow * cols, (uint64_t)validRows * cols);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + startRow, validRows);
-
-        pipe.InitBuffer(inQueueX, IN_BUFF_NUM, (uint32_t)(tileRows * cols * sizeof(DTYPE_X)));
-        pipe.InitBuffer(outQueueY, OUT_BUFF_NUM, (uint32_t)(tileRows * sizeof(DTYPE_Y)));
-
-        // 计算用中间缓冲：exp输入块大小
-        pipe.InitBuffer(calcBufs, (uint32_t)(tileRows * cols * sizeof(DTYPE_X)));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+        // 分配中间计算缓冲区（两段临时缓冲）
+        pipe.InitBuffer(calcBufs, this->tileLength * sizeof(float) * 2);
     }
 
     __aicore__ inline void Process()
     {
-        if (validRows == 0) { return; }
-        uint32_t tiles = (validRows + tileRows - 1) / tileRows;
-        for (uint32_t t = 0; t < tiles; ++t) {
-            uint32_t rowsThisTile = GetRowsThisTile(t);
-            CopyIn(t, rowsThisTile);
-            Compute(t, rowsThisTile);
-            CopyOut(t, rowsThisTile);
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
         }
     }
 
 private:
-    __aicore__ inline uint32_t GetRowsThisTile(uint32_t t) const
+    __aicore__ inline void CopyIn(int32_t progress)
     {
-        uint32_t rowStart = t * tileRows;
-        uint32_t remain = (rowStart < validRows) ? (validRows - rowStart) : 0;
-        return remain > tileRows ? tileRows : remain;
-    }
-
-    __aicore__ inline void CopyIn(uint32_t t, uint32_t rowsThisTile)
-    {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        uint64_t offset = (uint64_t)t * tileRows * cols;
-        AscendC::DataCopy(xLocal, xGm[offset], (uint32_t)(rowsThisTile * cols));
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
     }
 
-    __aicore__ inline void Compute(uint32_t t, uint32_t rowsThisTile)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        // 取出输入tile
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
 
-        // 中间缓冲：存放exp(x)
-        AscendC::LocalTensor<DTYPE_X> expLocal = calcBufs.Get<DTYPE_X>();
-        // 逐元素 exp
-        AscendC::Exp(expLocal, xLocal, (uint32_t)(rowsThisTile * cols));
+        // 两段中间缓冲
+        AscendC::LocalTensor<float> tmp1 = calcBufs.Get<float>(0);
+        AscendC::LocalTensor<float> tmp2 = calcBufs.Get<float>(this->tileLength * sizeof(float));
 
-        // 对最后一维（列）求和：得到每行的 sum(exp(x))
-        AscendC::LocalTensor<DTYPE_Y> lseLocal = outQueueY.AllocTensor<DTYPE_Y>();
-        // Sum: 按最后一维汇总，参考《Ascend C API Reference》中 Table 1-14 Sum
-        AscendC::Sum(lseLocal, expLocal, rowsThisTile, cols);
+        // LeakyReLU 1: tmp1 = LeakyRelu(xLocal, 0.01)
+        const float slope = 0.01f;
+        AscendC::LeakyRelu(tmp1, xLocal, slope, this->tileLength);
 
-        // log(sum(exp(x)))
-        AscendC::Log(lseLocal, lseLocal, rowsThisTile);
+        // LeakyReLU 2: tmp2 = LeakyRelu(tmp1, 0.01)
+        AscendC::LeakyRelu(tmp2, tmp1, slope, this->tileLength);
 
-        // 两次 LeakyReLU，负斜率 0.01
-        const DTYPE_Y slope = (DTYPE_Y)0.01f;
-        AscendC::LeakyRelu(lseLocal, lseLocal, slope, rowsThisTile);
-        AscendC::LeakyRelu(lseLocal, lseLocal, slope, rowsThisTile);
+        // GELU 1: tmp1 = Gelu(tmp2)
+        AscendC::Gelu(tmp1, tmp2, this->tileLength);
 
-        // 两次 GELU（使用 FasterGeluV2 高级API，参考文档 5.3.3.3）
-        AscendC::FasterGeluV2(lseLocal, lseLocal, rowsThisTile);
-        AscendC::FasterGeluV2(lseLocal, lseLocal, rowsThisTile);
+        // GELU 2: yLocal = Gelu(tmp1)
+        AscendC::Gelu(yLocal, tmp1, this->tileLength);
 
-        // 推出
-        outQueueY.EnQue<DTYPE_Y>(lseLocal);
+        outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
     }
 
-    __aicore__ inline void CopyOut(uint32_t t, uint32_t rowsThisTile)
+    __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
-        uint64_t offset = (uint64_t)t * tileRows;
-        AscendC::DataCopy(yGm[offset], yLocal, rowsThisTile);
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, IN_BUFF_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, OUT_BUFF_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM>  inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
     AscendC::TBuf<AscendC::TPosition::VECCALC> calcBufs;
 
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
 
-    uint32_t rows;
-    uint32_t cols;
-    uint32_t tileRows;
-
-    uint32_t rowsPerBlock;
-    uint32_t startRow;
-    uint32_t validRows;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__
-void gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
+extern "C" __global__ __aicore__ void gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelFused op;
-    op.Init(x, y, tiling_data.rows, tiling_data.cols, tiling_data.tileRows);
+    KernelFusedAct op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -271,12 +215,9 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_impl_npu(const at::Tensor& x) {
-    // 输入 x: [N, M]，输出 y: [N, 1]
-    auto sizes = x.sizes();
-    TORCH_CHECK(sizes.size() == 2, \\"input must be 2-D\\");
-    at::Tensor result = at::empty({sizes[0], 1}, x.options());
-    EXEC_NPU_CMD(aclnnGemmLogSumExpLeakyReluLeakyReluGeluGeluCustom, x, result);
+at::Tensor gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnGemmLogSumExpLeakyReluLeakyReluGeluGeluCustom, self, result);
     return result;
 }
 
@@ -285,7 +226,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom", &gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_impl_npu, "Fused LSE -> LReLU -> LReLU -> GELU -> GELU");
+    m.def("gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom", &gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_impl_npu, "Fused LeakyReLU*2 + GELU*2");
 }
 """
 
@@ -296,18 +237,18 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    说明：
-    1) 依然使用PyTorch的Linear完成 Gemm；
-    2) 将 LogSumExp(dim=1, keepdim=True) + LeakyReLU + LeakyReLU + GELU + GELU
-       替换为自定义 AscendC 算子 gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom。
+    计算流程：
+    1) 线性层（GEMM）；
+    2) 按 dim=1 执行 LogSumExp，保持 keepdim=True；
+    3) 使用自定义AscendC算子执行 LeakyReLU -> LeakyReLU -> GELU -> GELU。
     """
     def __init__(self, in_features, out_features, bias=True):
         super(ModelNew, self).__init__()
         self.linear = torch.nn.Linear(in_features, out_features, bias=bias)
 
     def forward(self, x):
-        x = self.linear(x)  # Gemm: [N, M]
-        # 自定义 AscendC 融合算子：LogSumExp + LeakyReLU + LeakyReLU + GELU + GELU
-        y = custom_ops_lib.gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom(x)
-        return y
+        x = self.linear(x)  # GEMM
+        x = torch.logsumexp(x, dim=1, keepdim=True)  # LogSumExp
+        x = custom_ops_lib.gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom(x)  # LeakyReLU*2 + GELU*2
+        return x
 '''

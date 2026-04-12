@@ -59,7 +59,6 @@ project_json_src='''
     }
 ]
 '''
-
 host_tiling_src="""
 #include "register/tilingdata_base.h"
 
@@ -67,8 +66,6 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(TripletMarginLossCustomTilingData)
     TILING_DATA_FIELD_DEF(uint32_t, totalLength);
     TILING_DATA_FIELD_DEF(uint32_t, blockLength);
-    TILING_DATA_FIELD_DEF(uint32_t, batchSize);
-    TILING_DATA_FIELD_DEF(uint32_t, featureLength);
     TILING_DATA_FIELD_DEF(uint32_t, tileNum);
     TILING_DATA_FIELD_DEF(uint32_t, tileLength);
     TILING_DATA_FIELD_DEF(uint32_t, lasttileLength);
@@ -77,51 +74,34 @@ END_TILING_DATA_DEF;
 REGISTER_TILING_DATA_CLASS(TripletMarginLossCustom, TripletMarginLossCustomTilingData)
 }
 """
-
 host_operator_src="""
 #include "triplet_margin_loss_custom_tiling.h"
 #include "register/op_def_registry.h"
 #include <string.h>
 
 namespace optiling {
-const uint32_t BLOCK_SIZE = 32;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     TripletMarginLossCustomTilingData tiling;
-    uint32_t sizeofdatatype = 4; // float
-    uint32_t totalLength = context->GetInputShape(0)->GetStorageShape().GetShapeSize();
+    auto shape = context->GetInputShape(0)->GetStorageShape();
+    uint32_t totalLength = shape.GetShapeSize();
+    uint32_t dimNum = shape.GetDimNum();
+    uint32_t featLen = (dimNum > 0) ? static_cast<uint32_t>(shape.GetDim(dimNum - 1)) : totalLength;
+    uint32_t batch = (featLen == 0) ? 0 : (totalLength / featLen);
 
-    // Try to get batch size from first dim; fallback to 1
-    uint32_t batchSize = 1;
-    uint32_t dimNum = context->GetInputShape(0)->GetStorageShape().GetDimNum();
-    if (dimNum >= 1) {
-        batchSize = static_cast<uint32_t>(context->GetInputShape(0)->GetStorageShape().GetDim(0));
-    }
-    if (batchSize == 0) batchSize = 1;
-
-    uint32_t featureLength = totalLength / batchSize;
-    uint32_t ALIGN_NUM = BLOCK_SIZE / sizeofdatatype;
-
-    // Align feature length to vector requirement
-    uint32_t featureLengthAligned = (featureLength % ALIGN_NUM == 0) ? featureLength
-                                : ((featureLength + ALIGN_NUM - 1) / ALIGN_NUM) * ALIGN_NUM;
-
-    uint32_t tile_num = batchSize;
-    uint32_t tileLength = featureLengthAligned;
-    uint32_t lasttileLength = tileLength;
+    // Each tile handles one sample (row)
+    uint32_t tileNum = batch;
+    uint32_t tileLength = featLen;
+    uint32_t lasttileLength = featLen;
+    uint32_t block_dim = 1;
 
     tiling.set_totalLength(totalLength);
     tiling.set_blockLength(totalLength);
-    tiling.set_batchSize(batchSize);
-    tiling.set_featureLength(featureLength);
-    tiling.set_tileNum(tile_num);
+    tiling.set_tileNum(tileNum);
     tiling.set_tileLength(tileLength);
     tiling.set_lasttileLength(lasttileLength);
 
-    auto block_dim = 1;
     context->SetBlockDim(block_dim);
-
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
@@ -171,7 +151,6 @@ public:
 OP_ADD(TripletMarginLossCustom);
 }
 """
-
 kernel_src="""
 #include "kernel_operator.h"
 constexpr int32_t BUFFER_NUM = 1;
@@ -179,18 +158,14 @@ constexpr int32_t BUFFER_NUM = 1;
 class KernelTripletMarginLoss {
 public:
     __aicore__ inline KernelTripletMarginLoss() {}
-    __aicore__ inline void Init(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR margin,
-                                GM_ADDR y,
+    __aicore__ inline void Init(GM_ADDR anchor, GM_ADDR positive, GM_ADDR negative, GM_ADDR margin, GM_ADDR y,
                                 uint32_t totalLength, uint32_t blockLength,
-                                uint32_t batchSize, uint32_t featureLength,
                                 uint32_t tileNum, uint32_t tileLength,
                                 uint32_t lasttileLength) {
         ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
 
-        this->totalLength = totalLength;
+        this->totalLength = static_cast<int32_t>(totalLength);
         this->blockLength = blockLength;
-        this->batchSize = batchSize;
-        this->featureLength = featureLength;
         this->tileNum = tileNum;
         this->tileLength = tileLength;
         this->lasttileLength = lasttileLength;
@@ -198,48 +173,53 @@ public:
         aGm.SetGlobalBuffer((__gm__ float*)anchor + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         pGm.SetGlobalBuffer((__gm__ float*)positive + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
         nGm.SetGlobalBuffer((__gm__ float*)negative + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        mGm.SetGlobalBuffer((__gm__ float*)margin, 1);
+        marginGm.SetGlobalBuffer((__gm__ float*)margin, 1);
         outGm.SetGlobalBuffer((__gm__ float*)y + this->blockLength * AscendC::GetBlockIdx(), 32);
 
         this->reduce_num = this->tileNum;
-        uint32_t reduce_align = (this->reduce_num + 32) / 32 * 32;
 
+        // Buffers: one IN queue for three vectors (anchor, positive, negative) per tile.
         pipe.InitBuffer(inQueueIN, BUFFER_NUM, this->tileLength * 3 * sizeof(float));
-        pipe.InitBuffer(tempBuf, reduce_align * sizeof(float));
+        // Buffer to store per-sample loss values for final reduction
+        uint32_t reduce_align = (this->reduce_num + 31) / 32 * 32;
+        pipe.InitBuffer(partialBuf, reduce_align * sizeof(float));
+        // Buffer to hold scalar margin on device
+        pipe.InitBuffer(marginBuf, sizeof(float));
+
+        // Load margin scalar from GM to local buffer
+        AscendC::LocalTensor<float> mLocal = marginBuf.Get<float>();
+        AscendC::DataCopy(mLocal[0], marginGm[0], 1);
     }
 
     __aicore__ inline void Process() {
-        // temp1[0] will store margin; temp1[1..reduce_num] store per-sample loss
-        AscendC::LocalTensor<float> temp1 = tempBuf.Get<float>();
-        AscendC::DataCopy(temp1, mGm, 1);
-
-        int32_t loopCount = static_cast<int32_t>(this->tileNum);
+        int32_t loopCount = this->tileNum;
         for (int32_t i = 0; i < loopCount; i++) {
             CopyIn(i);
             Compute(i);
         }
 
-        // Reduce losses and compute mean
-        AscendC::LocalTensor<float> losses = temp1[1]; // start from index 1
-        AscendC::LocalTensor<float> workspace = inQueueIN.AllocTensor<float>();
-        AscendC::Duplicate(workspace, (float)0, this->tileLength);
-        AscendC::ReduceSum<float>(losses, losses, workspace, this->reduce_num);
+        AscendC::LocalTensor<float> partials = partialBuf.Get<float>();
+        AscendC::LocalTensor<float> tmpWorkspace = inQueueIN.AllocTensor<float>();
 
-        // divide by batch size
-        workspace.SetValue(0, static_cast<float>(this->batchSize));
-        AscendC::Div(losses, losses, workspace, 1);
+        AscendC::ReduceSum<float>(partials, partials, tmpWorkspace, this->reduce_num);
 
-        outGm.SetValue(0, losses.GetValue(0));
-        inQueueIN.FreeTensor(workspace);
+        // Divide by batch (tileNum) to get mean
+        tmpWorkspace.SetValue(0, static_cast<float>(this->tileNum));
+        AscendC::Div(partials, partials, tmpWorkspace, 1);
+
+        outGm.SetValue(0, partials.GetValue(0));
+        inQueueIN.FreeTensor(tmpWorkspace);
     }
 
 private:
     __aicore__ inline void CopyIn(int32_t progress) {
         AscendC::LocalTensor<float> inLocal = inQueueIN.AllocTensor<float>();
-        // One sample (featureLength) per tile
-        AscendC::DataCopy(inLocal[0], aGm[progress * this->featureLength], this->featureLength);
-        AscendC::DataCopy(inLocal[this->tileLength], pGm[progress * this->featureLength], this->featureLength);
-        AscendC::DataCopy(inLocal[this->tileLength * 2], nGm[progress * this->featureLength], this->featureLength);
+
+        uint32_t offset = static_cast<uint32_t>(progress) * this->tileLength;
+        AscendC::DataCopy(inLocal[0], aGm[offset], this->tileLength);
+        AscendC::DataCopy(inLocal[this->tileLength], pGm[offset], this->tileLength);
+        AscendC::DataCopy(inLocal[this->tileLength * 2], nGm[offset], this->tileLength);
+
         inQueueIN.EnQue(inLocal);
     }
 
@@ -248,58 +228,46 @@ private:
         AscendC::LocalTensor<float> aLocal = inLocal;
         AscendC::LocalTensor<float> pLocal = inLocal[this->tileLength];
         AscendC::LocalTensor<float> nLocal = inLocal[this->tileLength * 2];
-        AscendC::LocalTensor<float> temp1 = tempBuf.Get<float>(); // margin at [0], losses start at [1]
+        AscendC::LocalTensor<float> partials = partialBuf.Get<float>();
+        AscendC::LocalTensor<float> mLocal = marginBuf.Get<float>();
 
-        // d_ap = sqrt(sum((a - p)^2) + eps)
-        AscendC::Sub(pLocal, aLocal, pLocal, this->featureLength);
-        AscendC::Mul(pLocal, pLocal, pLocal, this->featureLength);
-        AscendC::ReduceSum<float>(pLocal, pLocal, aLocal, this->featureLength);
-        // Add epsilon and sqrt on 1 element
-        AscendC::LocalTensor<float> epsVec = pLocal[1];
-        AscendC::Duplicate(epsVec, (float)1e-6f, 1);
-        AscendC::Add(pLocal, pLocal, epsVec, 1);
+        // d_ap = sqrt(sum((a - p)^2))
+        AscendC::Sub(pLocal, aLocal, pLocal, this->tileLength);
+        AscendC::Mul(pLocal, pLocal, pLocal, this->tileLength);
+        AscendC::ReduceSum<float>(pLocal, pLocal, aLocal, this->tileLength);
         AscendC::Sqrt(pLocal, pLocal, 1);
 
-        // d_an = sqrt(sum((a - n)^2) + eps)
-        AscendC::Sub(nLocal, aLocal, nLocal, this->featureLength);
-        AscendC::Mul(nLocal, nLocal, nLocal, this->featureLength);
-        AscendC::ReduceSum<float>(nLocal, nLocal, aLocal, this->featureLength);
-        AscendC::LocalTensor<float> epsVec2 = nLocal[1];
-        AscendC::Duplicate(epsVec2, (float)1e-6f, 1);
-        AscendC::Add(nLocal, nLocal, epsVec2, 1);
+        // d_an = sqrt(sum((a - n)^2))
+        AscendC::Sub(nLocal, aLocal, nLocal, this->tileLength);
+        AscendC::Mul(nLocal, nLocal, nLocal, this->tileLength);
+        AscendC::ReduceSum<float>(nLocal, nLocal, aLocal, this->tileLength);
         AscendC::Sqrt(nLocal, nLocal, 1);
 
-        // loss_i = max(d_ap - d_an + margin, 0)
-        AscendC::LocalTensor<float> marginVec = temp1; // temp1[0] holds the margin
+        // l_i = max(d_ap - d_an + margin, 0)
         AscendC::Sub(pLocal, pLocal, nLocal, 1);
-        AscendC::Add(pLocal, pLocal, marginVec, 1);
-        AscendC::LocalTensor<float> zeroVec = nLocal[2];
-        AscendC::Duplicate(zeroVec, (float)0.0f, 1);
-        AscendC::Max(pLocal, pLocal, zeroVec, 1);
+        AscendC::Add(pLocal, pLocal, mLocal, 1);
+        AscendC::Duplicate(aLocal, (float)0.0f, 1);
+        AscendC::Max(pLocal, pLocal, aLocal, 1);
 
-        // Save per-sample loss to temp buffer
-        temp1.SetValue(1 + progress, pLocal.GetValue(0));
-
+        partials.SetValue(progress, pLocal.GetValue(0));
         inQueueIN.FreeTensor(inLocal);
     }
 
 private:
     AscendC::TPipe pipe;
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueIN;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueOUT;
-    AscendC::TBuf<> tempBuf;
+    AscendC::TBuf<> partialBuf;
+    AscendC::TBuf<> marginBuf;
 
     AscendC::GlobalTensor<float> aGm;
     AscendC::GlobalTensor<float> pGm;
     AscendC::GlobalTensor<float> nGm;
-    AscendC::GlobalTensor<float> mGm;
+    AscendC::GlobalTensor<float> marginGm;
     AscendC::GlobalTensor<float> outGm;
 
-    uint32_t totalLength;
-    uint32_t blockLength;
-    uint32_t batchSize;
-    uint32_t featureLength;
+    int32_t totalLength;
     uint32_t reduce_num;
+    uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
     uint32_t lasttileLength;
@@ -309,26 +277,21 @@ extern "C" __global__ __aicore__ void triplet_margin_loss_custom(GM_ADDR anchor,
     GET_TILING_DATA(tiling_data, tiling);
     KernelTripletMarginLoss op;
     op.Init(anchor, positive, negative, margin, y,
-            tiling_data.totalLength, tiling_data.blockLength, tiling_data.batchSize,
-            tiling_data.featureLength, tiling_data.tileNum, tiling_data.tileLength,
-            tiling_data.lasttileLength);
+            tiling_data.totalLength, tiling_data.blockLength,
+            tiling_data.tileNum, tiling_data.tileLength, tiling_data.lasttileLength);
     op.Process();
 }
 """
-
 python_bind_src="""
 #include <torch/library.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor triplet_margin_loss_impl_npu(const at::Tensor& anchor,
-                                        const at::Tensor& positive,
-                                        const at::Tensor& negative,
-                                        double margin) {
+at::Tensor triplet_margin_loss_impl_npu(const at::Tensor& anchor, const at::Tensor& positive, const at::Tensor& negative, double margin) {
     at::Tensor result = at::empty({}, anchor.options());
-    at::Tensor margin_tensor = at::scalar_tensor(margin, anchor.options());
-    EXEC_NPU_CMD(aclnnTripletMarginLossCustom, anchor, positive, negative, margin_tensor, result);
+    at::Tensor margin_t = at::full({}, static_cast<float>(margin), anchor.options());
+    EXEC_NPU_CMD(aclnnTripletMarginLossCustom, anchor, positive, negative, margin_t, result);
     return result;
 }
 
@@ -339,7 +302,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("triplet_margin_loss_custom", &triplet_margin_loss_impl_npu, "triplet margin loss");
 }
 """
-
 model_src='''
 import torch
 import torch_npu

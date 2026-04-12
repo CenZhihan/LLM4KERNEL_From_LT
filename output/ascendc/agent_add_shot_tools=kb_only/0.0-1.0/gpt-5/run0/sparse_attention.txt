@@ -5,7 +5,7 @@ project_json_src='''
         "language": "cpp",
         "input_desc": [
             {
-                "name": "x",
+                "name": "logits",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -13,11 +13,21 @@ project_json_src='''
                 "type": [
                     "float"
                 ]
+            },
+            {
+                "name": "mask",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "uint8"
+                ]
             }
         ],
         "output_desc": [
             {
-                "name": "y",
+                "name": "out",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -35,30 +45,9 @@ host_tiling_src="""
 #include "register/tilingdata_base.h"
 
 namespace optiling {
-struct SoftMaxTiling {
-    uint32_t srcM = 0;
-    uint32_t srcK = 0;
-    uint32_t srcSize = 0;
-    uint32_t outMaxM = 0;
-    uint32_t outMaxK = 0;
-    uint32_t outMaxSize = 0;
-    uint32_t splitM = 0;
-    uint32_t splitK = 0;
-    uint32_t splitSize = 0;
-    uint32_t reduceM = 0;
-    uint32_t reduceK = 0;
-    uint32_t reduceSize = 0;
-    uint32_t rangeM = 0;
-    uint32_t tailM = 0;
-    uint32_t tailSplitSize = 0;
-    uint32_t tailReduceSize = 0;
-};
-
 BEGIN_TILING_DATA_DEF(SparseAttentionCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(uint32_t, seqK);
-  TILING_DATA_FIELD_DEF_STRUCT(SoftMaxTiling, softmaxTilingData);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(SparseAttentionCustom, SparseAttentionCustomTilingData)
@@ -68,61 +57,22 @@ REGISTER_TILING_DATA_CLASS(SparseAttentionCustom, SparseAttentionCustomTilingDat
 host_operator_src="""
 #include "sparse_attention_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
-extern uint32_t GetSoftMaxMinTmpSize(const ge::Shape& srcShape, const uint32_t dataTypeSize, const bool isReuseSource);
-extern void SoftMaxTilingFunc(const ge::Shape& srcShape, const uint32_t dataTypeSize, const uint32_t localWorkSpaceSize, optiling::SoftMaxTiling& softmaxTiling);
-
-static uint32_t GetLastDim(const gert::Shape* shape)
-{
-    auto origin = shape->GetOriginShape();
-    std::vector<int64_t> dims = origin.GetDims();
-    if (dims.size() == 0) { return 1; }
-    return static_cast<uint32_t>(dims.back());
-}
-
-static uint64_t GetTotalSize(const gert::Shape* shape)
-{
-    return static_cast<uint64_t>(shape->GetOriginShape().GetShapeSize());
-}
-
 const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     SparseAttentionCustomTilingData tiling;
-
-    const gert::Shape* inShape = context->GetInputShape(0);
-    uint32_t K = GetLastDim(inShape);
-    uint64_t totalLen = GetTotalSize(inShape);
-    if (K == 0) { return ge::GRAPH_FAILED; }
-
-    // SoftMax tiling expects a 2D layout [M, K]
-    uint64_t M = totalLen / K;
-    std::vector<int64_t> shapeVec = { static_cast<int64_t>(M), static_cast<int64_t>(K) };
-    ge::Shape srcShape(shapeVec);
-
-    // Minimum tmp size is enough as per doc
-    const uint32_t localWorkSpaceSize = AscendC::GetSoftMaxMinTmpSize(srcShape, sizeof(float), false);
-    AscendC::SoftMaxTilingFunc(srcShape, sizeof(float), localWorkSpaceSize, tiling.softmaxTilingData);
-
-    // Set block dim and basic tiling fields
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
     context->SetBlockDim(BLOCK_DIM);
-    tiling.set_totalLength(static_cast<uint32_t>(totalLen));
-    tiling.set_seqK(K);
-
-    // Make each tile exactly one row of length K
-    // tileNum * BUFFER_NUM * K == blockLength; let runtime split by core
-    // Here set tileNum as total rows per core; runtime kernel will compute per-core length
-    tiling.set_tileNum(static_cast<uint32_t>(M / AscendC::GetBlockNum() == 0 ? 1 : M / AscendC::GetBlockNum()));
-
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -130,9 +80,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* x_shape = context->GetInputShape(0);
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    *y_shape = *x_shape;
+    const gert::Shape* logits_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *logits_shape;
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
@@ -148,12 +98,17 @@ class SparseAttentionCustom : public OpDef {
 public:
     explicit SparseAttentionCustom(const char* name) : OpDef(name)
     {
-        this->Input("x")
+        this->Input("logits")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("y")
+        this->Input("mask")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_UINT8})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("out")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -164,44 +119,46 @@ public:
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(SparseAttentionCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "sparse_attention_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2;
+using DTYPE_LOGITS = float;
+using DTYPE_MASK = uint8_t;
+using DTYPE_OUT = float;
 
-class KernelSparseAttention {
+constexpr int32_t BUFFER_NUM = 2; // tensors per queue
+constexpr DTYPE_OUT NEG_LARGE = -1e9f;
+
+class KernelSparseAttentionMask {
 public:
-    __aicore__ inline KernelSparseAttention() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t totalLength, uint32_t tileNum, uint32_t seqK,
-                                const optiling::SoftMaxTiling &softmaxTilingData)
+    __aicore__ inline KernelSparseAttentionMask() {}
+    __aicore__ inline void Init(GM_ADDR logits, GM_ADDR mask, GM_ADDR out,
+                                uint32_t totalLength, uint32_t tileNum)
     {
-        this->totalLength = totalLength;
         this->blockLength = totalLength / AscendC::GetBlockNum();
-        this->tileNum = tileNum == 0 ? 1 : tileNum;
-        this->seqK = seqK;
-        this->tileLength = this->seqK; // process one row (softmax over last dim)
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        logitsGm.SetGlobalBuffer((__gm__ DTYPE_LOGITS *)logits + this->blockLength * AscendC::GetBlockIdx(),
+                                 this->blockLength);
+        maskGm.SetGlobalBuffer((__gm__ DTYPE_MASK *)mask + this->blockLength * AscendC::GetBlockIdx(),
+                               this->blockLength);
+        outGm.SetGlobalBuffer((__gm__ DTYPE_OUT *)out + this->blockLength * AscendC::GetBlockIdx(),
+                              this->blockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
-
-        this->softmaxTiling = softmaxTilingData;
+        pipe.InitBuffer(inQueueLogits, BUFFER_NUM, this->tileLength * sizeof(DTYPE_LOGITS));
+        pipe.InitBuffer(inQueueMask, BUFFER_NUM, this->tileLength * sizeof(DTYPE_MASK));
+        pipe.InitBuffer(outQueueOut, BUFFER_NUM, this->tileLength * sizeof(DTYPE_OUT));
     }
 
     __aicore__ inline void Process()
     {
-        // number of rows per core
-        uint32_t rowsPerCore = (this->blockLength / this->seqK);
-        int32_t loopCount = rowsPerCore * BUFFER_NUM;
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
         for (int32_t i = 0; i < loopCount; i++) {
             CopyIn(i);
             Compute(i);
@@ -212,56 +169,60 @@ public:
 private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
-        inQueueX.EnQue(xLocal);
+        AscendC::LocalTensor<DTYPE_LOGITS> logitsLocal = inQueueLogits.AllocTensor<DTYPE_LOGITS>();
+        AscendC::LocalTensor<DTYPE_MASK> maskLocal = inQueueMask.AllocTensor<DTYPE_MASK>();
+        AscendC::DataCopy(logitsLocal, logitsGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(maskLocal, maskGm[progress * this->tileLength], this->tileLength);
+        inQueueLogits.EnQue(logitsLocal);
+        inQueueMask.EnQue(maskLocal);
     }
 
     __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_LOGITS> logitsLocal = inQueueLogits.DeQue<DTYPE_LOGITS>();
+        AscendC::LocalTensor<DTYPE_MASK> maskLocal = inQueueMask.DeQue<DTYPE_MASK>();
+        AscendC::LocalTensor<DTYPE_OUT> outLocal = outQueueOut.AllocTensor<DTYPE_OUT>();
 
-        // Use SoftMax high-level API with precomputed tiling
-        // The xLocal is one row, softmax over K dimension
-        AscendC::SoftMax(yLocal, xLocal, this->softmaxTiling);
+        // cast mask uint8 -> float into outLocal (temp buffer)
+        AscendC::Cast(outLocal, maskLocal, this->tileLength);
+        // outLocal = mask_float * NEG_LARGE
+        AscendC::Muls(outLocal, outLocal, NEG_LARGE, this->tileLength);
+        // outLocal += logitsLocal
+        AscendC::Add(outLocal, outLocal, logitsLocal, this->tileLength);
 
-        outQueueY.EnQue<DTYPE_Y>(yLocal);
-        inQueueX.FreeTensor(xLocal);
+        outQueueOut.EnQue<DTYPE_OUT>(outLocal);
+        inQueueLogits.FreeTensor(logitsLocal);
+        inQueueMask.FreeTensor(maskLocal);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
-        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
-        outQueueY.FreeTensor(yLocal);
+        AscendC::LocalTensor<DTYPE_OUT> outLocal = outQueueOut.DeQue<DTYPE_OUT>();
+        AscendC::DataCopy(outGm[progress * this->tileLength], outLocal, this->tileLength);
+        outQueueOut.FreeTensor(outLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueLogits;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueMask;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueOut;
 
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<DTYPE_LOGITS> logitsGm;
+    AscendC::GlobalTensor<DTYPE_MASK> maskGm;
+    AscendC::GlobalTensor<DTYPE_OUT> outGm;
 
-    uint32_t totalLength;
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
-    uint32_t seqK;
-
-    optiling::SoftMaxTiling softmaxTiling;
 };
 
-extern "C" __global__ __aicore__ void sparse_attention_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tilingData, tiling);
-    KernelSparseAttention op;
-    op.Init(x, y, tilingData.totalLength, tilingData.tileNum, tilingData.seqK, tilingData.softmaxTilingData);
-    if (TILING_KEY_IS(1)) {
-        op.Process();
-    }
+extern "C" __global__ __aicore__ void sparse_attention_custom(GM_ADDR logits, GM_ADDR mask, GM_ADDR out,
+                                                              GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelSparseAttentionMask op;
+    op.Init(logits, mask, out, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
 }
 """
 
@@ -271,9 +232,9 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor sparse_attention_custom_impl_npu(const at::Tensor& scores) {
-    at::Tensor result = at::empty_like(scores);
-    EXEC_NPU_CMD(aclnnSparseAttentionCustom, scores, result);
+at::Tensor sparse_attention_custom_impl_npu(const at::Tensor& logits, const at::Tensor& mask) {
+    at::Tensor result = at::empty_like(logits);
+    EXEC_NPU_CMD(aclnnSparseAttentionCustom, logits, mask, result);
     return result;
 }
 
@@ -282,7 +243,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("sparse_attention_custom", &sparse_attention_custom_impl_npu, "masked softmax over last dim");
+    m.def("sparse_attention_custom", &sparse_attention_custom_impl_npu, "apply sparse attention mask");
 }
 """
 
@@ -290,63 +251,65 @@ model_src='''
 import math
 import torch
 import torch_npu
-import custom_ops_lib
 import torch.nn as nn
+import custom_ops_lib
 
-class ModelNew(nn.Module):
+class ModelNew(torch.nn.Module):
     """
-    Replace attention softmax with custom AscendC kernel (SparseAttentionCustom).
-    Masking is applied on PyTorch side, then softmax is computed by the custom kernel.
+    Optimized sparse attention: offloads mask application to a custom AscendC kernel,
+    while keeping projections and matmuls in PyTorch.
     """
     def __init__(self, d_model=256, num_heads=4, window_size=32, max_seq_len=4096):
         super().__init__()
-        assert d_model % num_heads == 0
-        self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.window_size = window_size
         self.max_seq_len = max_seq_len
 
-        self.q_proj = nn.Linear(d_model, d_model, bias=True)
-        self.k_proj = nn.Linear(d_model, d_model, bias=True)
-        self.v_proj = nn.Linear(d_model, d_model, bias=True)
-        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
-        # Precompute sparse mask: True means masked
-        mask = torch.ones(max_seq_len, max_seq_len)
+        # Precompute sparse mask (True -> masked)
+        mask = torch.ones(max_seq_len, max_seq_len, dtype=torch.bool)
         for i in range(max_seq_len):
             start = max(0, i - window_size)
             end = min(max_seq_len, i + window_size)
-            mask[i, start:end] = 0
-        self.register_buffer("attn_mask", mask.bool(), persistent=False)
+            mask[i, start:end] = False
+        self.register_buffer("attn_mask", mask, persistent=False)
 
     def forward(self, x):
         """
         x: (B, S, D)
+        returns: (B, S, D)
         """
         B, S, D = x.shape
         H = self.num_heads
-        Hd = self.head_dim
-        scale = 1.0 / math.sqrt(Hd)
+        Dh = self.head_dim
 
-        q = self.q_proj(x).view(B, S, H, Hd).transpose(1, 2)  # (B, H, S, Hd)
-        k = self.k_proj(x).view(B, S, H, Hd).transpose(1, 2)  # (B, H, S, Hd)
-        v = self.v_proj(x).view(B, S, H, Hd).transpose(1, 2)  # (B, H, S, Hd)
+        # Projections
+        q = self.q_proj(x).view(B, S, H, Dh).transpose(1, 2)   # (B, H, S, Dh)
+        k = self.k_proj(x).view(B, S, H, Dh).transpose(1, 2)   # (B, H, S, Dh)
+        v = self.v_proj(x).view(B, S, H, Dh).transpose(1, 2)   # (B, H, S, Dh)
 
-        # Attention logits
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, S, S)
+        # Scaled dot-product attention scores
+        logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(Dh)  # (B, H, S, S)
 
-        # Apply sparse band mask on CPU/PyTorch side: masked positions -> -inf
-        attn_mask = self.attn_mask[:S, :S]
-        scores = scores.masked_fill(attn_mask.view(1, 1, S, S), float("-inf"))
+        # Prepare mask (broadcast to (B, H, S, S)) and move to NPU dtype (uint8)
+        base_mask = self.attn_mask[:S, :S]            # (S, S), True means masked
+        mask_bhss = base_mask.unsqueeze(0).unsqueeze(0).expand(B, H, S, S).contiguous()
+        mask_u8 = mask_bhss.to(torch.uint8)
 
-        # Custom AscendC kernel to compute softmax along the last dim
-        # Output probs shape: (B, H, S, S)
-        probs = custom_ops_lib.sparse_attention_custom(scores)
+        # Apply mask using custom AscendC kernel: out = logits + mask * (-1e9)
+        masked_logits = custom_ops_lib.sparse_attention_custom(logits, mask_u8)
 
-        # Weighted sum
-        context = torch.matmul(probs, v)  # (B, H, S, Hd)
-        context = context.transpose(1, 2).contiguous().view(B, S, D)
-        out = self.out_proj(context)
+        # Softmax and value aggregation
+        attn = torch.softmax(masked_logits, dim=-1)
+        ctx = torch.matmul(attn, v)                   # (B, H, S, Dh)
+
+        # Merge heads
+        ctx = ctx.transpose(1, 2).contiguous().view(B, S, D)
+        out = self.out_proj(ctx)
         return out
 '''

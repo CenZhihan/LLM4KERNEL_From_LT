@@ -1,0 +1,505 @@
+project_json_src='''
+[
+    {
+        "op": "MinGptCausalAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "k",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "mask",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "scale",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MinGptCausalAttentionCustomTiling)
+  TILING_DATA_FIELD_DEF(uint32_t, B);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, T);
+  TILING_DATA_FIELD_DEF(uint32_t, HS);
+  TILING_DATA_FIELD_DEF(uint32_t, BH);     // B * H
+  TILING_DATA_FIELD_DEF(uint32_t, strideQ); // stride for q/k/v in elements
+  TILING_DATA_FIELD_DEF(uint32_t, strideV);
+  TILING_DATA_FIELD_DEF(uint32_t, strideY);
+  TILING_DATA_FIELD_DEF(uint32_t, workspacePerBlockBytes);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MinGptCausalAttentionCustom, MinGptCausalAttentionCustomTiling)
+}
+"""
+
+host_operator_src="""
+#include "min_gpt_causal_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t GetDim(const gert::Shape* s, int i) {
+    return static_cast<uint32_t>(s->GetOriginShape().GetDim(i));
+}
+}
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // 输入q,k,v形状: [B, H, T, HS] (float, ND)
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    if (q_shape->GetOriginShape().GetDimNum() != 4) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t B  = GetDim(q_shape, 0);
+    uint32_t H  = GetDim(q_shape, 1);
+    uint32_t T  = GetDim(q_shape, 2);
+    uint32_t HS = GetDim(q_shape, 3);
+
+    MinGptCausalAttentionCustomTiling tiling;
+    tiling.set_B(B);
+    tiling.set_H(H);
+    tiling.set_T(T);
+    tiling.set_HS(HS);
+    tiling.set_BH(B * H);
+
+    // 连续存储: [B, H, T, HS]
+    // 每个 (T, HS) 的步长（以元素计）:
+    uint32_t strideQ = T * HS;
+    tiling.set_strideQ(strideQ);
+    tiling.set_strideV(strideQ);
+    tiling.set_strideY(strideQ);
+
+    // 每个block处理一个(b,h)，需要一个 T x T 的attention中间矩阵workspace
+    uint64_t workspacePerBlockBytes = static_cast<uint64_t>(T) * static_cast<uint64_t>(T) * sizeof(float);
+    tiling.set_workspacePerBlockBytes(static_cast<uint32_t>(workspacePerBlockBytes));
+
+    // 设置block数量 = B * H
+    context->SetBlockDim(B * H);
+
+    // workspace: 为每个block准备T*T*sizeof(float)大小的缓冲
+    size_t* workspaces = context->GetWorkspaceSizes(1);
+    workspaces[0] = workspacePerBlockBytes;
+
+    // 保存tiling
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输出y形状与v同: [B, H, T, HS]
+    const gert::Shape* v_shape = context->GetInputShape(2);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *v_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    auto dt = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dt);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MinGptCausalAttentionCustom : public OpDef {
+public:
+    explicit MinGptCausalAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("k")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("v")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("mask")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("scale")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MinGptCausalAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+using A_T = float;
+using B_T = float;
+using C_T = float;
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCausalAttn {
+public:
+    __aicore__ inline KernelCausalAttn() {}
+
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR y,
+                                GM_ADDR workspace, GM_ADDR tilingGM)
+    {
+        // 读取自定义tiling
+        auto tgm = (__gm__ uint32_t*)tilingGM;
+        // 简单解析: 对齐我们在host_tiling中保存的顺序
+        B  = tgm[0];
+        H  = tgm[1];
+        T  = tgm[2];
+        HS = tgm[3];
+        BH = tgm[4];
+        strideQ = tgm[5];
+        strideV = tgm[6];
+        strideY = tgm[7];
+        // tgm[8] workspace bytes per block
+
+        // 当前block处理的(b,h)索引
+        uint32_t bh_idx = AscendC::GetBlockIdx(); // 0..B*H-1
+        uint32_t b = bh_idx / H;
+        uint32_t h = bh_idx % H;
+
+        // 全局基址
+        // layout: [B, H, T, HS] 连续
+        uint64_t base_off = ((uint64_t)b * H + h) * ((uint64_t)T * HS);
+
+        qGm.SetGlobalBuffer((__gm__ A_T*)q + base_off, (uint32_t)(T * HS));
+        kGm.SetGlobalBuffer((__gm__ B_T*)k + base_off, (uint32_t)(T * HS));
+        vGm.SetGlobalBuffer((__gm__ B_T*)v + base_off, (uint32_t)(T * HS));
+        yGm.SetGlobalBuffer((__gm__ C_T*)y + base_off, (uint32_t)(T * HS));
+
+        // mask形状: [T, T]，对所有(b,h)共享
+        maskGm.SetGlobalBuffer((__gm__ float*)mask, (uint32_t)(T * T));
+
+        // 工作空间: 存放本block的 T x T attention矩阵
+        attGm.SetGlobalBuffer((__gm__ float*)workspace, (uint32_t)(T * T));
+
+        // 管道队列初始化: 用于softmax行处理
+        pipe.InitBuffer(inQueueA,  BUFFER_NUM, T * sizeof(float));
+        pipe.InitBuffer(inQueueB,  BUFFER_NUM, T * sizeof(float));
+        pipe.InitBuffer(outQueueC, BUFFER_NUM, T * sizeof(float));
+
+        // Matmul实例化配置 (NORMAL布局)
+        typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> aType;
+        typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, true,  LayoutMode::NORMAL> bTType; // 转置B
+        typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> cType;
+
+        constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm_qk);
+        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm_av);
+
+        // 初始化tiling数据(此处简化，直接在kernel内构造常量tiling)
+        // 注意: 按需设置singleCore形状，依赖库内部检查调整
+        tilingQK.singleCoreM = T;
+        tilingQK.singleCoreN = T;
+        tilingQK.singleCoreK = HS;
+        tilingQK.CLayoutInfoB = 1;
+        tilingQK.ALayoutInfoB = 1;
+        tilingQK.BLayoutInfoB = 1;
+
+        tilingAV.singleCoreM = T;
+        tilingAV.singleCoreN = HS;
+        tilingAV.singleCoreK = T;
+        tilingAV.CLayoutInfoB = 1;
+        tilingAV.ALayoutInfoB = 1;
+        tilingAV.BLayoutInfoB = 1;
+
+        mm_qk.Init(&tilingQK);
+        mm_av.Init(&tilingAV);
+
+        // 绑定tensor
+        mm_qk.SetTensorA(qGm, false);     // A: [T, HS]
+        mm_qk.SetTensorB(kGm, true);      // B: [T, HS]^T -> [HS, T]
+        mm_qk.SetWorkspace(nullptr, 0);
+
+        mm_av.SetTensorA(attGm, false);   // A: [T, T]
+        mm_av.SetTensorB(vGm, false);     // B: [T, HS]
+        mm_av.SetWorkspace(nullptr, 0);
+    }
+
+    __aicore__ inline void Process(GM_ADDR scaleGM)
+    {
+        // 读取scale（每次一个标量）
+        AscendC::GlobalTensor<float> scaleG;
+        scaleG.SetGlobalBuffer((__gm__ float*)scaleGM, 1);
+        float scaleVal = *scaleG.GetPhyAddr();
+
+        // 1) 计算注意力分数: att = (q @ k^T_scaled)
+        // 我们将缩放作用到q侧: q_scaled = q * scaleVal
+        ScaleQInPlace(scaleVal);
+        // 写入到attGm: [T, T]
+        mm_qk.IterateBatch(attGm, 1, 1, false);
+
+        // 2) 加mask并softmax（逐行处理attGm）
+        ApplyMaskAndSoftmax();
+
+        // 3) y = att @ v -> [T, HS]
+        mm_av.IterateBatch(yGm, 1, 1, false);
+    }
+
+private:
+    __aicore__ inline void ScaleQInPlace(float scaleVal)
+    {
+        // 将q按行块搬运到UB，逐块乘以scale，再写回
+        const uint32_t rows = T;
+        const uint32_t cols = HS;
+        const uint32_t tileCols = HS; // 按行拷贝整行
+        for (uint32_t r = 0; r < rows; ++r) {
+            AscendC::LocalTensor<float> xLocal = inQueueA.AllocTensor<float>();
+            AscendC::DataCopy(xLocal, qGm[r * cols], tileCols);
+            // 标量乘
+            AscendC::Muls(xLocal, xLocal, scaleVal, tileCols);
+            AscendC::DataCopy(qGm[r * cols], xLocal, tileCols);
+            inQueueA.FreeTensor(xLocal);
+        }
+    }
+
+    __aicore__ inline void ApplyMaskAndSoftmax()
+    {
+        // Softmax按行进行: 每行长度为T
+        // 使用高阶SoftMax API: 先对(att行 + mask行)做softmax
+        for (uint32_t r = 0; r < T; ++r) {
+            AscendC::LocalTensor<float> attRow = inQueueA.AllocTensor<float>();
+            AscendC::LocalTensor<float> mRow   = inQueueB.AllocTensor<float>();
+            AscendC::LocalTensor<float> outRow = outQueueC.AllocTensor<float>();
+
+            AscendC::DataCopy(attRow, attGm[r * T], T);
+            AscendC::DataCopy(mRow,   maskGm[r * T], T);
+
+            // 加mask
+            AscendC::Add(attRow, attRow, mRow, T);
+
+            // softmax: 使用不带sum/max输出的简化接口
+            SoftMax<float>(outRow, attRow, smTiling, smShapeInfo);
+
+            // 写回
+            AscendC::DataCopy(attGm[r * T], outRow, T);
+
+            outQueueC.FreeTensor(outRow);
+            inQueueB.FreeTensor(mRow);
+            inQueueA.FreeTensor(attRow);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueA, inQueueB;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueC;
+
+    AscendC::GlobalTensor<A_T> qGm;
+    AscendC::GlobalTensor<B_T> kGm;
+    AscendC::GlobalTensor<B_T> vGm;
+    AscendC::GlobalTensor<C_T> yGm;
+    AscendC::GlobalTensor<float> maskGm;
+    AscendC::GlobalTensor<float> attGm;
+
+    // 形状参数
+    uint32_t B, H, T, HS, BH;
+    uint32_t strideQ, strideV, strideY;
+
+    // Matmul对象与tiling
+    matmul::Matmul<
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL>,
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, true,  LayoutMode::NORMAL>,
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL>,
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float>,
+        GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1)
+    > mm_qk;
+
+    matmul::Matmul<
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL>,
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL>,
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL>,
+        matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float>,
+        GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1)
+    > mm_av;
+
+    TCubeTiling tilingQK;
+    TCubeTiling tilingAV;
+
+    // Softmax tiling占位，启用内部校验重算
+    SoftMaxTiling smTiling;
+    SoftMaxShapeInfo smShapeInfo;
+};
+
+extern "C" __global__ __aicore__ void min_gpt_causal_attention_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v,
+                                                                       GM_ADDR mask, GM_ADDR scale,
+                                                                       GM_ADDR y,
+                                                                       GM_ADDR workspace, GM_ADDR tiling)
+{
+    KernelCausalAttn op;
+    op.Init(q, k, v, mask, y, workspace, tiling);
+    op.Process(scale);
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor min_gpt_causal_attention_custom_impl_npu(const at::Tensor& q,
+                                                    const at::Tensor& k,
+                                                    const at::Tensor& v,
+                                                    const at::Tensor& mask,
+                                                    const at::Tensor& scale) {
+    // 输出: y [B, H, T, HS]
+    at::Tensor y = at::empty_like(v);
+    EXEC_NPU_CMD(aclnnMinGptCausalAttentionCustom, q, k, v, mask, scale, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("min_gpt_causal_attention_custom", &min_gpt_causal_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("min_gpt_causal_attention_custom", &min_gpt_causal_attention_custom_impl_npu, "MinGPT Causal Attention");
+}
+"""
+
+model_src='''
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_npu
+import custom_ops_lib
+
+# 将原始Model替换为使用自定义AscendC核的版本
+class ModelNew(nn.Module):
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        self.attn_dropout = nn.Dropout(attn_pdrop)
+        self.resid_dropout = nn.Dropout(resid_pdrop)
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
+                                     .view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.size()
+        nh = self.n_head
+        hs = C // nh
+
+        # 线性映射得到qkv
+        qkv = self.c_attn(x)  # [B, T, 3C]
+        q, k, v = qkv.split(C, dim=2)
+        q = q.view(B, T, nh, hs).transpose(1, 2).contiguous()  # [B, H, T, HS]
+        k = k.view(B, T, nh, hs).transpose(1, 2).contiguous()
+        v = v.view(B, T, nh, hs).transpose(1, 2).contiguous()
+
+        # 缩放系数：将缩放应用到q侧，核内读取标量
+        scale = torch.tensor([1.0 / math.sqrt(hs)], dtype=q.dtype, device=q.device)
+
+        # 构造因果mask: 下三角为0，上三角为-Inf（以float最小近似）
+        # 这里保留为[B,H,T,T]共享的[1,1,T,T]，核内按行叠加
+        att_mask = (self.bias[:, :, :T, :T] - 1.0) * 1e9  # 0->-1e9, 1->0
+        att_mask = att_mask.to(dtype=q.dtype).expand(B, nh, T, T).contiguous()  # 扩展到[B,H,T,T]
+
+        # 调用自定义核完成: y = softmax((q @ k^T) + mask) @ v
+        # 输入/输出: q,k,v:[B,H,T,HS], mask:[B,H,T,T]共享按(b,h)，此处将每个(b,h)片的mask作为Global统一传递:
+        # 这里为了简化，将mask按照单一(b,h)共享处理：取第一组(b,h)的mask，核内按行使用
+        # 若需要为每个(b,h)提供不同mask，可在自定义核和tiling中扩展。
+        mask_bh = att_mask[0, 0]  # [T,T]
+        y = custom_ops_lib.min_gpt_causal_attention_custom(q, k, v, mask_bh, scale)  # [B,H,T,HS]
+
+        # dropout + 重新拼接并投影
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.attn_dropout(y)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+'''

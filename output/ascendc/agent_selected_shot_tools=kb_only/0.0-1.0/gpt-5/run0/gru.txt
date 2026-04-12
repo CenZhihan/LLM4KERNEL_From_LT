@@ -1,0 +1,376 @@
+project_json_src='''
+[
+    {
+        "op": "GruCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "hprev",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "n",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "hnext",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GruCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GruCustom, GruCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gru_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GruCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    const gert::Shape* z_shape = context->GetInputShape(1);
+    const gert::Shape* n_shape = context->GetInputShape(2);
+    // 简单一致性检查：形状相同
+    if (in_shape->GetOriginShape().GetShapeSize() != z_shape->GetOriginShape().GetShapeSize() ||
+        in_shape->GetOriginShape().GetShapeSize() != n_shape->GetOriginShape().GetShapeSize()) {
+        return ge::GRAPH_FAILED;
+    }
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GruCustom : public OpDef {
+public:
+    explicit GruCustom(const char* name) : OpDef(name)
+    {
+        this->Input("hprev")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("n")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("hnext")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GruCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
+class KernelGruCustom {
+public:
+    __aicore__ inline KernelGruCustom() {}
+    __aicore__ inline void Init(GM_ADDR hprev, GM_ADDR z, GM_ADDR n, GM_ADDR hnext,
+                                uint32_t totalLength, uint32_t tileNum)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        hprevGm.SetGlobalBuffer((__gm__ float *)hprev + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ float *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        nGm.SetGlobalBuffer((__gm__ float *)n + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        hnextGm.SetGlobalBuffer((__gm__ float *)hnext + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueH, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueZ, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueN, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueue, BUFFER_NUM, this->tileLength * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<float> hLocal = inQueueH.AllocTensor<float>();
+        AscendC::LocalTensor<float> zLocal = inQueueZ.AllocTensor<float>();
+        AscendC::LocalTensor<float> nLocal = inQueueN.AllocTensor<float>();
+
+        AscendC::DataCopy(hLocal, hprevGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(zLocal, zGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(nLocal, nGm[progress * this->tileLength], this->tileLength);
+
+        inQueueH.EnQue(hLocal);
+        inQueueZ.EnQue(zLocal);
+        inQueueN.EnQue(nLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<float> hLocal = inQueueH.DeQue<float>();
+        AscendC::LocalTensor<float> zLocal = inQueueZ.DeQue<float>();
+        AscendC::LocalTensor<float> nLocal = inQueueN.DeQue<float>();
+        AscendC::LocalTensor<float> outLocal = outQueue.AllocTensor<float>();
+
+        // 计算 hnext = n + z * (hprev - n)
+        AscendC::DataCopy(outLocal, hLocal, this->tileLength);                // outLocal = hprev
+        AscendC::Sub(outLocal, outLocal, nLocal, this->tileLength);           // outLocal = hprev - n
+        AscendC::Mul(outLocal, outLocal, zLocal, this->tileLength);           // outLocal = z * (hprev - n)
+        AscendC::Add(outLocal, outLocal, nLocal, this->tileLength);           // outLocal = n + ...
+
+        outQueue.EnQue<float>(outLocal);
+        inQueueH.FreeTensor(hLocal);
+        inQueueZ.FreeTensor(zLocal);
+        inQueueN.FreeTensor(nLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<float> outLocal = outQueue.DeQue<float>();
+        AscendC::DataCopy(hnextGm[progress * this->tileLength], outLocal, this->tileLength);
+        outQueue.FreeTensor(outLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueH;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueZ;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueN;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueue;
+
+    AscendC::GlobalTensor<float> hprevGm;
+    AscendC::GlobalTensor<float> zGm;
+    AscendC::GlobalTensor<float> nGm;
+    AscendC::GlobalTensor<float> hnextGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void gru_custom(GM_ADDR hprev, GM_ADDR z, GM_ADDR n, GM_ADDR hnext, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGruCustom op;
+    op.Init(hprev, z, n, hnext, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gru_custom_impl_npu(const at::Tensor& hprev, const at::Tensor& z, const at::Tensor& n) {
+    at::Tensor result = at::empty_like(hprev);
+    EXEC_NPU_CMD(aclnnGruCustom, hprev, z, n, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gru_custom", &gru_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gru_custom", &gru_custom_impl_npu, "GRU blend: n + z * (hprev - n)");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bias = bias
+        self.batch_first = batch_first
+
+        # 仿照 PyTorch GRU 参数组织：每层保存 W_ih, W_hh, b_ih, b_hh（3*hidden_size 切分为 r, z, n）
+        self.weight_ih = nn.ParameterList()
+        self.weight_hh = nn.ParameterList()
+        self.bias_ih = nn.ParameterList()
+        self.bias_hh = nn.ParameterList()
+
+        for l in range(num_layers):
+            in_features = input_size if l == 0 else hidden_size
+            w_ih = nn.Parameter(torch.empty(3 * hidden_size, in_features))
+            w_hh = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
+            self.weight_ih.append(w_ih)
+            self.weight_hh.append(w_hh)
+            if bias:
+                b_ih = nn.Parameter(torch.empty(3 * hidden_size))
+                b_hh = nn.Parameter(torch.empty(3 * hidden_size))
+            else:
+                b_ih = nn.Parameter(torch.zeros(3 * hidden_size), requires_grad=False)
+                b_hh = nn.Parameter(torch.zeros(3 * hidden_size), requires_grad=False)
+            self.bias_ih.append(b_ih)
+            self.bias_hh.append(b_hh)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # 简单初始化，近似 PyTorch 的统一分布
+        stdv = 1.0 / (self.hidden_size ** 0.5)
+        for l in range(self.num_layers):
+            nn.init.uniform_(self.weight_ih[l], -stdv, stdv)
+            nn.init.uniform_(self.weight_hh[l], -stdv, stdv)
+            if self.bias:
+                nn.init.uniform_(self.bias_ih[l], -stdv, stdv)
+                nn.init.uniform_(self.bias_hh[l], -stdv, stdv)
+
+    def forward(self, x, h0):
+        # 输入形状: (seq_len, batch, input_size)
+        assert not self.batch_first, "此示例仅支持 batch_first=False"
+        seq_len, batch_size, _ = x.shape
+        device = x.device
+
+        h_prev_layers = list(torch.unbind(h0, dim=0))  # List[num_layers] of (batch, hidden)
+        layer_input = x
+
+        for l in range(self.num_layers):
+            w_ih = self.weight_ih[l]
+            w_hh = self.weight_hh[l]
+            b_ih = self.bias_ih[l]
+            b_hh = self.bias_hh[l]
+
+            # 按 gate 切分索引
+            H = self.hidden_size
+            w_ih_r, w_ih_z, w_ih_n = w_ih[0:H, :], w_ih[H:2*H, :], w_ih[2*H:3*H, :]
+            w_hh_r, w_hh_z, w_hh_n = w_hh[0:H, :], w_hh[H:2*H, :], w_hh[2*H:3*H, :]
+            b_ih_r, b_ih_z, b_ih_n = b_ih[0:H], b_ih[H:2*H], b_ih[2*H:3*H]
+            b_hh_r, b_hh_z, b_hh_n = b_hh[0:H], b_hh[H:2*H], b_hh[2*H:3*H]
+
+            h_t = h_prev_layers[l]
+            outputs_t = []
+
+            for t in range(seq_len):
+                x_t = layer_input[t]  # (batch, in_features)
+
+                # r, z 门
+                i_r = F.linear(x_t, w_ih_r, b_ih_r)
+                i_z = F.linear(x_t, w_ih_z, b_ih_z)
+                h_r = F.linear(h_t, w_hh_r, b_hh_r)
+                h_z = F.linear(h_t, w_hh_z, b_hh_z)
+                r_t = torch.sigmoid(i_r + h_r)
+                z_t = torch.sigmoid(i_z + h_z)
+
+                # n 候选状态：i_n + (W_hh_n @ (r ⊙ h_t)) + b_hh_n
+                i_n = F.linear(x_t, w_ih_n, b_ih_n)
+                h_n_lin = F.linear(r_t * h_t, w_hh_n, b_hh_n)
+                n_t = torch.tanh(i_n + h_n_lin)
+
+                # 使用自定义 AscendC kernel 融合更新：h_{t+1} = n_t + z_t * (h_t - n_t)
+                h_t = custom_ops_lib.gru_custom(h_t, z_t, n_t)
+
+                outputs_t.append(h_t)
+
+            layer_output = torch.stack(outputs_t, dim=0)  # (seq_len, batch, hidden)
+            layer_input = layer_output
+            h_prev_layers[l] = h_t  # 最后时间步
+
+        # 返回最后一层的全部时间步输出
+        return layer_input
+'''

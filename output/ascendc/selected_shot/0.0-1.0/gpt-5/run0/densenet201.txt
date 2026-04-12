@@ -1,0 +1,408 @@
+project_json_src='''
+[
+    {
+        "op": "Densenet201Custom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(Densenet201CustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c1);
+  TILING_DATA_FIELD_DEF(uint32_t, c2);
+  TILING_DATA_FIELD_DEF(uint32_t, hw);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, sampleSize);
+  TILING_DATA_FIELD_DEF(uint32_t, xBlockSize);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, tileLength);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Densenet201Custom, Densenet201CustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "densenet201_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static constexpr uint32_t BLOCK_DIM = 1; // simplify: single block handles all
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Densenet201CustomTilingData tiling;
+
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* y_shape = context->GetInputShape(1);
+
+    // Expect 4D NCHW
+    uint32_t dims_x = x_shape->GetOriginShape().GetDimNum();
+    uint32_t dims_y = y_shape->GetOriginShape().GetDimNum();
+    if (dims_x < 4 || dims_y < 4) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+
+    uint64_t N = x_shape->GetOriginShape().GetDim(0);
+    uint64_t C1 = x_shape->GetOriginShape().GetDim(1);
+    uint64_t H  = x_shape->GetOriginShape().GetDim(2);
+    uint64_t W  = x_shape->GetOriginShape().GetDim(3);
+
+    uint64_t N2 = y_shape->GetOriginShape().GetDim(0);
+    uint64_t C2 = y_shape->GetOriginShape().GetDim(1);
+    uint64_t H2 = y_shape->GetOriginShape().GetDim(2);
+    uint64_t W2 = y_shape->GetOriginShape().GetDim(3);
+
+    if (N != N2 || H != H2 || W != W2) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+
+    uint64_t hw = H * W;
+    uint64_t totalLength = N * (C1 + C2) * hw;
+    uint64_t sampleSize = (C1 + C2) * hw;
+    uint64_t xBlockSize = C1 * hw;
+
+    // Tiling: choose 8 tiles and compute tileLength accordingly (BUFFER_NUM=2)
+    const uint32_t TILE_NUM = 8;
+    const uint32_t BUFFER_NUM = 2;
+    uint64_t tileLenU64 = (totalLength + (TILE_NUM * BUFFER_NUM) - 1) / (TILE_NUM * BUFFER_NUM);
+    if (tileLenU64 == 0) tileLenU64 = 1;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(static_cast<uint32_t>(N));
+    tiling.set_c1(static_cast<uint32_t>(C1));
+    tiling.set_c2(static_cast<uint32_t>(C2));
+    tiling.set_hw(static_cast<uint32_t>(hw));
+    tiling.set_totalLength(static_cast<uint32_t>(totalLength));
+    tiling.set_sampleSize(static_cast<uint32_t>(sampleSize));
+    tiling.set_xBlockSize(static_cast<uint32_t>(xBlockSize));
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_tileLength(static_cast<uint32_t>(tileLenU64));
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* y_shape = context->GetInputShape(1);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+
+    if (x_shape->GetOriginShape().GetDimNum() < 4 || y_shape->GetOriginShape().GetDimNum() < 4) {
+        return GRAPH_PARAM_INVALID;
+    }
+
+    uint64_t N = x_shape->GetOriginShape().GetDim(0);
+    uint64_t C1 = x_shape->GetOriginShape().GetDim(1);
+    uint64_t H = x_shape->GetOriginShape().GetDim(2);
+    uint64_t W = x_shape->GetOriginShape().GetDim(3);
+
+    uint64_t N2 = y_shape->GetOriginShape().GetDim(0);
+    uint64_t C2 = y_shape->GetOriginShape().GetDim(1);
+    uint64_t H2 = y_shape->GetOriginShape().GetDim(2);
+    uint64_t W2 = y_shape->GetOriginShape().GetDim(3);
+
+    if (N != N2 || H != H2 || W != W2) {
+        return GRAPH_PARAM_INVALID;
+    }
+
+    gert::Shape outOrigin({(int64_t)N, (int64_t)(C1 + C2), (int64_t)H, (int64_t)W});
+    out_shape->SetOriginShape(outOrigin);
+    out_shape->SetStorageShape(outOrigin);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class Densenet201Custom : public OpDef {
+public:
+    explicit Densenet201Custom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Densenet201Custom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelConcatC {
+public:
+    __aicore__ inline KernelConcatC() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z,
+                                uint32_t n, uint32_t c1, uint32_t c2, uint32_t hw,
+                                uint32_t totalLength, uint32_t sampleSize, uint32_t xBlockSize,
+                                uint32_t tileNum, uint32_t tileLength)
+    {
+        this->n = n;
+        this->c1 = c1;
+        this->c2 = c2;
+        this->hw = hw;
+        this->totalLength = totalLength;
+        this->sampleSize = sampleSize;
+        this->xBlockSize = xBlockSize;
+        this->tileNum = tileNum;
+        this->tileLength = tileLength;
+
+        uint32_t xLen = n * c1 * hw;
+        uint32_t yLen = n * c2 * hw;
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, xLen);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y, yLen);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z, totalLength);
+
+        pipe.InitBuffer(workQ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            uint32_t start = i * this->tileLength;
+            if (start >= this->totalLength) break;
+            uint32_t end = start + this->tileLength;
+            if (end > this->totalLength) end = this->totalLength;
+            uint32_t pos = start;
+
+            while (pos < end) {
+                // Determine which region (x or y) the current position belongs to
+                uint32_t sampleIdx = pos / this->sampleSize;
+                uint32_t remInSample = pos - sampleIdx * this->sampleSize;
+                bool inX = (remInSample < this->xBlockSize);
+                uint32_t regionOffset = inX ? remInSample : (remInSample - this->xBlockSize);
+                uint32_t regionSize = inX ? this->xBlockSize : this->sampleSize; // end boundary within sample
+
+                // Max contiguous length available within current region
+                uint32_t maxContig = regionSize - remInSample;
+                uint32_t curLen = end - pos;
+                if (curLen > maxContig) curLen = maxContig;
+
+                AscendC::LocalTensor<DTYPE_X> buf = workQ.AllocTensor<DTYPE_X>();
+                if (inX) {
+                    AscendC::DataCopy(buf, xGm[sampleIdx * this->xBlockSize + regionOffset], curLen);
+                } else {
+                    uint32_t yBlockSize = this->c2 * this->hw; // y per-sample size
+                    AscendC::DataCopy(buf, yGm[sampleIdx * yBlockSize + regionOffset], curLen);
+                }
+                AscendC::DataCopy(zGm[pos], buf, curLen);
+                workQ.FreeTensor(buf);
+                pos += curLen;
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> workQ;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+
+    uint32_t n;
+    uint32_t c1;
+    uint32_t c2;
+    uint32_t hw;
+    uint32_t totalLength;
+    uint32_t sampleSize;
+    uint32_t xBlockSize;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void densenet201_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConcatC op;
+    op.Init(x, y, z,
+            tiling_data.n, tiling_data.c1, tiling_data.c2, tiling_data.hw,
+            tiling_data.totalLength, tiling_data.sampleSize, tiling_data.xBlockSize,
+            tiling_data.tileNum, tiling_data.tileLength);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor densenet201_custom_impl_npu(const at::Tensor& x, const at::Tensor& y) {
+    at::Tensor result = at::empty_like(x, x.options());
+    EXEC_NPU_CMD(aclnnDensenet201Custom, x, y, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("densenet201_custom", &densenet201_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("densenet201_custom", &densenet201_custom_impl_npu, "Concat along channel dim");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_npu
+import custom_ops_lib
+
+class DenseBlock(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        super(DenseBlock, self).__init__()
+        layers = []
+        for i in range(num_layers):
+            layers.append(self._make_layer(num_input_features + i * growth_rate, growth_rate))
+        self.layers = nn.ModuleList(layers)
+
+    def _make_layer(self, in_features: int, growth_rate: int):
+        return nn.Sequential(
+            nn.BatchNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
+            nn.Dropout(0.0)
+        )
+
+    def forward(self, x):
+        out = x
+        for layer in self.layers:
+            new_feature = layer(out)
+            out = custom_ops_lib.densenet201_custom(out, new_feature)
+        return out
+
+class TransitionLayer(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        super(TransitionLayer, self).__init__()
+        self.transition = nn.Sequential(
+            nn.BatchNorm2d(num_input_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False),
+            nn.AvgPool2d(kernel_size=2, stride=2)
+        )
+
+    def forward(self, x):
+        return self.transition(x)
+
+class ModelNew(nn.Module):
+    def __init__(self, growth_rate: int = 32, num_classes: int = 1000):
+        super(ModelNew, self).__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+
+        num_features = 64
+        block_layers = [6, 12, 48, 32]
+
+        self.dense_blocks = nn.ModuleList()
+        self.transition_layers = nn.ModuleList()
+
+        for i, num_layers in enumerate(block_layers):
+            block = DenseBlock(num_layers=num_layers, num_input_features=num_features, growth_rate=growth_rate)
+            self.dense_blocks.append(block)
+            num_features = num_features + num_layers * growth_rate
+
+            if i != len(block_layers) - 1:
+                transition = TransitionLayer(num_input_features=num_features, num_output_features=num_features // 2)
+                self.transition_layers.append(transition)
+                num_features = num_features // 2
+
+        self.final_bn = nn.BatchNorm2d(num_features)
+        self.classifier = nn.Linear(num_features, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+
+        for i, block in enumerate(self.dense_blocks):
+            x = block(x)
+            if i != len(self.dense_blocks) - 1:
+                x = self.transition_layers[i](x)
+
+        x = self.final_bn(x)
+        x = F.relu(x, inplace=True)
+        x = F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+'''

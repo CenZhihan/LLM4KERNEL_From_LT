@@ -7,46 +7,24 @@ project_json_src='''
             {
                 "name": "x",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float16"]
-            },
-            {
-                "name": "h0",
-                "param_type": "required",
-                "format": ["ND"],
-                "type": ["float16"]
-            },
-            {
-                "name": "w_i2h",
-                "param_type": "required",
-                "format": ["ND"],
-                "type": ["float16"]
-            },
-            {
-                "name": "b_i2h",
-                "param_type": "required",
-                "format": ["ND"],
-                "type": ["float16"]
-            },
-            {
-                "name": "w_h2o",
-                "param_type": "required",
-                "format": ["ND"],
-                "type": ["float16"]
-            },
-            {
-                "name": "b_h2o",
-                "param_type": "required",
-                "format": ["ND"],
-                "type": ["float16"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ],
         "output_desc": [
             {
                 "name": "y",
                 "param_type": "required",
-                "format": ["ND"],
-                "type": ["float16"]
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
             }
         ]
     }
@@ -58,11 +36,8 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(VanillaRnnHiddenCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, seqLen);
-  TILING_DATA_FIELD_DEF(uint32_t, batch);
-  TILING_DATA_FIELD_DEF(uint32_t, inputSize);
-  TILING_DATA_FIELD_DEF(uint32_t, hiddenSize);
-  TILING_DATA_FIELD_DEF(uint32_t, outputSize);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(VanillaRnnHiddenCustom, VanillaRnnHiddenCustomTilingData)
@@ -72,103 +47,22 @@ REGISTER_TILING_DATA_CLASS(VanillaRnnHiddenCustom, VanillaRnnHiddenCustomTilingD
 host_operator_src="""
 #include "vanilla_rnn_hidden_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/platform/platform_ascendc.h"
-#include "tiling/tiling_api.h"
-#include "tiling/op_tiling.h"
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // Shapes
-    auto x_shape = context->GetInputShape(0)->GetOriginShape();
-    auto h0_shape = context->GetInputShape(1)->GetOriginShape();
-    auto wi2h_shape = context->GetInputShape(2)->GetOriginShape();
-    auto bi2h_shape = context->GetInputShape(3)->GetOriginShape();
-    auto wh2o_shape = context->GetInputShape(4)->GetOriginShape();
-    auto bho_shape = context->GetInputShape(5)->GetOriginShape();
-
-    uint32_t seqLen = static_cast<uint32_t>(x_shape.GetDim(0));
-    uint32_t batch  = static_cast<uint32_t>(x_shape.GetDim(1));
-    uint32_t input  = static_cast<uint32_t>(x_shape.GetDim(2));
-    uint32_t hidden = static_cast<uint32_t>(h0_shape.GetDim(1));
-    uint32_t output = static_cast<uint32_t>(wh2o_shape.GetDim(1)); // [hidden, output]
-
-    // Prepare matmul tiling for three GEMMs:
-    // 1) X_t @ W_x (M=batch, N=hidden, K=input) with bias b_i2h
-    // 2) H_{t-1} @ W_h (M=batch, N=hidden, K=hidden) without bias
-    // 3) H_t @ W_ho (M=batch, N=output, K=hidden) with bias b_h2o
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-
-    matmul_tiling::MatmulApiTiling tiling_x(ascendcPlatform);
-    tiling_x.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_x.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_x.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_x.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_x.SetShape(batch, hidden, input);
-    tiling_x.SetOrgShape(batch, hidden, input);
-    tiling_x.EnableBias(true);
-    tiling_x.SetBufferSpace(-1, -1, -1);
-    optiling::TCubeTiling tile_x;
-    if (tiling_x.GetTiling(tile_x) != 0) {
-        return ge::GRAPH_FAILED;
-    }
-
-    matmul_tiling::MatmulApiTiling tiling_h(ascendcPlatform);
-    tiling_h.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_h.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_h.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_h.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_h.SetShape(batch, hidden, hidden);
-    tiling_h.SetOrgShape(batch, hidden, hidden);
-    tiling_h.EnableBias(false);
-    tiling_h.SetBufferSpace(-1, -1, -1);
-    optiling::TCubeTiling tile_h;
-    if (tiling_h.GetTiling(tile_h) != 0) {
-        return ge::GRAPH_FAILED;
-    }
-
-    matmul_tiling::MatmulApiTiling tiling_o(ascendcPlatform);
-    tiling_o.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_o.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_o.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_o.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
-    tiling_o.SetShape(batch, output, hidden);
-    tiling_o.SetOrgShape(batch, output, hidden);
-    tiling_o.EnableBias(true);
-    tiling_o.SetBufferSpace(-1, -1, -1);
-    optiling::TCubeTiling tile_o;
-    if (tiling_o.GetTiling(tile_o) != 0) {
-        return ge::GRAPH_FAILED;
-    }
-
-    // Write tiling buffer: [Header(5x uint32)] + tile_x + tile_h + tile_o
-    char* buf = reinterpret_cast<char*>(context->GetRawTilingData()->GetData());
-    size_t cap = context->GetRawTilingData()->GetCapacity();
-    size_t off = 0;
-
-    auto write_bytes = [&](const void* src, size_t sz) {
-        if (off + sz > cap) return false;
-        memcpy(buf + off, src, sz);
-        off += sz;
-        return true;
-    };
-
-    uint32_t header[5] = {seqLen, batch, input, hidden, output};
-    if (!write_bytes(header, sizeof(header))) return ge::GRAPH_FAILED;
-    if (!write_bytes(&tile_x, sizeof(tile_x))) return ge::GRAPH_FAILED;
-    if (!write_bytes(&tile_h, sizeof(tile_h))) return ge::GRAPH_FAILED;
-    if (!write_bytes(&tile_o, sizeof(tile_o))) return ge::GRAPH_FAILED;
-
-    context->GetRawTilingData()->SetDataSize(off);
-
-    // Block dim
-    context->SetBlockDim(1);
-
-    // Workspace (simple, use 0 in this example; runtime alloc by framework if needed)
-    size_t* workspaces = context->GetWorkspaceSizes(1);
-    workspaces[0] = 0;
-
+    VanillaRnnHiddenCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -176,19 +70,15 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* x_shape = context->GetInputShape(0); // [T,B,I]
-    const gert::Shape* w_ho = context->GetInputShape(4);    // [H,O] (transposed in Python)
-    gert::Shape* y_shape = context->GetOutputShape(0);
-    gert::Shape out_shape = *x_shape;
-    out_shape.SetDim(2, w_ho->GetOriginShape().GetDim(1)); // O
-    *y_shape = out_shape;
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+    *out_shape = *in_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    // Keep float16 throughout
-    context->SetOutputDataType(0, context->GetInputDataType(0));
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -200,43 +90,16 @@ public:
     {
         this->Input("x")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16})
+            .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("h0")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("w_i2h")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("b_i2h")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("w_h2o")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("b_h2o")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("y")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16})
+            .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
@@ -248,35 +111,25 @@ OP_ADD(VanillaRnnHiddenCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#include "lib/matmul_intf.h"
-#define __NPU_TILING__
-#include "vanilla_rnn_hidden_custom_tiling_data.h"
 
-using half_t = half;
-
-// Local elementwise helper (add + tanh on half)
 constexpr int32_t BUFFER_NUM = 2;
 
-class HiddenPostProcess {
+class KernelVanillaRnnHiddenCustom {
 public:
-    __aicore__ inline HiddenPostProcess() {}
-    __aicore__ inline void Init(__gm__ half_t* tempX, __gm__ half_t* tempH, __gm__ half_t* outHidden,
-                                uint32_t elems, uint32_t tiles)
+    __aicore__ inline KernelVanillaRnnHiddenCustom() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
     {
-        this->elems = elems;
-        this->tileNum = tiles;
-        this->tileLen = elems / tiles / BUFFER_NUM;
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        gm_tempX.SetGlobalBuffer(tempX, elems);
-        gm_tempH.SetGlobalBuffer(tempH, elems);
-        gm_hidden.SetGlobalBuffer(outHidden, elems);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQX, BUFFER_NUM, this->tileLen * sizeof(half_t));
-        pipe.InitBuffer(inQH, BUFFER_NUM, this->tileLen * sizeof(half_t));
-        pipe.InitBuffer(outQ, BUFFER_NUM, this->tileLen * sizeof(half_t));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
     }
-
-    __aicore__ inline void Run()
+    __aicore__ inline void Process()
     {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
         for (int32_t i = 0; i < loopCount; ++i) {
@@ -289,180 +142,42 @@ public:
 private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        auto xLocal = inQX.AllocTensor<half_t>();
-        auto hLocal = inQH.AllocTensor<half_t>();
-        AscendC::DataCopy(xLocal, gm_tempX[progress * this->tileLen], this->tileLen);
-        AscendC::DataCopy(hLocal, gm_tempH[progress * this->tileLen], this->tileLen);
-        inQX.EnQue(xLocal);
-        inQH.EnQue(hLocal);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
     }
-
-    __aicore__ inline void Compute(int32_t)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        auto xLocal = inQX.DeQue<half_t>();
-        auto hLocal = inQH.DeQue<half_t>();
-        auto outLocal = outQ.AllocTensor<half_t>();
-
-        AscendC::Add(outLocal, xLocal, hLocal, this->tileLen);
-        AscendC::Tanh(outLocal, outLocal, this->tileLen);
-
-        outQ.EnQue(outLocal);
-        inQX.FreeTensor(xLocal);
-        inQH.FreeTensor(hLocal);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::Tanh(yLocal, xLocal, this->tileLength);
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
+        inQueueX.FreeTensor(xLocal);
     }
-
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        auto outLocal = outQ.DeQue<half_t>();
-        AscendC::DataCopy(gm_hidden[progress * this->tileLen], outLocal, this->tileLen);
-        outQ.FreeTensor(outLocal);
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQX, inQH;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQ;
-    AscendC::GlobalTensor<half_t> gm_tempX;
-    AscendC::GlobalTensor<half_t> gm_tempH;
-    AscendC::GlobalTensor<half_t> gm_hidden;
-    uint32_t elems;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM>  inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    uint32_t blockLength;
     uint32_t tileNum;
-    uint32_t tileLen;
+    uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void vanilla_rnn_hidden_custom(
-    GM_ADDR xGM,        // [T,B,I] float16
-    GM_ADDR h0GM,       // [B,H]   float16
-    GM_ADDR wi2hGM,     // [I+H,H] float16 (transposed weight of i2h)
-    GM_ADDR bi2hGM,     // [H]     float16
-    GM_ADDR wh2oGM,     // [H,O]   float16 (transposed weight of h2o)
-    GM_ADDR bhoGM,      // [O]     float16
-    GM_ADDR yGM,        // [T,B,O] float16
-    GM_ADDR workspaceGM,
-    GM_ADDR tilingGM)
+extern "C" __global__ __aicore__ void vanilla_rnn_hidden_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
-    // Parse header: seqLen, batch, input, hidden, output
-    __gm__ uint32_t* tPtr = reinterpret_cast<__gm__ uint32_t*>(tilingGM);
-    uint32_t seqLen   = tPtr[0];
-    uint32_t batch    = tPtr[1];
-    uint32_t inputSz  = tPtr[2];
-    uint32_t hiddenSz = tPtr[3];
-    uint32_t outputSz = tPtr[4];
-
-    // Read three TCubeTiling structs
-    optiling::TCubeTiling tile_x, tile_h, tile_o;
-    {
-        auto gm_u32 = reinterpret_cast<__gm__ uint32_t*>(tilingGM) + 5; // after header
-        auto copyInto = [&](optiling::TCubeTiling& dst, __gm__ uint32_t*& src) {
-            uint32_t* pd = reinterpret_cast<uint32_t*>(&dst);
-            for (uint32_t i = 0; i < sizeof(optiling::TCubeTiling) / sizeof(uint32_t); ++i, ++src, ++pd) {
-                *pd = *src;
-            }
-        };
-        copyInto(tile_x, gm_u32);
-        copyInto(tile_h, gm_u32);
-        copyInto(tile_o, gm_u32);
-    }
-
-    // Define Matmul types (NORMAL layout, ND format)
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half_t, false, LayoutMode::NORMAL> aType;
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half_t, false, LayoutMode::NORMAL> bType;
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half_t, false, LayoutMode::NORMAL> cType;
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, half_t> biasType;
-
-    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
-
-    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm_x;
-    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm_h;
-    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm_o;
-
-    AscendC::TPipe pipe;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm_x);
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm_h);
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm_o);
-
-    // GM tensors for static buffers
-    AscendC::GlobalTensor<half_t> gm_x_all, gm_h0, gm_wi2h, gm_bi2h, gm_wh2o, gm_bho, gm_y_all;
-    gm_x_all.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(xGM), seqLen * batch * inputSz);
-    gm_h0.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(h0GM), batch * hiddenSz);
-    gm_wi2h.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(wi2hGM), (inputSz + hiddenSz) * hiddenSz);
-    gm_bi2h.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(bi2hGM), hiddenSz);
-    gm_wh2o.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(wh2oGM), hiddenSz * outputSz);
-    gm_bho.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(bhoGM), outputSz);
-    gm_y_all.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(yGM), seqLen * batch * outputSz);
-
-    // Workspace layout:
-    // [hidden_half BxH][temp_x BxH][temp_h BxH]
-    uint64_t off_hidden = 0;
-    uint64_t off_temp_x = off_hidden + static_cast<uint64_t>(batch) * hiddenSz * sizeof(half_t);
-    uint64_t off_temp_h = off_temp_x + static_cast<uint64_t>(batch) * hiddenSz * sizeof(half_t);
-    __gm__ half_t* hidden_half_gm = reinterpret_cast<__gm__ half_t*>(workspaceGM + off_hidden);
-    __gm__ half_t* temp_x_gm      = reinterpret_cast<__gm__ half_t*>(workspaceGM + off_temp_x);
-    __gm__ half_t* temp_h_gm      = reinterpret_cast<__gm__ half_t*>(workspaceGM + off_temp_h);
-
-    // Initialize hidden = h0
-    AscendC::GlobalTensor<half_t> gm_hidden;
-    gm_hidden.SetGlobalBuffer(hidden_half_gm, batch * hiddenSz);
-    AscendC::DataCopy(gm_hidden, gm_h0, batch * hiddenSz);
-
-    // Matmul B partitions for i2h: split W into top (I x H) and bottom (H x H)
-    AscendC::GlobalTensor<half_t> gm_wx, gm_wh;
-    gm_wx.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(gm_wi2h.GetPhyAddr()), inputSz * hiddenSz);
-    gm_wh.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(gm_wi2h.GetPhyAddr()) + inputSz * hiddenSz,
-                          hiddenSz * hiddenSz);
-
-    // Bias
-    AscendC::GlobalTensor<half_t> gm_bias_i2h;
-    gm_bias_i2h.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(gm_bi2h.GetPhyAddr()), hiddenSz);
-
-    AscendC::GlobalTensor<half_t> gm_bias_ho;
-    gm_bias_ho.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(gm_bho.GetPhyAddr()), outputSz);
-
-    // Temp outputs
-    AscendC::GlobalTensor<half_t> gm_temp_x, gm_temp_h;
-    gm_temp_x.SetGlobalBuffer(temp_x_gm, batch * hiddenSz);
-    gm_temp_h.SetGlobalBuffer(temp_h_gm, batch * hiddenSz);
-
-    for (uint32_t t = 0; t < seqLen; ++t) {
-        // Slice X_t
-        AscendC::GlobalTensor<half_t> gm_xt;
-        gm_xt.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(gm_x_all.GetPhyAddr()) + t * (batch * inputSz),
-                              batch * inputSz);
-
-        // 1) X_t @ W_x + b -> temp_x
-        mm_x.Init(&tile_x);
-        mm_x.SetTensorA(gm_xt, 0);
-        mm_x.SetTensorB(gm_wx, 0);
-        mm_x.SetWorkspace(workspaceGM, 0);
-        mm_x.SetBias(gm_bias_i2h);
-        mm_x.IterateBatch(gm_temp_x, 1, 1, false);
-
-        // 2) H_{t-1} @ W_h -> temp_h
-        mm_h.Init(&tile_h);
-        mm_h.SetTensorA(gm_hidden, 0);
-        mm_h.SetTensorB(gm_wh, 0);
-        mm_h.SetWorkspace(workspaceGM, 0);
-        mm_h.IterateBatch(gm_temp_h, 1, 1, false);
-
-        // 3) (temp_x + temp_h).tanh() => hidden
-        {
-            HiddenPostProcess post;
-            // choose tiles = 8 for stream
-            post.Init(temp_x_gm, temp_h_gm, hidden_half_gm, batch * hiddenSz, 8);
-            post.Run();
-        }
-
-        // 4) H_t @ W_ho + b -> Y_t
-        AscendC::GlobalTensor<half_t> gm_yt;
-        gm_yt.SetGlobalBuffer(reinterpret_cast<__gm__ half_t*>(gm_y_all.GetPhyAddr()) + t * (batch * outputSz),
-                              batch * outputSz);
-        mm_o.Init(&tile_o);
-        mm_o.SetTensorA(gm_hidden, 0);
-        mm_o.SetTensorB(gm_wh2o, 0);
-        mm_o.SetWorkspace(workspaceGM, 0);
-        mm_o.SetBias(gm_bias_ho);
-        mm_o.IterateBatch(gm_yt, 1, 1, false);
-    }
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelVanillaRnnHiddenCustom op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
 }
 """
 
@@ -472,17 +187,10 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor vanilla_rnn_hidden_custom_impl_npu(const at::Tensor& x,
-                                              const at::Tensor& h0,
-                                              const at::Tensor& w_i2h_T,
-                                              const at::Tensor& b_i2h,
-                                              const at::Tensor& w_h2o_T,
-                                              const at::Tensor& b_h2o) {
-    auto y_sizes = x.sizes().vec();
-    y_sizes[2] = w_h2o_T.size(1);
-    at::Tensor y = at::empty(y_sizes, x.options());
-    EXEC_NPU_CMD(aclnnVanillaRnnHiddenCustom, x, h0, w_i2h_T, b_i2h, w_h2o_T, b_h2o, y);
-    return y;
+at::Tensor vanilla_rnn_hidden_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnVanillaRnnHiddenCustom, self, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -490,7 +198,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("vanilla_rnn_hidden_custom", &vanilla_rnn_hidden_custom_impl_npu, "Vanilla RNN hidden update fused");
+    m.def("vanilla_rnn_hidden_custom", &vanilla_rnn_hidden_custom_impl_npu, "tanh on hidden pre-activation");
 }
 """
 
@@ -501,20 +209,25 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     def __init__(self, input_size: int, hidden_size: int, output_size: int):
-        super().__init__()
+        super(ModelNew, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
+
         self.i2h = torch.nn.Linear(input_size + hidden_size, hidden_size)
         self.h2o = torch.nn.Linear(hidden_size, output_size)
-        self.tanh = torch.nn.Tanh()
 
     def forward(self, x: torch.Tensor, h0: torch.Tensor) -> torch.Tensor:
-        # x: [T,B,I], h0: [B,H]
-        # Weights expected by kernel: transposed (K,N)
-        w_i2h_T = self.i2h.weight.t().contiguous()  # [I+H, H]
-        b_i2h = self.i2h.bias.contiguous()          # [H]
-        w_h2o_T = self.h2o.weight.t().contiguous()  # [H, O]
-        b_h2o = self.h2o.bias.contiguous()          # [O]
-        return custom_ops_lib.vanilla_rnn_hidden_custom(x, h0, w_i2h_T, b_i2h, w_h2o_T, b_h2o)
+        seq_len, batch_size, _ = x.size()
+        hidden = h0.to(x.device)
+        outputs = []
+
+        for t in range(seq_len):
+            combined = torch.cat((x[t], hidden), dim=1)
+            preact = self.i2h(combined)
+            hidden = custom_ops_lib.vanilla_rnn_hidden_custom(preact)
+            output = self.h2o(hidden)
+            outputs.append(output)
+
+        return torch.stack(outputs, dim=0)
 '''

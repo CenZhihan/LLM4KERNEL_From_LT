@@ -58,6 +58,7 @@ REGISTER_TILING_DATA_CLASS(KlDivLossCustom, KlDivLossCustomTilingData)
 """
 
 host_operator_src="""
+
 #include "kl_div_loss_custom_tiling.h"
 #include "register/op_def_registry.h"
 #include <string.h>
@@ -67,26 +68,37 @@ const uint32_t BLOCK_SIZE = 32;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     KlDivLossCustomTilingData tiling;
-    uint32_t sizeofdatatype = 4; // float
+    uint32_t sizeofdatatype = 4; // for float
     uint32_t totalLengthAligned;
-    auto storageShape = context->GetInputShape(0)->GetStorageShape();
-    uint32_t totalLength = storageShape.GetShapeSize();
+    uint32_t totalLength = context->GetInputShape(0)->GetStorageShape().GetShapeSize();
+
+    // try get batch size from first dim
+    uint32_t batchSize = 1;
+    auto shp = context->GetInputShape(0);
+    if (shp != nullptr) {
+        batchSize = shp->GetStorageShape().GetDim(0);
+        if (batchSize == 0) {
+            batchSize = 1;
+        }
+    }
 
     uint32_t ALIGN_NUM = BLOCK_SIZE / sizeofdatatype;
     uint32_t ub_block_num = 1024;
     uint32_t tile_num;
 
     if (ub_block_num % 2 != 0) {
-        ub_block_num = ub_block_num - 1;
+      ub_block_num = ub_block_num - 1;
     }
 
     if (totalLength % ALIGN_NUM != 0) {
-        totalLengthAligned = ((totalLength + ALIGN_NUM - 1) / ALIGN_NUM) * ALIGN_NUM;
+        totalLengthAligned =
+            ((totalLength + ALIGN_NUM - 1) / ALIGN_NUM) * ALIGN_NUM;
     } else {
         totalLengthAligned = totalLength;
     }
 
     tiling.set_totalLength(totalLength);
+    tiling.set_batchSize(batchSize);
 
     auto block_dim = 1;
     context->SetBlockDim(block_dim);
@@ -104,12 +116,14 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
         }
         if (blockLength < ub_block_num * ALIGN_NUM) {
             tileLength = ((blockLength / ALIGN_NUM) + 1) / 2 * 2 * ALIGN_NUM;
-            lasttileLength = (totalLength < tileLength) ? totalLength : tileLength;
-        } else {
+            lasttileLength = tileLength;
+        }
+        else {
             tileLength = ub_block_num * ALIGN_NUM;
             lasttileLength = tileLength;
         }
-    } else {
+    }
+    else {
         tile_num = tile_num + 1;
         tileLength = ub_block_num * ALIGN_NUM;
         lasttileLength = blockLength - (tile_num - 1) * tileLength;
@@ -120,17 +134,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling.set_tileLength(tileLength);
     tiling.set_lasttileLength(lasttileLength);
 
-    // batch size = first dimension
-    uint32_t batchSize = 1;
-    if (storageShape.GetDimNum() > 0) {
-        batchSize = static_cast<uint32_t>(storageShape.GetDim(0));
-    }
-    tiling.set_batchSize(batchSize);
-
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
                         context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t* currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -168,45 +174,46 @@ OP_ADD(KlDivLossCustom);
 """
 
 kernel_src="""
+
 #include "kernel_operator.h"
 constexpr int32_t BUFFER_NUM = 1;
 
 class KernelKlDivLoss {
 public:
     __aicore__ inline KernelKlDivLoss() {}
-    __aicore__ inline void Init(GM_ADDR predict, GM_ADDR label, GM_ADDR y,
+    __aicore__ inline void Init(GM_ADDR predict, GM_ADDR label, GM_ADDR y, 
                                 uint32_t totalLength, uint32_t blockLength,
                                 uint32_t tileNum, uint32_t tileLength,
                                 uint32_t lasttileLength, uint32_t batchSize) {
         ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
 
         this->totalLength = static_cast<int32_t>(totalLength);
+        this->batchSize_f32 = static_cast<float>(batchSize);
+
         this->blockLength = blockLength;
         this->tileNum = tileNum;
         this->tileLength = tileLength / BUFFER_NUM;
         this->lasttileLength = lasttileLength;
-        this->batchSize = batchSize;
 
-        xGm.SetGlobalBuffer((__gm__ float*)predict + this->blockLength * AscendC::GetBlockIdx(),
+        inLogPGm.SetGlobalBuffer((__gm__ float*)predict + this->blockLength * AscendC::GetBlockIdx(),
                             this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ float*)label + this->blockLength * AscendC::GetBlockIdx(),
+        targetGm.SetGlobalBuffer((__gm__ float*)label + this->blockLength * AscendC::GetBlockIdx(),
                             this->blockLength);
-        outGm.SetGlobalBuffer((__gm__ float*)y + this->blockLength * AscendC::GetBlockIdx(), 32);
+        outGm.SetGlobalBuffer(
+            (__gm__ float*)y + this->blockLength * AscendC::GetBlockIdx(), 32);
 
         this->reduce_num = this->tileNum * BUFFER_NUM;
         uint32_t reduce_align = (this->reduce_num + 31) / 32 * 32;
 
-        // Need 3 * tileLength: predict, target, temp (for ln(target))
-        pipe.InitBuffer(inQueueIN, BUFFER_NUM, this->tileLength * 3 * sizeof(float));
+        pipe.InitBuffer(inQueueIN, BUFFER_NUM, this->tileLength * 2 * sizeof(float));
         pipe.InitBuffer(tempBuf, reduce_align * sizeof(float));
     }
 
     __aicore__ inline void Process() {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
         for (int32_t i = 0; i < loopCount; i++) {
-            uint32_t currLen = 0;
-            CopyIn(i, currLen);
-            Compute(i, currLen);
+            CopyIn(i);
+            Compute(i);
         }
         AscendC::LocalTensor<float> temp1 = tempBuf.Get<float>();
         AscendC::LocalTensor<float> temp2 = inQueueIN.AllocTensor<float>();
@@ -214,60 +221,59 @@ public:
         AscendC::Duplicate(temp2, (float)0, this->tileLength);
         AscendC::ReduceSum<float>(temp1, temp1, temp2, this->reduce_num);
 
-        float denom = static_cast<float>(this->batchSize);
-        temp2.SetValue(0, denom);
+        float bsz = this->batchSize_f32;
+        temp2.SetValue(0, bsz);
         AscendC::Div(temp1, temp1, temp2, 1);
-
+    
         outGm.SetValue(0, temp1.GetValue(0));
         inQueueIN.FreeTensor(temp2);
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress, uint32_t& currLen) {
+    __aicore__ inline void CopyIn(int32_t progress) {
         AscendC::LocalTensor<float> inLocal = inQueueIN.AllocTensor<float>();
-        uint32_t offset = progress * this->tileLength;
+
         if (progress == this->tileNum - 1) {
-            currLen = this->lasttileLength;
-        } else {
-            currLen = this->tileLength;
+            if (progress == 0) {
+                AscendC::DataCopy(inLocal[0], inLogPGm[0], this->tileLength);
+                AscendC::DataCopy(inLocal[this->tileLength], targetGm[0], this->tileLength);
+            } 
+            else {
+                AscendC::DataCopy(
+                    inLocal[0],
+                    inLogPGm[(progress - 1) * this->tileLength + this->lasttileLength],
+                    this->tileLength);
+                AscendC::DataCopy(
+                    inLocal[this->tileLength],
+                    targetGm[(progress - 1) * this->tileLength + this->lasttileLength],
+                    this->tileLength);
+            }
+        } 
+        else {
+            AscendC::DataCopy(inLocal[0], inLogPGm[progress * this->tileLength],
+                    this->tileLength);
+            AscendC::DataCopy(inLocal[this->tileLength], targetGm[progress * this->tileLength],
+                    this->tileLength);
         }
-        AscendC::DataCopy(inLocal[0], xGm[offset], currLen);
-        AscendC::DataCopy(inLocal[this->tileLength], yGm[offset], currLen);
-        // third segment will be prepared in Compute by copying target
         inQueueIN.EnQue(inLocal);
     }
 
-    __aicore__ inline void Compute(int32_t progress, uint32_t currLen) {
+    __aicore__ inline void Compute(int32_t progress) {
         AscendC::LocalTensor<float> inLocal = inQueueIN.DeQue<float>();
-        AscendC::LocalTensor<float> pLocal = inLocal;                                 // predict
-        AscendC::LocalTensor<float> tLocal = inLocal[this->tileLength];               // target
-        AscendC::LocalTensor<float> tmpLocal = inLocal[this->tileLength * 2];         // temp for ln(target)
+        AscendC::LocalTensor<float> logpLocal = inLocal; // log(predictions)
+        AscendC::LocalTensor<float> targetLocal = inLocal[this->tileLength]; // targets
+        AscendC::LocalTensor<float> tmpReduce = tempBuf.Get<float>();
 
-        constexpr float eps = 1.0e-12f;
+        // compute per-element: target * (log(target) - log(pred))
+        // reuse logpLocal as temp buffer to store log(target)
+        AscendC::Ln(logpLocal, targetLocal, this->tileLength);          // logpLocal = ln(target)
+        AscendC::Sub(logpLocal, logpLocal, inLocal, this->tileLength);  // log(target) - log(pred)
+        AscendC::Mul(targetLocal, targetLocal, logpLocal, this->tileLength); // target * (log(target) - log(pred))
 
-        // ln(predict_clamped)
-        AscendC::Maxs(pLocal, pLocal, eps, currLen);
-        AscendC::Ln(pLocal, pLocal, currLen); // pLocal = ln(p)
-
-        // tmpLocal = tLocal (copy), then clamp and ln
-        AscendC::DataCopy(tmpLocal, tLocal, currLen);
-        AscendC::Maxs(tmpLocal, tmpLocal, eps, currLen);
-        AscendC::Ln(tmpLocal, tmpLocal, currLen); // tmpLocal = ln(t)
-
-        // tmpLocal = ln(t) - ln(p)
-        AscendC::Sub(tmpLocal, tmpLocal, pLocal, currLen);
-
-        // tLocal = t * (ln(t) - ln(p))
-        AscendC::Mul(tLocal, tLocal, tmpLocal, currLen);
-
-        // reduce to scalar for this tile
-        AscendC::LocalTensor<float> temp1 = tempBuf.Get<float>();
-        AscendC::LocalTensor<float> redTmp = inQueueIN.AllocTensor<float>();
-        AscendC::Duplicate(redTmp, (float)0, this->tileLength);
-        AscendC::ReduceSum<float>(tLocal, tLocal, redTmp, currLen);
-        temp1.SetValue(progress, tLocal.GetValue(0));
-        inQueueIN.FreeTensor(redTmp);
-
+        // reduce sum over tile
+        AscendC::ReduceSum<float>(targetLocal, targetLocal, logpLocal, this->tileLength);
+        tmpReduce.SetValue(progress, targetLocal.GetValue(0));
+        
         inQueueIN.FreeTensor(inLocal);
     }
 
@@ -276,28 +282,27 @@ private:
     AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueIN;
     AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueOUT;
     AscendC::TBuf<> tempBuf;
-    AscendC::GlobalTensor<float> xGm;
-    AscendC::GlobalTensor<float> yGm;
+    AscendC::GlobalTensor<float> inLogPGm;
+    AscendC::GlobalTensor<float> targetGm;
     AscendC::GlobalTensor<float> outGm;
-
+    float batchSize_f32;
     int32_t totalLength;
     uint32_t reduce_num;
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
     uint32_t lasttileLength;
-    uint32_t batchSize;
 };
 
 extern "C" __global__ __aicore__ void kl_div_loss_custom(GM_ADDR predict, GM_ADDR label, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
     KernelKlDivLoss op;
-    op.Init(predict, label, y,
-            tiling_data.totalLength, tiling_data.blockLength,
-            tiling_data.tileNum, tiling_data.tileLength,
-            tiling_data.lasttileLength, tiling_data.batchSize);
+
+    op.Init(predict, label, y, tiling_data.totalLength, tiling_data.blockLength,
+            tiling_data.tileNum, tiling_data.tileLength, tiling_data.lasttileLength, tiling_data.batchSize);
     op.Process();
 }
+
 """
 
 python_bind_src="""
@@ -306,9 +311,9 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor kl_div_loss_impl_npu(const at::Tensor& predict, const at::Tensor& label) {
-    at::Tensor result = at::empty({}, predict.options());
-    EXEC_NPU_CMD(aclnnKlDivLossCustom, predict, label, result);
+at::Tensor kl_div_loss_impl_npu(const at::Tensor& predict_log, const at::Tensor& label) {
+    at::Tensor result = at::empty({}, predict_log.options());
+    EXEC_NPU_CMD(aclnnKlDivLossCustom, predict_log, label, result);
     return result;
 }
 
@@ -316,8 +321,9 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
     m.impl("kl_div_loss_custom", &kl_div_loss_impl_npu);
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("kl_div_loss_custom", &kl_div_loss_impl_npu, "kl div loss with batchmean");
+    m.def("kl_div_loss_custom", &kl_div_loss_impl_npu, "kl div loss (batchmean)");
 }
+
 """
 
 model_src='''
@@ -328,9 +334,8 @@ import custom_ops_lib
 class ModelNew(torch.nn.Module):
     def __init__(self):
         super(ModelNew, self).__init__()
-
+    
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Compute KL divergence with reduction='batchmean'
-        # Kernel internally computes log and batchmean normalization.
-        return custom_ops_lib.kl_div_loss_custom(predictions, targets)
+        # Pass log probabilities and targets to the custom op to compute batchmean KL divergence
+        return custom_ops_lib.kl_div_loss_custom(torch.log(predictions), targets)
 '''

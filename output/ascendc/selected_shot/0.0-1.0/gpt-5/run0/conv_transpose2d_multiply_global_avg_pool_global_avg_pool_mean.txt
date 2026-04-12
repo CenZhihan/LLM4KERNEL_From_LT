@@ -1,0 +1,334 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTranspose2dMultiplyGlobalAvgPoolGlobalAvgPoolMeanCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "multiplier",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTranspose2dMultiplyGlobalAvgPoolGlobalAvgPoolMeanCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, outerLength); // N*C
+  TILING_DATA_FIELD_DEF(uint32_t, innerSize);   // H*W
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTranspose2dMultiplyGlobalAvgPoolGlobalAvgPoolMeanCustom, ConvTranspose2dMultiplyGlobalAvgPoolGlobalAvgPoolMeanCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transpose2d_multiply_global_avg_pool_global_avg_pool_mean_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTranspose2dMultiplyGlobalAvgPoolGlobalAvgPoolMeanCustomTilingData tiling;
+
+    auto in_shape = context->GetInputShape(0)->GetOriginShape();
+    uint64_t dims = in_shape.GetDimNum();
+    if (dims < 4) {
+        return ge::GRAPH_FAILED;
+    }
+    uint64_t n = in_shape.GetDim(0);
+    uint64_t c = in_shape.GetDim(1);
+    uint64_t h = in_shape.GetDim(2);
+    uint64_t w = in_shape.GetDim(3);
+
+    uint32_t outerLength = static_cast<uint32_t>(n * c);
+    uint32_t innerSize = static_cast<uint32_t>(h * w);
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_outerLength(outerLength);
+    tiling.set_innerSize(innerSize);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    if (x_shape->GetDimNum() < 2) {
+        return GRAPH_FAILED;
+    }
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    // Output shape is [N, C, 1, 1]
+    gert::Shape out;
+    out.SetDimNum(4);
+    out.SetDim(0, x_shape->GetDim(0));
+    out.SetDim(1, x_shape->GetDim(1));
+    out.SetDim(2, 1);
+    out.SetDim(3, 1);
+    *y_shape = out;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTranspose2dMultiplyGlobalAvgPoolGlobalAvgPoolMeanCustom : public OpDef {
+public:
+    explicit ConvTranspose2dMultiplyGlobalAvgPoolGlobalAvgPoolMeanCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("multiplier")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTranspose2dMultiplyGlobalAvgPoolGlobalAvgPoolMeanCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 1; // number of tensors for each queue
+
+// This kernel computes y[n,c,0,0] = multiplier * mean_{h,w}(x[n,c,h,w])
+class KernelGAPMul {
+public:
+    __aicore__ inline KernelGAPMul() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR multiplier, GM_ADDR y,
+                                uint32_t outerLength, uint32_t innerSize, uint32_t tileNum)
+    {
+        this->outerLength = outerLength; // N*C
+        this->innerSize = innerSize;     // H*W
+        this->blockOuter = (outerLength + AscendC::GetBlockNum() - 1) / AscendC::GetBlockNum();
+        // Align block start and end for current block
+        this->blockStart = this->blockOuter * AscendC::GetBlockIdx();
+        this->blockEnd = AscendC::Min(this->blockStart + this->blockOuter, this->outerLength);
+        this->tileNum = tileNum == 0 ? 1 : tileNum;
+        this->tileOuter = AscendC::Max<uint32_t>(1, (this->blockEnd - this->blockStart) / this->tileNum);
+        if (this->tileOuter == 0) {
+            this->tileOuter = this->blockEnd > this->blockStart ? (this->blockEnd - this->blockStart) : 1;
+        }
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockStart * this->innerSize,
+                            (this->blockEnd - this->blockStart) * this->innerSize);
+        mGm.SetGlobalBuffer((__gm__ DTYPE_Y *)multiplier, 1);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y + this->blockStart, (this->blockEnd - this->blockStart));
+
+        // local buffers: input tile = tileOuter * innerSize, output tile = tileOuter
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileOuter * this->innerSize * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileOuter * sizeof(DTYPE_Z));
+        pipe.InitBuffer(scaleQueue, BUFFER_NUM, sizeof(DTYPE_Y));
+    }
+
+    __aicore__ inline void Process()
+    {
+        // load multiplier once
+        LoadScale();
+
+        int32_t totalTiles = 0;
+        if (this->blockEnd > this->blockStart) {
+            uint32_t elems = this->blockEnd - this->blockStart;
+            totalTiles = (elems + this->tileOuter - 1) / this->tileOuter;
+        }
+
+        for (int32_t t = 0; t < totalTiles; ++t) {
+            uint32_t curOuter = this->tileOuter;
+            uint32_t offsetOuter = t * this->tileOuter;
+            if (offsetOuter + curOuter > (this->blockEnd - this->blockStart)) {
+                curOuter = (this->blockEnd - this->blockStart) - offsetOuter;
+            }
+            CopyIn(offsetOuter, curOuter);
+            Compute(curOuter);
+            CopyOut(offsetOuter, curOuter);
+        }
+    }
+
+private:
+    __aicore__ inline void LoadScale()
+    {
+        AscendC::LocalTensor<DTYPE_Y> sLocal = scaleQueue.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(sLocal, mGm[0], 1);
+        scaleQueue.EnQue(sLocal);
+    }
+
+    __aicore__ inline void CopyIn(uint32_t offsetOuter, uint32_t curOuter)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal,
+                          xGm[offsetOuter * this->innerSize],
+                          curOuter * this->innerSize);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t curOuter)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Y> sLocal = scaleQueue.DeQue<DTYPE_Y>();
+
+        // For each (n,c) in the tile, reduce over innerSize to a scalar
+        for (uint32_t i = 0; i < curOuter; ++i) {
+            AscendC::LocalTensor<DTYPE_Z> tmp = yLocal[i]; // placeholder view
+            // Reduce sum over innerSize elements
+            AscendC::ReduceSum(tmp, xLocal[i * this->innerSize], this->innerSize);
+            // Compute average
+            DTYPE_Y invInner = static_cast<DTYPE_Y>(1.0f) / static_cast<DTYPE_Y>(this->innerSize);
+            AscendC::Muls(tmp, tmp, invInner, 1);
+            // Multiply by scalar multiplier
+            AscendC::Muls(tmp, tmp, sLocal.GetValue(0), 1);
+        }
+
+        outQueueY.EnQue<DTYPE_Z>(yLocal);
+        inQueueX.FreeTensor(xLocal);
+        scaleQueue.FreeTensor(sLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t offsetOuter, uint32_t curOuter)
+    {
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[offsetOuter], yLocal, curOuter);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> scaleQueue;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> mGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    uint32_t outerLength;
+    uint32_t innerSize;
+    uint32_t blockStart;
+    uint32_t blockEnd;
+    uint32_t blockOuter;
+    uint32_t tileNum;
+    uint32_t tileOuter;
+};
+
+extern "C" __global__ __aicore__ void conv_transpose2d_multiply_global_avg_pool_global_avg_pool_mean_custom(GM_ADDR x, GM_ADDR multiplier, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGAPMul op;
+    op.Init(x, multiplier, y, tiling_data.outerLength, tiling_data.innerSize, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_transpose2d_multiply_global_avg_pool_global_avg_pool_mean_custom_impl_npu(const at::Tensor& x, const at::Tensor& multiplier) {
+    TORCH_CHECK(multiplier.numel() == 1, "multiplier must be a scalar tensor with 1 element");
+    auto sizes = x.sizes();
+    TORCH_CHECK(sizes.size() == 4, "Input x must be 4D [N,C,H,W]");
+    std::vector<int64_t> out_sizes = {sizes[0], sizes[1], 1, 1};
+    at::Tensor result = at::empty(out_sizes, x.options());
+    EXEC_NPU_CMD(aclnnConvTranspose2dMultiplyGlobalAvgPoolGlobalAvgPoolMeanCustom, x, multiplier, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transpose2d_multiply_global_avg_pool_global_avg_pool_mean_custom", &conv_transpose2d_multiply_global_avg_pool_global_avg_pool_mean_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transpose2d_multiply_global_avg_pool_global_avg_pool_mean_custom", &conv_transpose2d_multiply_global_avg_pool_global_avg_pool_mean_custom_impl_npu, "mul + GAP + GAP");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model: keep ConvTranspose2d on PyTorch, fuse multiply + two global average pools into a custom AscendC op.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.multiplier = multiplier
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        # fused: multiply by scalar and two global average pools
+        scale = torch.tensor(self.multiplier, dtype=x.dtype, device=x.device).view(1)
+        y = custom_ops_lib.conv_transpose2d_multiply_global_avg_pool_global_avg_pool_mean_custom(x, scale)
+        return y
+'''

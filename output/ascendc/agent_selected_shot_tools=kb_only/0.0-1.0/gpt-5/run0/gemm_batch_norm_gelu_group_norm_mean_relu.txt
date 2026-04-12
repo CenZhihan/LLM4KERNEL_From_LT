@@ -1,0 +1,390 @@
+project_json_src='''
+[
+    {
+        "op": "GemmBatchNormGeluGroupNormMeanReluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "gamma",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "beta",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "mean",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "rstd",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmBatchNormGeluGroupNormMeanReluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, reserved);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmBatchNormGeluGroupNormMeanReluCustom, GemmBatchNormGeluGroupNormMeanReluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gemm_batch_norm_gelu_group_norm_mean_relu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GemmBatchNormGeluGroupNormMeanReluCustomTilingData tiling;
+
+    const auto* inShape = context->GetInputShape(0);
+    const auto& origin = inShape->GetOriginShape();
+    uint32_t rows = static_cast<uint32_t>(origin.GetDim(0));
+    uint32_t cols = static_cast<uint32_t>(origin.GetDim(1));
+
+    context->SetBlockDim(8);
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+    tiling.set_reserved(0);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GemmBatchNormGeluGroupNormMeanReluCustom : public OpDef {
+public:
+    explicit GemmBatchNormGeluGroupNormMeanReluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("gamma")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("beta")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("mean")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("rstd")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmBatchNormGeluGroupNormMeanReluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelFusedBnGeluRelu {
+public:
+    __aicore__ inline KernelFusedBnGeluRelu() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR gamma, GM_ADDR beta, GM_ADDR mean, GM_ADDR rstd, GM_ADDR z, uint32_t rows, uint32_t cols)
+    {
+        this->rows = rows;
+        this->cols = cols;
+
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+
+        // Range-based row split
+        uint64_t start_row = (static_cast<uint64_t>(rows) * blockIdx) / blockNum;
+        uint64_t end_row   = (static_cast<uint64_t>(rows) * (blockIdx + 1)) / blockNum;
+        this->rowStart = static_cast<uint32_t>(start_row);
+        this->rowCount = static_cast<uint32_t>(end_row - start_row);
+
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(x) + this->rowStart * this->cols, this->rowCount * this->cols);
+        zGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(z) + this->rowStart * this->cols, this->rowCount * this->cols);
+
+        gammaGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(gamma), this->cols);
+        betaGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(beta), this->cols);
+        meanGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(mean), this->cols);
+        rstdGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(rstd), this->cols);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->cols * sizeof(DTYPE));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->cols * sizeof(DTYPE));
+
+        // BN params local buffers (kept for reuse)
+        pipe.InitBuffer(bufGamma, this->cols * sizeof(DTYPE));
+        pipe.InitBuffer(bufBeta,  this->cols * sizeof(DTYPE));
+        pipe.InitBuffer(bufMean,  this->cols * sizeof(DTYPE));
+        pipe.InitBuffer(bufRstd,  this->cols * sizeof(DTYPE));
+
+        // Temp buffers
+        pipe.InitBuffer(tmpBuf, this->cols * sizeof(DTYPE) * 3);
+
+        // Preload BN params once
+        {
+            AscendC::LocalTensor<DTYPE> gLocal = bufGamma.Get<DTYPE>();
+            AscendC::LocalTensor<DTYPE> bLocal = bufBeta.Get<DTYPE>();
+            AscendC::LocalTensor<DTYPE> mLocal = bufMean.Get<DTYPE>();
+            AscendC::LocalTensor<DTYPE> rLocal = bufRstd.Get<DTYPE>();
+            AscendC::DataCopy(gLocal, gammaGm, this->cols);
+            AscendC::DataCopy(bLocal, betaGm,  this->cols);
+            AscendC::DataCopy(mLocal, meanGm,  this->cols);
+            AscendC::DataCopy(rLocal, rstdGm,  this->cols);
+        }
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = 0; r < this->rowCount; ++r) {
+            CopyIn(r);
+            Compute();
+            CopyOut(r);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
+        AscendC::DataCopy(xLocal, xGm[rowIdx * this->cols], this->cols);
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.DeQue<DTYPE>();
+        AscendC::LocalTensor<DTYPE> zLocal = outQueueZ.AllocTensor<DTYPE>();
+
+        // BN params locals (already loaded)
+        AscendC::LocalTensor<DTYPE> gLocal = bufGamma.Get<DTYPE>();
+        AscendC::LocalTensor<DTYPE> bLocal = bufBeta.Get<DTYPE>();
+        AscendC::LocalTensor<DTYPE> mLocal = bufMean.Get<DTYPE>();
+        AscendC::LocalTensor<DTYPE> rLocal = bufRstd.Get<DTYPE>();
+
+        // Temp locals
+        AscendC::LocalTensor<DTYPE> t0 = tmpBuf.Get<DTYPE>();                 // x - mean
+        AscendC::LocalTensor<DTYPE> t1 = tmpBuf.Get<DTYPE>() + this->cols;    // (x-mean)*rstd -> then *gamma -> then +beta
+        AscendC::LocalTensor<DTYPE> t2 = tmpBuf.Get<DTYPE>() + this->cols*2;  // GELU intermediate
+
+        // BN: (x - mean) * rstd * gamma + beta
+        AscendC::Sub(t0, xLocal, mLocal, this->cols);
+        AscendC::Mul(t1, t0, rLocal, this->cols);
+        AscendC::Mul(t1, t1, gLocal, this->cols);
+        AscendC::Add(t1, t1, bLocal, this->cols);
+
+        // GELU
+        AscendC::Gelu(t2, t1, this->cols);
+
+        // ReLU
+        AscendC::Relu(zLocal, t2, this->cols);
+
+        outQueueZ.EnQue<DTYPE>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<DTYPE> zLocal = outQueueZ.DeQue<DTYPE>();
+        AscendC::DataCopy(zGm[rowIdx * this->cols], zLocal, this->cols);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t rowStart;
+    uint32_t rowCount;
+
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM>  inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+
+    AscendC::GlobalTensor<DTYPE> xGm;
+    AscendC::GlobalTensor<DTYPE> zGm;
+
+    AscendC::GlobalTensor<DTYPE> gammaGm;
+    AscendC::GlobalTensor<DTYPE> betaGm;
+    AscendC::GlobalTensor<DTYPE> meanGm;
+    AscendC::GlobalTensor<DTYPE> rstdGm;
+
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufGamma;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufBeta;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufMean;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufRstd;
+
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tmpBuf;
+};
+
+extern "C" __global__ __aicore__ void gemm_batch_norm_gelu_group_norm_mean_relu_custom(
+    GM_ADDR x,
+    GM_ADDR gamma,
+    GM_ADDR beta,
+    GM_ADDR mean,
+    GM_ADDR rstd,
+    GM_ADDR z,
+    GM_ADDR workspace,
+    GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelFusedBnGeluRelu op;
+    op.Init(x, gamma, beta, mean, rstd, z, tiling_data.rows, tiling_data.cols);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gemm_batch_norm_gelu_group_norm_mean_relu_custom_impl_npu(const at::Tensor& x,
+                                                                     const at::Tensor& gamma,
+                                                                     const at::Tensor& beta,
+                                                                     const at::Tensor& mean,
+                                                                     const at::Tensor& rstd) {
+    auto y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnGemmBatchNormGeluGroupNormMeanReluCustom, x, gamma, beta, mean, rstd, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_batch_norm_gelu_group_norm_mean_relu_custom", &gemm_batch_norm_gelu_group_norm_mean_relu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_batch_norm_gelu_group_norm_mean_relu_custom",
+          &gemm_batch_norm_gelu_group_norm_mean_relu_custom_impl_npu,
+          "Fused BatchNorm + GELU + ReLU");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.gemm = torch.nn.Linear(in_features, out_features)
+        self.batch_norm = torch.nn.BatchNorm1d(out_features)
+
+    def forward(self, x):
+        # GEMM
+        x = self.gemm(x)
+
+        # Prepare BN parameters and rstd on host
+        gamma = self.batch_norm.weight
+        beta = self.batch_norm.bias
+        running_mean = self.batch_norm.running_mean
+        running_var = self.batch_norm.running_var
+        eps = self.batch_norm.eps
+
+        rstd = 1.0 / torch.sqrt(running_var + eps)
+
+        # Fused: BatchNorm -> GELU -> ReLU
+        y = custom_ops_lib.gemm_batch_norm_gelu_group_norm_mean_relu_custom(
+            x, gamma, beta, running_mean, rstd
+        )
+        return y
+'''

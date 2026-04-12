@@ -1,0 +1,313 @@
+project_json_src='''
+[
+    {
+        "op": "GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmLogSumExpLeakyReluLeakyReluGeluGeluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);
+  TILING_DATA_FIELD_DEF(uint32_t, cols);
+  TILING_DATA_FIELD_DEF(uint32_t, tileRows);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom, GemmLogSumExpLeakyReluLeakyReluGeluGeluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GemmLogSumExpLeakyReluLeakyReluGeluGeluCustomTilingData tiling;
+
+    // 输入 x 形状：[rows, cols]
+    auto xShape = context->GetInputShape(0)->GetOriginShape();
+    uint32_t rows = static_cast<uint32_t>(xShape.GetDim(0));
+    uint32_t cols = static_cast<uint32_t>(xShape.GetDim(1));
+
+    // 简单按行分块
+    const uint32_t tileRows = 64;  // 每个tile处理的行数，按UB容量自行调整
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_rows(rows);
+    tiling.set_cols(cols);
+    tiling.set_tileRows(tileRows);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* wk = context->GetWorkspaceSizes(1);
+    wk[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输入 [N, M]，LogSumExp 按 dim=1，keepdim=True，输出 [N, 1]
+    const gert::Shape* in = context->GetInputShape(0);
+    std::vector<int64_t> outDims = in->GetDimSizes();
+    if (outDims.size() < 2) {
+        // 默认作为二维
+        if (outDims.empty()) outDims.push_back(1);
+        outDims.resize(2, 1);
+    }
+    outDims[1] = 1;
+    gert::Shape* out = context->GetOutputShape(0);
+    out->SetDimSizes(outDims);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    auto dt = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dt);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom : public OpDef {
+public:
+    explicit GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmLogSumExpLeakyReluLeakyReluGeluGeluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_tiling_data.h"
+
+using DTYPE_X = float;
+using DTYPE_Y = float;
+
+constexpr int32_t IN_BUFF_NUM = 2;
+constexpr int32_t OUT_BUFF_NUM = 2;
+
+class KernelFused {
+public:
+    __aicore__ inline KernelFused() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t rows, uint32_t cols, uint32_t tileRows)
+    {
+        this->rows = rows;
+        this->cols = cols;
+        this->tileRows = tileRows;
+
+        // 基于block划分行区间
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->rowsPerBlock = (rows + blocks - 1) / blocks; // ceil
+        this->startRow = this->rowsPerBlock * blockIdx;
+        // 实际有效行数
+        this->validRows = (startRow + rowsPerBlock <= rows) ? rowsPerBlock : (rows > startRow ? rows - startRow : 0);
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + (uint64_t)startRow * cols, (uint64_t)validRows * cols);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + startRow, validRows);
+
+        pipe.InitBuffer(inQueueX, IN_BUFF_NUM, (uint32_t)(tileRows * cols * sizeof(DTYPE_X)));
+        pipe.InitBuffer(outQueueY, OUT_BUFF_NUM, (uint32_t)(tileRows * sizeof(DTYPE_Y)));
+
+        // 计算用中间缓冲：exp输入块大小
+        pipe.InitBuffer(calcBufs, (uint32_t)(tileRows * cols * sizeof(DTYPE_X)));
+    }
+
+    __aicore__ inline void Process()
+    {
+        if (validRows == 0) { return; }
+        uint32_t tiles = (validRows + tileRows - 1) / tileRows;
+        for (uint32_t t = 0; t < tiles; ++t) {
+            uint32_t rowsThisTile = GetRowsThisTile(t);
+            CopyIn(t, rowsThisTile);
+            Compute(t, rowsThisTile);
+            CopyOut(t, rowsThisTile);
+        }
+    }
+
+private:
+    __aicore__ inline uint32_t GetRowsThisTile(uint32_t t) const
+    {
+        uint32_t rowStart = t * tileRows;
+        uint32_t remain = (rowStart < validRows) ? (validRows - rowStart) : 0;
+        return remain > tileRows ? tileRows : remain;
+    }
+
+    __aicore__ inline void CopyIn(uint32_t t, uint32_t rowsThisTile)
+    {
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        uint64_t offset = (uint64_t)t * tileRows * cols;
+        AscendC::DataCopy(xLocal, xGm[offset], (uint32_t)(rowsThisTile * cols));
+        inQueueX.EnQue(xLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t t, uint32_t rowsThisTile)
+    {
+        // 取出输入tile
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+
+        // 中间缓冲：存放exp(x)
+        AscendC::LocalTensor<DTYPE_X> expLocal = calcBufs.Get<DTYPE_X>();
+        // 逐元素 exp
+        AscendC::Exp(expLocal, xLocal, (uint32_t)(rowsThisTile * cols));
+
+        // 对最后一维（列）求和：得到每行的 sum(exp(x))
+        AscendC::LocalTensor<DTYPE_Y> lseLocal = outQueueY.AllocTensor<DTYPE_Y>();
+        // Sum: 按最后一维汇总，参考《Ascend C API Reference》中 Table 1-14 Sum
+        AscendC::Sum(lseLocal, expLocal, rowsThisTile, cols);
+
+        // log(sum(exp(x)))
+        AscendC::Log(lseLocal, lseLocal, rowsThisTile);
+
+        // 两次 LeakyReLU，负斜率 0.01
+        const DTYPE_Y slope = (DTYPE_Y)0.01f;
+        AscendC::LeakyRelu(lseLocal, lseLocal, slope, rowsThisTile);
+        AscendC::LeakyRelu(lseLocal, lseLocal, slope, rowsThisTile);
+
+        // 两次 GELU（使用 FasterGeluV2 高级API，参考文档 5.3.3.3）
+        AscendC::FasterGeluV2(lseLocal, lseLocal, rowsThisTile);
+        AscendC::FasterGeluV2(lseLocal, lseLocal, rowsThisTile);
+
+        // 推出
+        outQueueY.EnQue<DTYPE_Y>(lseLocal);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t t, uint32_t rowsThisTile)
+    {
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        uint64_t offset = (uint64_t)t * tileRows;
+        AscendC::DataCopy(yGm[offset], yLocal, rowsThisTile);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, IN_BUFF_NUM> inQueueX;
+    AscendC::TQue<AscendC::TPosition::VECOUT, OUT_BUFF_NUM> outQueueY;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> calcBufs;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t tileRows;
+
+    uint32_t rowsPerBlock;
+    uint32_t startRow;
+    uint32_t validRows;
+};
+
+extern "C" __global__ __aicore__
+void gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelFused op;
+    op.Init(x, y, tiling_data.rows, tiling_data.cols, tiling_data.tileRows);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_impl_npu(const at::Tensor& x) {
+    // 输入 x: [N, M]，输出 y: [N, 1]
+    auto sizes = x.sizes();
+    TORCH_CHECK(sizes.size() == 2, \\"input must be 2-D\\");
+    at::Tensor result = at::empty({sizes[0], 1}, x.options());
+    EXEC_NPU_CMD(aclnnGemmLogSumExpLeakyReluLeakyReluGeluGeluCustom, x, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom", &gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom", &gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom_impl_npu, "Fused LSE -> LReLU -> LReLU -> GELU -> GELU");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    说明：
+    1) 依然使用PyTorch的Linear完成 Gemm；
+    2) 将 LogSumExp(dim=1, keepdim=True) + LeakyReLU + LeakyReLU + GELU + GELU
+       替换为自定义 AscendC 算子 gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom。
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = torch.nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        x = self.linear(x)  # Gemm: [N, M]
+        # 自定义 AscendC 融合算子：LogSumExp + LeakyReLU + LeakyReLU + GELU + GELU
+        y = custom_ops_lib.gemm_log_sum_exp_leaky_relu_leaky_relu_gelu_gelu_custom(x)
+        return y
+'''

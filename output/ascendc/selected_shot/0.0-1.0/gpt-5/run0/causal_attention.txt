@@ -1,0 +1,313 @@
+project_json_src='''
+[
+    {
+        "op": "CausalAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "attn_probs",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CausalAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, heads);
+  TILING_DATA_FIELD_DEF(uint32_t, seqLen);
+  TILING_DATA_FIELD_DEF(uint32_t, headDim);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CausalAttentionCustom, CausalAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "causal_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CausalAttentionCustomTilingData tiling;
+
+    const auto& attn_shape = context->GetInputShape(0)->GetOriginShape();
+    const auto& v_shape = context->GetInputShape(1)->GetOriginShape();
+
+    uint32_t batch = static_cast<uint32_t>(attn_shape.GetDim(0));
+    uint32_t heads = static_cast<uint32_t>(attn_shape.GetDim(1));
+    uint32_t seqLen = static_cast<uint32_t>(attn_shape.GetDim(2));
+    // attn_probs shape is [B, H, S, S], v shape is [B, H, S, D]
+    uint32_t headDim = static_cast<uint32_t>(v_shape.GetDim(3));
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_batch(batch);
+    tiling.set_heads(heads);
+    tiling.set_seqLen(seqLen);
+    tiling.set_headDim(headDim);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // Output z has the same shape as v: [B, H, S, D]
+    const gert::Shape* v_shape = context->GetInputShape(1);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    *z_shape = *v_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // Output dtype follows v's dtype
+    const auto vDataType = context->GetInputDataType(1);
+    context->SetOutputDataType(0, vDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CausalAttentionCustom : public OpDef {
+public:
+    explicit CausalAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("attn_probs")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("v")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CausalAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+class KernelCausalAttention {
+public:
+    __aicore__ inline KernelCausalAttention() {}
+    __aicore__ inline void Init(GM_ADDR attn, GM_ADDR v, GM_ADDR z,
+                                uint32_t batch, uint32_t heads,
+                                uint32_t seqLen, uint32_t headDim, uint32_t tileNum)
+    {
+        this->batch = batch;
+        this->heads = heads;
+        this->seqLen = seqLen;
+        this->headDim = headDim;
+        this->tileNum = tileNum;
+
+        // Number of queries per block (B * H * S divided across blocks)
+        this->blockQueryCount = (batch * heads * seqLen) / AscendC::GetBlockNum();
+
+        attnGm.SetGlobalBuffer((__gm__ float *)attn + (uint64_t)blockQueryCount * seqLen * AscendC::GetBlockIdx(),
+                               (uint64_t)blockQueryCount * seqLen);
+        vGm.SetGlobalBuffer((__gm__ float *)v + (uint64_t)blockQueryCount * headDim * AscendC::GetBlockIdx(),
+                            (uint64_t)blockQueryCount * headDim);
+        zGm.SetGlobalBuffer((__gm__ float *)z + (uint64_t)blockQueryCount * headDim * AscendC::GetBlockIdx(),
+                            (uint64_t)blockQueryCount * headDim);
+    }
+
+    __aicore__ inline void Process()
+    {
+        // For each query row q in this block:
+        for (uint32_t q = 0; q < blockQueryCount; ++q) {
+            uint32_t groupIndex = q / seqLen;      // index over (B * H)
+            uint32_t rowIndex   = q % seqLen;      // query position i in [0, S)
+
+            uint64_t attnRowBase = (uint64_t)q * seqLen;
+            uint64_t vGroupBase  = (uint64_t)groupIndex * seqLen * headDim;
+            uint64_t zRowBase    = (uint64_t)q * headDim;
+
+            // Accumulator for output z[b,h,i,:]
+            // Initialize output row to 0
+            for (uint32_t d = 0; d < headDim; ++d) {
+                zGm[zRowBase + d] = 0.0f;
+            }
+
+            // z[i,:] = sum_j attn_probs[i,j] * v[j,:]
+            for (uint32_t j = 0; j < seqLen; ++j) {
+                float p = attnGm[attnRowBase + j]; // attn_probs[b,h,i,j]
+                uint64_t vRowBase = vGroupBase + (uint64_t)j * headDim;
+                for (uint32_t d = 0; d < headDim; ++d) {
+                    zGm[zRowBase + d] += p * vGm[vRowBase + d];
+                }
+            }
+        }
+    }
+
+private:
+    AscendC::GlobalTensor<float> attnGm;
+    AscendC::GlobalTensor<float> vGm;
+    AscendC::GlobalTensor<float> zGm;
+
+    uint32_t batch;
+    uint32_t heads;
+    uint32_t seqLen;
+    uint32_t headDim;
+    uint32_t tileNum;
+    uint32_t blockQueryCount;
+};
+
+extern "C" __global__ __aicore__ void causal_attention_custom(GM_ADDR attn_probs, GM_ADDR v, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelCausalAttention op;
+    op.Init(attn_probs, v, z,
+            tiling_data.batch, tiling_data.heads,
+            tiling_data.seqLen, tiling_data.headDim,
+            tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor causal_attention_custom_impl_npu(const at::Tensor& attn_probs, const at::Tensor& v) {
+    // Output shape matches v: [B, H, S, D]
+    at::Tensor result = at::empty_like(v);
+    EXEC_NPU_CMD(aclnnCausalAttentionCustom, attn_probs, v, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("causal_attention_custom", &causal_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("causal_attention_custom", &causal_attention_custom_impl_npu, "Causal attention value aggregation");
+}
+"""
+
+model_src='''
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    """
+    Causal (decoder) self-attention with a custom AscendC kernel for
+    attention value aggregation: z = softmax(scores) @ V
+    """
+    def __init__(self, d_model=256, num_heads=4, max_seq_len=4096):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.num_heads = num_heads
+        self.d_model = d_model
+        self.max_seq_len = max_seq_len
+
+        # Precompute causal mask (True for disallowed positions)
+        mask = torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1).bool()
+        self.register_buffer("causal_mask", mask, persistent=False)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+        Returns:
+            output: (batch, seq_len, d_model)
+        """
+        B, S, D = x.shape
+        H = self.num_heads
+        head_dim = D // H
+
+        # Compute Q, K, V using MultiheadAttention's in-projection parameters
+        # in_proj_weight: (3*D, D), in_proj_bias: (3*D)
+        qkv = F.linear(x, self.mha.in_proj_weight, self.mha.in_proj_bias)  # (B, S, 3*D)
+        q, k, v = qkv.split(D, dim=-1)  # each (B, S, D)
+
+        # Reshape to (B, H, S, head_dim)
+        def reshape_heads(t):
+            return t.view(B, S, H, head_dim).transpose(1, 2).contiguous()
+        q = reshape_heads(q)
+        k = reshape_heads(k)
+        v = reshape_heads(v)
+
+        # Scaled dot-product attention scores: (B, H, S, S)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
+
+        # Causal mask application
+        attn_mask = self.causal_mask[:S, :S]  # (S, S), bool
+        # Expand mask over batch and heads
+        attn_scores = attn_scores.masked_fill(attn_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        # Softmax to probabilities
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+
+        # Custom AscendC kernel: z = attn_probs @ v -> (B, H, S, head_dim)
+        z = custom_ops_lib.causal_attention_custom(attn_probs, v)
+
+        # Merge heads: (B, S, D)
+        z = z.transpose(1, 2).contiguous().view(B, S, D)
+
+        # Output projection
+        out = F.linear(z, self.mha.out_proj.weight, self.mha.out_proj.bias)
+        return out
+'''

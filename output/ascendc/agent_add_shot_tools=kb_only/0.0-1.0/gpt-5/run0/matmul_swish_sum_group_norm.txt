@@ -3,85 +3,38 @@ project_json_src='''
     {
         "op": "MatmulSwishSumGroupNormCustom",
         "language": "cpp",
-        "attr": [
-            {
-                "name": "num_groups",
-                "param_type": "required",
-                "type": "int"
-            }
-        ],
         "input_desc": [
             {
                 "name": "x",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
                 "name": "weight",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
                 "name": "bias_linear",
-                "param_type": "optional",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
             },
             {
-                "name": "bias_add",
+                "name": "extra_bias",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "gn_gamma",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "gn_beta",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ],
         "output_desc": [
             {
                 "name": "y",
                 "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "format": ["ND"],
+                "type": ["float"]
             }
         ]
     }
@@ -90,85 +43,88 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
-
-namespace optiling {
-BEGIN_TILING_DATA_DEF(MatmulSwishSumGroupNormCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, m);
-  TILING_DATA_FIELD_DEF(uint32_t, n);
-  TILING_DATA_FIELD_DEF(uint32_t, k);
-  TILING_DATA_FIELD_DEF(uint32_t, numGroups);
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-END_TILING_DATA_DEF;
-
-REGISTER_TILING_DATA_CLASS(MatmulSwishSumGroupNormCustom, MatmulSwishSumGroupNormCustomTilingData)
-}
 """
 
 host_operator_src="""
-#include "matmul_swish_sum_group_norm_custom_tiling.h"
+#include <cstring>
 #include "register/op_def_registry.h"
+#include "register/tilingdata_base.h"
+
+#include "graph/tiling/tiling_api.h"
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 32;
-const uint32_t TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    MatmulSwishSumGroupNormCustomTilingData tiling;
-
-    // 读取形状
-    // x: [M, K], weight: [N, K] (PyTorch Linear 权重为 [out_features, in_features])
-    auto xShape = context->GetInputShape(0)->GetOriginShape();
-    auto wShape = context->GetInputShape(1)->GetOriginShape();
-
-    if (xShape.GetDimNum() != 2 || wShape.GetDimNum() != 2) {
+    // Shapes
+    const gert::Shape* x_shape = context->GetInputShape(0);      // [B, K]
+    const gert::Shape* w_shape = context->GetInputShape(1);      // [N, K]
+    if (x_shape->GetOriginShape().GetDimNum() != 2 || w_shape->GetOriginShape().GetDimNum() != 2) {
         return ge::GRAPH_FAILED;
     }
-    uint32_t M = static_cast<uint32_t>(xShape.GetDim(0));
-    uint32_t K = static_cast<uint32_t>(xShape.GetDim(1));
-    uint32_t N = static_cast<uint32_t>(wShape.GetDim(0));
+    int64_t B = x_shape->GetOriginShape().GetDim(0);
+    int64_t K = x_shape->GetOriginShape().GetDim(1);
+    int64_t N = w_shape->GetOriginShape().GetDim(0);
+    // Build matmul tiling (multi-core)
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
+    tiling.SetDim(1);
+    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                    matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                    matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                    matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND,
+                       matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetShape(static_cast<int32_t>(B), static_cast<int32_t>(N), static_cast<int32_t>(K));
+    tiling.SetSingleShape(static_cast<int32_t>(B), static_cast<int32_t>(N), static_cast<int32_t>(K));
+    tiling.SetOrgShape(static_cast<int32_t>(B), static_cast<int32_t>(N), static_cast<int32_t>(K));
+    tiling.SetBias(true);
+    tiling.SetBufferSpace(-1, -1, -1);
 
-    // 获取属性 num_groups
-    int64_t groups = 1;
-    auto attr = context->GetAttrs();
-    if (attr != nullptr && attr->HasAttr("num_groups")) {
-        groups = attr->GetAttr<int64_t>("num_groups");
+    optiling::TCubeTiling tilingData;
+    int ret = tiling.GetTiling(tilingData);
+    if (ret != 0) {
+        return ge::GRAPH_FAILED;
     }
 
-    context->SetBlockDim(BLOCK_DIM);
+    int32_t coreNum = tiling.GetCoreNum();
+    context->SetBlockDim(static_cast<uint32_t>(coreNum));
 
-    tiling.set_m(M);
-    tiling.set_n(N);
-    tiling.set_k(K);
-    tiling.set_numGroups(static_cast<uint32_t>(groups));
-    tiling.set_totalLength(M * N);
-    tiling.set_tileNum(TILE_NUM);
+    // Serialize tiling
+    auto raw = context->GetRawTilingData();
+    if (raw->GetCapacity() < sizeof(tilingData)) {
+        return ge::GRAPH_FAILED;
+    }
+    std::memcpy(raw->GetData(), &tilingData, sizeof(tilingData));
+    raw->SetDataSize(sizeof(tilingData));
 
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
-    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    // No workspace required
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
 
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
-}
+
+} // namespace optiling
 
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* xShape = context->GetInputShape(0);   // [M, K]
-    const gert::Shape* wShape = context->GetInputShape(1);   // [N, K]
-    if (xShape->GetDimNum() != 2 || wShape->GetDimNum() != 2) {
+    const gert::Shape* x_shape = context->GetInputShape(0);  // [B, K]
+    const gert::Shape* w_shape = context->GetInputShape(1);  // [N, K]
+    if (x_shape->GetOriginShape().GetDimNum() != 2 || w_shape->GetOriginShape().GetDimNum() != 2) {
         return GRAPH_FAILED;
     }
-    int64_t M = xShape->GetDim(0);
-    int64_t N = wShape->GetDim(0);
-
-    gert::Shape* yShape = context->GetOutputShape(0);
-    yShape->SetDimNum(2);
-    yShape->SetDim(0, M);
-    yShape->SetDim(1, N);
+    int64_t B = x_shape->GetOriginShape().GetDim(0);
+    int64_t N = w_shape->GetOriginShape().GetDim(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    gert::Shape out;
+    out.SetDimNum(2);
+    out.SetDim(0, B);
+    out.SetDim(1, N);
+    *y_shape = out;
     return GRAPH_SUCCESS;
 }
 
@@ -178,51 +134,33 @@ static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
     context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
-}
+} // namespace ge
 
 namespace ops {
 class MatmulSwishSumGroupNormCustom : public OpDef {
 public:
     explicit MatmulSwishSumGroupNormCustom(const char* name) : OpDef(name)
     {
-        this->Attr("num_groups").Int(1);
-
         this->Input("x")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Input("weight")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Input("bias_linear")
-            .ParamType(OPTIONAL)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Input("bias_add")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Input("gn_gamma")
+        this->Input("extra_bias")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Input("gn_beta")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -236,239 +174,154 @@ public:
 };
 
 OP_ADD(MatmulSwishSumGroupNormCustom);
-}
+} // namespace ops
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "matmul_swish_sum_group_norm_custom_tiling_data.h"
+#include "lib/matmul_intf.h"
 
-// 参考：
-// - Ascend C 高阶API Matmul/GroupNorm/Sigmoid/Swish/Add/Mul/DataCopy 等
-//   (Ascend C API Reference: 高阶API Matmul, GroupNorm, Sigmoid, Swish, Add, Mul, DataCopy, TPipe/TQue/GET_TILING_DATA/TILING_KEY_IS)
-// - 本内核完成：Y = GroupNorm( Swish( X @ W^T + bias_linear ) + bias_add )
+using A_T = float;
+using B_T = float;
+using C_T = float;
+using BiasT = float;
 
-using DTYPE = float;
+constexpr int32_t VEC_BUFFER_NUM = 2; // for post-ops streaming
 
-constexpr int32_t BUFFER_NUM = 2;
-
-class KernelMatmulSwishSumGroupNorm {
+class KernelMatmulSwishSum {
 public:
-    __aicore__ inline KernelMatmulSwishSumGroupNorm() {}
+    __aicore__ inline KernelMatmulSwishSum() {}
 
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR b0, GM_ADDR b1,
-                                GM_ADDR gamma, GM_ADDR beta,
-                                GM_ADDR y,
-                                uint32_t m, uint32_t n, uint32_t k,
-                                uint32_t groups, uint32_t tileNum)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR w, GM_ADDR bias_linear, GM_ADDR extra_bias,
+                                GM_ADDR y, GM_ADDR workspace, GM_ADDR tilingGM)
     {
-        this->M = m;
-        this->N = n;
-        this->K = k;
-        this->numGroups = groups;
-        this->tileNum = tileNum;
-
-        xGm.SetGlobalBuffer((__gm__ DTYPE*)x, (uint64_t)m * k);
-        wGm.SetGlobalBuffer((__gm__ DTYPE*)w, (uint64_t)n * k);
-        if (b0 != nullptr) {
-            b0Gm.SetGlobalBuffer((__gm__ DTYPE*)b0, n);
-            hasB0 = true;
-        } else {
-            hasB0 = false;
-        }
-        b1Gm.SetGlobalBuffer((__gm__ DTYPE*)b1, n);
-        gammaGm.SetGlobalBuffer((__gm__ DTYPE*)gamma, n);
-        betaGm.SetGlobalBuffer((__gm__ DTYPE*)beta, n);
-        yGm.SetGlobalBuffer((__gm__ DTYPE*)y, (uint64_t)m * n);
-
-        // 基于输出总长度进行简单切分
-        totalLength = (uint64_t)m * n;
-        blockLength = totalLength / AscendC::GetBlockNum();
-        tileLen = blockLength / tileNum / BUFFER_NUM;
-
-        // 为向量阶段初始化队列
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, tileLen * sizeof(DTYPE));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, tileLen * sizeof(DTYPE));
-    }
-
-    __aicore__ inline void Process()
-    {
-        // 1) 矩阵乘法 Y = X @ W^T (+ bias_linear)
-        // 参考 Ascend C 高阶API: Matmul/Gemm
-        // 简化示例：直接调用高阶Gemm接口（伪代码示意，具体接口以版本为准）
-        // AscendC::Gemm(yGm, xGm, wGm, M, N, K, false, true);
-        // 这里以逐行块化为例，实际请使用 Matmul 高阶API以获得最佳性能
-        MatmulCompute();
-
-        // 2) Swish: y = sigmoid(y) * y
-        // 3) y = y + bias_add
-        // 以上向量操作分块执行
-        int32_t loopCount = tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; ++i) {
-            CopyInY(i);
-            SwishAndBiasAdd(i);
-            CopyOutY(i);
+        // Load TCubeTiling from GM
+        auto tilingGMU32 = reinterpret_cast<__gm__ uint32_t*>(tilingGM);
+        auto tilingLocalU32 = reinterpret_cast<uint32_t*>(&tiling_);
+        for (int i = 0; i < static_cast<int>(sizeof(TCubeTiling) / sizeof(uint32_t)); ++i) {
+            tilingLocalU32[i] = tilingGMU32[i];
         }
 
-        // 4) GroupNorm 按输出通道N维分组
-        // 参考 Ascend C 高阶API: GroupNorm
-        GroupNormCompute();
+        // Global buffers for A, B, C, bias
+        // Set intermediate C to y directly, then do post-ops in-place
+        aGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(x),
+                                 tiling_.singleCoreM * tiling_.singleCoreK);
+        bGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(w),
+                                 tiling_.singleCoreK * tiling_.singleCoreN);
+        cGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(y),
+                                 tiling_.singleCoreM * tiling_.singleCoreN);
+        biasLinearGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(bias_linear),
+                                          tiling_.singleCoreN);
+        extraBiasGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(extra_bias),
+                                         tiling_.singleCoreN);
+
+        // Initialize queue buffers for post-ops
+        postPipe_.InitBuffer(inQueue_,  VEC_BUFFER_NUM, kTileElems_ * sizeof(C_T));
+        postPipe_.InitBuffer(outQueue_, VEC_BUFFER_NUM, kTileElems_ * sizeof(C_T));
+        postPipe_.InitBuffer(biasQueue_,VEC_BUFFER_NUM, kTileElems_ * sizeof(BiasT));
     }
 
-private:
-    __aicore__ inline void MatmulCompute()
+    __aicore__ inline void ComputeMatmul()
     {
-        // 这里给出一个逻辑示意（推荐使用 Matmul 高阶API）
-        // 为简单起见，按行处理（不作为性能最优实现）
-        // y[m, n] = sum_k x[m, k] * w[n, k] (+ b0[n])
+        // Define Matmul types
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL> bType;
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, BiasT> biasType;
 
-        const uint32_t blockIdx = AscendC::GetBlockIdx();
-        uint64_t blockStart = blockIdx * blockLength;
-        uint64_t rowStart = blockStart / N;
-        uint64_t rowsToProcess = blockLength / N;
+        // Matmul config: NORMAL layout, batch-less-than-L1 for safety
+        constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
 
-        for (uint64_t r = 0; r < rowsToProcess; ++r) {
-            uint64_t mIdx = rowStart + r;
-            for (uint32_t nIdx = 0; nIdx < N; ++nIdx) {
-                float acc = 0.f;
-                for (uint32_t kIdx = 0; kIdx < K; ++kIdx) {
-                    acc += xGm.GetValue(mIdx * K + kIdx) * wGm.GetValue(nIdx * K + kIdx);
-                }
-                if (hasB0) {
-                    acc += b0Gm.GetValue(nIdx);
-                }
-                yGm.SetValue(mIdx * N + nIdx, acc);
-            }
-        }
+        matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm;
+        AscendC::TPipe pipe;
+        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
+
+        mm.Init(&tiling_);
+        mm.SetTensorA(aGlobal_, false);  // A not transposed
+        mm.SetTensorB(bGlobal_, true);   // B is transposed layout (weight: [N, K])
+        mm.SetWorkspace(nullptr, 0);
+        mm.SetBias(biasLinearGlobal_);
+
+        // Execute Matmul (write to cGlobal_)
+        // Use IterateAll for full compute under NORMAL layout
+        mm.IterateAll(cGlobal_);
     }
 
-    __aicore__ inline void CopyInY(int32_t progress)
+    __aicore__ inline void PostProcessSwishAndAdd()
     {
-        AscendC::LocalTensor<DTYPE> yLocal = inQueueX.AllocTensor<DTYPE>();
-        AscendC::DataCopy(yLocal, yGm[progress * tileLen], tileLen);
-        inQueueX.EnQue(yLocal);
-    }
+        // After Matmul, cGlobal_ holds [M_sub, N_full] of this core.
+        // Stream by a 1D tile along N dimension per row.
+        const uint32_t singleM = tiling_.singleCoreM;
+        const uint32_t singleN = tiling_.singleCoreN;
+        const float swishBeta = 1.0f;
 
-    __aicore__ inline void SwishAndBiasAdd(int32_t progress)
-    {
-        AscendC::LocalTensor<DTYPE> yLocal = inQueueX.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> zLocal = outQueueY.AllocTensor<DTYPE>();
+        // Process row by row
+        for (uint32_t m = 0; m < singleM; ++m) {
+            uint32_t rowBase = m * singleN;
+            // Tile across N
+            for (uint32_t c = 0; c < singleN; c += kTileElems_) {
+                uint32_t len = AscendC::min(kTileElems_, singleN - c);
 
-        // zLocal = sigmoid(yLocal) * yLocal
-        AscendC::Sigmoid(zLocal, yLocal, tileLen);
-        AscendC::Mul(zLocal, zLocal, yLocal, tileLen);
+                // Copy in Matmul result tile
+                AscendC::LocalTensor<C_T> inLocal  = inQueue_.AllocTensor<C_T>();
+                AscendC::DataCopy(inLocal, cGlobal_[rowBase + c], len);
+                inQueue_.EnQue(inLocal);
 
-        // 加 bias_add（按通道N广播）
-        // 计算该tile的全局起始位置，定位到对应列通道索引
-        uint64_t globalStart = AscendC::GetBlockIdx() * blockLength + progress * tileLen;
-        for (uint32_t i = 0; i < tileLen; ++i) {
-            uint64_t linearIndex = globalStart + i;
-            uint32_t c = linearIndex % N;
-            float val = zLocal.GetValue(i) + b1Gm.GetValue(c);
-            zLocal.SetValue(i, val);
-        }
+                // Swish
+                AscendC::LocalTensor<C_T> inLocal2 = inQueue_.DeQue<C_T>();
+                AscendC::LocalTensor<C_T> outLocal = outQueue_.AllocTensor<C_T>();
+                Swish<C_T>(outLocal, inLocal2, len, swishBeta);
+                inQueue_.FreeTensor(inLocal2);
 
-        outQueueY.EnQue<DTYPE>(zLocal);
-        inQueueX.FreeTensor(yLocal);
-    }
+                // Load extra bias slice (per-channel, broadcast on batch)
+                AscendC::LocalTensor<BiasT> biasLocal = biasQueue_.AllocTensor<BiasT>();
+                AscendC::DataCopy(biasLocal, extraBiasGlobal_[c], len);
+                biasQueue_.EnQue(biasLocal);
+                AscendC::LocalTensor<BiasT> biasLocal2 = biasQueue_.DeQue<BiasT>();
 
-    __aicore__ inline void CopyOutY(int32_t progress)
-    {
-        AscendC::LocalTensor<DTYPE> zLocal = outQueueY.DeQue<DTYPE>();
-        AscendC::DataCopy(yGm[progress * tileLen], zLocal, tileLen);
-        outQueueY.FreeTensor(zLocal);
-    }
+                // z = swish_out + extra_bias
+                AscendC::Add(outLocal, outLocal, biasLocal2, len);
+                biasQueue_.FreeTensor(biasLocal2);
 
-    __aicore__ inline void GroupNormCompute()
-    {
-        // 对每个样本行做 GroupNorm，C=N 通道，分组数为 numGroups
-        // 参考 Ascend C 高阶API: GroupNorm(B, C 分组)
-        // 简化为行循环，组内做均值方差，再仿照 GroupNorm 计算：
-        // y = (y - mean)/sqrt(var + eps) * gamma + beta
-
-        const float eps = 1e-5f;
-        const uint32_t blockIdx = AscendC::GetBlockIdx();
-        uint64_t blockStart = blockIdx * blockLength;
-        uint64_t rowStart = blockStart / N;
-        uint64_t rowsToProcess = blockLength / N;
-
-        uint32_t groupSize = N / numGroups;
-
-        for (uint64_t r = 0; r < rowsToProcess; ++r) {
-            uint64_t mIdx = rowStart + r;
-
-            for (uint32_t g = 0; g < numGroups; ++g) {
-                uint32_t cStart = g * groupSize;
-                // 均值
-                float mean = 0.f;
-                for (uint32_t ci = 0; ci < groupSize; ++ci) {
-                    mean += yGm.GetValue(mIdx * N + cStart + ci);
-                }
-                mean /= (float)groupSize;
-
-                // 方差
-                float var = 0.f;
-                for (uint32_t ci = 0; ci < groupSize; ++ci) {
-                    float v = yGm.GetValue(mIdx * N + cStart + ci) - mean;
-                    var += v * v;
-                }
-                var /= (float)groupSize;
-
-                float rstd = 1.0f / AscendC::Sqrt(var + eps);
-
-                // 归一化 + 仿射
-                for (uint32_t ci = 0; ci < groupSize; ++ci) {
-                    uint32_t c = cStart + ci;
-                    float v = yGm.GetValue(mIdx * N + c);
-                    float yhat = (v - mean) * rstd;
-                    float outv = yhat * gammaGm.GetValue(c) + betaGm.GetValue(c);
-                    yGm.SetValue(mIdx * N + c, outv);
-                }
+                // Write back
+                AscendC::LocalTensor<C_T> outLocal2 = outQueue_.DeQue<C_T>();
+                AscendC::DataCopy(cGlobal_[rowBase + c], outLocal2, len);
+                outQueue_.FreeTensor(outLocal2);
             }
         }
     }
 
 private:
-    AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    // Post-ops tile length (elements)
+    static constexpr uint32_t kTileElems_ = 1024;
 
-    AscendC::GlobalTensor<DTYPE> xGm;
-    AscendC::GlobalTensor<DTYPE> wGm;
-    AscendC::GlobalTensor<DTYPE> b0Gm;
-    AscendC::GlobalTensor<DTYPE> b1Gm;
-    AscendC::GlobalTensor<DTYPE> gammaGm;
-    AscendC::GlobalTensor<DTYPE> betaGm;
-    AscendC::GlobalTensor<DTYPE> yGm;
+    // Tiling
+    TCubeTiling tiling_;
 
-    bool hasB0 = false;
+    // Global tensors
+    AscendC::GlobalTensor<A_T> aGlobal_;
+    AscendC::GlobalTensor<B_T> bGlobal_;
+    AscendC::GlobalTensor<C_T> cGlobal_;
+    AscendC::GlobalTensor<BiasT> biasLinearGlobal_;
+    AscendC::GlobalTensor<BiasT> extraBiasGlobal_;
 
-    uint32_t M;
-    uint32_t N;
-    uint32_t K;
-    uint32_t numGroups;
-
-    uint64_t totalLength;
-    uint64_t blockLength;
-    uint64_t tileLen;
-    uint32_t tileNum;
+    // Vector pipeline for post-ops
+    AscendC::TPipe postPipe_;
+    AscendC::TQue<AscendC::TPosition::VECIN,  VEC_BUFFER_NUM> inQueue_;
+    AscendC::TQue<AscendC::TPosition::VECOUT, VEC_BUFFER_NUM> outQueue_;
+    AscendC::TQue<AscendC::TPosition::VECIN,  VEC_BUFFER_NUM> biasQueue_;
 };
 
-extern "C" __global__ __aicore__ void matmul_swish_sum_group_norm_custom(
-    GM_ADDR x, GM_ADDR weight, GM_ADDR bias_linear, GM_ADDR bias_add,
-    GM_ADDR gn_gamma, GM_ADDR gn_beta, GM_ADDR y,
-    GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void matmul_swish_sum_group_norm_custom(GM_ADDR x, GM_ADDR weight,
+                                                                          GM_ADDR bias_linear, GM_ADDR extra_bias,
+                                                                          GM_ADDR y,
+                                                                          GM_ADDR workspace, GM_ADDR tilingGM)
 {
-    GET_TILING_DATA(tiling_data, tiling);
-    KernelMatmulSwishSumGroupNorm op;
-    op.Init(
-        x, weight, bias_linear, bias_add,
-        gn_gamma, gn_beta, y,
-        tiling_data.m, tiling_data.n, tiling_data.k,
-        tiling_data.numGroups, tiling_data.tileNum
-    );
-    op.Process();
+    set_atomic_none();
+    KernelMatmulSwishSum op;
+    op.Init(x, weight, bias_linear, extra_bias, y, workspace, tilingGM);
+    op.ComputeMatmul();
+    op.PostProcessSwishAndAdd();
 }
 """
 
@@ -478,25 +331,14 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor matmul_swish_sum_group_norm_custom_impl_npu(
-    const at::Tensor& x,
-    const at::Tensor& weight,
-    c10::optional<at::Tensor> bias_linear_opt,
-    const at::Tensor& bias_add,
-    const at::Tensor& gn_gamma,
-    const at::Tensor& gn_beta,
-    int64_t num_groups)
-{
-    at::Tensor bias_linear = bias_linear_opt.has_value() ? *bias_linear_opt : at::Tensor();
-    auto out_sizes = std::vector<int64_t>{x.size(0), weight.size(0)};
-    at::Tensor y = at::empty(out_sizes, x.options());
-
-    if (bias_linear.defined()) {
-        EXEC_NPU_CMD(aclnnMatmulSwishSumGroupNormCustom, x, weight, bias_linear, bias_add, gn_gamma, gn_beta, num_groups, y);
-    } else {
-        // 传空Tensor时，后端按照无linear bias处理
-        EXEC_NPU_CMD(aclnnMatmulSwishSumGroupNormCustom, x, weight, at::Tensor(), bias_add, gn_gamma, gn_beta, num_groups, y);
-    }
+at::Tensor matmul_swish_sum_group_norm_custom_impl_npu(const at::Tensor& x,
+                                                       const at::Tensor& weight,
+                                                       const at::Tensor& bias_linear,
+                                                       const at::Tensor& extra_bias) {
+    auto B = x.size(0);
+    auto N = weight.size(0);
+    at::Tensor y = at::empty({B, N}, x.options());
+    EXEC_NPU_CMD(aclnnMatmulSwishSumGroupNormCustom, x, weight, bias_linear, extra_bias, y);
     return y;
 }
 
@@ -505,7 +347,8 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_swish_sum_group_norm_custom", &matmul_swish_sum_group_norm_custom_impl_npu, "Matmul + Swish + Sum + GroupNorm");
+    m.def("matmul_swish_sum_group_norm_custom", &matmul_swish_sum_group_norm_custom_impl_npu,
+          "fused matmul + swish + sum (extra bias)");
 }
 """
 
@@ -516,24 +359,21 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    使用自定义 AscendC 内核将 Linear(含bias) + Swish + 加法偏置 + GroupNorm 融合为单算子
+    Optimized: fused Matmul + Swish + Sum by custom AscendC kernel,
+    followed by GroupNorm in PyTorch.
     """
     def __init__(self, in_features, out_features, num_groups, bias_shape):
-        super(ModelNew, self).__init__()
+        super().__init__()
         self.matmul = torch.nn.Linear(in_features, out_features)
         self.bias = torch.nn.Parameter(torch.randn(bias_shape))
         self.group_norm = torch.nn.GroupNorm(num_groups, out_features)
 
     def forward(self, x):
-        # 权重: [out_features, in_features]，输入: [batch, in_features]
-        # 自定义算子：y = GroupNorm( Swish( x @ W^T + bias_linear ) + bias_add )
-        return custom_ops_lib.matmul_swish_sum_group_norm_custom(
-            x,
-            self.matmul.weight,
-            self.matmul.bias,
-            self.bias,
-            self.group_norm.weight,
-            self.group_norm.bias,
-            self.group_norm.num_groups
+        # fused: (x @ W^T + bias_linear) -> swish -> + extra_bias
+        y = custom_ops_lib.matmul_swish_sum_group_norm_custom(
+            x, self.matmul.weight, self.matmul.bias, self.bias
         )
+        # GroupNorm stays in PyTorch for stability and simplicity
+        y = self.group_norm(y)
+        return y
 '''

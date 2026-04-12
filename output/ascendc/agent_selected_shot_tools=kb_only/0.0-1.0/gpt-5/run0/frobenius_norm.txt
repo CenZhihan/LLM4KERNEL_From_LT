@@ -1,0 +1,312 @@
+project_json_src='''
+[
+    {
+        "op":"FrobeniusNormCustom",
+        "input_desc":[
+            {
+                "name":"x",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ],
+                "param_type":"required"
+            }
+        ],
+        "output_desc":[
+            {
+                "name":"y",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ],
+                "param_type":"required"
+            }
+        ],
+        "attr":[
+        ]
+    }
+]
+'''
+
+host_tiling_src"""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(FrobeniusNormCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, size);         // Sum API临时空间
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);  // 输入总元素数
+  TILING_DATA_FIELD_DEF(uint32_t, inner);        // 每次归约的对齐后长度
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);      // 需要的tile个数
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(FrobeniusNormCustom, FrobeniusNormCustomTilingData)
+}
+"""
+
+host_operator_src"""
+#include "frobenius_norm_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+
+static inline uint32_t AlignInner(uint32_t n, uint32_t dtypeSize) {
+  // inner = ceil((n * dtypeSize) / 32) * 32 / dtypeSize
+  uint64_t bytes = static_cast<uint64_t>(n) * dtypeSize;
+  uint64_t alignedBytes = (bytes + 32 - 1) / 32 * 32;
+  return static_cast<uint32_t>(alignedBytes / dtypeSize);
+}
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context) {
+  FrobeniusNormCustomTilingData tiling;
+
+  uint32_t totalLength = context->GetInputTensor(0)->GetShapeSize();
+  auto dt = context->GetInputTensor(0)->GetDataType();
+  uint32_t dtypeSize = 4; // 默认float32
+  if (dt == ge::DT_FLOAT16) {
+    dtypeSize = 2;
+  } else {
+    dtypeSize = 4;
+  }
+
+  // 选择一次归约的目标长度（元素数），并进行32字节对齐
+  // 选择一个合理的tile长度以适配UB容量（示例取4096元素）
+  uint32_t targetN = 4096;
+  if (totalLength < targetN) targetN = totalLength;
+  uint32_t inner = AlignInner(targetN, dtypeSize);
+
+  // 计算tile数量
+  uint32_t tileNum = (totalLength + inner - 1) / inner;
+
+  // 获取Sum API所需的临时空间大小（按一次归约的inner长度计算）
+  uint32_t maxValue = 0;
+  uint32_t minValue = 0;
+  AscendC::GetSumMaxMinTmpSize(inner, dtypeSize, false, maxValue, minValue);
+
+  tiling.set_size(minValue);
+  tiling.set_totalLength(totalLength);
+  tiling.set_inner(inner);
+  tiling.set_tileNum(tileNum);
+
+  // 为简单起见，使用单核心进行全局归约与归一化
+  context->SetBlockDim(1);
+
+  tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                      context->GetRawTilingData()->GetCapacity());
+  context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+  context->SetTilingKey(1);
+
+  // 无额外workspace
+  size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+  currentWorkspace[0] = 0;
+
+  return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context) {
+  const gert::Shape* x_shape = context->GetInputShape(0);
+  gert::Shape* y_shape = context->GetOutputShape(0);
+  *y_shape = *x_shape;
+  return GRAPH_SUCCESS;
+}
+} // namespace ge
+
+namespace ops {
+class FrobeniusNormCustom : public OpDef {
+ public:
+  explicit FrobeniusNormCustom(const char* name) : OpDef(name) {
+    this->Input("x")
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_FLOAT})
+        .Format({ge::FORMAT_ND})
+        .UnknownShapeFormat({ge::FORMAT_ND});
+    this->Output("y")
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_FLOAT})
+        .Format({ge::FORMAT_ND})
+        .UnknownShapeFormat({ge::FORMAT_ND});
+
+    this->SetInferShape(ge::InferShape);
+    this->AICore().SetTiling(optiling::TilingFunc);
+    this->AICore().AddConfig("ascend910b");
+  }
+};
+
+OP_ADD(FrobeniusNormCustom);
+} // namespace ops
+"""
+
+kernel_src"""
+#include "kernel_operator.h"
+
+class KernelFrobeniusNorm {
+ public:
+  __aicore__ inline KernelFrobeniusNorm() {}
+
+  __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    totalLength = tiling_data.totalLength;
+    inner = tiling_data.inner;
+    tileNum = tiling_data.tileNum;
+    tmpSize = tiling_data.size;
+
+    xGm.SetGlobalBuffer((__gm__ float*)x, totalLength);
+    yGm.SetGlobalBuffer((__gm__ float*)y, totalLength);
+
+    // 输入tile缓冲
+    pipe.InitBuffer(inQueueX, 1, inner * sizeof(float));
+    // 计算用缓冲（存放平方结果）
+    pipe.InitBuffer(calcQueue, 1, inner * sizeof(float));
+    // Sum结果缓冲（只需要1个float，按框架对齐到ONE_BLK_SIZE）
+    uint32_t sumOutAligned = (sizeof(float) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE;
+    pipe.InitBuffer(outQueueSum, 1, sumOutAligned);
+    // 输出tile缓冲
+    pipe.InitBuffer(outQueueY, 1, inner * sizeof(float));
+    // Sum临时空间
+    pipe.InitBuffer(workQueue, 1, tmpSize);
+  }
+
+  __aicore__ inline void Process() {
+    // 第一遍：累计平方和
+    float acc = 0.0f;
+    for (uint32_t t = 0; t < tileNum; ++t) {
+      uint32_t offset = t * inner;
+      uint32_t remain = (totalLength > offset) ? (totalLength - offset) : 0;
+      uint32_t n = remain >= inner ? inner : remain;
+      if (n == 0) { break; }
+
+      // CopyIn
+      AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+      AscendC::DataCopy(xLocal, xGm[offset], n);
+      inQueueX.EnQue(xLocal);
+
+      // Compute square and partial sum
+      AscendC::LocalTensor<float> xLocalCalc = inQueueX.DeQue<float>();
+      AscendC::LocalTensor<float> squareLocal = calcQueue.AllocTensor<float>();
+      AscendC::Mul(squareLocal, xLocalCalc, xLocalCalc, n);
+
+      AscendC::LocalTensor<uint8_t> workLocal = workQueue.AllocTensor<uint8_t>();
+      AscendC::LocalTensor<float> sumLocal = outQueueSum.AllocTensor<float>();
+
+      // 为对齐的输出空间进行填充初始化
+      uint32_t alignedElems = (sizeof(float) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(float);
+      float zero = 0.0f;
+      AscendC::Duplicate<float>(sumLocal, zero, alignedElems);
+
+      AscendC::Sum<float, -1, false, false>(sumLocal, squareLocal, AscendC::SumParams{1, inner, n});
+
+      acc += sumLocal.GetValue(0);
+
+      // 释放本tile所用资源
+      outQueueSum.FreeTensor(sumLocal);
+      calcQueue.FreeTensor(squareLocal);
+      workQueue.FreeTensor(workLocal);
+      inQueueX.FreeTensor(xLocalCalc);
+    }
+
+    // 计算1/||x||_F
+    // 使用向量算子计算sqrt与倒数，避免未定义的标量库函数
+    float invNorm = 0.0f;
+    {
+      // 将acc放入对齐的LocalTensor
+      AscendC::LocalTensor<float> accLocal = outQueueSum.AllocTensor<float>();
+      uint32_t alignedElems = (sizeof(float) + AscendC::ONE_BLK_SIZE - 1) / AscendC::ONE_BLK_SIZE * AscendC::ONE_BLK_SIZE / sizeof(float);
+      AscendC::Duplicate<float>(accLocal, acc, alignedElems);
+
+      AscendC::Sqrt(accLocal, accLocal, 1);
+
+      AscendC::LocalTensor<float> oneLocal = calcQueue.AllocTensor<float>();
+      AscendC::Duplicate<float>(oneLocal, 1.0f, alignedElems);
+      AscendC::Div(accLocal, oneLocal, accLocal, 1); // accLocal = 1 / sqrt(acc)
+      invNorm = accLocal.GetValue(0);
+
+      calcQueue.FreeTensor(oneLocal);
+      outQueueSum.FreeTensor(accLocal);
+    }
+
+    // 第二遍：输出归一化后的结果 y = x / ||x||_F
+    for (uint32_t t = 0; t < tileNum; ++t) {
+      uint32_t offset = t * inner;
+      uint32_t remain = (totalLength > offset) ? (totalLength - offset) : 0;
+      uint32_t n = remain >= inner ? inner : remain;
+      if (n == 0) { break; }
+
+      AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+      AscendC::DataCopy(xLocal, xGm[offset], n);
+      inQueueX.EnQue(xLocal);
+
+      AscendC::LocalTensor<float> xLocal2 = inQueueX.DeQue<float>();
+      AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
+      AscendC::Muls(yLocal, xLocal2, invNorm, n);
+
+      outQueueY.EnQue(yLocal);
+      inQueueX.FreeTensor(xLocal2);
+
+      AscendC::LocalTensor<float> yLocalOut = outQueueY.DeQue<float>();
+      AscendC::DataCopy(yGm[offset], yLocalOut, n);
+      outQueueY.FreeTensor(yLocalOut);
+    }
+  }
+
+ private:
+  AscendC::TPipe pipe;
+  AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX;
+  AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueSum;
+  AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY;
+  AscendC::TQue<AscendC::QuePosition::VECIN, 1> workQueue;
+  AscendC::TQue<AscendC::QuePosition::VECCALC, 1> calcQueue;
+
+  AscendC::GlobalTensor<float> xGm, yGm;
+
+  uint32_t totalLength = 0;
+  uint32_t inner = 0;
+  uint32_t tileNum = 0;
+  uint32_t tmpSize = 0;
+};
+
+extern "C" __global__ __aicore__ void frobenius_norm_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+  KernelFrobeniusNorm op;
+  op.Init(x, y, tiling);
+  if (TILING_KEY_IS(1)) {
+    op.Process();
+  }
+}
+"""
+
+python_bind_src"""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor frobenius_norm_impl_npu(const at::Tensor& x) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnFrobeniusNormCustom, x, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("frobenius_norm_custom", &frobenius_norm_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("frobenius_norm_custom", &frobenius_norm_impl_npu, "frobenius norm normalization");
+}
+"""
+
+model_src'''
+import torch, torch_npu, custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.frobenius_norm_custom(x)
+'''

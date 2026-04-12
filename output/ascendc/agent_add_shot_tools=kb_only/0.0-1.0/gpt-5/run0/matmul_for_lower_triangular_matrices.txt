@@ -46,9 +46,7 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(MatmulForLowerTriangularMatricesCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, n);
-  // 保存Matmul的tiling信息，供内核侧使用
-  TILING_DATA_FIELD_DEF(TCubeTiling, tiling);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(MatmulForLowerTriangularMatricesCustom, MatmulForLowerTriangularMatricesCustomTilingData)
@@ -58,87 +56,68 @@ REGISTER_TILING_DATA_CLASS(MatmulForLowerTriangularMatricesCustom, MatmulForLowe
 host_operator_src="""
 #include "matmul_for_lower_triangular_matrices_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/platform/platform_ascendc.h"
-#include "tiling/matmul_tiling.h"
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 32;
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-
-    // 获取输入形状，A、B均为(N, N)
-    const auto* in_shape = context->GetInputShape(0);
-    const auto& origin = in_shape->GetOriginShape();
-    if (origin.GetDimNum() != 2) {
+    MatmulForLowerTriangularMatricesCustomTilingData tiling;
+    auto *shapeA = context->GetInputShape(0);
+    if (shapeA == nullptr || shapeA->GetOriginShape().GetDimNum() != 2) {
         return ge::GRAPH_FAILED;
     }
-    uint32_t n = static_cast<uint32_t>(origin.GetDim(0));
-
-    // 使用Matmul多核tiling获取TCubeTiling
-    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
-    tiling.SetDim(-1); // 由tiling自动选择核心数
-    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling.SetBias(false);
-    tiling.SetShape(n, n, n);
-    tiling.SetSingleShape(n, n, n);
-    tiling.SetOrgShape(n, n, n);
-    tiling.SetBufferSpace(-1, -1, -1); // 默认使用全部可用空间
-
-    optiling::TCubeTiling cubeTilingHost;
-    int64_t ret = tiling.GetTiling(cubeTilingHost);
-    if (ret == -1) {
+    uint64_t dim0 = shapeA->GetOriginShape().GetDim(0);
+    uint64_t dim1 = shapeA->GetOriginShape().GetDim(1);
+    if (dim0 != dim1) {
         return ge::GRAPH_FAILED;
     }
+    uint32_t N = static_cast<uint32_t>(dim0);
 
-    // 设置blockDim（核心数）
-    int32_t blockDim = tiling.GetCoreNum();
-    if (blockDim <= 0) {
-        blockDim = 1;
-    }
-    context->SetBlockDim(static_cast<uint32_t>(blockDim));
+    tiling.set_N(N);
+    context->SetBlockDim(BLOCK_DIM);
 
-    // 回填自定义TilingData
-    MatmulForLowerTriangularMatricesCustomTilingData td;
-    td.set_n(n);
-    td.set_tiling(cubeTilingHost);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    // 保存tiling数据到上下文
-    td.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
-    context->GetRawTilingData()->SetDataSize(td.GetDataSize());
-
-    // 无需额外workspace
-    size_t* workspaces = context->GetWorkspaceSizes(1);
-    workspaces[0] = 0;
-
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
-} // namespace optiling
-
+}
 
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* a_shape = context->GetInputShape(0);
-    const gert::Shape* b_shape = context->GetInputShape(1);
-    if (a_shape->GetDimNum() != 2 || b_shape->GetDimNum() != 2) {
+    const gert::Shape* A_shape = context->GetInputShape(0);
+    const gert::Shape* B_shape = context->GetInputShape(1);
+    if (A_shape == nullptr || B_shape == nullptr) {
         return GRAPH_FAILED;
     }
-    // 输出与输入A同形状(N,N)
-    gert::Shape* c_shape = context->GetOutputShape(0);
-    *c_shape = *a_shape;
+    if (A_shape->GetDimNum() != 2 || B_shape->GetDimNum() != 2) {
+        return GRAPH_FAILED;
+    }
+    if (A_shape->GetDim(0) != A_shape->GetDim(1)) {
+        return GRAPH_FAILED;
+    }
+    if (B_shape->GetDim(0) != B_shape->GetDim(1)) {
+        return GRAPH_FAILED;
+    }
+    if (A_shape->GetDim(1) != B_shape->GetDim(0)) {
+        return GRAPH_FAILED;
+    }
+    gert::Shape* C_shape = context->GetOutputShape(0);
+    *C_shape = *A_shape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
     context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
-} // namespace ge
-
+}
 
 namespace ops {
 class MatmulForLowerTriangularMatricesCustom : public OpDef {
@@ -175,46 +154,54 @@ OP_ADD(MatmulForLowerTriangularMatricesCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "matmul_for_lower_triangular_matrices_custom_tiling_data.h"
 
-// 为简化演示，采用标量计算下三角矩阵乘法并写回下三角，严格保证上三角置零。
-// 在需要进一步性能优化时，可结合Matmul对象及GetTiling/REGIST_MATMUL_OBJ进行块级GEMM。
+struct TriTiling {
+    uint32_t N;
+};
 
-using DTYPE_A = float;
-using DTYPE_B = float;
-using DTYPE_C = float;
-
-extern "C" __global__ __aicore__ void matmul_for_lower_triangular_matrices_custom(
-    GM_ADDR a, GM_ADDR b, GM_ADDR c, GM_ADDR workspace, GM_ADDR tiling_gm)
+extern "C" __global__ __aicore__ void matmul_for_lower_triangular_matrices_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, GM_ADDR tiling)
 {
-    GET_TILING_DATA(td, tiling_gm);
-    const uint32_t N = td.n();
-
-    __gm__ DTYPE_A* A = reinterpret_cast<__gm__ DTYPE_A*>(a);
-    __gm__ DTYPE_B* B = reinterpret_cast<__gm__ DTYPE_B*>(b);
-    __gm__ DTYPE_C* C = reinterpret_cast<__gm__ DTYPE_C*>(c);
-
-    // 多核分块：按行划分
-    const uint32_t blockNum = AscendC::GetBlockNum();
-    const uint32_t blockIdx = AscendC::GetBlockIdx();
-    const uint32_t rowsPerBlock = (N + blockNum - 1) / blockNum;
-    const uint32_t rowStart = blockIdx * rowsPerBlock;
-    const uint32_t rowEnd = AscendC::Min(rowStart + rowsPerBlock, N);
-
-    for (uint32_t i = rowStart; i < rowEnd; ++i) {
-        // 上三角部分直接置零
-        for (uint32_t j = i + 1; j < N; ++j) {
-            C[i * N + j] = static_cast<DTYPE_C>(0.0f);
+    // 读取tiling数据
+    TriTiling tri;
+    {
+        auto src = reinterpret_cast<__gm__ uint8_t*>(tiling);
+        auto dst = reinterpret_cast<uint8_t*>(&tri);
+        for (uint32_t i = 0; i < sizeof(TriTiling); ++i) {
+            dst[i] = src[i];
         }
-        // 下三角及对角（j <= i）
-        for (uint32_t j = 0; j <= i && j < N; ++j) {
-            DTYPE_C acc = static_cast<DTYPE_C>(0.0f);
-            // 利用下三角稀疏性，k范围为[j, i]
+    }
+
+    const uint32_t N = tri.N;
+    __gm__ float* Agm = reinterpret_cast<__gm__ float*>(A);
+    __gm__ float* Bgm = reinterpret_cast__gm__ (reinterpret_cast<float*>(B)); // avoid warning
+
+    // 修正上一行的写法（编译时等价）
+    Bgm = reinterpret_cast<__gm__ float*>(B);
+    __gm__ float* Cgm = reinterpret_cast<__gm__ float*>(C);
+
+    const uint32_t blockNum = AscendC::GetBlockNum();
+    const uint32_t blockId  = AscendC::GetBlockIdx();
+
+    // 将行按block划分，简化负载均衡
+    uint32_t rowsPerBlock = (N + blockNum - 1) / blockNum;
+    uint32_t rowStart = blockId * rowsPerBlock;
+    uint32_t rowEnd = rowStart + rowsPerBlock;
+    if (rowEnd > N) rowEnd = N;
+
+    // 对每个分配到的行进行计算：仅计算下三角部分（j <= i），上三角直接置0
+    for (uint32_t i = rowStart; i < rowEnd; ++i) {
+        // 上三角清零
+        for (uint32_t j = i + 1; j < N; ++j) {
+            Cgm[i * N + j] = 0.0f;
+        }
+        // 下三角与对角线：C[i,j] = sum_{k=j..i} A[i,k] * B[k,j] （A、B均为下三角）
+        for (uint32_t j = 0; j <= i; ++j) {
+            float acc = 0.0f;
+            // 利用下三角性质缩小k范围
             for (uint32_t k = j; k <= i; ++k) {
-                acc += static_cast<DTYPE_C>(A[i * N + k]) * static_cast<DTYPE_C>(B[k * N + j]);
+                acc += Agm[i * N + k] * Bgm[k * N + j];
             }
-            C[i * N + j] = acc;
+            Cgm[i * N + j] = acc;
         }
     }
 }
@@ -227,15 +214,8 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor matmul_for_lower_triangular_matrices_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
-    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, \"Inputs must be 2D square matrices\");
-    TORCH_CHECK(A.size(0) == A.size(1) && B.size(0) == B.size(1), \"Inputs must be square\");
-    TORCH_CHECK(A.sizes() == B.sizes(), \"A and B must have the same shape\");
-
-    at::Tensor A_c = A.contiguous();
-    at::Tensor B_c = B.contiguous();
-    at::Tensor C = at::empty_like(A_c);
-
-    EXEC_NPU_CMD(aclnnMatmulForLowerTriangularMatricesCustom, A_c, B_c, C);
+    at::Tensor C = at::empty_like(A);
+    EXEC_NPU_CMD(aclnnMatmulForLowerTriangularMatricesCustom, A, B, C);
     return C;
 }
 
@@ -244,7 +224,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("matmul_for_lower_triangular_matrices_custom", &matmul_for_lower_triangular_matrices_custom_impl_npu, "Lower-triangular Matmul with tril");
+    m.def("matmul_for_lower_triangular_matrices_custom", &matmul_for_lower_triangular_matrices_custom_impl_npu, "Lower-triangular MatMul with tril");
 }
 """
 
@@ -258,6 +238,5 @@ class ModelNew(torch.nn.Module):
         super().__init__()
 
     def forward(self, A, B):
-        # 调用自定义AscendC算子：返回下三角的(A @ B)
         return custom_ops_lib.matmul_for_lower_triangular_matrices_custom(A, B)
 '''

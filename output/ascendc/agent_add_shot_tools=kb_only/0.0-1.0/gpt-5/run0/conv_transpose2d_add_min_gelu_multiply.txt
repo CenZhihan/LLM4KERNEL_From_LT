@@ -13,31 +13,21 @@ project_json_src='''
                 "type": [
                     "float"
                 ]
+            }
+        ],
+        "attr_desc": [
+            {
+                "name": "add_value",
+                "type": "float"
             },
             {
-                "name": "add_full",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "mul_full",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
+                "name": "multiply_value",
+                "type": "float"
             }
         ],
         "output_desc": [
             {
-                "name": "z",
+                "name": "y",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -58,6 +48,8 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(ConvTranspose2dAddMinGeluMultiplyCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(float, addValue);
+  TILING_DATA_FIELD_DEF(float, mulValue);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ConvTranspose2dAddMinGeluMultiplyCustom, ConvTranspose2dAddMinGeluMultiplyCustomTilingData)
@@ -75,14 +67,25 @@ const uint32_t TILE_NUM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     ConvTranspose2dAddMinGeluMultiplyCustomTilingData tiling;
+
+    // 输入x的元素总数
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
 
+    // 从属性中获取标量参数
+    float addV = 0.0f;
+    float mulV = 1.0f;
+    if (context->GetAttrs() != nullptr) {
+        context->GetAttrs()->GetFloat("add_value", addV);
+        context->GetAttrs()->GetFloat("multiply_value", mulV);
+    }
+    tiling.set_addValue(addV);
+    tiling.set_mulValue(mulV);
+
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -93,11 +96,10 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
-    gert::Shape* z_shape = context->GetOutputShape(0);
-    *z_shape = *x_shape;
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -116,24 +118,21 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("add_full")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("mul_full")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("z")
+
+        this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
+        // 注册属性（标量），由Python侧传入
+        this->Attr("add_value").Float(0.0);
+        this->Attr("multiply_value").Float(1.0);
+
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -144,30 +143,25 @@ OP_ADD(ConvTranspose2dAddMinGeluMultiplyCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv_transpose2d_add_min_gelu_multiply_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的Tensor个数
 
-class KernelConvTranspose2dAddMinGeluMultiply {
+class KernelFused {
 public:
-    __aicore__ inline KernelConvTranspose2dAddMinGeluMultiply() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR add_full, GM_ADDR mul_full, GM_ADDR z,
-                                uint32_t totalLength, uint32_t tileNum)
+    __aicore__ inline KernelFused() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, float addValue, float mulValue, uint32_t totalLength, uint32_t tileNum)
     {
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->addValue = addValue;
+        this->mulValue = mulValue;
 
-        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        addGm.SetGlobalBuffer((__gm__ float *)add_full + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        mulGm.SetGlobalBuffer((__gm__ float *)mul_full + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        zGm.SetGlobalBuffer((__gm__ float *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(inQueueAdd, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(inQueueMul, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
     }
 
     __aicore__ inline void Process()
@@ -183,75 +177,54 @@ public:
 private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
-        AscendC::LocalTensor<float> addLocal = inQueueAdd.AllocTensor<float>();
-        AscendC::LocalTensor<float> mulLocal = inQueueMul.AllocTensor<float>();
-
-        AscendC::DataCopy(xLocal,   xGm[progress * this->tileLength],   this->tileLength);
-        AscendC::DataCopy(addLocal, addGm[progress * this->tileLength], this->tileLength);
-        AscendC::DataCopy(mulLocal, mulGm[progress * this->tileLength], this->tileLength);
-
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
-        inQueueAdd.EnQue(addLocal);
-        inQueueMul.EnQue(mulLocal);
     }
 
-    __aicore__ inline void Compute(int32_t)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<float> xLocal   = inQueueX.DeQue<float>();
-        AscendC::LocalTensor<float> addLocal = inQueueAdd.DeQue<float>();
-        AscendC::LocalTensor<float> mulLocal = inQueueMul.DeQue<float>();
-        AscendC::LocalTensor<float> zLocal   = outQueueZ.AllocTensor<float>();
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.AllocTensor<DTYPE_Y>();
 
-        // 1) Add
-        AscendC::Add(zLocal, xLocal, addLocal, this->tileLength);
+        // 逐步执行: y = x + add_value
+        AscendC::Adds(yLocal, xLocal, (DTYPE_X)addValue, this->tileLength);
+        // y = min(y, 0.0)
+        AscendC::Mins(yLocal, yLocal, (DTYPE_Y)0.0f, this->tileLength);
+        // y = GELU(y)
+        AscendC::Gelu(yLocal, yLocal, this->tileLength);
+        // y = y * multiply_value
+        AscendC::Muls(yLocal, yLocal, (DTYPE_Y)mulValue, this->tileLength);
 
-        // 2) Min(x, 0.0) -> ClampMax with scalar 0.0
-        AscendC::ClampMax(zLocal, zLocal, 0.0f, this->tileLength);
-
-        // 3) GELU
-        AscendC::Gelu(zLocal, zLocal, this->tileLength);
-
-        // 4) Multiply
-        AscendC::Mul(zLocal, zLocal, mulLocal, this->tileLength);
-
-        outQueueZ.EnQue<float>(zLocal);
+        outQueueY.EnQue<DTYPE_Y>(yLocal);
         inQueueX.FreeTensor(xLocal);
-        inQueueAdd.FreeTensor(addLocal);
-        inQueueMul.FreeTensor(mulLocal);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<float> zLocal = outQueueZ.DeQue<float>();
-        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
-        outQueueZ.FreeTensor(zLocal);
+        AscendC::LocalTensor<DTYPE_Y> yLocal = outQueueY.DeQue<DTYPE_Y>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX, inQueueAdd, inQueueMul;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
-    AscendC::GlobalTensor<float> xGm;
-    AscendC::GlobalTensor<float> addGm;
-    AscendC::GlobalTensor<float> mulGm;
-    AscendC::GlobalTensor<float> zGm;
-
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
+    float addValue;
+    float mulValue;
 };
 
-extern "C" __global__ __aicore__ void conv_transpose2d_add_min_gelu_multiply_custom(GM_ADDR x,
-                                                                                     GM_ADDR add_full,
-                                                                                     GM_ADDR mul_full,
-                                                                                     GM_ADDR z,
-                                                                                     GM_ADDR workspace,
-                                                                                     GM_ADDR tiling)
+extern "C" __global__ __aicore__ void conv_transpose2d_add_min_gelu_multiply_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
-    GET_TILING_DATA(tiling_data, tiling);
-    KernelConvTranspose2dAddMinGeluMultiply op;
-    op.Init(x, add_full, mul_full, z, tiling_data.totalLength, tiling_data.tileNum);
+    GET_TILING_DATA(tilingData, tiling);
+    KernelFused op;
+    op.Init(x, y, tilingData.addValue, tilingData.mulValue, tilingData.totalLength, tilingData.tileNum);
     op.Process();
 }
 """
@@ -262,11 +235,9 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv_transpose2d_add_min_gelu_multiply_custom_impl_npu(const at::Tensor& x,
-                                                                  const at::Tensor& add_full,
-                                                                  const at::Tensor& mul_full) {
+at::Tensor conv_transpose2d_add_min_gelu_multiply_custom_impl_npu(const at::Tensor& x, double add_value, double multiply_value) {
     at::Tensor result = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnConvTranspose2dAddMinGeluMultiplyCustom, x, add_full, mul_full, result);
+    EXEC_NPU_CMD(aclnnConvTranspose2dAddMinGeluMultiplyCustom, x, static_cast<float>(add_value), static_cast<float>(multiply_value), result);
     return result;
 }
 
@@ -275,9 +246,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv_transpose2d_add_min_gelu_multiply_custom",
-          &conv_transpose2d_add_min_gelu_multiply_custom_impl_npu,
-          "fused: add -> min(.,0) -> gelu -> mul");
+    m.def("conv_transpose2d_add_min_gelu_multiply_custom", &conv_transpose2d_add_min_gelu_multiply_custom_impl_npu, "x -> (x+add) min 0 gelu * mul");
 }
 """
 
@@ -288,8 +257,7 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Keep ConvTranspose2d from PyTorch, fuse the following elementwise chain by a custom AscendC kernel:
-    y = ( (convT(x) + add_value).clamp(max=0) ).gelu() * multiply_value
+    Transposed conv followed by fused (add -> min with 0 -> GELU -> multiply) on NPU.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride, add_value, multiply_value):
         super(ModelNew, self).__init__()
@@ -298,8 +266,7 @@ class ModelNew(torch.nn.Module):
         self.multiply_value = float(multiply_value)
 
     def forward(self, x):
-        y = self.conv_transpose(x)
-        add_full = torch.full_like(y, self.add_value)
-        mul_full = torch.full_like(y, self.multiply_value)
-        return custom_ops_lib.conv_transpose2d_add_min_gelu_multiply_custom(y, add_full, mul_full)
+        x = self.conv_transpose(x)
+        x = custom_ops_lib.conv_transpose2d_add_min_gelu_multiply_custom(x, self.add_value, self.multiply_value)
+        return x
 '''

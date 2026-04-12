@@ -1,0 +1,550 @@
+project_json_src='''
+[
+    {
+        "op": "GemmBiasAddHardtanhMishGroupNormCustom",
+        "language": "cpp",
+        "attr": [
+            {
+                "name": "num_groups",
+                "type": "int"
+            },
+            {
+                "name": "min_val",
+                "type": "float"
+            },
+            {
+                "name": "max_val",
+                "type": "float"
+            }
+        ],
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float16"]
+            },
+            {
+                "name": "weight",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float16"]
+            },
+            {
+                "name": "bias0",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float16"]
+            },
+            {
+                "name": "bias1",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float16"]
+            },
+            {
+                "name": "gamma",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float16"]
+            },
+            {
+                "name": "beta",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float16"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float16"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include \"register/tilingdata_base.h\"
+#include \"lib/matmul_intf.h\"
+
+namespace optiling {
+// 融合算子 Tiling 结构体
+BEGIN_TILING_DATA_DEF(GemmBiasAddHardtanhMishGroupNormCustomTilingData)
+  // 基本维度
+  TILING_DATA_FIELD_DEF(uint32_t, n);      // batch
+  TILING_DATA_FIELD_DEF(uint32_t, c);      // out_features
+  TILING_DATA_FIELD_DEF(uint32_t, k);      // in_features
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  // Hardtanh
+  TILING_DATA_FIELD_DEF(float, minVal);
+  TILING_DATA_FIELD_DEF(float, maxVal);
+  // GroupNorm
+  TILING_DATA_FIELD_DEF(uint32_t, groupNum);
+  // 为 Matmul 与 GroupNorm 传递内部 tiling
+  TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, mmTiling);
+  TILING_DATA_FIELD_DEF_STRUCT(GroupNormTiling, groupNormTilingData);
+END_TILING_DATA_DEF;
+
+// 绑定 tiling 类
+REGISTER_TILING_DATA_CLASS(GemmBiasAddHardtanhMishGroupNormCustom, GemmBiasAddHardtanhMishGroupNormCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include \"gemm_bias_add_hardtanh_mish_group_norm_custom_tiling.h\"
+#include \"register/op_def_registry.h\"
+#include \"graph/utils/type_utils.h\"
+#include \"lib/matmul_intf.h\"
+#include \"platform/platform_ascendc.h\"
+
+using namespace optiling;
+
+namespace {
+// 根据 [N, C, 1, 1] 生成 GroupNorm tiling
+static inline void GenGroupNormTiling(uint32_t N, uint32_t C, uint32_t groupNum,
+                                      optiling::GroupNormTiling &gnTiling) {
+    std::vector<int64_t> shapeVec = {static_cast<int64_t>(N), static_cast<int64_t>(C), 1, 1};
+    ge::Shape srcShape(shapeVec);
+    uint32_t minSize = 0;
+    uint32_t maxSize = 0;
+    // HALF 数据类型大小为2字节
+    AscendC::GetGroupNormMaxMinTmpSize(srcShape, 2, false, groupNum, maxSize, minSize);
+    // 这里选择使用 maxSize，实际可根据 UB 剩余空间做权衡
+    AscendC::GetGroupNormNDTilingInfo(srcShape, maxSize, 2, false, groupNum, gnTiling);
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    GemmBiasAddHardtanhMishGroupNormCustomTilingData tiling;
+
+    // 输入形状：x:[N,K], weight:[C,K], 偏置/gn参数均为 [C]
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+
+    uint32_t N = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t K = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    uint32_t C = static_cast<uint32_t>(w_shape->GetOriginShape().GetDim(0));
+
+    // 读取属性：num_groups / hardtanh min/max
+    uint32_t groupNum = 1;
+    float minVal = -1.0f;
+    float maxVal =  1.0f;
+    if (context->HasAttr(\"num_groups\")) {
+        groupNum = static_cast<uint32_t>(context->GetIntAttr(\"num_groups\"));
+    }
+    if (context->HasAttr(\"min_val\")) {
+        minVal = static_cast<float>(context->GetFloatAttr(\"min_val\"));
+    }
+    if (context->HasAttr(\"max_val\")) {
+        maxVal = static_cast<float>(context->GetFloatAttr(\"max_val\"));
+    }
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_n(N);
+    tiling.set_c(C);
+    tiling.set_k(K);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_minVal(minVal);
+    tiling.set_maxVal(maxVal);
+    tiling.set_groupNum(groupNum);
+
+    // 生成 GroupNorm tiling
+    GroupNormTiling gnTiling;
+    GenGroupNormTiling(N, C, groupNum, gnTiling);
+    tiling.set_groupNormTilingData(gnTiling);
+
+    // 生成 Matmul tiling（示例：使用默认 NORMAL 模板）
+    // 依赖平台信息创建 tiler
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    matmul_tiling::MatmulApiTiling mmTiler(ascendcPlatform);
+    // 设置 A/B/C 类型 (GM, ND, half)
+    mmTiler.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    mmTiler.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    mmTiler.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT16);
+    // 生成 tiling
+    TCubeTiling mmTilingData{};
+    (void)mmTiler.GetTiling(mmTilingData); // 实际环境中应补充形状/策略设置
+    tiling.set_mmTiling(mmTilingData);
+
+    // 保存 tiling
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 工作空间：为 GroupNorm 均值/方差预留 (2*C*4) 足够的空间（按float保存）
+    size_t *workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = static_cast<size_t>(2 * C * sizeof(float));
+
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+
+namespace ge {
+// 形状推理：输出形状 [N, C]
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    int64_t N = x_shape->GetDim(0);
+    int64_t C = w_shape->GetDim(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(2);
+    y_shape->SetDim(0, N);
+    y_shape->SetDim(1, C);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // 统一使用输入 x 的 dtype
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+
+namespace ops {
+// 注册算子定义
+class GemmBiasAddHardtanhMishGroupNormCustom : public OpDef {
+public:
+    explicit GemmBiasAddHardtanhMishGroupNormCustom(const char* name) : OpDef(name)
+    {
+        this->Input(\"x\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"weight\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"bias0\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"bias1\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"gamma\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input(\"beta\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output(\"z\")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        // 属性
+        this->Attr(\"num_groups\").SetInt(1);
+        this->Attr(\"min_val\").SetFloat(-1.0f);
+        this->Attr(\"max_val\").SetFloat(1.0f);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig(\"ascend910b\");
+    }
+};
+
+OP_ADD(GemmBiasAddHardtanhMishGroupNormCustom);
+}
+"""
+
+kernel_src="""
+#include \"kernel_operator.h\"
+#include \"lib/matmul_intf.h\"
+
+using DTYPE_X = half;
+using DTYPE_W = half;
+using DTYPE_Z = half;
+
+constexpr int32_t BUFFER_NUM = 2; // 队列buffer数量
+
+// 行优先后处理（BiasAdd + Hardtanh + Mish）
+class PostAct {
+public:
+    __aicore__ inline PostAct() {}
+    __aicore__ inline void Init(GM_ADDR y, GM_ADDR b0, GM_ADDR b1, uint32_t N, uint32_t C, uint32_t tileNum, float minVal, float maxVal)
+    {
+        this->N = N;
+        this->C = C;
+        this->tileNum = tileNum;
+        this->tilesPerRow = tileNum * BUFFER_NUM;
+        this->tileLen = C / this->tilesPerRow; // 简化：假定可整除
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z*)y, N * C);
+        b0Gm.SetGlobalBuffer((__gm__ DTYPE_Z*)b0, C);
+        b1Gm.SetGlobalBuffer((__gm__ DTYPE_Z*)b1, C);
+
+        pipe.InitBuffer(inQueueY, BUFFER_NUM, this->tileLen * sizeof(DTYPE_Z));
+        pipe.InitBuffer(inQueueB0, BUFFER_NUM, this->tileLen * sizeof(DTYPE_Z));
+        pipe.InitBuffer(inQueueB1, BUFFER_NUM, this->tileLen * sizeof(DTYPE_Z));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLen * sizeof(DTYPE_Z));
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileLen * sizeof(DTYPE_Z));
+
+        this->minVal = static_cast<DTYPE_Z>(minVal);
+        this->maxVal = static_cast<DTYPE_Z>(maxVal);
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = N * tilesPerRow;
+        for (int32_t i = 0; i < loopCount; ++i) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        int32_t row = progress / tilesPerRow;
+        int32_t tileIdxInRow = progress % tilesPerRow;
+        int32_t colOffset = tileIdxInRow * tileLen;
+
+        AscendC::LocalTensor<DTYPE_Z> yLocal = inQueueY.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> b0Local = inQueueB0.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> b1Local = inQueueB1.AllocTensor<DTYPE_Z>();
+
+        AscendC::DataCopy(yLocal, yGm[row * C + colOffset], tileLen);
+        AscendC::DataCopy(b0Local, b0Gm[colOffset], tileLen);
+        AscendC::DataCopy(b1Local, b1Gm[colOffset], tileLen);
+
+        inQueueY.EnQue(yLocal);
+        inQueueB0.EnQue(b0Local);
+        inQueueB1.EnQue(b1Local);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE_Z> yLocal = inQueueY.DeQue<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> b0Local = inQueueB0.DeQue<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> b1Local = inQueueB1.DeQue<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal  = outQueueZ.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> tLocal  = tmpQueue.AllocTensor<DTYPE_Z>();
+
+        // z = y + bias0
+        AscendC::Add(zLocal, yLocal, b0Local, tileLen);
+        // z = z + bias1
+        AscendC::Add(zLocal, zLocal, b1Local, tileLen);
+
+        // Hardtanh: z = min(max(z, minVal), maxVal)
+        AscendC::Maxs(zLocal, zLocal, minVal, tileLen);
+        AscendC::Mins(zLocal, zLocal, maxVal, tileLen);
+
+        // Mish: z = z * tanh(ln(1 + exp(z)))
+        // t = exp(z)
+        AscendC::Exp(tLocal, zLocal, tileLen);
+        // t = t + 1
+        AscendC::Adds(tLocal, tLocal, static_cast<DTYPE_Z>(1.0f), tileLen);
+        // t = ln(t)
+        AscendC::Ln(tLocal, tLocal, tileLen);
+        // t = tanh(t)
+        AscendC::Tanh(tLocal, tLocal, tileLen);
+        // z = z * t
+        AscendC::Mul(zLocal, zLocal, tLocal, tileLen);
+
+        outQueueZ.EnQue(zLocal);
+        inQueueY.FreeTensor(yLocal);
+        inQueueB0.FreeTensor(b0Local);
+        inQueueB1.FreeTensor(b1Local);
+        tmpQueue.FreeTensor(tLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        int32_t row = progress / tilesPerRow;
+        int32_t tileIdxInRow = progress % tilesPerRow;
+        int32_t colOffset = tileIdxInRow * tileLen;
+
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(yGm[row * C + colOffset], zLocal, tileLen);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueY, inQueueB0, inQueueB1;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> tmpQueue;
+
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+    AscendC::GlobalTensor<DTYPE_Z> b0Gm;
+    AscendC::GlobalTensor<DTYPE_Z> b1Gm;
+
+    uint32_t N;
+    uint32_t C;
+    uint32_t tileNum;
+    uint32_t tilesPerRow;
+    uint32_t tileLen;
+    DTYPE_Z minVal;
+    DTYPE_Z maxVal;
+};
+
+extern \"C\" __global__ __aicore__ void gemm_bias_add_hardtanh_mish_group_norm_custom(
+    GM_ADDR x, GM_ADDR weight, GM_ADDR bias0, GM_ADDR bias1, GM_ADDR gamma, GM_ADDR beta,
+    GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+
+    // 读取维度
+    const uint32_t N = tilingData.n;
+    const uint32_t C = tilingData.c;
+    const uint32_t K = tilingData.k;
+
+    // 中间结果 y (与输出 z 同型)，直接用 z 作为最终输出，用 workspace 保存mean/var
+    AscendC::GlobalTensor<DTYPE_X> aGM;
+    AscendC::GlobalTensor<DTYPE_W> bGM;
+    AscendC::GlobalTensor<DTYPE_Z> cGM;
+    AscendC::GlobalTensor<DTYPE_Z> bias0GM;
+    AscendC::GlobalTensor<DTYPE_Z> bias1GM;
+    AscendC::GlobalTensor<DTYPE_Z> gammaGM;
+    AscendC::GlobalTensor<DTYPE_Z> betaGM;
+
+    aGM.SetGlobalBuffer((__gm__ DTYPE_X*)x, N * K);
+    // weight:[C,K]，右矩阵；在Matmul中通过转置标志进行处理
+    bGM.SetGlobalBuffer((__gm__ DTYPE_W*)weight, C * K);
+    cGM.SetGlobalBuffer((__gm__ DTYPE_Z*)z, N * C);
+
+    bias0GM.SetGlobalBuffer((__gm__ DTYPE_Z*)bias0, C);
+    bias1GM.SetGlobalBuffer((__gm__ DTYPE_Z*)bias1, C);
+    gammaGM.SetGlobalBuffer((__gm__ DTYPE_Z*)gamma, C);
+    betaGM.SetGlobalBuffer((__gm__ DTYPE_Z*)beta, C);
+
+    // 1) GEMM: [N,K] x [C,K]^T => [N,C]
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, DTYPE_X, false, LayoutMode::NORMAL> aType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, DTYPE_W, true,  LayoutMode::NORMAL> bType; // B转置
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, DTYPE_Z, false, LayoutMode::NORMAL> cType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, DTYPE_Z> biasType;
+
+    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm;
+    TPipe pipe;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
+    // 使用来自 host 的 tiling
+    TCubeTiling mmTiling = tilingData.mmTiling;
+    mm.Init(&mmTiling);
+    mm.SetTensorA(aGM, 0);  // A 不转置
+    mm.SetTensorB(bGM, 1);  // B 逻辑上视为转置
+    mm.SetWorkspace(workspace, 0);
+    mm.IterateAll(cGM);     // 单批次全量
+
+    // 2) 后处理：BiasAdd + Hardtanh + Mish
+    PostAct post;
+    post.Init(z, bias0, bias1, N, C, tilingData.tileNum, tilingData.minVal, tilingData.maxVal);
+    post.Process();
+
+    // 3) GroupNorm：[N,C,1,1] 上做分组归一化
+    // 使用 workspace 作为 mean/var：mean在前，var在后
+    __gm__ char* ws = (__gm__ char*)workspace;
+    GM_ADDR outMeanGM = (GM_ADDR)(ws);
+    GM_ADDR outVarGM  = (GM_ADDR)(ws + C * sizeof(float));
+
+    KernelGroupNorm<DTYPE_Z, false> gnOp;
+    gnOp.Init(z, gamma, beta, z, outMeanGM, outVarGM, tilingData.groupNormTilingData);
+    gnOp.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include \"pytorch_npu_helper.hpp\"
+#include <torch/extension.h>
+
+// x:[N,K], weight:[C,K], bias0:[C], bias1:[C], gamma:[C], beta:[C]
+at::Tensor gemm_bias_add_hardtanh_mish_group_norm_custom_impl_npu(const at::Tensor& x,
+                                                                  const at::Tensor& weight,
+                                                                  const at::Tensor& bias0,
+                                                                  const at::Tensor& bias1,
+                                                                  const at::Tensor& gamma,
+                                                                  const at::Tensor& beta,
+                                                                  int64_t num_groups,
+                                                                  double min_val,
+                                                                  double max_val) {
+    TORCH_CHECK(x.dtype() == at::kHalf, \"x must be float16\");
+    TORCH_CHECK(weight.dtype() == at::kHalf, \"weight must be float16\");
+    TORCH_CHECK(bias0.dtype() == at::kHalf && bias1.dtype() == at::kHalf, \"bias must be float16\");
+    TORCH_CHECK(gamma.dtype() == at::kHalf && beta.dtype() == at::kHalf, \"gamma/beta must be float16\");
+
+    // 输出 [N, C]
+    auto C = weight.size(0);
+    std::vector<int64_t> out_sizes = {x.size(0), C};
+    at::Tensor result = at::empty(out_sizes, x.options());
+
+    // 调用 NPU 自定义核
+    EXEC_NPU_CMD(aclnnGemmBiasAddHardtanhMishGroupNormCustom, x, weight, bias0, bias1, gamma, beta,
+                 result, num_groups, static_cast<float>(min_val), static_cast<float>(max_val));
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"gemm_bias_add_hardtanh_mish_group_norm_custom\", &gemm_bias_add_hardtanh_mish_group_norm_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"gemm_bias_add_hardtanh_mish_group_norm_custom\", &gemm_bias_add_hardtanh_mish_group_norm_custom_impl_npu,
+          \"GEMM + BiasAdd + Hardtanh + Mish + GroupNorm (fused)\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, in_features, out_features, bias_shape, num_groups):
+        super().__init__()
+        # 仍使用 PyTorch Linear 参数容器，但权重/偏置将作为输入传给自定义核
+        self.gemm = torch.nn.Linear(in_features, out_features, bias=True)
+        # 额外 Bias
+        self.bias = torch.nn.Parameter(torch.randn(bias_shape))
+        # GroupNorm 参数
+        self.groupnorm = torch.nn.GroupNorm(num_groups=num_groups, num_channels=out_features)
+        # Hardtanh阈值
+        self.min_val = -1.0
+        self.max_val = 1.0
+
+        # 初始化为 half 以匹配核实现
+        self.gemm.to(dtype=torch.float16)
+        with torch.no_grad():
+            self.bias.data = self.bias.data.to(dtype=torch.float16)
+            self.groupnorm.weight.data = self.groupnorm.weight.data.to(dtype=torch.float16)
+            self.groupnorm.bias.data = self.groupnorm.bias.data.to(dtype=torch.float16)
+
+    def forward(self, x):
+        # 自定义核输入均为 float16
+        x = x.to(dtype=torch.float16)
+        w = self.gemm.weight
+        b0 = self.gemm.bias
+        b1 = self.bias
+        gamma = self.groupnorm.weight
+        beta = self.groupnorm.bias
+        g = int(self.groupnorm.num_groups)
+        return custom_ops_lib.gemm_bias_add_hardtanh_mish_group_norm_custom(
+            x, w, b0, b1, gamma, beta, g, float(self.min_val), float(self.max_val)
+        )
+'''

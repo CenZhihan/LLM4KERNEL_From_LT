@@ -3,19 +3,29 @@ project_json_src='''
     {
         "op": "GemmMultiplyLeakyreluCustom",
         "language": "cpp",
-        "attr": [
-            {
-                "name": "multiplier",
-                "type": "float"
-            },
-            {
-                "name": "negative_slope",
-                "type": "float"
-            }
-        ],
         "input_desc": [
             {
                 "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "multiplier",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "negative_slope",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -48,8 +58,6 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(GemmMultiplyLeakyreluCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, totalLength);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
-  TILING_DATA_FIELD_DEF(float, multiplier);
-  TILING_DATA_FIELD_DEF(float, negativeSlope);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(GemmMultiplyLeakyreluCustom, GemmMultiplyLeakyreluCustomTilingData)
@@ -67,25 +75,13 @@ const uint32_t TILE_NUM = 8;
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     GemmMultiplyLeakyreluCustomTilingData tiling;
-
-    // 输入x的元素总数
+    // Input 0 is the post-GEMM tensor to be processed (B, N)
     uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
-
-    // 读取属性
-    float multiplier = 1.0f;
-    float negativeSlope = 0.0f;
-    (void)context->GetAttr("multiplier", multiplier);
-    (void)context->GetAttr("negative_slope", negativeSlope);
-
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-    tiling.set_multiplier(multiplier);
-    tiling.set_negativeSlope(negativeSlope);
-
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -95,9 +91,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    gert::Shape* out_shape = context->GetOutputShape(0);
-    *out_shape = *in_shape;
+    // y has the same shape as x
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
 
@@ -119,18 +116,26 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
+        this->Input("multiplier")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("negative_slope")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
         this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        this->Attr("multiplier").Float(1.0);
-        this->Attr("negative_slope").Float(0.0);
-
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-        this->AICore().SetTiling(optiling::TilingFunc);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
@@ -141,39 +146,35 @@ OP_ADD(GemmMultiplyLeakyreluCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "gemm_multiply_leakyrelu_custom_tiling_data.h"
 
-// 数据类型设定
-using DTYPE = float;
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
-constexpr int32_t BUFFER_NUM = 2; // 每个队列的张量数量
-
-class KernelMulLeakyRelu {
+class KernelGemmMulLeakyRelu {
 public:
-    __aicore__ inline KernelMulLeakyRelu() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
-                                uint32_t totalLength, uint32_t tileNum,
-                                float multiplier, float negativeSlope)
+    __aicore__ inline KernelGemmMulLeakyRelu() : multiplier(1.0f), negSlope(0.1f), scalarLoaded(false) {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR multiplierGm, GM_ADDR negSlopeGm, GM_ADDR y,
+                                uint32_t totalLength, uint32_t tileNum)
     {
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
-        this->multiplier = multiplier;
-        this->negativeSlope = negativeSlope;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        mulGm.SetGlobalBuffer((__gm__ float *)multiplierGm, 1);
+        slopeGm.SetGlobalBuffer((__gm__ float *)negSlopeGm, 1);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE));
-        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(scalarQueue, 1, 2 * sizeof(float));
+        LoadScalars();
     }
 
     __aicore__ inline void Process()
     {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; ++i) {
+        for (int32_t i = 0; i < loopCount; i++) {
             CopyIn(i);
             Compute(i);
             CopyOut(i);
@@ -181,59 +182,76 @@ public:
     }
 
 private:
+    __aicore__ inline void LoadScalars()
+    {
+        if (!scalarLoaded) {
+            AscendC::LocalTensor<float> tmp = scalarQueue.AllocTensor<float>();
+            // load multiplier
+            AscendC::DataCopy(tmp, mulGm, 1);
+            multiplier = tmp.GetValue(0);
+            // load negative slope
+            AscendC::DataCopy(tmp, slopeGm, 1);
+            negSlope = tmp.GetValue(0);
+            scalarQueue.FreeTensor(tmp);
+            scalarLoaded = true;
+        }
+    }
+
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
     }
 
     __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> tmpLocal = tmpQueue.AllocTensor<DTYPE>();
-        AscendC::LocalTensor<DTYPE> yLocal = outQueueY.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
 
-        // 先进行标量乘法: tmp = x * multiplier
-        AscendC::Muls(tmpLocal, xLocal, (DTYPE)multiplier, this->tileLength);
+        // scale by multiplier then apply LeakyReLU
+        AscendC::LocalTensor<float> tmpLocal = outQueueY.AllocTensor<float>();
+        AscendC::Muls(tmpLocal, xLocal, multiplier, this->tileLength);
+        AscendC::LeakyRelu(yLocal, tmpLocal, negSlope, this->tileLength);
 
-        // 再进行LeakyReLU: y = LeakyRelu(tmp, negativeSlope)
-        AscendC::LeakyRelu(yLocal, tmpLocal, (DTYPE)negativeSlope, this->tileLength);
-
-        outQueueY.EnQue<DTYPE>(yLocal);
-        tmpQueue.FreeTensor(tmpLocal);
+        outQueueY.EnQue<float>(yLocal);
+        outQueueY.FreeTensor(tmpLocal);
         inQueueX.FreeTensor(xLocal);
     }
 
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE> yLocal = outQueueY.DeQue<DTYPE>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
         AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
         outQueueY.FreeTensor(yLocal);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN,  BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> scalarQueue;
 
-    AscendC::GlobalTensor<DTYPE> xGm;
-    AscendC::GlobalTensor<DTYPE> yGm;
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> yGm;
+    AscendC::GlobalTensor<float> mulGm;
+    AscendC::GlobalTensor<float> slopeGm;
 
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
+
     float multiplier;
-    float negativeSlope;
+    float negSlope;
+    bool scalarLoaded;
 };
 
-extern "C" __global__ __aicore__ void gemm_multiply_leakyrelu_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+extern "C" __global__ __aicore__ void gemm_multiply_leakyrelu_custom(GM_ADDR x, GM_ADDR multiplier,
+                                                                      GM_ADDR negative_slope, GM_ADDR y,
+                                                                      GM_ADDR workspace, GM_ADDR tiling) {
     GET_TILING_DATA(tiling_data, tiling);
-    KernelMulLeakyRelu op;
-    op.Init(x, y,
-            tiling_data.totalLength, tiling_data.tileNum,
-            tiling_data.multiplier, tiling_data.negativeSlope);
+    KernelGemmMulLeakyRelu op;
+    op.Init(x, multiplier, negative_slope, y, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -244,9 +262,11 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor gemm_multiply_leakyrelu_custom_impl_npu(const at::Tensor& x, double multiplier, double negative_slope) {
+at::Tensor gemm_multiply_leakyrelu_custom_impl_npu(const at::Tensor& x,
+                                                   const at::Tensor& multiplier,
+                                                   const at::Tensor& negative_slope) {
     at::Tensor result = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnGemmMultiplyLeakyreluCustom, x, static_cast<float>(multiplier), static_cast<float>(negative_slope), result);
+    EXEC_NPU_CMD(aclnnGemmMultiplyLeakyreluCustom, x, multiplier, negative_slope, result);
     return result;
 }
 
@@ -255,7 +275,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("gemm_multiply_leakyrelu_custom", &gemm_multiply_leakyrelu_custom_impl_npu, "fused multiply + leakyrelu on GEMM output");
+    m.def("gemm_multiply_leakyrelu_custom", &gemm_multiply_leakyrelu_custom_impl_npu, "scale + LeakyReLU");
 }
 """
 
@@ -266,18 +286,17 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Replace PyTorch multiply + LeakyReLU with custom AscendC fused kernel.
-    GEMM remains as nn.Linear to produce input for the fused kernel.
+    Optimized model: keep GEMM with nn.Linear, fuse subsequent multiply and LeakyReLU into one AscendC kernel.
     """
     def __init__(self, in_features, out_features, multiplier, negative_slope):
         super(ModelNew, self).__init__()
         self.gemm = torch.nn.Linear(in_features, out_features)
-        self.multiplier = float(multiplier)
-        self.negative_slope = float(negative_slope)
+        self.register_buffer("_multiplier_buf", torch.tensor([multiplier], dtype=torch.float32))
+        self.register_buffer("_neg_slope_buf", torch.tensor([negative_slope], dtype=torch.float32))
 
     def forward(self, x):
-        x = self.gemm(x)  # GEMM
-        # Fused: x * multiplier + LeakyReLU
-        x = custom_ops_lib.gemm_multiply_leakyrelu_custom(x, self.multiplier, self.negative_slope)
-        return x
+        x = self.gemm(x)
+        # fused: y = LeakyReLU(x * multiplier, negative_slope)
+        y = custom_ops_lib.gemm_multiply_leakyrelu_custom(x, self._multiplier_buf, self._neg_slope_buf)
+        return y
 '''

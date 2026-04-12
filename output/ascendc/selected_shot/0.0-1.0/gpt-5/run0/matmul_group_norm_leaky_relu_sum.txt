@@ -1,0 +1,398 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulGroupNormLeakyReluSumCustom",
+        "language": "cpp",
+        "attr": [
+            {
+                "name": "num_groups",
+                "type": "int"
+            },
+            {
+                "name": "eps",
+                "type": "float"
+            },
+            {
+                "name": "negative_slope",
+                "type": "float"
+            }
+        ],
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "weight",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "bias",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "gn_weight",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "gn_bias",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulGroupNormLeakyReluSumCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, inSize);
+  TILING_DATA_FIELD_DEF(uint32_t, outSize);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF(uint32_t, numGroups);
+  TILING_DATA_FIELD_DEF(float, eps);
+  TILING_DATA_FIELD_DEF(float, negativeSlope);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulGroupNormLeakyReluSumCustom, MatmulGroupNormLeakyReluSumCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "matmul_group_norm_leaky_relu_sum_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline uint32_t GetDim(const gert::Shape* s, size_t idx) {
+    if (s == nullptr) return 0;
+    auto shp = s->GetOriginShape();
+    if (idx >= shp.GetDimNum()) return 0;
+    return static_cast<uint32_t>(shp.GetDim(idx));
+}
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MatmulGroupNormLeakyReluSumCustomTilingData tiling;
+
+    const auto* x_shape = context->GetInputShape(0);       // [N, in]
+    const auto* w_shape = context->GetInputShape(1);       // [out, in]
+
+    uint32_t N   = GetDim(x_shape, 0);
+    uint32_t Kin = GetDim(x_shape, 1);
+    uint32_t Mout= GetDim(w_shape, 0);
+
+    // attributes
+    int64_t num_groups = 1;
+    double eps = 1e-5;
+    double neg_slope = 0.01;
+    if (context->HasAttr("num_groups")) {
+        num_groups = context->GetAttr("num_groups")->GetInt();
+    }
+    if (context->HasAttr("eps")) {
+        eps = context->GetAttr("eps")->GetFloat();
+    }
+    if (context->HasAttr("negative_slope")) {
+        neg_slope = context->GetAttr("negative_slope")->GetFloat();
+    }
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_batch(N);
+    tiling.set_inSize(Kin);
+    tiling.set_outSize(Mout);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.set_numGroups(static_cast<uint32_t>(num_groups));
+    tiling.set_eps(static_cast<float>(eps));
+    tiling.set_negativeSlope(static_cast<float>(neg_slope));
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0); // [N, in]
+    const gert::Shape* w_shape = context->GetInputShape(1); // [out, in]
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    gert::Shape out;
+    out.Resize(2);
+    out.SetDim(0, w_shape->GetOriginShape().GetDim(0)); // out features
+    out.SetDim(1, x_shape->GetOriginShape().GetDim(0)); // batch as 2nd? Keep [out, N]? We ensure [N, out]
+    // fix order to [N, out]
+    out.SetDim(0, x_shape->GetOriginShape().GetDim(0)); // N
+    out.SetDim(1, w_shape->GetOriginShape().GetDim(0)); // out
+    *y_shape = out;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MatmulGroupNormLeakyReluSumCustom : public OpDef {
+public:
+    explicit MatmulGroupNormLeakyReluSumCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("gn_weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("gn_bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("num_groups").Int(1);
+        this->Attr("eps").Float(1e-5f);
+        this->Attr("negative_slope").Float(0.01f);
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulGroupNormLeakyReluSumCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+
+extern \"C\" __global__ __aicore__ void matmul_group_norm_leaky_relu_sum_custom(
+    GM_ADDR x,           // [N, K]
+    GM_ADDR weight,      // [M, K] (Linear weight)
+    GM_ADDR bias,        // [M]
+    GM_ADDR gn_weight,   // [M]
+    GM_ADDR gn_bias,     // [M]
+    GM_ADDR y,           // [N, M]
+    GM_ADDR workspace,
+    GM_ADDR tiling)
+{
+    GET_TILING_DATA(t, tiling);
+
+    const uint32_t N = t.batch;
+    const uint32_t K = t.inSize;
+    const uint32_t M = t.outSize;
+    const uint32_t groups = t.numGroups > 0 ? t.numGroups : 1;
+    const uint32_t groupSize = M / groups;
+    const float eps = t.eps;
+    const float negSlope = t.negativeSlope;
+
+    __gm__ DTYPE* xGm = reinterpret_cast<__gm__ DTYPE*>(x);
+    __gm__ DTYPE* wGm = reinterpret_cast<__gm__ DTYPE*>(weight);
+    __gm__ DTYPE* bGm = reinterpret_cast<__gm__ DTYPE*>(bias);
+    __gm__ DTYPE* gwGm = reinterpret_cast<__gm__ DTYPE*>(gn_weight);
+    __gm__ DTYPE* gbGm = reinterpret_cast<__gm__ DTYPE*>(gn_bias);
+    __gm__ DTYPE* yGm = reinterpret_cast<__gm__ DTYPE*>(y);
+
+    // Simple parallel split across blocks by rows (N)
+    const uint32_t blockNum = AscendC::GetBlockNum();
+    const uint32_t blockIdx = AscendC::GetBlockIdx();
+    uint32_t rowsPerBlock = (N + blockNum - 1) / blockNum;
+    uint32_t rowStart = blockIdx * rowsPerBlock;
+    uint32_t rowEnd = AscendC::Min(rowStart + rowsPerBlock, N);
+
+    // Allocate small local buffers per row processing
+    for (uint32_t n = rowStart; n < rowEnd; ++n) {
+        // 1) GEMM: y[n, :] = x[n, :] @ W^T + b
+        // Compute into L1 via vector add/mul in a naive loop
+        // We'll compute output vector yrow[m]
+        // To avoid large local memory, compute in chunks along M dimension
+        const uint32_t tileM = 256; // chunk of output features
+        for (uint32_t mBase = 0; mBase < M; mBase += tileM) {
+            uint32_t mLen = AscendC::Min(tileM, M - mBase);
+
+            // Initialize accumulation buffer
+            // Using software loop with GM reads
+            for (uint32_t m = 0; m < mLen; ++m) {
+                DTYPE acc = 0.f;
+                // Dot product over K
+                for (uint32_t k = 0; k < K; ++k) {
+                    DTYPE xv = xGm[n * K + k];
+                    DTYPE wv = wGm[(mBase + m) * K + k];
+                    acc += xv * wv;
+                }
+                // add bias
+                acc += bGm[mBase + m];
+                // store temporary to yGm (we will normalize in-place)
+                yGm[n * M + (mBase + m)] = acc;
+            }
+        }
+
+        // 2) GroupNorm over channel dimension M for this row n
+        // For each group, compute mean and variance, then normalize
+        for (uint32_t g = 0; g < groups; ++g) {
+            uint32_t cStart = g * groupSize;
+            uint32_t cEnd = cStart + groupSize;
+
+            // mean
+            DTYPE mean = 0.f;
+            for (uint32_t c = cStart; c < cEnd; ++c) {
+                mean += yGm[n * M + c];
+            }
+            mean /= static_cast<DTYPE>(groupSize);
+
+            // variance
+            DTYPE var = 0.f;
+            for (uint32_t c = cStart; c < cEnd; ++c) {
+                DTYPE v = yGm[n * M + c] - mean;
+                var += v * v;
+            }
+            var /= static_cast<DTYPE>(groupSize);
+            DTYPE invStd = 1.0f / AscendC::Sqrt(var + static_cast<DTYPE>(eps));
+
+            // normalize, affine, leaky relu, and sum with itself (x + x)
+            for (uint32_t c = cStart; c < cEnd; ++c) {
+                DTYPE v = yGm[n * M + c];
+                DTYPE norm = (v - mean) * invStd;
+                DTYPE affine = norm * gwGm[c] + gbGm[c];
+                // leaky relu
+                DTYPE act = affine >= 0.f ? affine : affine * static_cast<DTYPE>(negSlope);
+                // final sum x + x
+                yGm[n * M + c] = act + act;
+            }
+        }
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_group_norm_leaky_relu_sum_custom_impl_npu(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& bias,
+    const at::Tensor& gn_weight,
+    const at::Tensor& gn_bias,
+    int64_t num_groups,
+    double eps,
+    double negative_slope) {
+
+    TORCH_CHECK(x.dtype() == at::kFloat, "x must be float32");
+    TORCH_CHECK(weight.dtype() == at::kFloat, "weight must be float32");
+    TORCH_CHECK(bias.dtype() == at::kFloat, "bias must be float32");
+    TORCH_CHECK(gn_weight.dtype() == at::kFloat, "gn_weight must be float32");
+    TORCH_CHECK(gn_bias.dtype() == at::kFloat, "gn_bias must be float32");
+
+    // Output shape [N, M] where M = weight.size(0)
+    at::Tensor out = at::empty({x.size(0), weight.size(0)}, x.options());
+
+    EXEC_NPU_CMD(aclnnMatmulGroupNormLeakyReluSumCustom,
+                 x, weight, bias, gn_weight, gn_bias,
+                 static_cast<int>(num_groups),
+                 static_cast<float>(eps),
+                 static_cast<float>(negative_slope),
+                 out);
+    return out;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_group_norm_leaky_relu_sum_custom", &matmul_group_norm_leaky_relu_sum_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_group_norm_leaky_relu_sum_custom",
+          &matmul_group_norm_leaky_relu_sum_custom_impl_npu,
+          "Fused Linear + GroupNorm + LeakyReLU + Sum");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized model using fused custom AscendC kernel:
+    y = (LeakyReLU(GroupNorm(Linear(x)))) + (LeakyReLU(GroupNorm(Linear(x))))
+    """
+    def __init__(self, input_size, hidden_size, num_groups, eps=1e-5, negative_slope=0.01):
+        super().__init__()
+        self.fc = torch.nn.Linear(input_size, hidden_size, bias=True)
+        self.gn = torch.nn.GroupNorm(num_groups=num_groups, num_channels=hidden_size, eps=eps, affine=True)
+        self.negative_slope = float(negative_slope)
+        self.num_groups = int(num_groups)
+        self.eps = float(eps)
+
+    def forward(self, x):
+        # Pass raw tensors and attributes to the fused custom kernel.
+        # Linear: weight [out, in], bias [out]
+        # GroupNorm affine: weight [out], bias [out]
+        return custom_ops_lib.matmul_group_norm_leaky_relu_sum_custom(
+            x,
+            self.fc.weight,
+            self.fc.bias,
+            self.gn.weight,
+            self.gn.bias,
+            self.num_groups,
+            self.eps,
+            self.negative_slope
+        )
+'''

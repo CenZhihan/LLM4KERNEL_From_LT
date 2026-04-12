@@ -1,0 +1,300 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulSubtractMultiplyReluCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "sub",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "mul",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulSubtractMultiplyReluCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulSubtractMultiplyReluCustom, MatmulSubtractMultiplyReluCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "matmul_subtract_multiply_relu_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    MatmulSubtractMultiplyReluCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* sub_shape = context->GetInputShape(1);
+    const gert::Shape* mul_shape = context->GetInputShape(2);
+    // 简单一致性校验：形状需相同
+    if (x_shape->GetOriginShape().GetShapeSize() != sub_shape->GetOriginShape().GetShapeSize() ||
+        x_shape->GetOriginShape().GetShapeSize() != mul_shape->GetOriginShape().GetShapeSize()) {
+        return ge::GRAPH_FAILED;
+    }
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MatmulSubtractMultiplyReluCustom : public OpDef {
+public:
+    explicit MatmulSubtractMultiplyReluCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("sub")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Input("mul")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulSubtractMultiplyReluCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的Tensor数量
+
+class KernelMatmulSubMulRelu {
+public:
+    __aicore__ inline KernelMatmulSubMulRelu() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR sub, GM_ADDR mul, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        subGm.SetGlobalBuffer((__gm__ float *)sub + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        mulGm.SetGlobalBuffer((__gm__ float *)mul + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ float *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueSub, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueMul, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(float));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
+        AscendC::LocalTensor<float> subLocal = inQueueSub.AllocTensor<float>();
+        AscendC::LocalTensor<float> mulLocal = inQueueMul.AllocTensor<float>();
+
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(subLocal, subGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(mulLocal, mulGm[progress * this->tileLength], this->tileLength);
+
+        inQueueX.EnQue(xLocal);
+        inQueueSub.EnQue(subLocal);
+        inQueueMul.EnQue(mulLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> subLocal = inQueueSub.DeQue<float>();
+        AscendC::LocalTensor<float> mulLocal = inQueueMul.DeQue<float>();
+        AscendC::LocalTensor<float> zLocal = outQueueZ.AllocTensor<float>();
+
+        // z = relu( (x - sub) * mul )
+        AscendC::Sub(zLocal, xLocal, subLocal, this->tileLength);
+        AscendC::Mul(zLocal, zLocal, mulLocal, this->tileLength);
+        AscendC::Relu(zLocal, zLocal, this->tileLength);
+
+        outQueueZ.EnQue<float>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueSub.FreeTensor(subLocal);
+        inQueueMul.FreeTensor(mulLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<float> zLocal = outQueueZ.DeQue<float>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueSub, inQueueMul;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> subGm;
+    AscendC::GlobalTensor<float> mulGm;
+    AscendC::GlobalTensor<float> zGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void matmul_subtract_multiply_relu_custom(GM_ADDR x, GM_ADDR sub, GM_ADDR mul, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelMatmulSubMulRelu op;
+    op.Init(x, sub, mul, z, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_subtract_multiply_relu_custom_impl_npu(const at::Tensor& x, const at::Tensor& sub, const at::Tensor& mul) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnMatmulSubtractMultiplyReluCustom, x, sub, mul, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_subtract_multiply_relu_custom", &matmul_subtract_multiply_relu_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_subtract_multiply_relu_custom", &matmul_subtract_multiply_relu_custom_impl_npu, "fused (x - sub) * mul with ReLU");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    计算流程：
+    y = Linear(x)
+    z = ReLU( (y - subtract_value) * multiply_value )
+    其中减法/乘法/激活由自定义AscendC算子完成。
+    """
+    def __init__(self, in_features, out_features, subtract_value, multiply_value) -> None:
+        super().__init__()
+        self.linear = torch.nn.Linear(in_features, out_features)
+        self.subtract_value = float(subtract_value)
+        self.multiply_value = float(multiply_value)
+
+    def forward(self, x):
+        y = self.linear(x)
+        # 为了与自定义算子接口对齐，将标量广播成与y同形状的张量，避免在Kernel侧处理标量广播
+        sub = torch.full_like(y, self.subtract_value)
+        mul = torch.full_like(y, self.multiply_value)
+        return custom_ops_lib.matmul_subtract_multiply_relu_custom(y, sub, mul)
+'''

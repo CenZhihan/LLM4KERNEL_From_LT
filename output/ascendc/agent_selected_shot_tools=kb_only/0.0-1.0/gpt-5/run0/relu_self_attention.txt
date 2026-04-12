@@ -1,0 +1,286 @@
+project_json_src='''
+[
+    {
+        "op": "ReluSelfAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "scores",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "mask",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ReluSelfAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ReluSelfAttentionCustom, ReluSelfAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "relu_self_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ReluSelfAttentionCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ReluSelfAttentionCustom : public OpDef {
+public:
+    explicit ReluSelfAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("scores")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("mask")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ReluSelfAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+typedef float DTYPE_X; // scores
+typedef float DTYPE_Y; // mask
+typedef float DTYPE_Z; // output
+
+constexpr int32_t BUFFER_NUM = 2; // queue tensor num
+
+class KernelReluSelfAttention {
+public:
+    __aicore__ inline KernelReluSelfAttention() {}
+    __aicore__ inline void Init(GM_ADDR scores, GM_ADDR mask, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
+    {
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+
+        scoresGm.SetGlobalBuffer((__gm__ DTYPE_X *)scores + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        maskGm.SetGlobalBuffer((__gm__ DTYPE_Y *)mask + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+
+        pipe.InitBuffer(inQueueScores, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueMask, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+        pipe.InitBuffer(calcBuf, this->tileLength * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_X> scoresLocal = inQueueScores.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> maskLocal = inQueueMask.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(scoresLocal, scoresGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(maskLocal, maskGm[progress * this->tileLength], this->tileLength);
+        inQueueScores.EnQue(scoresLocal);
+        inQueueMask.EnQue(maskLocal);
+    }
+
+    __aicore__ inline void Compute(int32_t /*progress*/)
+    {
+        AscendC::LocalTensor<DTYPE_X> scoresLocal = inQueueScores.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> maskLocal = inQueueMask.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> tmpLocal = calcBuf.Get<DTYPE_Z>();
+
+        // tmp = ReLU(scores)
+        AscendC::Relu(tmpLocal, scoresLocal, (int32_t)this->tileLength);
+        // z = tmp * mask
+        AscendC::Mul(zLocal, tmpLocal, maskLocal, (int32_t)this->tileLength);
+
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        inQueueScores.FreeTensor(scoresLocal);
+        inQueueMask.FreeTensor(maskLocal);
+    }
+
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueScores, inQueueMask;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> calcBuf;
+
+    AscendC::GlobalTensor<DTYPE_X> scoresGm;
+    AscendC::GlobalTensor<DTYPE_Y> maskGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
+};
+
+extern "C" __global__ __aicore__ void relu_self_attention_custom(GM_ADDR scores, GM_ADDR mask, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelReluSelfAttention op;
+    op.Init(scores, mask, z, tiling_data.totalLength, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor relu_self_attention_custom_impl_npu(const at::Tensor& scores, const at::Tensor& mask) {
+    at::Tensor result = at::empty_like(scores);
+    EXEC_NPU_CMD(aclnnReluSelfAttentionCustom, scores, mask, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("relu_self_attention_custom", &relu_self_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("relu_self_attention_custom", &relu_self_attention_custom_impl_npu, "masked ReLU for attention scores");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+import torch.nn as nn
+import math
+
+class NewGELU(nn.Module):
+    def __init__(self):
+        super(NewGELU, self).__init__()
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, n_embd, n_head, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
+                                     .view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+
+        # 将下三角mask扩展到(B, nh, T, T)，与att相同形状
+        mask = self.bias[:, :, :T, :T].expand(B, self.n_head, T, T).contiguous().to(att.device)
+        att = custom_ops_lib.relu_self_attention_custom(att, mask)
+
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return y
+'''

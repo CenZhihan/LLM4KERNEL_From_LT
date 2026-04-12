@@ -15,7 +15,7 @@ project_json_src='''
                 ]
             },
             {
-                "name": "y",
+                "name": "scale",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -27,7 +27,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "z",
+                "name": "y",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -81,12 +81,11 @@ namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* x_shape = context->GetInputShape(0);
-    const gert::Shape* y_shape = context->GetInputShape(1);
-    gert::Shape* z_shape = context->GetOutputShape(0);
-    // Broadcast check is omitted here; assume same shape in this pipeline.
-    *z_shape = *x_shape;
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
+
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -105,12 +104,12 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("y")
+        this->Input("scale")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Output("z")
+        this->Output("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -130,85 +129,108 @@ OP_ADD(Conv2dInstanceNormDivideCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "conv2d_instance_norm_divide_custom_tiling_data.h"
 
-constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+constexpr int32_t BUFFER_NUM = 2; // 每个队列的张量数量
 
-class KernelDiv {
+class KernelConv2dInstanceNormDivide {
 public:
-    __aicore__ inline KernelDiv() {}
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
+    __aicore__ inline KernelConv2dInstanceNormDivide() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR scale, GM_ADDR y, uint32_t totalLength, uint32_t tileNum)
     {
-        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
         this->blockLength = totalLength / AscendC::GetBlockNum();
         this->tileNum = tileNum;
-        ASSERT(tileNum != 0 && "tile num can not be zero!");
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        xGm.SetGlobalBuffer((__gm__ DTYPE_X*)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        yGm.SetGlobalBuffer((__gm__ DTYPE_Y*)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        zGm.SetGlobalBuffer((__gm__ DTYPE_Z*)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        xGm.SetGlobalBuffer((__gm__ float *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        scaleGm.SetGlobalBuffer((__gm__ float *)scale, 1); // 标量scale，形状为[1]
+        yGm.SetGlobalBuffer((__gm__ float *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
-        pipe.InitBuffer(inQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
-        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(float));
+        pipe.InitBuffer(inQueueScale, 1, sizeof(float));
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileLength * sizeof(float)); // 用于广播scale
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLength * sizeof(float));
     }
+
     __aicore__ inline void Process()
     {
+        // 将scale常量拷贝一次到本地队列
+        CopyInScaleOnce();
+
         int32_t loopCount = this->tileNum * BUFFER_NUM;
         for (int32_t i = 0; i < loopCount; i++) {
             CopyIn(i);
             Compute(i);
             CopyOut(i);
         }
+        // 释放scale本地缓冲
+        AscendC::LocalTensor<float> sLocal = inQueueScale.DeQue<float>();
+        inQueueScale.FreeTensor(sLocal);
     }
+
 private:
+    __aicore__ inline void CopyInScaleOnce()
+    {
+        AscendC::LocalTensor<float> sLocal = inQueueScale.AllocTensor<float>();
+        AscendC::DataCopy(sLocal, scaleGm, 1);
+        inQueueScale.EnQue(sLocal);
+    }
+
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::LocalTensor<float> xLocal = inQueueX.AllocTensor<float>();
         AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
-        AscendC::DataCopy(yLocal, yGm[progress * this->tileLength], this->tileLength);
         inQueueX.EnQue(xLocal);
-        inQueueY.EnQue(yLocal);
     }
+
     __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
-        AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.DeQue<DTYPE_Y>();
-        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<float> xLocal = inQueueX.DeQue<float>();
+        AscendC::LocalTensor<float> yLocal = outQueueY.AllocTensor<float>();
 
-        // Element-wise division: z = x / y
-        AscendC::Div(zLocal, xLocal, yLocal, this->tileLength);
+        // 取出scale标量，并广播到tile长度
+        AscendC::LocalTensor<float> sLocal = inQueueScale.DeQue<float>();
+        AscendC::LocalTensor<float> sVecLocal = tmpQueue.AllocTensor<float>();
+        uint32_t dstShape[1] = {this->tileLength};
+        uint32_t srcShape[1] = {1};
+        AscendC::BroadCast<float, 1, 0>(sVecLocal, sLocal, dstShape, srcShape);
 
-        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        // 按元素相乘：y = x * scale(= 1/divide_by)
+        AscendC::Mul(yLocal, xLocal, sVecLocal, this->tileLength);
+
+        outQueueY.EnQue<float>(yLocal);
         inQueueX.FreeTensor(xLocal);
-        inQueueY.FreeTensor(yLocal);
+        tmpQueue.FreeTensor(sVecLocal);
+        // 将scale重新入队，供后续tile复用
+        inQueueScale.EnQue(sLocal);
     }
+
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
-        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
-        outQueueZ.FreeTensor(zLocal);
+        AscendC::LocalTensor<float> yLocal = outQueueY.DeQue<float>();
+        AscendC::DataCopy(yGm[progress * this->tileLength], yLocal, this->tileLength);
+        outQueueY.FreeTensor(yLocal);
     }
+
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueY;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
-    AscendC::GlobalTensor<DTYPE_X> xGm;
-    AscendC::GlobalTensor<DTYPE_Y> yGm;
-    AscendC::GlobalTensor<DTYPE_Z> zGm;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueScale;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<float> xGm;
+    AscendC::GlobalTensor<float> scaleGm;
+    AscendC::GlobalTensor<float> yGm;
+
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
 };
 
-extern "C" __global__ __aicore__ void conv2d_instance_norm_divide_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling)
-{
-    GET_TILING_DATA(tilingData, tiling);
-    KernelDiv op;
-    op.Init(x, y, z, tilingData.totalLength, tilingData.tileNum);
+extern "C" __global__ __aicore__ void conv2d_instance_norm_divide_custom(GM_ADDR x, GM_ADDR scale, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv2dInstanceNormDivide op;
+    op.Init(x, scale, y, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -219,9 +241,9 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor conv2d_instance_norm_divide_custom_impl_npu(const at::Tensor& self, const at::Tensor& other) {
-    at::Tensor result = at::empty_like(self);
-    EXEC_NPU_CMD(aclnnConv2dInstanceNormDivideCustom, self, other, result);
+at::Tensor conv2d_instance_norm_divide_custom_impl_npu(const at::Tensor& x, const at::Tensor& scale) {
+    at::Tensor result = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnConv2dInstanceNormDivideCustom, x, scale, result);
     return result;
 }
 
@@ -230,30 +252,32 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("conv2d_instance_norm_divide_custom", &conv2d_instance_norm_divide_custom_impl_npu, "x / y");
+    m.def("conv2d_instance_norm_divide_custom", &conv2d_instance_norm_divide_custom_impl_npu, "y = x * scale");
 }
 """
 
 model_src='''
 import torch
+import torch.nn as nn
 import torch_npu
 import custom_ops_lib
 
-class ModelNew(torch.nn.Module):
+class ModelNew(nn.Module):
     """
-    Conv2d -> InstanceNorm2d -> Custom AscendC kernel for division by constant (via tensor).
+    使用自定义AscendC算子替换归一化后的常数除法：y = x / divide_by = x * (1/divide_by)
+    卷积和InstanceNorm仍采用PyTorch实现，以便专注于热点逐元素缩放的加速。
     """
     def __init__(self, in_channels, out_channels, kernel_size, divide_by):
         super(ModelNew, self).__init__()
-        self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size)
-        self.instance_norm = torch.nn.InstanceNorm2d(out_channels)
-        self.divide_by = divide_by
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.instance_norm = nn.InstanceNorm2d(out_channels)
+        self.divide_by = float(divide_by)
 
     def forward(self, x):
         x = self.conv(x)
         x = self.instance_norm(x)
-        # Create a tensor filled with the scalar to leverage the element-wise Div kernel.
-        divisor = torch.full_like(x, self.divide_by)
-        x = custom_ops_lib.conv2d_instance_norm_divide_custom(x, divisor)
+        scale = torch.tensor(1.0 / self.divide_by, dtype=x.dtype, device=x.device)
+        # 自定义AscendC算子：按标量缩放
+        x = custom_ops_lib.conv2d_instance_norm_divide_custom(x, scale)
         return x
 '''

@@ -1,0 +1,389 @@
+project_json_src='''
+[
+    {
+        "op": "CausalAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "scores",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "mask",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "probs",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "optiling/tiling.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CausalAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+  TILING_DATA_FIELD_DEF_STRUCT(AscendC::SoftMaxTiling, softmaxTilingData);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CausalAttentionCustom, CausalAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "causal_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "optiling/tiling.h"
+#include "graph/utils/type_utils.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 1;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CausalAttentionCustomTilingData tiling;
+
+    // 获取输入形状 (期望为二维 [m, n])
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    auto origin_shape = in_shape->GetOriginShape();
+    int64_t dim_num = origin_shape.GetDimNum();
+    if (dim_num < 2) {
+        return ge::GRAPH_FAILED;
+    }
+    int64_t n = origin_shape.GetDim(dim_num - 1);
+    int64_t total = origin_shape.GetShapeSize();
+    if (n <= 0 || total <= 0) {
+        return ge::GRAPH_FAILED;
+    }
+    int64_t m = total / n;
+
+    // 设置并行度
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(static_cast<uint32_t>(total));
+    tiling.set_tileNum(TILE_NUM);
+
+    // 构造 SoftMax tiling 所需形状
+    std::vector<int64_t> shapeVec = {m, n};
+    ge::Shape srcShape(shapeVec);
+
+    // 计算 SoftMax 所需的最小 workspace，并获取 tiling 参数
+    const uint32_t localWorkSpaceSize = AscendC::GetSoftMaxMinTmpSize(srcShape, sizeof(float), false);
+    AscendC::SoftMaxTilingFunc(srcShape, sizeof(float), localWorkSpaceSize, tiling.mutable_softmaxTilingData());
+
+    // 设置 workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = static_cast<size_t>(localWorkSpaceSize);
+
+    // 保存 tiling
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CausalAttentionCustom : public OpDef {
+public:
+    explicit CausalAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("scores")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("mask")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("probs")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CausalAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+
+class KernelCausalAttention {
+public:
+    __aicore__ inline KernelCausalAttention() {}
+
+    __aicore__ inline void Init(__gm__ uint8_t *scoresGm, __gm__ uint8_t *maskGm, __gm__ uint8_t *probsGm,
+                                const AscendC::SoftMaxTiling &softmaxTiling)
+    {
+        // 从 SoftMaxTiling 读入全局形状 [m, n]
+        this->globalM = softmaxTiling.srcM;
+        this->globalN = softmaxTiling.srcK;
+
+        // 基于 Block 划分 m 维
+        uint32_t blocks = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->localM = globalM / blocks;
+        uint32_t remain = globalM % blocks;
+        uint32_t startM = blockIdx * localM + (blockIdx < remain ? blockIdx : remain);
+        localM += (blockIdx < remain) ? 1 : 0;
+
+        this->height = localM;
+        this->width = globalN;
+        this->elementNumPerBlk = 32 / sizeof(DTYPE);
+
+        // 计算偏移并设置 GM
+        uint64_t offsetElems = static_cast<uint64_t>(startM) * static_cast<uint64_t>(width);
+        scoresGlobal.SetGlobalBuffer(((__gm__ DTYPE*)scoresGm) + offsetElems);
+        maskGlobal.SetGlobalBuffer(((__gm__ DTYPE*)maskGm) + offsetElems);
+        probsGlobal.SetGlobalBuffer(((__gm__ DTYPE*)probsGm) + offsetElems);
+
+        // 分配 UB Buffer
+        pipe.InitBuffer(inQueueScores, 1, height * width * sizeof(DTYPE));
+        pipe.InitBuffer(inQueueMask,   1, height * width * sizeof(DTYPE));
+        pipe.InitBuffer(outQueueProbs, 1, height * width * sizeof(DTYPE));
+        pipe.InitBuffer(sumQueue,      1, height * elementNumPerBlk * sizeof(DTYPE));
+        pipe.InitBuffer(maxQueue,      1, height * elementNumPerBlk * sizeof(DTYPE));
+
+        this->tiling = softmaxTiling;
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        AscendC::LocalTensor<DTYPE> scoresLocal = inQueueScores.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<DTYPE> maskLocal   = inQueueMask.AllocTensor<DTYPE>();
+        AscendC::DataCopy(scoresLocal, scoresGlobal, height * width);
+        AscendC::DataCopy(maskLocal,   maskGlobal,   height * width);
+        inQueueScores.EnQue(scoresLocal);
+        inQueueMask.EnQue(maskLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<DTYPE> scoresLocal = inQueueScores.DeQue<DTYPE>();
+        AscendC::LocalTensor<DTYPE> maskLocal   = inQueueMask.DeQue<DTYPE>();
+        AscendC::LocalTensor<DTYPE> probsLocal  = outQueueProbs.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<DTYPE> sumTempLocal = sumQueue.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<DTYPE> maxTempLocal = maxQueue.AllocTensor<DTYPE>();
+
+        // 先加上加性 mask (允许位置 +0，屏蔽位置 +(-1e9))
+        AscendC::Add(probsLocal, scoresLocal, maskLocal, height * width);
+
+        // 执行按行 SoftMax
+        AscendC::SoftMaxShapeInfo shape = {height, width, height, width};
+        AscendC::SoftMax<DTYPE>(probsLocal, sumTempLocal, maxTempLocal, probsLocal, tiling, shape);
+
+        outQueueProbs.EnQue<DTYPE>(probsLocal);
+        sumQueue.FreeTensor(sumTempLocal);
+        maxQueue.FreeTensor(maxTempLocal);
+        inQueueScores.FreeTensor(scoresLocal);
+        inQueueMask.FreeTensor(maskLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<DTYPE> probsLocal = outQueueProbs.DeQue<DTYPE>();
+        AscendC::DataCopy(probsGlobal, probsLocal, height * width);
+        outQueueProbs.FreeTensor(probsLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1>  inQueueScores;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1>  inQueueMask;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1>  sumQueue;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1>  maxQueue;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueProbs;
+
+    AscendC::GlobalTensor<DTYPE> scoresGlobal;
+    AscendC::GlobalTensor<DTYPE> maskGlobal;
+    AscendC::GlobalTensor<DTYPE> probsGlobal;
+
+    uint32_t globalM = 0;
+    uint32_t globalN = 0;
+    uint32_t localM = 0;
+    uint32_t height = 0;
+    uint32_t width = 0;
+    uint32_t elementNumPerBlk = 0;
+    AscendC::SoftMaxTiling tiling;
+};
+
+extern "C" __global__ __aicore__ void causal_attention_custom(__gm__ uint8_t *scores,
+                                                              __gm__ uint8_t *mask,
+                                                              __gm__ uint8_t *probs,
+                                                              __gm__ uint8_t *workspace,
+                                                              __gm__ uint8_t *tilingGm)
+{
+    GET_TILING_DATA(tilingData, tilingGm);
+    KernelCausalAttention op;
+    op.Init(scores, mask, probs, tilingData.softmaxTilingData());
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor causal_attention_custom_impl_npu(const at::Tensor& scores, const at::Tensor& mask) {
+    // scores: [m, n], mask: [m, n] 加性 mask
+    at::Tensor result = at::empty_like(scores);
+    EXEC_NPU_CMD(aclnnCausalAttentionCustom, scores, mask, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("causal_attention_custom", &causal_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("causal_attention_custom", &causal_attention_custom_impl_npu, "masked softmax for causal attention");
+}
+"""
+
+model_src='''
+import math
+import torch
+import torch_npu
+import torch.nn as nn
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    """
+    使用自定义 AscendC kernel (CausalAttentionCustom) 加速因果注意力中的 masked softmax。
+    其余 Q/K/V 投影与输出投影使用 PyTorch 线性层。
+    """
+    def __init__(self, d_model=256, num_heads=4, max_seq_len=4096):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model 必须能被 num_heads 整除"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.max_seq_len = max_seq_len
+
+        # Q/K/V/输出投影
+        self.q_proj = nn.Linear(d_model, d_model, bias=True)
+        self.k_proj = nn.Linear(d_model, d_model, bias=True)
+        self.v_proj = nn.Linear(d_model, d_model, bias=True)
+        self.o_proj = nn.Linear(d_model, d_model, bias=True)
+
+        # 预计算因果 mask (True 表示不允许的位置)
+        mask = torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1).bool()
+        self.register_buffer("causal_mask", mask, persistent=False)
+
+    def _shape(self, x, b, s):
+        # (B,S,D) -> (B, H, S, Dh)
+        x = x.view(b, s, self.num_heads, self.head_dim)
+        return x.permute(0, 2, 1, 3).contiguous()
+
+    def forward(self, x):
+        """
+        x: (B, S, D)
+        返回: (B, S, D)
+        """
+        b, s, d = x.shape
+        assert d == self.d_model
+
+        # 线性投影得到 Q/K/V
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = self._shape(q, b, s)  # (B,H,S,Dh)
+        k = self._shape(k, b, s)  # (B,H,S,Dh)
+        v = self._shape(v, b, s)  # (B,H,S,Dh)
+
+        # 注意力分数 (B,H,S,S)
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        # 构造加性 mask: 允许位置 +0，屏蔽位置 +(-1e9)
+        # (S,S) -> (B,H,S,S)
+        base_mask = self.causal_mask[:s, :s]  # bool
+        additive_mask = base_mask.to(attn_scores.dtype) * (-1e9)
+        additive_mask = additive_mask.unsqueeze(0).unsqueeze(0).expand(b, self.num_heads, s, s).contiguous()
+
+        # 展平成二维 [m, n]，m=B*H*S, n=S
+        m = b * self.num_heads * s
+        n = s
+        scores_2d = attn_scores.contiguous().view(m, n)
+        mask_2d = additive_mask.view(m, n)
+
+        # 自定义 kernel: masked softmax
+        probs_2d = custom_ops_lib.causal_attention_custom(scores_2d, mask_2d)
+        attn_probs = probs_2d.view(b, self.num_heads, s, s)
+
+        # (B,H,S,S) @ (B,H,S,Dh) -> (B,H,S,Dh)
+        context = torch.matmul(attn_probs, v)
+
+        # 合并头 (B,S,D)
+        context = context.permute(0, 2, 1, 3).contiguous().view(b, s, d)
+
+        # 输出投影
+        out = self.o_proj(context)
+        return out
+'''

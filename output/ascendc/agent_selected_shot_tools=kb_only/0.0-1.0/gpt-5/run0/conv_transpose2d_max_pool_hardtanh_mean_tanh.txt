@@ -1,0 +1,343 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTranspose2dMaxPoolHardtanhMeanTanhCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "min_val",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "max_val",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTranspose2dMaxPoolHardtanhMeanTanhCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, c);
+  TILING_DATA_FIELD_DEF(uint32_t, h);
+  TILING_DATA_FIELD_DEF(uint32_t, w);
+  TILING_DATA_FIELD_DEF(uint32_t, planeSize);
+  TILING_DATA_FIELD_DEF(uint32_t, planesPerBlock);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTranspose2dMaxPoolHardtanhMeanTanhCustom, ConvTranspose2dMaxPoolHardtanhMeanTanhCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "register/op_def_registry.h"
+#include "conv_transpose2d_max_pool_hardtanh_mean_tanh_custom_tiling.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTranspose2dMaxPoolHardtanhMeanTanhCustomTilingData tiling;
+
+    const gert::Shape* xShape = context->GetInputShape(0);
+    // 期望输入为 [N, C, H, W]，这里的 H, W 已经过了 MaxPool2d（在模型中前置完成）
+    if (xShape->GetDimNum() != 4) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t n = static_cast<uint32_t>(xShape->GetDim(0));
+    uint32_t c = static_cast<uint32_t>(xShape->GetDim(1));
+    uint32_t h = static_cast<uint32_t>(xShape->GetDim(2));
+    uint32_t w = static_cast<uint32_t>(xShape->GetDim(3));
+    uint32_t planeSize = h * w;
+
+    // 简单按 (N*C) 维度做 block 切分
+    const uint32_t BLOCK_DIM = 8;
+    context->SetBlockDim(BLOCK_DIM);
+    uint32_t totalPlanes = n * c;
+    uint32_t planesPerBlock = (totalPlanes + BLOCK_DIM - 1) / BLOCK_DIM;
+
+    tiling.set_n(n);
+    tiling.set_c(c);
+    tiling.set_h(h);
+    tiling.set_w(w);
+    tiling.set_planeSize(planeSize);
+    tiling.set_planesPerBlock(planesPerBlock);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0; // 无需额外 workspace
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* xShape = context->GetInputShape(0);
+    if (xShape->GetDimNum() != 4) {
+        return GRAPH_FAILED;
+    }
+    // 输出为 [N, C, 1, 1]
+    gert::Shape* yShape = context->GetOutputShape(0);
+    std::vector<int64_t> outDims = {xShape->GetDim(0), xShape->GetDim(1), 1, 1};
+    yShape->SetDimNum(4);
+    for (size_t i = 0; i < outDims.size(); ++i) {
+        yShape->SetDim(i, outDims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
+{
+    const auto inputType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputType);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTranspose2dMaxPoolHardtanhMeanTanhCustom : public OpDef {
+public:
+    explicit ConvTranspose2dMaxPoolHardtanhMeanTanhCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("min_val")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("max_val")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape)
+            .SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTranspose2dMaxPoolHardtanhMeanTanhCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+
+class KernelConvTranspose2dMaxPoolHardtanhMeanTanh {
+public:
+    __aicore__ inline KernelConvTranspose2dMaxPoolHardtanhMeanTanh() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR minGm, GM_ADDR maxGm, GM_ADDR y,
+                                uint32_t n, uint32_t c, uint32_t h, uint32_t w, uint32_t planesPerBlock)
+    {
+        this->n = n;
+        this->c = c;
+        this->h = h;
+        this->w = w;
+        this->planeSize = h * w;
+        this->totalPlanes = n * c;
+        this->planesPerBlock = planesPerBlock;
+
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t startPlane = blockIdx * planesPerBlock;
+        if (startPlane >= totalPlanes) {
+            startPlane = totalPlanes;
+        }
+        this->startPlane = startPlane;
+        uint32_t endPlane = startPlane + planesPerBlock;
+        if (endPlane > totalPlanes) {
+            endPlane = totalPlanes;
+        }
+        this->actualPlanes = (endPlane > startPlane) ? (endPlane - startPlane) : 0;
+
+        xGm.SetGlobalBuffer((__gm__ DTYPE*)x + (uint64_t)startPlane * planeSize);
+        yGm.SetGlobalBuffer((__gm__ DTYPE*)y + (uint64_t)startPlane * 1); // 每个平面输出1个标量
+        minGmGlobal.SetGlobalBuffer((__gm__ DTYPE*)minGm);
+        maxGmGlobal.SetGlobalBuffer((__gm__ DTYPE*)maxGm);
+
+        // UB缓冲区：一整个平面 + 输出标量 + 标量缓存
+        pipe.InitBuffer(inQueuePlane, 1, planeSize * sizeof(DTYPE));
+        pipe.InitBuffer(outQueueScalar, 1, 32); // 标量占位，按框架对齐
+        pipe.InitBuffer(scalarBufQueue, 1, 32); // 存放min/max
+    }
+
+    __aicore__ inline void Process()
+    {
+        // 读入 min/max 标量
+        DTYPE minVal = 0.f, maxVal = 0.f;
+        {
+            AscendC::LocalTensor<DTYPE> tmpLocal = scalarBufQueue.AllocTensor<DTYPE>();
+            AscendC::DataCopy(tmpLocal, minGmGlobal, 1);
+            minVal = tmpLocal.GetValue(0);
+            AscendC::DataCopy(tmpLocal, maxGmGlobal, 1);
+            maxVal = tmpLocal.GetValue(0);
+            scalarBufQueue.FreeTensor(tmpLocal);
+        }
+
+        for (uint32_t p = 0; p < actualPlanes; ++p) {
+            // 复制整个平面到UB
+            AscendC::LocalTensor<DTYPE> planeLocal = inQueuePlane.AllocTensor<DTYPE>();
+            AscendC::DataCopy(planeLocal, xGm[p * planeSize], planeSize);
+
+            // Hardtanh: clamp到[minVal, maxVal]
+            AscendC::Maxs(planeLocal, planeLocal, minVal, planeSize);
+            AscendC::Mins(planeLocal, planeLocal, maxVal, planeSize);
+
+            // 计算 HxW 平均值（按最后一维，outter=1，inner=planeSize，对齐满足32字节）
+            AscendC::LocalTensor<DTYPE> meanLocal = outQueueScalar.AllocTensor<DTYPE>();
+            AscendC::MeanParams mp;
+            mp.outter = 1;
+            mp.inner = planeSize; // 由于 float，planeSize*4=65536，为32字节对齐
+            mp.n = planeSize;
+            AscendC::Mean<DTYPE, DTYPE, false, false, -1>(meanLocal, planeLocal, mp);
+
+            // tanh 激活
+            AscendC::Tanh(meanLocal, meanLocal, 1);
+
+            // 写回结果
+            AscendC::DataCopy(yGm[p], meanLocal, 1);
+
+            outQueueScalar.FreeTensor(meanLocal);
+            inQueuePlane.FreeTensor(planeLocal);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueuePlane;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueScalar;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> scalarBufQueue;
+
+    AscendC::GlobalTensor<DTYPE> xGm, yGm;
+    AscendC::GlobalTensor<DTYPE> minGmGlobal, maxGmGlobal;
+
+    uint32_t n{0}, c{0}, h{0}, w{0};
+    uint32_t planeSize{0};
+    uint32_t totalPlanes{0};
+    uint32_t planesPerBlock{0};
+    uint32_t startPlane{0};
+    uint32_t actualPlanes{0};
+};
+
+extern "C" __global__ __aicore__ void conv_transpose2d_max_pool_hardtanh_mean_tanh_custom(
+    GM_ADDR x, GM_ADDR minGm, GM_ADDR maxGm, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    uint32_t n  = tilingData.n;
+    uint32_t c  = tilingData.c;
+    uint32_t h  = tilingData.h;
+    uint32_t w  = tilingData.w;
+    uint32_t planesPerBlock = tilingData.planesPerBlock;
+
+    KernelConvTranspose2dMaxPoolHardtanhMeanTanh op;
+    op.Init(x, minGm, maxGm, y, n, c, h, w, planesPerBlock);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include <torch/extension.h>
+#include "pytorch_npu_helper.hpp"
+
+at::Tensor conv_transpose2d_max_pool_hardtanh_mean_tanh_custom_impl_npu(
+    const at::Tensor& x, double min_val, double max_val) {
+    TORCH_CHECK(x.device().type() == at::kPrivateUse1, "Input must be on NPU device");
+
+    // 创建 min/max 标量张量（与 x 同设备/类型）
+    auto opts = x.options();
+    at::Tensor min_t = at::empty({1}, opts);
+    at::Tensor max_t = at::empty({1}, opts);
+    min_t.fill_(static_cast<float>(min_val));
+    max_t.fill_(static_cast<float>(max_val));
+
+    // 输出 [N, C, 1, 1]
+    auto sizes = x.sizes();
+    TORCH_CHECK(sizes.size() == 4, "x must be 4D NCHW after MaxPool");
+    at::Tensor y = at::empty({sizes[0], sizes[1], 1, 1}, opts);
+
+    EXEC_NPU_CMD(aclnnConvTranspose2dMaxPoolHardtanhMeanTanhCustom, x, min_t, max_t, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transpose2d_max_pool_hardtanh_mean_tanh_custom", &conv_transpose2d_max_pool_hardtanh_mean_tanh_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transpose2d_max_pool_hardtanh_mean_tanh_custom", &conv_transpose2d_max_pool_hardtanh_mean_tanh_custom_impl_npu,
+          "Hardtanh + Mean(HW, keepdim=True) + Tanh fused op (expects input after MaxPool)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    优化版本：
+    - 保留原始的 ConvTranspose2d 和 MaxPool2d（利用框架高效实现）
+    - 将 Hardtanh + mean(沿HW, keepdim=True) + tanh 融合为自定义 AscendC 算子
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
+                 maxpool_kernel_size, maxpool_stride, hardtanh_min, hardtanh_max):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size,
+                                                       stride=stride, padding=padding)
+        self.maxpool = torch.nn.MaxPool2d(kernel_size=maxpool_kernel_size, stride=maxpool_stride)
+        self.hardtanh_min = hardtanh_min
+        self.hardtanh_max = hardtanh_max
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.maxpool(x)
+        # 自定义AscendC算子：对池化后的特征执行 Hardtanh + Mean(HW, keepdim=True) + Tanh
+        x = custom_ops_lib.conv_transpose2d_max_pool_hardtanh_mean_tanh_custom(
+            x, float(self.hardtanh_min), float(self.hardtanh_max)
+        )
+        return x
+'''

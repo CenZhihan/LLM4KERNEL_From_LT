@@ -1,0 +1,298 @@
+project_json_src='''
+[
+    {
+        "op": "Conv3dSoftmaxMaxPoolMaxPoolCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "graph/tensor.h"
+
+namespace optiling {
+
+BEGIN_TILING_DATA_DEF(Conv3dSoftmaxMaxPoolMaxPoolCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);              // x的元素总数
+  TILING_DATA_FIELD_DEF(uint32_t, width);                    // softmax的最后一维长度(通道数C，需32B对齐)
+  TILING_DATA_FIELD_DEF(uint32_t, rows);                     // 展平后的行数M = totalLength / width
+  TILING_DATA_FIELD_DEF_STRUCT(SoftMaxTiling, softmaxTilingData); // SoftMax所需tiling
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(Conv3dSoftmaxMaxPoolMaxPoolCustom, Conv3dSoftmaxMaxPoolMaxPoolCustomTilingData)
+
+} // namespace optiling
+"""
+
+host_operator_src="""
+#include "conv3d_softmax_max_pool_max_pool_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    Conv3dSoftmaxMaxPoolMaxPoolCustomTilingData tiling;
+
+    // 输入形状：期望来自上游为 (B, D, H, W, C) 连续内存，softmax沿最后一维C
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    std::vector<int64_t> dims;
+    for (int i = 0; i < in_shape->GetDimNum(); ++i) {
+        dims.push_back(in_shape->GetDim(i));
+    }
+
+    // 计算总元素数与最后一维(通道数)
+    uint64_t totalLength = 1;
+    for (auto d : dims) { totalLength *= static_cast<uint64_t>(d); }
+    uint32_t width = static_cast<uint32_t>(dims.back());  // C
+    uint32_t rows  = static_cast<uint32_t>(totalLength / width); // B*D*H*W
+
+    tiling.set_totalLength(static_cast<uint32_t>(totalLength));
+    tiling.set_width(width);
+    tiling.set_rows(rows);
+
+    // SoftMax Tiling：对形状 [1, width] 获取最小临时空间并生成tiling
+    std::vector<int64_t> sm_shape_vec = {1, static_cast<int64_t>(width)};
+    ge::Shape srcShape(sm_shape_vec);
+
+    const uint32_t localWorkSpaceSize = AscendC::GetSoftMaxMinTmpSize(srcShape, sizeof(float), false);
+    AscendC::SoftMaxTilingFunc(srcShape, sizeof(float), localWorkSpaceSize, tiling.softmaxTilingData);
+
+    // 保存Tiling数据
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 工作空间无需额外申请
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    // 使用单一AICore策略或由框架决定，此处不强制设置BlockDim
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输出形状与输入一致
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+
+namespace ops {
+class Conv3dSoftmaxMaxPoolMaxPoolCustom : public OpDef {
+public:
+    explicit Conv3dSoftmaxMaxPoolMaxPoolCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(Conv3dSoftmaxMaxPoolMaxPoolCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+
+class KernelConv3dSoftmaxMaxPoolMaxPool {
+public:
+    __aicore__ inline KernelConv3dSoftmaxMaxPoolMaxPool() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,
+                                uint32_t totalLength, uint32_t width, uint32_t rows,
+                                const SoftMaxTiling &tilingData)
+    {
+        this->totalLength = totalLength;
+        this->width = width;     // K = 通道数 (最后一维)
+        this->rows = rows;       // M = B*D*H*W
+        this->tiling = tilingData;
+
+        srcGlobal.SetGlobalBuffer((__gm__ DTYPE *)x, this->totalLength);
+        dstGlobal.SetGlobalBuffer((__gm__ DTYPE *)y, this->totalLength);
+
+        elementNumPerBlk = 32 / sizeof(DTYPE); // sum/max的最后轴固定为32B
+        // 为单行softmax准备本地buffer
+        pipe.InitBuffer(inQueueSrc, 1, width * sizeof(DTYPE));
+        pipe.InitBuffer(maxQueue,    1, elementNumPerBlk * sizeof(DTYPE));
+        pipe.InitBuffer(sumQueue,    1, elementNumPerBlk * sizeof(DTYPE));
+        pipe.InitBuffer(outQueueDst, 1, width * sizeof(DTYPE));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = 0; r < rows; ++r) {
+            CopyIn(r);
+            Compute();
+            CopyOut(r);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<DTYPE> srcLocal = inQueueSrc.AllocTensor<DTYPE>();
+        AscendC::DataCopy(srcLocal, srcGlobal[rowIdx * width], width);
+        inQueueSrc.EnQue(srcLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        AscendC::LocalTensor<DTYPE> srcLocal = inQueueSrc.DeQue<DTYPE>();
+        AscendC::LocalTensor<DTYPE> sumTempLocal = sumQueue.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<DTYPE> maxTempLocal = maxQueue.AllocTensor<DTYPE>();
+        AscendC::LocalTensor<DTYPE> dstLocal = outQueueDst.AllocTensor<DTYPE>();
+
+        // 形状信息：单行 [1, width]
+        AscendC::SoftMaxShapeInfo srcShape = {1, width, 1, width};
+        // 软最大，按最后一维width计算
+        AscendC::SoftMax<DTYPE>(dstLocal, sumTempLocal, maxTempLocal, srcLocal, tiling, srcShape);
+
+        outQueueDst.EnQue<DTYPE>(dstLocal);
+        maxQueue.FreeTensor(maxTempLocal);
+        sumQueue.FreeTensor(sumTempLocal);
+        inQueueSrc.FreeTensor(srcLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t rowIdx)
+    {
+        AscendC::LocalTensor<DTYPE> dstLocal = outQueueDst.DeQue<DTYPE>();
+        AscendC::DataCopy(dstGlobal[rowIdx * width], dstLocal, width);
+        outQueueDst.FreeTensor(dstLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  inQueueSrc;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  maxQueue;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1>  sumQueue;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueDst;
+
+    AscendC::GlobalTensor<DTYPE> srcGlobal, dstGlobal;
+
+    uint32_t totalLength = 0;
+    uint32_t width = 0;   // K
+    uint32_t rows  = 0;   // M
+    uint32_t elementNumPerBlk = 0;
+    SoftMaxTiling tiling;
+};
+
+extern "C" __global__ __aicore__ void conv3d_softmax_max_pool_max_pool_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelConv3dSoftmaxMaxPoolMaxPool op;
+    op.Init(x, y, tiling_data.totalLength, tiling_data.width, tiling_data.rows, tiling_data.softmaxTilingData);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv3d_softmax_max_pool_max_pool_custom_impl_npu(const at::Tensor& x) {
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnConv3dSoftmaxMaxPoolMaxPoolCustom, x, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv3d_softmax_max_pool_max_pool_custom", &conv3d_softmax_max_pool_max_pool_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv3d_softmax_max_pool_max_pool_custom", &conv3d_softmax_max_pool_max_pool_custom_impl_npu, "Softmax over last dim for 5D tensor");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    优化版：保留Conv3d与MaxPool3d，由自定义AscendC算子加速Softmax（沿通道维）。
+    说明：
+    - 为便于在AscendC中使用高阶SoftMax API（按最后一维规约），先将通道维C移到最后一维再调用自定义算子，
+      然后再换回原始布局，最后执行两次MaxPool3d。
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.pool1 = nn.MaxPool3d(pool_kernel_size)
+        self.pool2 = nn.MaxPool3d(pool_kernel_size)
+
+    def forward(self, x):
+        # x: (B, C, D, H, W)
+        x = self.conv(x)  # (B, C_out, D, H, W)
+        # 将通道维移到最后： (B, D, H, W, C_out)，保证Softmax按最后一维
+        x = x.permute(0, 2, 3, 4, 1).contiguous()
+        x = custom_ops_lib.conv3d_softmax_max_pool_max_pool_custom(x)
+        # 换回原布局 (B, C_out, D, H, W)
+        x = x.permute(0, 4, 1, 2, 3).contiguous()
+        # 仍由PyTorch执行两次3D最大池化
+        x = self.pool1(x)
+        x = self.pool2(x)
+        return x
+'''

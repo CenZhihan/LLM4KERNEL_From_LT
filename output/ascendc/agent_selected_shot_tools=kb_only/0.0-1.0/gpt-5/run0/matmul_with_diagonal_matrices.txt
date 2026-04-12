@@ -1,0 +1,247 @@
+project_json_src='''
+[
+    {
+        "op": "MatmulWithDiagonalMatricesCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "A",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "B",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "C",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MatmulWithDiagonalMatricesCustomTilingData)
+TILING_DATA_FIELD_DEF(int32_t, N);
+TILING_DATA_FIELD_DEF(int32_t, M);
+TILING_DATA_FIELD_DEF(int32_t, rowsPerBlock);
+TILING_DATA_FIELD_DEF(int32_t, tileCols);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MatmulWithDiagonalMatricesCustom, MatmulWithDiagonalMatricesCustomTilingData)
+} // namespace optiling
+"""
+
+host_operator_src="""
+#include "matmul_with_diagonal_matrices_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext *context)
+{
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+
+    auto shape_A = context->GetInputTensor(0)->GetOriginShape(); // (N,)
+    auto shape_B = context->GetInputTensor(1)->GetOriginShape(); // (N, M)
+
+    if (shape_A.GetDimNum() < 1 || shape_B.GetDimNum() < 2) {
+        return ge::GRAPH_FAILED;
+    }
+
+    int32_t N = static_cast<int32_t>(shape_A.GetDim(shape_A.GetDimNum() - 1));
+    int32_t M = static_cast<int32_t>(shape_B.GetDim(shape_B.GetDimNum() - 1));
+
+    int32_t blockDim = (ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND310P) ? 2 : 8;
+    if (N < blockDim) {
+        blockDim = N > 0 ? N : 1;
+    }
+    int32_t rowsPerBlock = (N + blockDim - 1) / blockDim;
+    int32_t tileCols = 512; // 每次在UB中处理的列块大小
+
+    MatmulWithDiagonalMatricesCustomTilingData tiling;
+    tiling.set_N(N);
+    tiling.set_M(M);
+    tiling.set_rowsPerBlock(rowsPerBlock);
+    tiling.set_tileCols(tileCols);
+
+    context->SetBlockDim(blockDim);
+    context->SetTilingKey(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t userWorkspaceSize = 0;
+    size_t systemWorkspaceSize = static_cast<size_t>(ascendcPlatform.GetLibApiWorkSpaceSize());
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = userWorkspaceSize + systemWorkspaceSize;
+
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace optiling
+
+namespace ops {
+class MatmulWithDiagonalMatricesCustom : public OpDef {
+public:
+    explicit MatmulWithDiagonalMatricesCustom(const char *name) : OpDef(name)
+    {
+        this->Input("A")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+        this->Input("B")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+        this->Output("C")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND});
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc)
+            .AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MatmulWithDiagonalMatricesCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "matmul_with_diagonal_matrices_custom_tiling.h"
+
+__aicore__ inline uint32_t CeilDiv(uint32_t x, uint32_t y) {
+    return (x + y - 1) / y;
+}
+
+extern "C" __global__ __aicore__ void matmul_with_diagonal_matrices_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+    int32_t N = tilingData.get_N();
+    int32_t M = tilingData.get_M();
+    int32_t rowsPerBlock = tilingData.get_rowsPerBlock();
+    int32_t tileCols = tilingData.get_tileCols();
+
+    AscendC::TPipe pipe;
+
+    AscendC::GlobalTensor<float> aGlobal;
+    AscendC::GlobalTensor<float> bGlobal;
+    AscendC::GlobalTensor<float> cGlobal;
+
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(A), N);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(B), static_cast<uint32_t>(N) * static_cast<uint32_t>(M));
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(C), static_cast<uint32_t>(N) * static_cast<uint32_t>(M));
+
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueA;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueB;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueC;
+
+    pipe.InitBuffer(inQueueA, 1, sizeof(float));
+    pipe.InitBuffer(inQueueB, 1, static_cast<uint32_t>(tileCols) * sizeof(float));
+    pipe.InitBuffer(outQueueC, 1, static_cast<uint32_t>(tileCols) * sizeof(float));
+
+    int32_t blockIdx = GetBlockIdx();
+    int32_t rowStart = blockIdx * rowsPerBlock;
+    int32_t rowEnd = rowStart + rowsPerBlock;
+    if (rowEnd > N) rowEnd = N;
+
+    for (int32_t i = rowStart; i < rowEnd; ++i) {
+        // 读入标量 A[i]
+        AscendC::LocalTensor<float> aLocal = inQueueA.AllocTensor<float>();
+        AscendC::DataCopy(aLocal, aGlobal[i], 1);
+        inQueueA.EnQue(aLocal);
+        aLocal = inQueueA.DeQue<float>();
+        float scale = aLocal.GetValue(0);
+        inQueueA.FreeTensor(aLocal);
+
+        // 逐块处理 B 的列
+        for (int32_t col = 0; col < M; col += tileCols) {
+            int32_t len = (col + tileCols <= M) ? tileCols : (M - col);
+
+            AscendC::LocalTensor<float> bLocal = inQueueB.AllocTensor<float>();
+            AscendC::DataCopy(bLocal, bGlobal[i * M + col], static_cast<uint32_t>(len));
+            inQueueB.EnQue(bLocal);
+
+            AscendC::LocalTensor<float> bTile = inQueueB.DeQue<float>();
+            AscendC::LocalTensor<float> cLocal = outQueueC.AllocTensor<float>();
+
+            // 将 B 行块按标量 A[i] 进行缩放：C = scale * B
+            AscendC::Axpy(cLocal, bTile, (float)scale, static_cast<uint32_t>(len));
+
+            outQueueC.EnQue<float>(cLocal);
+            inQueueB.FreeTensor(bTile);
+
+            AscendC::LocalTensor<float> cTile = outQueueC.DeQue<float>();
+            AscendC::DataCopy(cGlobal[i * M + col], cTile, static_cast<uint32_t>(len));
+            outQueueC.FreeTensor(cTile);
+        }
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor matmul_with_diagonal_matrices_impl_npu(const at::Tensor& A, const at::Tensor& B) {
+    TORCH_CHECK(A.dim() == 1, \\"A must be 1D\\");
+    TORCH_CHECK(B.dim() == 2, \\"B must be 2D\\");
+    TORCH_CHECK(A.size(0) == B.size(0), \\"A.size(0) must equal B.size(0)\\");
+    auto N = B.size(0);
+    auto M = B.size(1);
+    at::Tensor C = at::empty({N, M}, B.options());
+    EXEC_NPU_CMD(aclnnMatmulWithDiagonalMatricesCustom, A, B, C);
+    return C;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("matmul_with_diagonal_matrices_custom", &matmul_with_diagonal_matrices_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("matmul_with_diagonal_matrices_custom", &matmul_with_diagonal_matrices_impl_npu, "Diag(A) @ B");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, A, B):
+        return custom_ops_lib.matmul_with_diagonal_matrices_custom(A, B)
+'''

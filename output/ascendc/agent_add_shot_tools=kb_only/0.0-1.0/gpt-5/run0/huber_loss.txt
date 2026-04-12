@@ -69,13 +69,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     context->SetBlockDim(BLOCK_DIM);
     tiling.set_totalLength(totalLength);
     tiling.set_tileNum(TILE_NUM);
-
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
-
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
-    context->SetTilingKey(1);
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -85,10 +82,9 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
     const gert::Shape* in_shape = context->GetInputShape(0);
     gert::Shape* out_shape = context->GetOutputShape(0);
-    *out_shape = *in_shape; // 输出与输入同形状（逐元素损失）
+    *out_shape = *in_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -132,8 +128,6 @@ OP_ADD(HuberLossCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "huber_loss_custom_tiling_data.h"
 
 constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
 
@@ -146,19 +140,15 @@ public:
         this->tileNum = tileNum;
         this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        predGm.SetGlobalBuffer((__gm__ float *)pred + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        targetGm.SetGlobalBuffer((__gm__ float *)target + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        lossGm.SetGlobalBuffer((__gm__ float *)loss + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        predGm.SetGlobalBuffer((__gm__ DTYPE_X *)pred + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        targetGm.SetGlobalBuffer((__gm__ DTYPE_Y *)target + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        lossGm.SetGlobalBuffer((__gm__ DTYPE_Z *)loss + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        pipe.InitBuffer(inQueuePred, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(inQueueTarget, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(outQueueLoss, BUFFER_NUM, this->tileLength * sizeof(float));
-
-        // two temporary local buffers for intermediate results
-        pipe.InitBuffer(tmpQueueA, BUFFER_NUM, this->tileLength * sizeof(uint8_t)); // used as float buffer
-        pipe.InitBuffer(tmpQueueB, BUFFER_NUM, this->tileLength * sizeof(uint8_t)); // used as float buffer
+        pipe.InitBuffer(inQueuePred, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueTarget, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueLoss, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z)); // workspace for intermediate t = |x - y|
     }
-
     __aicore__ inline void Process()
     {
         int32_t loopCount = this->tileNum * BUFFER_NUM;
@@ -172,59 +162,45 @@ public:
 private:
     __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<float> predLocal = inQueuePred.AllocTensor<float>();
-        AscendC::LocalTensor<float> targetLocal = inQueueTarget.AllocTensor<float>();
+        AscendC::LocalTensor<DTYPE_X> predLocal = inQueuePred.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> targetLocal = inQueueTarget.AllocTensor<DTYPE_Y>();
         AscendC::DataCopy(predLocal, predGm[progress * this->tileLength], this->tileLength);
         AscendC::DataCopy(targetLocal, targetGm[progress * this->tileLength], this->tileLength);
         inQueuePred.EnQue(predLocal);
         inQueueTarget.EnQue(targetLocal);
     }
-
-    __aicore__ inline void Compute(int32_t progress)
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<float> predLocal = inQueuePred.DeQue<float>();
-        AscendC::LocalTensor<float> targetLocal = inQueueTarget.DeQue<float>();
-        AscendC::LocalTensor<float> lossLocal = outQueueLoss.AllocTensor<float>();
+        AscendC::LocalTensor<DTYPE_X> predLocal = inQueuePred.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> targetLocal = inQueueTarget.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> lossLocal = outQueueLoss.AllocTensor<DTYPE_Z>();
+        AscendC::LocalTensor<DTYPE_Z> tmpLocal = tmpQueue.AllocTensor<DTYPE_Z>();
 
-        AscendC::LocalTensor<uint8_t> tmpALocalU8 = tmpQueueA.AllocTensor<uint8_t>();
-        AscendC::LocalTensor<uint8_t> tmpBLocalU8 = tmpQueueB.AllocTensor<uint8_t>();
-        AscendC::LocalTensor<float> tmpALocal = tmpALocalU8.ReinterpretCast<float>();
-        AscendC::LocalTensor<float> tmpBLocal = tmpBLocalU8.ReinterpretCast<float>();
+        // t = |pred - target|
+        AscendC::Sub(tmpLocal, predLocal, targetLocal, this->tileLength);
+        AscendC::Abs(tmpLocal, tmpLocal, this->tileLength);
 
-        // diff = pred - target => store in lossLocal
-        AscendC::Sub(lossLocal, predLocal, targetLocal, this->tileLength);
+        // m = min(t, 1.0)
+        AscendC::DataCopy(lossLocal, tmpLocal, this->tileLength);
+        AscendC::Mins(lossLocal, lossLocal, static_cast<DTYPE_Z>(1.0f));
 
-        // absd = Abs(diff) => in place in lossLocal
-        AscendC::Abs(lossLocal, lossLocal, this->tileLength);
+        // n = max(t - 1.0, 0.0)
+        AscendC::Adds(tmpLocal, tmpLocal, static_cast<DTYPE_Z>(-1.0f));
+        AscendC::Maxs(tmpLocal, tmpLocal, static_cast<DTYPE_Z>(0.0f));
 
-        // tmpBLocal = 1.0 (broadcast)
-        float one = 1.0f;
-        AscendC::Duplicate(tmpBLocal, one, this->tileLength);
+        // loss = 0.5 * m^2 + n
+        AscendC::Mul(lossLocal, lossLocal, lossLocal, this->tileLength);
+        AscendC::Muls(lossLocal, lossLocal, static_cast<DTYPE_Z>(0.5f), this->tileLength);
+        AscendC::Add(lossLocal, lossLocal, tmpLocal, this->tileLength);
 
-        // tmpALocal = min(absd, 1.0) => t
-        AscendC::Minimum(tmpALocal, lossLocal, tmpBLocal, this->tileLength);
-
-        // term2: lossLocal = absd - t
-        AscendC::Sub(lossLocal, lossLocal, tmpALocal, this->tileLength);
-
-        // term1: tmpBLocal = 0.5 * t * t
-        AscendC::Mul(tmpBLocal, tmpALocal, tmpALocal, this->tileLength);
-        AscendC::Muls(tmpBLocal, tmpBLocal, 0.5f, this->tileLength);
-
-        // lossLocal = term1 + term2
-        AscendC::Add(lossLocal, lossLocal, tmpBLocal, this->tileLength);
-
-        outQueueLoss.EnQue<float>(lossLocal);
-
-        tmpQueueA.FreeTensor(tmpALocalU8);
-        tmpQueueB.FreeTensor(tmpBLocalU8);
+        outQueueLoss.EnQue<DTYPE_Z>(lossLocal);
         inQueuePred.FreeTensor(predLocal);
         inQueueTarget.FreeTensor(targetLocal);
+        tmpQueue.FreeTensor(tmpLocal);
     }
-
     __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<float> lossLocal = outQueueLoss.DeQue<float>();
+        AscendC::LocalTensor<DTYPE_Z> lossLocal = outQueueLoss.DeQue<DTYPE_Z>();
         AscendC::DataCopy(lossGm[progress * this->tileLength], lossLocal, this->tileLength);
         outQueueLoss.FreeTensor(lossLocal);
     }
@@ -232,13 +208,11 @@ private:
 private:
     AscendC::TPipe pipe;
     AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueuePred, inQueueTarget;
-    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueueA, tmpQueueB;
     AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueLoss;
-
-    AscendC::GlobalTensor<float> predGm;
-    AscendC::GlobalTensor<float> targetGm;
-    AscendC::GlobalTensor<float> lossGm;
-
+    AscendC::TQue<AscendC::TPosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::GlobalTensor<DTYPE_X> predGm;
+    AscendC::GlobalTensor<DTYPE_Y> targetGm;
+    AscendC::GlobalTensor<DTYPE_Z> lossGm;
     uint32_t blockLength;
     uint32_t tileNum;
     uint32_t tileLength;
@@ -269,7 +243,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("huber_loss_custom", &huber_loss_custom_impl_npu, "Smooth L1 (Huber) loss (elementwise)");
+    m.def("huber_loss_custom", &huber_loss_custom_impl_npu, "element-wise Smooth L1 (Huber) loss");
 }
 """
 
@@ -283,6 +257,6 @@ class ModelNew(torch.nn.Module):
         super().__init__()
 
     def forward(self, predictions, targets):
-        # 自定义算子返回逐元素Huber损失，这里与原始语义一致取mean
-        return custom_ops_lib.huber_loss_custom(predictions, targets).mean()
+        # 自定义AscendC核计算逐元素Huber损失，再取平均以对齐PyTorch smooth_l1_loss 默认reduction="mean"
+        return torch.mean(custom_ops_lib.huber_loss_custom(predictions, targets))
 '''

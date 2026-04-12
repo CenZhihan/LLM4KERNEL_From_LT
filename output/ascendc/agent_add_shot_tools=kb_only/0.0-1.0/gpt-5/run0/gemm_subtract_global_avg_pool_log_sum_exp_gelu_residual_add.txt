@@ -15,7 +15,7 @@ project_json_src='''
                 ]
             },
             {
-                "name": "residual",
+                "name": "v",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -25,7 +25,7 @@ project_json_src='''
                 ]
             },
             {
-                "name": "sub",
+                "name": "c",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -58,7 +58,7 @@ namespace optiling {
 BEGIN_TILING_DATA_DEF(GemmSubtractGlobalAvgPoolLogSumExpGeluResidualAddCustomTilingData)
   TILING_DATA_FIELD_DEF(uint32_t, batch);
   TILING_DATA_FIELD_DEF(uint32_t, inFeatures);
-  TILING_DATA_FIELD_DEF(uint32_t, outFeatures);
+  TILING_DATA_FIELD_DEF(uint32_t, tileK);
   TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
@@ -72,34 +72,30 @@ host_operator_src="""
 
 namespace optiling {
 const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 1;
+const uint32_t TILE_NUM = 8;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
     GemmSubtractGlobalAvgPoolLogSumExpGeluResidualAddCustomTilingData tiling;
-
-    // x: [B, Out]
-    const auto *xShape = context->GetInputShape(0);
-    // residual: [B, In]
-    const auto *residualShape = context->GetInputShape(1);
-
-    uint32_t batch = (xShape->GetDimNum() >= 1) ? static_cast<uint32_t>(xShape->GetDim(0)) : 1U;
-    uint32_t outFeatures = (xShape->GetDimNum() >= 2) ? static_cast<uint32_t>(xShape->GetDim(1)) : 1U;
-    uint32_t inFeatures = (residualShape->GetDimNum() >= 2) ? static_cast<uint32_t>(residualShape->GetDim(1)) : outFeatures;
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    uint32_t batch = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t inFeatures = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
 
     context->SetBlockDim(BLOCK_DIM);
 
+    uint32_t tileNum = TILE_NUM;
+    uint32_t tileK = (inFeatures / tileNum > 0) ? (inFeatures / tileNum) : inFeatures;
+
     tiling.set_batch(batch);
     tiling.set_inFeatures(inFeatures);
-    tiling.set_outFeatures(outFeatures);
-    tiling.set_tileNum(TILE_NUM);
+    tiling.set_tileK(tileK);
+    tiling.set_tileNum(tileNum);
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
-    workspaceSizes[0] = 0; // no extra workspace
-
+    size_t* currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
@@ -107,13 +103,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // Output shape equals residual input shape [B, In]
-    const gert::Shape* residualShape = context->GetInputShape(1);
-    gert::Shape* yShape = context->GetOutputShape(0);
-    *yShape = *residualShape;
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -132,12 +126,12 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("residual")
+        this->Input("v")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("sub")
+        this->Input("c")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -153,156 +147,164 @@ public:
         this->AICore().AddConfig("ascend910b");
     }
 };
+
 OP_ADD(GemmSubtractGlobalAvgPoolLogSumExpGeluResidualAddCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom_tiling_data.h"
 
 using DTYPE = float;
-constexpr int32_t BUFFER_NUM = 1;
+constexpr int32_t BUFFER_NUM = 2;
 
-class KernelGemmSubAvgLseGeluResidualAdd {
+class KernelFused {
 public:
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR residual, GM_ADDR sub, GM_ADDR y,
-                                uint32_t batch, uint32_t inFeat, uint32_t outFeat)
+    __aicore__ inline KernelFused() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR v, GM_ADDR c, GM_ADDR y,
+                                uint32_t batch, uint32_t inFeatures, uint32_t tileK, uint32_t tileNum)
     {
         this->batch = batch;
-        this->inFeatures = inFeat;
-        this->outFeatures = outFeat;
+        this->inFeatures = inFeatures;
+        this->tileK = tileK;
+        this->tileNum = tileNum;
 
-        // Block-level batch split
-        uint32_t blockNum = AscendC::GetBlockNum();
+        // assign block rows
+        uint32_t blocks = AscendC::GetBlockNum();
         uint32_t blockIdx = AscendC::GetBlockIdx();
-        this->rowsPerBlock = (batch + blockNum - 1) / blockNum;
-        this->rowStart = blockIdx * rowsPerBlock;
-        this->rowEnd = AscendC::Min(batch, rowStart + rowsPerBlock);
+        uint32_t rowsPerBlock = (batch + blocks - 1) / blocks;
+        this->rowStart = rowsPerBlock * blockIdx;
+        this->rowEnd = this->rowStart + rowsPerBlock;
+        if (this->rowEnd > batch) this->rowEnd = batch;
 
-        // Set global buffers ranged for this block
-        if (rowStart < rowEnd) {
-            xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(x) + static_cast<uint64_t>(rowStart) * outFeatures,
-                                static_cast<uint64_t>(rowEnd - rowStart) * outFeatures);
-            residualGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(residual) + static_cast<uint64_t>(rowStart) * inFeatures,
-                                       static_cast<uint64_t>(rowEnd - rowStart) * inFeatures);
-            yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(y) + static_cast<uint64_t>(rowStart) * inFeatures,
-                                static_cast<uint64_t>(rowEnd - rowStart) * inFeatures);
-        } else {
-            xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(x), 0);
-            residualGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(residual), 0);
-            yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(y), 0);
-        }
-        subGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE*>(sub), outFeatures);
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(x) + static_cast<uint64_t>(this->rowStart) * inFeatures,
+                            static_cast<uint64_t>(this->rowEnd - this->rowStart) * inFeatures);
+        yGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(y) + static_cast<uint64_t>(this->rowStart) * inFeatures,
+                            static_cast<uint64_t>(this->rowEnd - this->rowStart) * inFeatures);
+        vGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(v), inFeatures);
+        cGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE *>(c), 1);
 
-        // Queues for per-row processing
-        pipe.InitBuffer(inQueueX, BUFFER_NUM, outFeatures * sizeof(DTYPE));
-        pipe.InitBuffer(inQueueResidual, BUFFER_NUM, inFeatures * sizeof(DTYPE));
-        pipe.InitBuffer(outQueueY, BUFFER_NUM, inFeatures * sizeof(DTYPE));
-
-        // Buffer to hold sub vector locally
-        pipe.InitBuffer(bufSub, 1, outFeatures * sizeof(DTYPE));
+        // init buffers
+        uint32_t tileLen = this->tileK;
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, tileLen * sizeof(DTYPE));
+        pipe.InitBuffer(inQueueV, BUFFER_NUM, tileLen * sizeof(DTYPE));
+        pipe.InitBuffer(tmpQueue, BUFFER_NUM, tileLen * sizeof(DTYPE));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, tileLen * sizeof(DTYPE));
+        pipe.InitBuffer(workQ, 1, tileLen * sizeof(DTYPE)); // for ReduceSum work buffer
+        pipe.InitBuffer(constQ, BUFFER_NUM, tileLen * sizeof(DTYPE)); // for broadcast const
+        pipe.InitBuffer(geluQ, BUFFER_NUM, tileLen * sizeof(DTYPE));
     }
 
     __aicore__ inline void Process()
     {
-        if (rowStart >= rowEnd) {
-            return;
-        }
-        // Load sub vector once
-        AscendC::LocalTensor<DTYPE> subLocal = bufSub.AllocTensor<DTYPE>();
-        AscendC::DataCopy(subLocal, subGm, outFeatures);
-
-        for (uint32_t r = rowStart; r < rowEnd; ++r) {
-            // Copy one row of x (gemm output) and residual
-            AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
-            AscendC::LocalTensor<DTYPE> residualLocal = inQueueResidual.AllocTensor<DTYPE>();
-            AscendC::DataCopy(xLocal, xGm[(r - rowStart) * outFeatures], outFeatures);
-            AscendC::DataCopy(residualLocal, residualGm[(r - rowStart) * inFeatures], inFeatures);
-            inQueueX.EnQue(xLocal);
-            inQueueResidual.EnQue(residualLocal);
-
-            ComputeRow(subLocal);
-
-            // Write back
-            AscendC::LocalTensor<DTYPE> yLocal = outQueueY.DeQue<DTYPE>();
-            AscendC::DataCopy(yGm[(r - rowStart) * inFeatures], yLocal, inFeatures);
-            outQueueY.FreeTensor(yLocal);
-        }
-        bufSub.FreeTensor(subLocal);
-    }
-
-private:
-    __aicore__ inline void ComputeRow(const AscendC::LocalTensor<DTYPE>& subLocal)
-    {
-        // Dequeue inputs
-        AscendC::LocalTensor<DTYPE> xLocal = inQueueX.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> residualLocal = inQueueResidual.DeQue<DTYPE>();
-        AscendC::LocalTensor<DTYPE> yLocal = outQueueY.AllocTensor<DTYPE>();
-
-        // Step 1: Subtract and compute mean over features (GlobalAvgPool on feature dim)
-        DTYPE acc = (DTYPE)0;
-        // Loop over outFeatures for mean(x - sub)
-        for (uint32_t i = 0; i < outFeatures; ++i) {
-            acc += (xLocal.GetValue(i) - subLocal.GetValue(i));
-        }
-        DTYPE meanVal = acc / static_cast<DTYPE>(outFeatures);
-
-        // Step 2: LogSumExp over dim=1 with keepdim=True.
-        // Since the tensor is [B,1] after mean, LSE over size-1 dim is the value itself.
-        DTYPE lseVal = meanVal;
-
-        // Step 3: GELU activation (approx) on scalar
-        // tanh-based approximation
-        const DTYPE k0 = (DTYPE)0.7978845608028654;      // sqrt(2/pi)
-        const DTYPE k1 = (DTYPE)0.044715;
-        DTYPE x3 = lseVal * lseVal * lseVal;
-        DTYPE tanhArg = k0 * (lseVal + k1 * x3);
-        // device math tanhf
-        DTYPE t = (DTYPE)tanhf((float)tanhArg);
-        DTYPE geluVal = (DTYPE)0.5 * lseVal * ((DTYPE)1.0 + t);
-
-        // Step 4: Residual add with broadcast over inFeatures
-        for (uint32_t j = 0; j < inFeatures; ++j) {
-            yLocal.SetValue(j, residualLocal.GetValue(j) + geluVal);
+        // read scalar c once
+        DTYPE cScalar = 0.0f;
+        {
+            AscendC::LocalTensor<DTYPE> cLocal = tmpQueue.AllocTensor<DTYPE>();
+            AscendC::DataCopy(cLocal, cGm, 1);
+            cScalar = cLocal.GetValue(0);
+            tmpQueue.FreeTensor(cLocal);
         }
 
-        // Enqueue output and free inputs
-        outQueueY.EnQue(yLocal);
-        inQueueX.FreeTensor(xLocal);
-        inQueueResidual.FreeTensor(residualLocal);
+        uint32_t rows = this->rowEnd - this->rowStart;
+        for (uint32_t r = 0; r < rows; ++r) {
+            // Pass 1: compute dot(x_row, v) -> sumDot
+            float sumDot = 0.0f;
+            uint32_t processed = 0;
+            for (uint32_t t = 0; t < this->tileNum; ++t) {
+                uint32_t currLen = this->tileK;
+                if (processed + currLen > this->inFeatures) {
+                    currLen = this->inFeatures - processed;
+                }
+                AscendC::LocalTensor<DTYPE> xLocal = inQueueX.AllocTensor<DTYPE>();
+                AscendC::LocalTensor<DTYPE> vLocal = inQueueV.AllocTensor<DTYPE>();
+                AscendC::DataCopy(xLocal, xGm[r * this->inFeatures + processed], currLen);
+                AscendC::DataCopy(vLocal, vGm[processed], currLen);
+
+                AscendC::LocalTensor<DTYPE> prodLocal = tmpQueue.AllocTensor<DTYPE>();
+                AscendC::Mul(prodLocal, xLocal, vLocal, currLen);
+
+                AscendC::LocalTensor<DTYPE> dstDummy = geluQ.AllocTensor<DTYPE>();
+                AscendC::LocalTensor<DTYPE> workLocal = workQ.AllocTensor<DTYPE>();
+                AscendC::ReduceSum(dstDummy, prodLocal, workLocal, currLen);
+                float partial = AscendC::GetAccVal<float>();
+                sumDot += partial;
+
+                geluQ.FreeTensor(dstDummy);
+                tmpQueue.FreeTensor(prodLocal);
+                inQueueX.FreeTensor(xLocal);
+                inQueueV.FreeTensor(vLocal);
+                processed += currLen;
+                if (processed >= this->inFeatures) break;
+            }
+
+            // GELU on scalar (broadcast later)
+            float gIn = sumDot + cScalar;
+
+            // Pass 2: y_row = x_row + GELU(gIn) (broadcast)
+            processed = 0;
+            for (uint32_t t = 0; t < this->tileNum; ++t) {
+                uint32_t currLen = this->tileK;
+                if (processed + currLen > this->inFeatures) {
+                    currLen = this->inFeatures - processed;
+                }
+                AscendC::LocalTensor<DTYPE> xLocal2 = inQueueX.AllocTensor<DTYPE>();
+                AscendC::DataCopy(xLocal2, xGm[r * this->inFeatures + processed], currLen);
+
+                AscendC::LocalTensor<DTYPE> constLocal = constQ.AllocTensor<DTYPE>();
+                AscendC::Duplicate(constLocal, gIn, currLen);
+
+                AscendC::LocalTensor<DTYPE> geluLocal = geluQ.AllocTensor<DTYPE>();
+                AscendC::Gelu(geluLocal, constLocal, currLen);
+
+                AscendC::LocalTensor<DTYPE> yLocal = outQueueY.AllocTensor<DTYPE>();
+                AscendC::Add(yLocal, xLocal2, geluLocal, currLen);
+
+                AscendC::DataCopy(yGm[r * this->inFeatures + processed], yLocal, currLen);
+
+                outQueueY.FreeTensor(yLocal);
+                geluQ.FreeTensor(geluLocal);
+                constQ.FreeTensor(constLocal);
+                inQueueX.FreeTensor(xLocal2);
+
+                processed += currLen;
+                if (processed >= this->inFeatures) break;
+            }
+        }
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueResidual;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
-
-    AscendC::TBuf<AscendC::TPosition::VECIN> bufSub;
+    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX, inQueueV;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> tmpQueue;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> workQ;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> constQ;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, BUFFER_NUM> geluQ;
 
     AscendC::GlobalTensor<DTYPE> xGm;
-    AscendC::GlobalTensor<DTYPE> residualGm;
-    AscendC::GlobalTensor<DTYPE> subGm;
     AscendC::GlobalTensor<DTYPE> yGm;
+    AscendC::GlobalTensor<DTYPE> vGm;
+    AscendC::GlobalTensor<DTYPE> cGm;
 
     uint32_t batch;
     uint32_t inFeatures;
-    uint32_t outFeatures;
-
-    uint32_t rowsPerBlock;
+    uint32_t tileK;
+    uint32_t tileNum;
     uint32_t rowStart;
     uint32_t rowEnd;
 };
 
 extern "C" __global__ __aicore__ void gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom(
-    GM_ADDR x, GM_ADDR residual, GM_ADDR sub, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR x, GM_ADDR v, GM_ADDR c, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
 {
-    GET_TILING_DATA(tilingData, tiling);
-    KernelGemmSubAvgLseGeluResidualAdd op;
-    op.Init(x, residual, sub, y,
-            tilingData.batch, tilingData.inFeatures, tilingData.outFeatures);
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelFused op;
+    op.Init(x, v, c, y,
+            tiling_data.batch,
+            tiling_data.inFeatures,
+            tiling_data.tileK,
+            tiling_data.tileNum);
     op.Process();
 }
 """
@@ -313,23 +315,25 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom_impl_npu(
-    const at::Tensor& x, const at::Tensor& residual, const at::Tensor& sub) {
-    // Output has the same shape as residual
-    at::Tensor result = at::empty_like(residual);
-    EXEC_NPU_CMD(aclnnGemmSubtractGlobalAvgPoolLogSumExpGeluResidualAddCustom, x, residual, sub, result);
-    return result;
+at::Tensor gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom_impl_npu(const at::Tensor& x,
+                                                                                       const at::Tensor& v,
+                                                                                       const at::Tensor& c) {
+    TORCH_CHECK(x.dtype() == at::kFloat && v.dtype() == at::kFloat && c.dtype() == at::kFloat, "dtype must be float32");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [N, K]");
+    TORCH_CHECK(v.dim() == 1 && v.size(0) == x.size(1), "v must be 1D with length equal to K");
+    TORCH_CHECK(c.numel() == 1, "c must be scalar tensor of size 1");
+    at::Tensor y = at::empty_like(x);
+    EXEC_NPU_CMD(aclnnGemmSubtractGlobalAvgPoolLogSumExpGeluResidualAddCustom, x, v, c, y);
+    return y;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom",
-           &gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom_impl_npu);
+    m.impl("gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom", &gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom",
-          &gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom_impl_npu,
-          "Gemm-Subtract-GlobalAvgPool-LogSumExp-GELU-ResidualAdd fused op");
+    m.def("gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom", &gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom_impl_npu,
+          "Fused: GEMM->Subtract->GlobalAvgPool->LogSumExp->GELU->ResidualAdd (custom AscendC)");
 }
 """
 
@@ -340,19 +344,30 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     """
-    Fused kernel replaces: Subtract -> GlobalAvgPool (dim=1, keepdim=True) -> LogSumExp (dim=1, keepdim=True) -> GELU -> ResidualAdd
-    GEMM (Linear) remains as nn.Linear to reuse highly-optimized GEMM on NPU.
+    Fused forward: compute v = mean_j W[j,:], c = mean_j (b_j - s_j), then y = X + GELU(X @ v + c).
+    This is mathematically equivalent to the original sequence.
     """
     def __init__(self, in_features, out_features, bias=True):
-        super().__init__()
+        super(ModelNew, self).__init__()
         self.gemm = torch.nn.Linear(in_features, out_features, bias=bias)
         self.subtract = torch.nn.Parameter(torch.randn(out_features))
 
     def forward(self, x):
-        original_x = x
-        # GEMM
-        x = self.gemm(x)
-        # Fused custom AscendC op
-        y = custom_ops_lib.gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom(x, original_x, self.subtract)
+        # Precompute v and c on-the-fly to keep consistency with current parameters
+        # v: column-wise mean of weight over output features
+        W = self.gemm.weight    # [out_features, in_features]
+        v = W.mean(dim=0)       # [in_features]
+
+        if self.gemm.bias is not None:
+            c = (self.gemm.bias - self.subtract).mean()
+        else:
+            c = (-self.subtract).mean()
+
+        # Ensure tensors are on NPU and correct dtype
+        v = v.to(x.device, dtype=x.dtype).contiguous()
+        c_tensor = c.to(x.device, dtype=x.dtype).view(1)
+
+        # Custom fused op: y = x + GELU(x @ v + c)
+        y = custom_ops_lib.gemm_subtract_global_avg_pool_log_sum_exp_gelu_residual_add_custom(x, v, c_tensor)
         return y
 '''

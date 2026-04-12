@@ -1,0 +1,331 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTransposed2dAsymmetricInputSquareKernelCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTransposed2dAsymmetricInputSquareKernelCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cin);
+  TILING_DATA_FIELD_DEF(uint32_t, cout);
+  TILING_DATA_FIELD_DEF(uint32_t, hin);
+  TILING_DATA_FIELD_DEF(uint32_t, win);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, hout);
+  TILING_DATA_FIELD_DEF(uint32_t, wout);
+  TILING_DATA_FIELD_DEF(uint64_t, totalOut);
+  TILING_DATA_FIELD_DEF(uint32_t, blockNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTransposed2dAsymmetricInputSquareKernelCustom, ConvTransposed2dAsymmetricInputSquareKernelCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transposed_2d_asymmetric_input_square_kernel_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTransposed2dAsymmetricInputSquareKernelCustomTilingData tiling;
+
+    const gert::Shape* xShape = context->GetInputShape(0); // [N, Cin, Hin, Win]
+    const gert::Shape* wShape = context->GetInputShape(1); // [Cin, Cout, K, K]
+
+    uint32_t n = (uint32_t)xShape->GetOriginShape().GetDim(0);
+    uint32_t cin = (uint32_t)xShape->GetOriginShape().GetDim(1);
+    uint32_t hin = (uint32_t)xShape->GetOriginShape().GetDim(2);
+    uint32_t win = (uint32_t)xShape->GetOriginShape().GetDim(3);
+
+    uint32_t cin_w = (uint32_t)wShape->GetOriginShape().GetDim(0);
+    uint32_t cout = (uint32_t)wShape->GetOriginShape().GetDim(1);
+    uint32_t k = (uint32_t)wShape->GetOriginShape().GetDim(2); // square kernel
+
+    // Assume stride=1, padding=0, output_padding=0 for this custom kernel
+    uint32_t hout = hin + k - 1;
+    uint32_t wout = win + k - 1;
+
+    // Basic validation: Cin must match
+    if (cin != cin_w) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint64_t totalOut = (uint64_t)n * (uint64_t)cout * (uint64_t)hout * (uint64_t)wout;
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.set_n(n);
+    tiling.set_cin(cin);
+    tiling.set_cout(cout);
+    tiling.set_hin(hin);
+    tiling.set_win(win);
+    tiling.set_k(k);
+    tiling.set_hout(hout);
+    tiling.set_wout(wout);
+    tiling.set_totalOut(totalOut);
+    tiling.set_blockNum(BLOCK_DIM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* xShape = context->GetInputShape(0); // [N, Cin, Hin, Win]
+    const gert::Shape* wShape = context->GetInputShape(1); // [Cin, Cout, K, K]
+
+    uint64_t n = xShape->GetDim(0);
+    uint64_t hin = xShape->GetDim(2);
+    uint64_t win = xShape->GetDim(3);
+    uint64_t cout = wShape->GetDim(1);
+    uint64_t k = wShape->GetDim(2);
+
+    uint64_t hout = hin + k - 1;
+    uint64_t wout = win + k - 1;
+
+    gert::Shape* yShape = context->GetOutputShape(0);
+    yShape->SetDimNum(4);
+    yShape->SetDim(0, n);
+    yShape->SetDim(1, cout);
+    yShape->SetDim(2, hout);
+    yShape->SetDim(3, wout);
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTransposed2dAsymmetricInputSquareKernelCustom : public OpDef {
+public:
+    explicit ConvTransposed2dAsymmetricInputSquareKernelCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTransposed2dAsymmetricInputSquareKernelCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+extern "C" __global__ __aicore__ void conv_transposed_2d_asymmetric_input_square_kernel_custom(GM_ADDR x, GM_ADDR w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+
+    // Assume float data type
+    __gm__ float* x_ptr = reinterpret_cast<__gm__ float*>(x); // [N, Cin, Hin, Win]
+    __gm__ float* w_ptr = reinterpret_cast<__gm__ float*>(w); // [Cin, Cout, K, K]
+    __gm__ float* y_ptr = reinterpret_cast<__gm__ float*>(y); // [N, Cout, Hout, Wout]
+
+    uint32_t N = tiling_data.n;
+    uint32_t Cin = tiling_data.cin;
+    uint32_t Cout = tiling_data.cout;
+    uint32_t Hin = tiling_data.hin;
+    uint32_t Win = tiling_data.win;
+    uint32_t K = tiling_data.k;
+    uint32_t Hout = tiling_data.hout;
+    uint32_t Wout = tiling_data.wout;
+
+    uint64_t totalOut = tiling_data.totalOut;
+
+    // Strides
+    uint64_t x_stride_n = (uint64_t)Cin * Hin * Win;
+    uint64_t x_stride_c = (uint64_t)Hin * Win;
+    uint64_t x_stride_h = (uint64_t)Win;
+
+    uint64_t y_stride_n = (uint64_t)Cout * Hout * Wout;
+    uint64_t y_stride_c = (uint64_t)Hout * Wout;
+    uint64_t y_stride_h = (uint64_t)Wout;
+
+    uint64_t w_stride_ic = (uint64_t)Cout * K * K;
+    uint64_t w_stride_oc = (uint64_t)K * K;
+    uint64_t w_stride_kh = (uint64_t)K;
+
+    // Split work by block: each block computes a contiguous slice of output elements
+    uint32_t block_num = AscendC::GetBlockNum();
+    uint32_t block_idx = AscendC::GetBlockIdx();
+    uint64_t blk_len = (totalOut + block_num - 1) / block_num;
+    uint64_t start = blk_len * block_idx;
+    uint64_t end = start + blk_len;
+    if (end > totalOut) end = totalOut;
+
+    for (uint64_t out_idx = start; out_idx < end; ++out_idx) {
+        // decode linear index to [n, oc, oh, ow]
+        uint64_t tmp = out_idx;
+        uint32_t ow = (uint32_t)(tmp % Wout);
+        tmp /= Wout;
+        uint32_t oh = (uint32_t)(tmp % Hout);
+        tmp /= Hout;
+        uint32_t oc = (uint32_t)(tmp % Cout);
+        uint32_t n = (uint32_t)(tmp / Cout);
+
+        float acc = 0.0f;
+
+        for (uint32_t ic = 0; ic < Cin; ++ic) {
+            // Iterate over kernel window
+            for (uint32_t kh = 0; kh < K; ++kh) {
+                // Corresponding input h index: oh - kh
+                int32_t ih = (int32_t)oh - (int32_t)kh;
+                if (ih < 0 || ih >= (int32_t)Hin) continue;
+                for (uint32_t kw = 0; kw < K; ++kw) {
+                    int32_t iw = (int32_t)ow - (int32_t)kw;
+                    if (iw < 0 || iw >= (int32_t)Win) continue;
+
+                    uint64_t x_off = (uint64_t)n * x_stride_n + (uint64_t)ic * x_stride_c +
+                                     (uint64_t)ih * x_stride_h + (uint64_t)iw;
+                    uint64_t w_off = (uint64_t)ic * w_stride_ic + (uint64_t)oc * w_stride_oc +
+                                     (uint64_t)kh * w_stride_kh + (uint64_t)kw;
+
+                    acc += x_ptr[x_off] * w_ptr[w_off];
+                }
+            }
+        }
+
+        uint64_t y_off = (uint64_t)n * y_stride_n + (uint64_t)oc * y_stride_c +
+                         (uint64_t)oh * y_stride_h + (uint64_t)ow;
+        y_ptr[y_off] = acc;
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor conv_transposed_2d_asymmetric_input_square_kernel_custom_impl_npu(const at::Tensor& x, const at::Tensor& w) {
+    TORCH_CHECK(x.dim() == 4, "Input x must be 4D NCHW");
+    TORCH_CHECK(w.dim() == 4, "Weight w must be 4D [Cin, Cout, K, K]");
+    TORCH_CHECK(x.scalar_type() == at::kFloat && w.scalar_type() == at::kFloat, "Only float32 is supported");
+    TORCH_CHECK(x.size(1) == w.size(0), "Cin mismatch between x and w");
+    TORCH_CHECK(w.size(2) == w.size(3), "Kernel must be square");
+
+    auto N = x.size(0);
+    auto Cin = x.size(1);
+    auto Hin = x.size(2);
+    auto Win = x.size(3);
+    auto Cout = w.size(1);
+    auto K = w.size(2);
+
+    auto Hout = Hin + K - 1;
+    auto Wout = Win + K - 1;
+
+    at::Tensor result = at::empty({N, Cout, Hout, Wout}, x.options());
+    EXEC_NPU_CMD(aclnnConvTransposed2dAsymmetricInputSquareKernelCustom, x, w, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("conv_transposed_2d_asymmetric_input_square_kernel_custom", &conv_transposed_2d_asymmetric_input_square_kernel_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("conv_transposed_2d_asymmetric_input_square_kernel_custom", &conv_transposed_2d_asymmetric_input_square_kernel_custom_impl_npu, "Custom transposed conv2d (asymmetric input, square kernel)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Optimized transposed 2D convolution with asymmetric input and a square kernel using a custom AscendC kernel.
+    Constraints in this custom implementation:
+      - stride=1, padding=0, output_padding=0
+      - groups=1
+      - bias=False
+      - float32 only
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int):
+        super().__init__()
+        # weight shape for ConvTranspose2d: [Cin, Cout, K, K]
+        w = torch.empty(in_channels, out_channels, kernel_size, kernel_size, dtype=torch.float32)
+        torch.nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+        self.weight = torch.nn.Parameter(w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.conv_transposed_2d_asymmetric_input_square_kernel_custom(x, self.weight)
+
+import math
+'''

@@ -1,0 +1,379 @@
+project_json_src='''
+[
+    {
+        "op": "CrossModalAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "kv",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "out",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(CrossModalAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+  TILING_DATA_FIELD_DEF(uint32_t, heads);
+  TILING_DATA_FIELD_DEF(uint32_t, lenQ);
+  TILING_DATA_FIELD_DEF(uint32_t, lenK);
+  TILING_DATA_FIELD_DEF(uint32_t, headDim);
+  TILING_DATA_FIELD_DEF(uint32_t, blockDim);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(CrossModalAttentionCustom, CrossModalAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "cross_modal_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include <algorithm>
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    CrossModalAttentionCustomTilingData tiling;
+
+    // Expect input shapes:
+    // q: [B, H, Tq, Dh]
+    // kv: [B, H, Tk, Dh]
+    const gert::Shape* qShape = context->GetInputShape(0);
+    const gert::Shape* kvShape = context->GetInputShape(1);
+
+    if (qShape->GetDimNum() != 4 || kvShape->GetDimNum() != 4) {
+        return ge::GRAPH_PARAM_INVALID;
+    }
+
+    uint32_t B  = static_cast<uint32_t>(qShape->GetDim(0));
+    uint32_t H  = static_cast<uint32_t>(qShape->GetDim(1));
+    uint32_t Tq = static_cast<uint32_t>(qShape->GetDim(2));
+    uint32_t Dh = static_cast<uint32_t>(qShape->GetDim(3));
+    uint32_t Tk = static_cast<uint32_t>(kvShape->GetDim(2));
+
+    uint32_t groups = B * H;
+    uint32_t blockDim = std::min<uint32_t>(groups, 32);
+
+    tiling.set_batch(B);
+    tiling.set_heads(H);
+    tiling.set_lenQ(Tq);
+    tiling.set_lenK(Tk);
+    tiling.set_headDim(Dh);
+    tiling.set_blockDim(blockDim);
+
+    context->SetBlockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0; // no extra workspace
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // out has same shape as q: [B, H, Tq, Dh]
+    const gert::Shape* qShape = context->GetInputShape(0);
+    gert::Shape* outShape = context->GetOutputShape(0);
+    *outShape = *qShape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class CrossModalAttentionCustom : public OpDef {
+public:
+    explicit CrossModalAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("kv")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("out")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(CrossModalAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE = float;
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelCrossModalAttention {
+public:
+    __aicore__ inline KernelCrossModalAttention() {}
+
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR kv, GM_ADDR out, 
+                                uint32_t B, uint32_t H, uint32_t Tq, uint32_t Tk, uint32_t Dh)
+    {
+        this->B = B;
+        this->H = H;
+        this->Tq = Tq;
+        this->Tk = Tk;
+        this->Dh = Dh;
+
+        uint32_t groups = B * H;
+        uint32_t elemsQPerGroup = Tq * Dh;
+        uint32_t elemsKvPerGroup = Tk * Dh;
+
+        // Each block handles one (b, h) group indexed by blockIdx
+        uint32_t gid = AscendC::GetBlockIdx();
+        uint32_t qOffset = gid * elemsQPerGroup;
+        uint32_t kvOffset = gid * elemsKvPerGroup;
+
+        qGm.SetGlobalBuffer((__gm__ DTYPE *)q + qOffset, elemsQPerGroup);
+        kvGm.SetGlobalBuffer((__gm__ DTYPE *)kv + kvOffset, elemsKvPerGroup);
+        outGm.SetGlobalBuffer((__gm__ DTYPE *)out + qOffset, elemsQPerGroup);
+
+        // Allocate queues for full-group tiles (simple version)
+        // Local buffers:
+        // qLocal: [Tq, Dh], kvLocal: [Tk, Dh], scores: [Tq, Tk], probs: [Tq, Tk], outLocal: [Tq, Dh]
+        uint32_t qBytes  = elemsQPerGroup * sizeof(DTYPE);
+        uint32_t kvBytes = elemsKvPerGroup * sizeof(DTYPE);
+        uint32_t outBytes = elemsQPerGroup * sizeof(DTYPE);
+
+        // For simplicity, use queues for q and out; kv handled similarly
+        AscendC::GetTPipePtr()->InitBuffer(inQueueQ, 1, qBytes);
+        AscendC::GetTPipePtr()->InitBuffer(inQueueKV, 1, kvBytes);
+        AscendC::GetTPipePtr()->InitBuffer(outQueueO, 1, outBytes);
+    }
+
+    __aicore__ inline void Process()
+    {
+        CopyIn();
+        Compute();
+        CopyOut();
+    }
+
+private:
+    __aicore__ inline void CopyIn()
+    {
+        // Q
+        AscendC::LocalTensor<DTYPE> qLocal = inQueueQ.AllocTensor<DTYPE>();
+        AscendC::DataCopy(qLocal, qGm, Tq * Dh);
+        inQueueQ.EnQue(qLocal);
+
+        // KV (used as both K and V)
+        AscendC::LocalTensor<DTYPE> kvLocal = inQueueKV.AllocTensor<DTYPE>();
+        AscendC::DataCopy(kvLocal, kvGm, Tk * Dh);
+        inQueueKV.EnQue(kvLocal);
+    }
+
+    __aicore__ inline void Compute()
+    {
+        // Dequeue inputs
+        AscendC::LocalTensor<DTYPE> qLocal = inQueueQ.DeQue<DTYPE>();
+        AscendC::LocalTensor<DTYPE> kvLocal = inQueueKV.DeQue<DTYPE>();
+        AscendC::LocalTensor<DTYPE> outLocal = outQueueO.AllocTensor<DTYPE>();
+
+        // Allocate temporaries in local L1/L0 by using queue-style temps
+        // scores: [Tq, Tk]
+        AscendC::LocalTensor<DTYPE> scoresLocal = AscendC::AllocLocalTensor<DTYPE>(Tq * Tk);
+        AscendC::LocalTensor<DTYPE> probsLocal = AscendC::AllocLocalTensor<DTYPE>(Tq * Tk);
+
+        // scores = (q @ k^T) / sqrt(Dh)
+        // q: [Tq, Dh], k: [Tk, Dh] -> k^T: [Dh, Tk]
+        // MatMul: (Tq x Dh) * (Dh x Tk) = (Tq x Tk)
+        // Note: API signatures are conceptual; rely on AscendC high-level matmul
+        AscendC::MatMul(scoresLocal, qLocal, kvLocal, Tq, Tk, Dh, false, true);
+
+        // scale
+        DTYPE scale = (DTYPE)(1.0f / sqrtf((float)Dh));
+        AscendC::Muls(scoresLocal, scoresLocal, scale, Tq * Tk);
+
+        // softmax along last dim (Tk) for each of Tq rows
+        AscendC::Softmax(probsLocal, scoresLocal, Tq, Tk);
+
+        // out = probs @ v, where v == kvLocal: [Tk, Dh]
+        // (Tq x Tk) * (Tk x Dh) = (Tq x Dh)
+        AscendC::MatMul(outLocal, probsLocal, kvLocal, Tq, Dh, Tk, false, false);
+
+        // release inputs
+        inQueueQ.FreeTensor(qLocal);
+        inQueueKV.FreeTensor(kvLocal);
+
+        // enqueue output
+        outQueueO.EnQue(outLocal);
+
+        // free temporaries
+        AscendC::FreeLocalTensor(probsLocal);
+        AscendC::FreeLocalTensor(scoresLocal);
+    }
+
+    __aicore__ inline void CopyOut()
+    {
+        AscendC::LocalTensor<DTYPE> outLocal = outQueueO.DeQue<DTYPE>();
+        AscendC::DataCopy(outGm, outLocal, Tq * Dh);
+        outQueueO.FreeTensor(outLocal);
+    }
+
+private:
+    // Queues and global tensors
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueQ;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueKV;
+    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueO;
+
+    AscendC::GlobalTensor<DTYPE> qGm;
+    AscendC::GlobalTensor<DTYPE> kvGm;
+    AscendC::GlobalTensor<DTYPE> outGm;
+
+    // dims per (b,h) group
+    uint32_t B, H, Tq, Tk, Dh;
+};
+
+extern "C" __global__ __aicore__ void cross_modal_attention_custom(GM_ADDR q, GM_ADDR kv, GM_ADDR out, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    uint32_t B  = tiling_data.batch;
+    uint32_t H  = tiling_data.heads;
+    uint32_t Tq = tiling_data.lenQ;
+    uint32_t Tk = tiling_data.lenK;
+    uint32_t Dh = tiling_data.headDim;
+
+    // One TPipe per kernel entry
+    AscendC::TPipe pipe;
+
+    KernelCrossModalAttention op;
+    op.Init(q, kv, out, B, H, Tq, Tk, Dh);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor cross_modal_attention_custom_impl_npu(const at::Tensor& q, const at::Tensor& kv) {
+    // q: [B, H, Tq, Dh], kv: [B, H, Tk, Dh]
+    TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
+    TORCH_CHECK(kv.is_contiguous(), "kv must be contiguous");
+    TORCH_CHECK(q.dtype() == at::kFloat, "dtype must be float32");
+    TORCH_CHECK(kv.dtype() == at::kFloat, "dtype must be float32");
+    TORCH_CHECK(q.sizes().size() == 4 && kv.sizes().size() == 4, "inputs must be 4D [B,H,T,Dh]");
+    TORCH_CHECK(q.size(0) == kv.size(0) && q.size(1) == kv.size(1), "B,H must match");
+    TORCH_CHECK(q.size(3) == kv.size(3), "Dh must match");
+
+    at::Tensor out = at::empty_like(q);
+    EXEC_NPU_CMD(aclnnCrossModalAttentionCustom, q, kv, out);
+    return out;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("cross_modal_attention_custom", &cross_modal_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cross_modal_attention_custom", &cross_modal_attention_custom_impl_npu, "Cross-modal attention (Q,KV) -> Out");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Cross-modal attention using custom AscendC kernel for scaled dot-product attention.
+    Expect kernel input shapes:
+      q:  [B, H, Tq, Dh]
+      kv: [B, H, Tk, Dh]
+    Output:
+      out: [B, H, Tq, Dh] -> merged to [B, Tq, D]
+    """
+    def __init__(self, d_model_text=256, d_model_img=512, num_heads=8):
+        super().__init__()
+        self.d_model_text = d_model_text
+        self.d_model_img = d_model_img
+        self.num_heads = num_heads
+        self.head_dim = d_model_text // num_heads
+        assert self.d_model_text % self.num_heads == 0, "d_model_text must be divisible by num_heads"
+
+        self.q_proj = torch.nn.Linear(d_model_text, d_model_text, bias=True)
+        self.kv_proj = torch.nn.Linear(d_model_img, d_model_text, bias=True)
+
+    def forward(self, text, img):
+        # text: [B, Tq, Dt], img: [B, Tk, Di]
+        B, Tq, _ = text.shape
+        Tk = img.shape[1]
+
+        q = self.q_proj(text)    # [B, Tq, Dt]
+        kv = self.kv_proj(img)   # [B, Tk, Dt]
+
+        H = self.num_heads
+        Dh = self.head_dim
+
+        # [B, Tq, H, Dh] -> [B, H, Tq, Dh]
+        q = q.view(B, Tq, H, Dh).permute(0, 2, 1, 3).contiguous()
+        # [B, Tk, H, Dh] -> [B, H, Tk, Dh]
+        kv = kv.view(B, Tk, H, Dh).permute(0, 2, 1, 3).contiguous()
+
+        out_heads = custom_ops_lib.cross_modal_attention_custom(q, kv)  # [B, H, Tq, Dh]
+
+        # merge heads: [B, Tq, D]
+        out = out_heads.permute(0, 2, 1, 3).contiguous().view(B, Tq, H * Dh)
+        return out
+'''

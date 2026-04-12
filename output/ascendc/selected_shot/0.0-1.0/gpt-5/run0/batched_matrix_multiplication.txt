@@ -65,23 +65,20 @@ using namespace matmul_tiling;
 
 namespace optiling {
 /**
-  * @brief  Generate matmul tiling for batched matrix multiplication.
+  * @brief  Generate batched matmul tiling.
   * @param  context: Tiling kernel context.
   * @retval Status of GetTiling (GRAPH_SUCCESS or GRAPH_FAILED).
   */
 static ge::graphStatus TilingFunc(gert::TilingContext *context)
 {
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    auto shape_A = context->GetInputTensor(0)->GetOriginShape();
-    auto shape_B = context->GetInputTensor(1)->GetOriginShape();
+    auto shape_a = context->GetInputTensor(0)->GetOriginShape(); // [batch, m, k]
+    auto shape_b = context->GetInputTensor(1)->GetOriginShape(); // [batch, k, n]
 
-    // Shapes:
-    // A: [batch, M, K]
-    // B: [batch, K, N]
-    int32_t batch = shape_A.GetDim(0);
-    int32_t M = shape_A.GetDim(1);
-    int32_t K = shape_A.GetDim(2);
-    int32_t N = shape_B.GetDim(2);
+    int32_t batch = shape_a.GetDim(0);
+    int32_t M = shape_a.GetDim(1);
+    int32_t K = shape_a.GetDim(2);
+    int32_t N = shape_b.GetDim(2);
 
     int32_t baseM = 128;
     int32_t baseN = 128;
@@ -101,8 +98,6 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
 
-    tiling.batchSize = batch;
-
     if (ascendcPlatform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND310P) {
         context->SetBlockDim(2);
         context->SetTilingKey(2);
@@ -110,6 +105,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
         context->SetBlockDim(1);
         context->SetTilingKey(1);
     }
+
+    tiling.batchSize = batch;
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
@@ -165,7 +162,7 @@ __aicore__ inline uint32_t Ceiling(uint32_t a, uint32_t b)
 template <typename aType, typename bType, typename cType> class BatchedMatmulKernel {
 public:
     __aicore__ inline BatchedMatmulKernel(){};
-    __aicore__ inline void Init(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace,
+    __aicore__ inline void Init(GM_ADDR a, GM_ADDR b, GM_ADDR c, GM_ADDR workspace,
                                 const TCubeTiling &tiling, int32_t batchSize);
     template <bool setTmpSpace = false> __aicore__ inline void Process(AscendC::TPipe *pipe);
 
@@ -180,31 +177,27 @@ public:
     AscendC::GlobalTensor<aType> aGlobal;
     AscendC::GlobalTensor<bType> bGlobal;
     AscendC::GlobalTensor<cType> cGlobal;
-
     TCubeTiling tiling;
     int32_t batchSize;
+    int32_t offsetA;
+    int32_t offsetB;
+    int32_t offsetC;
 };
 
 template <typename aType, typename bType, typename cType>
-__aicore__ inline void BatchedMatmulKernel<aType, bType, cType>::Init(GM_ADDR A, GM_ADDR B, GM_ADDR C,
-                                                                      GM_ADDR workspace, const TCubeTiling &tiling,
-                                                                      int32_t batchSize)
+__aicore__ inline void BatchedMatmulKernel<aType, bType, cType>::Init(GM_ADDR a, GM_ADDR b, GM_ADDR c,
+                                                                      GM_ADDR workspace, const TCubeTiling &tiling, int32_t batchSize)
 {
     this->tiling = tiling;
     this->batchSize = batchSize;
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ aType *>(a), static_cast<int64_t>(tiling.M) * tiling.Ka * batchSize);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ bType *>(b), static_cast<int64_t>(tiling.Kb) * tiling.N * batchSize);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ cType *>(c), static_cast<int64_t>(tiling.M) * tiling.N * batchSize);
 
-    // Total buffer length across all batches
-    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ aType *>(A), tiling.M * tiling.Ka * batchSize);
-    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ bType *>(B), tiling.Kb * tiling.N * batchSize);
-    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ cType *>(C), tiling.M * tiling.N * batchSize);
-
-    int32_t offsetA = 0;
-    int32_t offsetB = 0;
-    int32_t offsetC = 0;
+    offsetA = 0;
+    offsetB = 0;
+    offsetC = 0;
     CalcOffset(GetBlockIdx(), tiling, offsetA, offsetB, offsetC);
-    aGlobal = aGlobal[offsetA];
-    bGlobal = bGlobal[offsetB];
-    cGlobal = cGlobal[offsetC];
 
     if (GetSysWorkSpacePtr() == nullptr) {
         return;
@@ -223,15 +216,18 @@ __aicore__ inline void BatchedMatmulKernel<aType, bType, cType>::Process(AscendC
         matmulObj.SetLocalWorkspace(mmformatUb);
     }
 
-    // Process all batches for this (m, n) tile
-    int32_t aBatchStride = tiling.M * tiling.Ka;
-    int32_t bBatchStride = tiling.Kb * tiling.N;
-    int32_t cBatchStride = tiling.M * tiling.N;
+    int64_t aBatchStride = static_cast<int64_t>(tiling.M) * tiling.Ka;
+    int64_t bBatchStride = static_cast<int64_t>(tiling.Kb) * tiling.N;
+    int64_t cBatchStride = static_cast<int64_t>(tiling.M) * tiling.N;
+
+    auto aTileBase = aGlobal[offsetA];
+    auto bTileBase = bGlobal[offsetB];
+    auto cTileBase = cGlobal[offsetC];
 
     for (int32_t bIdx = 0; bIdx < batchSize; ++bIdx) {
-        auto aBatch = aGlobal[bIdx * aBatchStride];
-        auto bBatch = bGlobal[bIdx * bBatchStride];
-        auto cBatch = cGlobal[bIdx * cBatchStride];
+        auto aBatch = aTileBase[bIdx * aBatchStride];
+        auto bBatch = bTileBase[bIdx * bBatchStride];
+        auto cBatch = cTileBase[bIdx * cBatchStride];
 
         matmulObj.SetTensorA(aBatch);
         matmulObj.SetTensorB(bBatch);
@@ -254,18 +250,18 @@ BatchedMatmulKernel<aType, bType, cType>::CalcOffset(int32_t blockIdx, const TCu
     offsetC = mCoreIndx * tiling.N * tiling.singleCoreM + nCoreIndx * tiling.singleCoreN;
 }
 
-extern "C" __global__ __aicore__ void batched_matrix_multiplication_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C,
-                                                                           GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void batched_matrix_multiplication_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace,
+                                                                           GM_ADDR tiling)
 {
     GET_TILING_DATA(tilingData, tiling);
-    BatchedMatmulKernel<float, float, float> kernel;
+    BatchedMatmulKernel<float, float, float> matmulKernel;
     AscendC::TPipe pipe;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), kernel.matmulObj, &tilingData.cubeTilingData);
-    kernel.Init(A, B, C, workspace, tilingData.cubeTilingData, tilingData.batchSize);
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), matmulKernel.matmulObj, &tilingData.cubeTilingData);
+    matmulKernel.Init(A, B, C, workspace, tilingData.cubeTilingData, tilingData.batchSize);
     if (TILING_KEY_IS(1)) {
-        kernel.Process(&pipe);
+        matmulKernel.Process(&pipe);
     } else if (TILING_KEY_IS(2)) {
-        kernel.Process<true>(&pipe);
+        matmulKernel.Process<true>(&pipe);
     }
 }
 """
@@ -277,28 +273,30 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor batched_matmul_impl_npu(const at::Tensor& A, const at::Tensor& B) {
-    // Expect A: [batch, M, K], B: [batch, K, N]
-    TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "Inputs must be 3D tensors for batched matmul");
+    // A: [batch, m, k], B: [batch, k, n]
     auto A_sizes = A.sizes();
     auto B_sizes = B.sizes();
-    TORCH_CHECK(A_sizes[0] == B_sizes[0], "Batch sizes must match");
-    TORCH_CHECK(A_sizes[2] == B_sizes[1], "Inner dimensions K must match");
+
+    TORCH_CHECK(A.dim() == 3 && B.dim() == 3, \"Input tensors must be 3D for batched matmul\");
 
     int64_t batch = A_sizes[0];
-    int64_t M = A_sizes[1];
-    int64_t N = B_sizes[2];
+    int64_t m = A_sizes[1];
+    int64_t k = A_sizes[2];
+    TORCH_CHECK(B_sizes[0] == batch && B_sizes[1] == k, \"Batch and K dimensions must match\");
 
-    at::Tensor result = at::empty({batch, M, N}, A.options());
+    int64_t n = B_sizes[2];
+
+    at::Tensor result = at::empty({batch, m, n}, A.options());
     EXEC_NPU_CMD(aclnnBatchedMatrixMultiplicationCustom, A, B, result);
     return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
-    m.impl("batched_matrix_multiplication_custom", &batched_matmul_impl_npu);
+    m.impl(\"batched_matrix_multiplication_custom\", &batched_matmul_impl_npu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("batched_matrix_multiplication_custom", &batched_matmul_impl_npu, "batched matrix multiplication");
+    m.def(\"batched_matrix_multiplication_custom\", &batched_matmul_impl_npu, \"batched matrix multiplication\");
 }
 """
 

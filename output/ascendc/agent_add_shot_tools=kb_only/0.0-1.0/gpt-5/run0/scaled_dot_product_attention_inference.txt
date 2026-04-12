@@ -56,12 +56,14 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(ScaledDotProductAttentionInferenceCustomTilingData)
-  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
-  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
   TILING_DATA_FIELD_DEF(uint32_t, batch);
-  TILING_DATA_FIELD_DEF(uint32_t, seqLen);
-  TILING_DATA_FIELD_DEF(uint32_t, dModel);
-  TILING_DATA_FIELD_DEF(float, invSqrtD);
+  TILING_DATA_FIELD_DEF(uint32_t, seqlen);
+  TILING_DATA_FIELD_DEF(uint32_t, dmodel);
+  // raw bytes for two TCubeTiling blocks (QK^T and Attn*V)
+  TILING_DATA_FIELD_DEF(uint32_t, qk_tiling_size_u32);
+  TILING_DATA_FIELD_DEF(uint32_t, av_tiling_size_u32);
+  TILING_DATA_FIELD_DEF(TILING_DATA_ARRAY(uint32_t, 512), qk_tiling_data);
+  TILING_DATA_FIELD_DEF(TILING_DATA_ARRAY(uint32_t, 512), av_tiling_data);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(ScaledDotProductAttentionInferenceCustom, ScaledDotProductAttentionInferenceCustomTilingData)
@@ -71,74 +73,114 @@ REGISTER_TILING_DATA_CLASS(ScaledDotProductAttentionInferenceCustom, ScaledDotPr
 host_operator_src="""
 #include "scaled_dot_product_attention_inference_custom_tiling.h"
 #include "register/op_def_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/op_tiling.h"
+#include "tiling/register/op_tiling_registry.h"
+#include "tiling/matmul_tiling.h"
+
+using namespace optiling;
 
 namespace {
-inline uint32_t GetShapeSize(const gert::Shape* s) {
-    uint64_t size = 1;
-    for (int i = 0; i < s->GetDimNum(); ++i) {
-        size *= s->GetDim(i);
+inline void SaveTilingBytes(const void* src, uint32_t bytes, uint32_t* dstU32, uint32_t maxU32)
+{
+    uint32_t words = (bytes + 3) / 4;
+    if (words > maxU32) {
+        words = maxU32;
     }
-    return static_cast<uint32_t>(size);
+    const uint32_t* p = reinterpret_cast<const uint32_t*>(src);
+    for (uint32_t i = 0; i < words; ++i) {
+        dstU32[i] = p[i];
+    }
 }
 }
 
 namespace optiling {
-const uint32_t BLOCK_DIM = 8;
-const uint32_t TILE_NUM = 8;
-
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    ScaledDotProductAttentionInferenceCustomTilingData tiling;
+    // 输入形状：Q/K/V: [B, S, D]
+    auto* qShape = context->GetInputShape(0);
+    auto ori = qShape->GetOriginShape();
+    uint32_t dims = ori.GetDimNum();
+    if (dims != 3) {
+        return ge::GRAPH_FAILED;
+    }
+    uint32_t B = static_cast<uint32_t>(ori.GetDim(0));
+    uint32_t S = static_cast<uint32_t>(ori.GetDim(1));
+    uint32_t D = static_cast<uint32_t>(ori.GetDim(2));
 
-    const gert::Shape* q_shape = context->GetInputShape(0);
-    // Expect ND: [B, S, D]
-    uint32_t dim_num = q_shape->GetDimNum();
-    if (dim_num < 2) return ge::GRAPH_FAILED;
-    uint32_t B = (dim_num == 3) ? static_cast<uint32_t>(q_shape->GetDim(0)) : 1;
-    uint32_t S = (dim_num == 3) ? static_cast<uint32_t>(q_shape->GetDim(1)) : static_cast<uint32_t>(q_shape->GetDim(0));
-    uint32_t D = (dim_num == 3) ? static_cast<uint32_t>(q_shape->GetDim(2)) : static_cast<uint32_t>(q_shape->GetDim(1));
-
-    uint32_t totalLength = GetShapeSize(q_shape); // B*S*D
-
+    // 设置并行核数
+    const uint32_t BLOCK_DIM = 8;
     context->SetBlockDim(BLOCK_DIM);
 
-    tiling.set_totalLength(totalLength);
-    tiling.set_tileNum(TILE_NUM);
-    tiling.set_batch(B);
-    tiling.set_seqLen(S);
-    tiling.set_dModel(D);
-    // inv sqrt(d_model)
-    float invSqrtD = 1.0f / std::sqrt(static_cast<float>(D));
-    tiling.set_invSqrtD(invSqrtD);
+    // 计算Matmul tiling：Q[S,D] x K[S,D]^T -> Scores[S,S]; Scores[S,S] x V[S,D] -> O[S,D]
+    platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
+    matmul_tiling::MatmulApiTiling qkTiling(platform);
+    qkTiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    qkTiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    qkTiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    qkTiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    qkTiling.SetShape(S, S, D);        // M=N=S, K=D
+    qkTiling.SetOrgShape(S, S, D);     // Ka=Kb=D
+    qkTiling.SetBias(false);
+    qkTiling.SetBufferSpace(-1, -1, -1);
+    optiling::TCubeTiling qkTc;
+    if (qkTiling.GetTiling(qkTc) != 0) {
+        return ge::GRAPH_FAILED;
+    }
 
+    matmul_tiling::MatmulApiTiling avTiling(platform);
+    avTiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    avTiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    avTiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    avTiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    avTiling.SetShape(S, D, S);        // M=S, N=D, K=S
+    avTiling.SetOrgShape(S, D, S);
+    avTiling.SetBias(false);
+    avTiling.SetBufferSpace(-1, -1, -1);
+    optiling::TCubeTiling avTc;
+    if (avTiling.GetTiling(avTc) != 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 设置workspace: 保存Scores[B,S,S]
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = static_cast<size_t>(B) * static_cast<size_t>(S) * static_cast<size_t>(S) * sizeof(float);
+
+    // 序列化到tiling buffer
+    ScaledDotProductAttentionInferenceCustomTilingData tiling;
+    tiling.set_batch(B);
+    tiling.set_seqlen(S);
+    tiling.set_dmodel(D);
+
+    tiling.set_qk_tiling_size_u32(static_cast<uint32_t>(sizeof(optiling::TCubeTiling) / 4));
+    tiling.set_av_tiling_size_u32(static_cast<uint32_t>(sizeof(optiling::TCubeTiling) / 4));
+    SaveTilingBytes(&qkTc, sizeof(optiling::TCubeTiling), tiling.mutable_qk_tiling_data(), 512);
+    SaveTilingBytes(&avTc, sizeof(optiling::TCubeTiling), tiling.mutable_av_tiling_data(), 512);
+
+    // 写入原始tiling缓冲
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
-    // No extra workspace requested from tiling here
-    workspaceSizes[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
-
 
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    // Output has the same shape as V
-    const gert::Shape* v_shape = context->GetInputShape(2);
-    gert::Shape* o_shape = context->GetOutputShape(0);
-    *o_shape = *v_shape;
+    // 输出形状与输入Q相同: [B, S, D]
+    const gert::Shape* qShape = context->GetInputShape(0);
+    gert::Shape* oShape = context->GetOutputShape(0);
+    *oShape = *qShape;
     return GRAPH_SUCCESS;
 }
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
-    const auto inputDataType = context->GetInputDataType(2); // follow V dtype
-    context->SetOutputDataType(0, inputDataType);
+    const auto dt = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dt);
     return ge::GRAPH_SUCCESS;
 }
 }
-
 
 namespace ops {
 class ScaledDotProductAttentionInferenceCustom : public OpDef {
@@ -160,7 +202,6 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-
         this->Output("o")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -168,111 +209,195 @@ public:
             .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
-
         this->AICore().SetTiling(optiling::TilingFunc);
         this->AICore().AddConfig("ascend910b");
     }
 };
-
 OP_ADD(ScaledDotProductAttentionInferenceCustom);
 }
 """
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "scaled_dot_product_attention_inference_custom_tiling_data.h"
+#include "lib/matmul_intf.h"
 
-// 本示例内核使用基础搬运与分块框架，将V直接搬运到输出O，
-// 模板与管线写法参考 AscendC 两操作数模板示例（参考资料 4.1.2.9）
-// 实际生产中可用 Matmul + SoftmaxFlashV3 高级API按两次GEMM与行Softmax实现注意力。
+using A_T = float;
+using B_T = float;
+using C_T = float;
 
-constexpr int32_t BUFFER_NUM = 2;
+struct TilingPack {
+    uint32_t batch;
+    uint32_t seqlen;
+    uint32_t dmodel;
+    uint32_t qk_tiling_size_u32;
+    uint32_t av_tiling_size_u32;
+    __gm__ uint32_t* qk_tiling_data;
+    __gm__ uint32_t* av_tiling_data;
+};
 
-class KernelSdpAttnInfer {
+constexpr float kEps = 1e-6f;
+
+class KernelSDPA {
 public:
-    __aicore__ inline KernelSdpAttnInfer() {}
-    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o,
-                                uint32_t totalLength, uint32_t tileNum,
-                                uint32_t batch, uint32_t seqLen, uint32_t dModel, float invSqrtD)
+    __aicore__ inline KernelSDPA() {}
+    __aicore__ inline void Init(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o, GM_ADDR workspace, GM_ADDR tilingGM)
     {
-        (void)q; (void)k; (void)invSqrtD;
-        this->batch = batch;
-        this->seqLen = seqLen;
-        this->dModel = dModel;
+        // 反序列化tiling
+        auto* p32 = reinterpret_cast<__gm__ uint32_t*>(tilingGM);
+        // 读标量
+        uint32_t batch = p32[0];
+        uint32_t seqlen = p32[1];
+        uint32_t dmodel = p32[2];
+        uint32_t qk_sz = p32[3];
+        uint32_t av_sz = p32[4];
 
-        // 简单分块：按总长度（等于 B*S*D）在多block间均分，再细分为tile
-        this->blockLength = totalLength / AscendC::GetBlockNum();
-        this->tileNum = tileNum;
-        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
+        this->B = batch;
+        this->S = seqlen;
+        this->D = dmodel;
 
-        vGm.SetGlobalBuffer((__gm__ float *)v + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
-        oGm.SetGlobalBuffer((__gm__ float *)o + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        // 指针偏移至tiling原始数据
+        __gm__ uint32_t* qk_data = p32 + 5;
+        __gm__ uint32_t* av_data = qk_data + 512; // 每个512 u32的槽位
+        // 重构TCubeTiling
+        for (int i = 0; i < static_cast<int>(sizeof(TCubeTiling) / sizeof(uint32_t)); ++i) {
+            (reinterpret_cast<uint32_t*>(&qkTiling))[i] = qk_data[i];
+            (reinterpret_cast<uint32_t*>(&avTiling))[i] = av_data[i];
+        }
 
-        pipe.InitBuffer(inQueueV, BUFFER_NUM, this->tileLength * sizeof(float));
-        pipe.InitBuffer(outQueueO, BUFFER_NUM, this->tileLength * sizeof(float));
+        // GM张量设置
+        qGm.SetGlobalBuffer((__gm__ A_T*)q, (uint32_t)B*S*D);
+        kGm.SetGlobalBuffer((__gm__ B_T*)k, (uint32_t)B*S*D);
+        vGm.SetGlobalBuffer((__gm__ B_T*)v, (uint32_t)B*S*D);
+        oGm.SetGlobalBuffer((__gm__ C_T*)o, (uint32_t)B*S*D);
+
+        // workspace: scores [B, S, S]
+        scoresGm.SetGlobalBuffer((__gm__ C_T*)workspace, (uint32_t)B*S*S);
+
+        // 初始化pipe
+        pipe.InitBuffer(scoresRowIn, 1, S * sizeof(C_T));
+        pipe.InitBuffer(scoresRowOut, 1, S * sizeof(C_T));
     }
 
     __aicore__ inline void Process()
     {
-        int32_t loopCount = this->tileNum * BUFFER_NUM;
-        for (int32_t i = 0; i < loopCount; i++) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
+        // 处理每个batch
+        for (uint32_t b = 0; b < B; ++b) {
+            ComputeQKT(b);      // scores = Q @ K^T
+            SoftmaxScores(b);   // softmax(scores / sqrt(D))
+            ComputeAV(b);       // O = scores @ V
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(int32_t progress)
+    __aicore__ inline void ComputeQKT(uint32_t b)
     {
-        AscendC::LocalTensor<float> vLocal = inQueueV.AllocTensor<float>();
-        AscendC::DataCopy(vLocal, vGm[progress * this->tileLength], this->tileLength);
-        inQueueV.EnQue(vLocal);
+        // Matmul: [S,D] x [D,S] -> [S,S]
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL> bType; // Transpose K
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T> biasType;
+
+        matmul::Matmul<aType, bType, cType, biasType> mm;
+        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
+
+        // 偏移到当前batch
+        AscendC::GlobalTensor<A_T> qSlice;
+        AscendC::GlobalTensor<B_T> kSlice;
+        AscendC::GlobalTensor<C_T> cSlice;
+
+        qSlice.SetGlobalBuffer(const_cast<__gm__ A_T*>(qGm[b * S * D].GetPhyAddr()), S * D);
+        kSlice.SetGlobalBuffer(const_cast<__gm__ B_T*>(kGm[b * S * D].GetPhyAddr()), S * D);
+        cSlice.SetGlobalBuffer(const_cast<__gm__ C_T*>(scoresGm[b * S * S].GetPhyAddr()), S * S);
+
+        mm.Init(&qkTiling);
+        mm.SetTensorA(qSlice, false);
+        mm.SetTensorB(kSlice, true);  // 按需转置
+        mm.SetWorkspace(GetSysWorkSpacePtr(), 0);
+        mm.IterateAll(cSlice);
     }
 
-    __aicore__ inline void Compute(int32_t /*progress*/)
+    __aicore__ inline void SoftmaxScores(uint32_t b)
     {
-        AscendC::LocalTensor<float> vLocal = inQueueV.DeQue<float>();
-        AscendC::LocalTensor<float> oLocal = outQueueO.AllocTensor<float>();
-        // 占位：直接拷贝（真实注意力需QK^T缩放+Softmax再乘V，参考 Matmul 与 SoftmaxFlashV3 高级API）
-        AscendC::DataCopy(oLocal, vLocal, this->tileLength);
-        outQueueO.EnQue<float>(oLocal);
-        inQueueV.FreeTensor(vLocal);
+        // 行级softmax: 对scores[b, i, :] 做softmax(./sqrt(D))
+        float scale = 1.0f / AscendC::Sqrt((float)D + kEps);
+
+        for (uint32_t i = 0; i < S; ++i) {
+            // 拷贝一行到UB
+            AscendC::LocalTensor<C_T> rowIn = scoresRowIn.AllocTensor<C_T>();
+            AscendC::DataCopy(rowIn, scoresGm[b * S * S + i * S], S);
+
+            // 按比例缩放
+            AscendC::Mul(rowIn, rowIn, scale, S);
+
+            // 这里调用高层SoftMax接口完成归一化
+            // 注意：内部会进行逐行max/exp/sum/div计算
+            AscendC::LocalTensor<C_T> rowOut = scoresRowOut.AllocTensor<C_T>();
+            // SoftMax高阶API示意调用（API内部根据形状自适配tiling）
+            // 原型参考高阶API：SoftMax(dst, src, tiling, shapeInfo)（由框架管理暂存空间）
+            // 实际工程中可按文档使用SoftMax/SimpleSoftMax及对应tiling
+            AscendC::SoftMax(rowOut, rowIn, S);
+
+            // 回写
+            AscendC::DataCopy(scoresGm[b * S * S + i * S], rowOut, S);
+            scoresRowOut.FreeTensor(rowOut);
+            scoresRowIn.FreeTensor(rowIn);
+        }
     }
 
-    __aicore__ inline void CopyOut(int32_t progress)
+    __aicore__ inline void ComputeAV(uint32_t b)
     {
-        AscendC::LocalTensor<float> oLocal = outQueueO.DeQue<float>();
-        AscendC::DataCopy(oGm[progress * this->tileLength], oLocal, this->tileLength);
-        outQueueO.FreeTensor(oLocal);
+        // Matmul: [S,S] x [S,D] -> [S,D]
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, false, LayoutMode::NORMAL> bType;
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+        typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T> biasType;
+
+        matmul::Matmul<aType, bType, cType, biasType> mm;
+        REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
+
+        AscendC::GlobalTensor<A_T> aSlice;
+        AscendC::GlobalTensor<B_T> bSlice;
+        AscendC::GlobalTensor<C_T> cSlice;
+
+        aSlice.SetGlobalBuffer(const_cast<__gm__ A_T*>(scoresGm[b * S * S].GetPhyAddr()), S * S);
+        bSlice.SetGlobalBuffer(const_cast<__gm__ B_T*>(vGm[b * S * D].GetPhyAddr()), S * D);
+        cSlice.SetGlobalBuffer(const_cast<__gm__ C_T*>(oGm[b * S * D].GetPhyAddr()), S * D);
+
+        mm.Init(&avTiling);
+        mm.SetTensorA(aSlice, false);
+        mm.SetTensorB(bSlice, false);
+        mm.SetWorkspace(GetSysWorkSpacePtr(), 0);
+        mm.IterateAll(cSlice);
     }
 
 private:
     AscendC::TPipe pipe;
-    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueV;
-    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueO;
 
-    AscendC::GlobalTensor<float> vGm;
-    AscendC::GlobalTensor<float> oGm;
+    // 全局张量
+    AscendC::GlobalTensor<A_T> qGm;
+    AscendC::GlobalTensor<B_T> kGm;
+    AscendC::GlobalTensor<B_T> vGm;
+    AscendC::GlobalTensor<C_T> oGm;
+    AscendC::GlobalTensor<C_T> scoresGm;
 
-    uint32_t batch;
-    uint32_t seqLen;
-    uint32_t dModel;
-    uint32_t blockLength;
-    uint32_t tileNum;
-    uint32_t tileLength;
+    // 本地行缓冲
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> scoresRowIn;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> scoresRowOut;
+
+    // tiling
+    TCubeTiling qkTiling;
+    TCubeTiling avTiling;
+
+    // 形状
+    uint32_t B;
+    uint32_t S;
+    uint32_t D;
 };
 
-extern "C" __global__ __aicore__ void scaled_dot_product_attention_inference_custom(
-    GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o, GM_ADDR workspace, GM_ADDR tiling)
+extern "C" __global__ __aicore__ void scaled_dot_product_attention_inference_custom(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o, GM_ADDR workspace, GM_ADDR tiling)
 {
-    (void)workspace;
-    GET_TILING_DATA(tiling_data, tiling);
-    KernelSdpAttnInfer op;
-    op.Init(q, k, v, o,
-            tiling_data.totalLength, tiling_data.tileNum,
-            tiling_data.batch, tiling_data.seqLen, tiling_data.dModel, tiling_data.invSqrtD);
+    KernelSDPA op;
+    op.Init(q, k, v, o, workspace, tiling);
     op.Process();
 }
 """
@@ -283,12 +408,10 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor scaled_dot_product_attention_inference_custom_impl_npu(const at::Tensor& q,
-                                                                  const at::Tensor& k,
-                                                                  const at::Tensor& v) {
-    at::Tensor result = at::empty_like(v);
-    EXEC_NPU_CMD(aclnnScaledDotProductAttentionInferenceCustom, q, k, v, result);
-    return result;
+at::Tensor scaled_dot_product_attention_inference_custom_impl_npu(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+    at::Tensor output = at::empty_like(q);
+    EXEC_NPU_CMD(aclnnScaledDotProductAttentionInferenceCustom, q, k, v, output);
+    return output;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -296,7 +419,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("scaled_dot_product_attention_inference_custom", &scaled_dot_product_attention_inference_custom_impl_npu, "SDPA inference");
+    m.def("scaled_dot_product_attention_inference_custom", &scaled_dot_product_attention_inference_custom_impl_npu, "scaled dot-product attention inference");
 }
 """
 

@@ -1,0 +1,376 @@
+project_json_src='''
+[
+    {
+        "op": "ArgminOverADimensionCustom",
+        "language": "cpp",
+        "attr": [
+            {
+                "name": "dim",
+                "type": "int"
+            }
+        ],
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "index",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ArgminOverADimensionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, outter);     // product of dims before 'dim'
+  TILING_DATA_FIELD_DEF(uint32_t, n);          // length along 'dim'
+  TILING_DATA_FIELD_DEF(uint32_t, inner);      // product of dims after 'dim'
+  TILING_DATA_FIELD_DEF(uint32_t, tileInner);  // tile size along 'inner'
+  TILING_DATA_FIELD_DEF(int32_t, dim);         // normalized dim
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ArgminOverADimensionCustom, ArgminOverADimensionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "argmin_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace {
+inline uint32_t ProdDims(const gert::StorageShape &shape, uint32_t start, uint32_t end) {
+    uint32_t p = 1;
+    for (uint32_t i = start; i < end; ++i) {
+        p *= static_cast<uint32_t>(shape.GetDim(i));
+    }
+    return p;
+}
+}
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ArgminOverADimensionCustomTilingData tiling;
+
+    const gert::StorageShape* x_shape = context->GetInputShape(0);
+    const auto &shape = x_shape->GetStorageShape();
+    uint32_t rank = static_cast<uint32_t>(shape.GetDimNum());
+
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+    int64_t dimAttr = 0;
+    if (attrs != nullptr && attrs->GetAttrNum() >= 1) {
+        dimAttr = *(attrs->GetAttrPointer<int64_t>(0));
+    }
+    // normalize dim
+    int32_t dim = static_cast<int32_t>(dimAttr < 0 ? (dimAttr + rank) : dimAttr);
+    if (dim < 0) dim = 0;
+    if (dim >= static_cast<int32_t>(rank)) dim = static_cast<int32_t>(rank) - 1;
+
+    uint32_t outter = (dim == 0) ? 1 : ProdDims(shape, 0, static_cast<uint32_t>(dim));
+    uint32_t n = static_cast<uint32_t>(shape.GetDim(dim));
+    uint32_t inner = (static_cast<uint32_t>(dim) + 1 >= rank) ? 1 : ProdDims(shape, static_cast<uint32_t>(dim) + 1, rank);
+
+    // simple tiling: process full inner in one tile (fits typical UB for float/int)
+    uint32_t tileInner = inner == 0 ? 1 : inner;
+
+    // choose a reasonable block dim by outter
+    uint32_t blockDim = outter >= 8 ? 8 : (outter == 0 ? 1 : outter);
+    context->SetBlockDim(blockDim);
+
+    tiling.set_outter(outter);
+    tiling.set_n(n);
+    tiling.set_inner(inner);
+    tiling.set_tileInner(tileInner);
+    tiling.set_dim(dim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::RuntimeAttrs *attrs = context->GetAttrs();
+
+    int64_t dimAttr = 0;
+    if (attrs != nullptr && attrs->GetAttrNum() >= 1) {
+        dimAttr = *(attrs->GetAttrPointer<int64_t>(0));
+    }
+    int64_t rank = static_cast<int64_t>(x_shape->GetOriginShape().GetDimNum());
+    int64_t dim = dimAttr < 0 ? (dimAttr + rank) : dimAttr;
+    if (dim < 0) dim = 0;
+    if (dim >= rank) dim = rank - 1;
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+
+    // output shape = input shape with dimension 'dim' removed
+    std::vector<int64_t> outDims;
+    outDims.reserve(static_cast<size_t>(rank > 0 ? rank - 1 : 0));
+    for (int64_t i = 0; i < rank; ++i) {
+        if (i == dim) continue;
+        outDims.push_back(x_shape->GetOriginShape().GetDim(i));
+    }
+    if (outDims.empty()) {
+        // if reduced to scalar, set it to [1]
+        outDims.push_back(1);
+    }
+    y_shape->SetDimNum(outDims.size());
+    for (size_t i = 0; i < outDims.size(); ++i) {
+        y_shape->SetDim(i, outDims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // indices output type int32
+    context->SetOutputDataType(0, ge::DT_INT32);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+OP_ATTR(dim);
+
+class ArgminOverADimensionCustom : public OpDef {
+public:
+    explicit ArgminOverADimensionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("index")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Attr("dim");
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ArgminOverADimensionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "argmin_over_a_dimension_custom_tiling_data.h"
+
+using DTYPE_X = float;
+using DTYPE_INDEX = int32_t;
+
+class KernelArgmin {
+public:
+    __aicore__ inline KernelArgmin() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR index, uint32_t outter, uint32_t n, uint32_t inner, uint32_t tileInner)
+    {
+        this->outter = outter;
+        this->n = n;
+        this->inner = inner;
+        this->tileInner = (tileInner == 0) ? 1 : tileInner;
+
+        // split by outter on multi-cores
+        this->coreNum = AscendC::GetBlockNum();
+        this->coreIdx = AscendC::GetBlockIdx();
+        this->outterPerCore = (outter + coreNum - 1) / coreNum; // simple ceil split
+        this->outterStart = this->outterPerCore * coreIdx;
+        if (this->outterStart + this->outterPerCore > outter) {
+            this->outterPerCore = (outter > this->outterStart) ? (outter - this->outterStart) : 0;
+        }
+
+        // total elements in this core's slice for x: outterPerCore * n * inner
+        uint64_t xOffset = static_cast<uint64_t>(this->outterStart) * static_cast<uint64_t>(this->n) * static_cast<uint64_t>(this->inner);
+        uint64_t xSize   = static_cast<uint64_t>(this->outterPerCore) * static_cast<uint64_t>(this->n) * static_cast<uint64_t>(this->inner);
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + xOffset, xSize);
+
+        // output indices shape [outter, inner]
+        uint64_t yOffset = static_cast<uint64_t>(this->outterStart) * static_cast<uint64_t>(this->inner);
+        uint64_t ySize   = static_cast<uint64_t>(this->outterPerCore) * static_cast<uint64_t>(this->inner);
+        indexGm.SetGlobalBuffer((__gm__ DTYPE_INDEX *)index + yOffset, ySize);
+
+        // allocate local buffers
+        pipe.InitBuffer(bufMinVal, 1, this->tileInner * sizeof(DTYPE_X));
+        pipe.InitBuffer(bufCurVal, 1, this->tileInner * sizeof(DTYPE_X));
+        pipe.InitBuffer(bufIdx,    1, this->tileInner * sizeof(DTYPE_INDEX));
+        pipe.InitBuffer(bufCurIdx, 1, this->tileInner * sizeof(DTYPE_INDEX));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t b = 0; b < this->outterPerCore; ++b) {
+            uint64_t baseSlice = static_cast<uint64_t>(b) * static_cast<uint64_t>(this->n) * static_cast<uint64_t>(this->inner);
+            uint64_t outBase   = static_cast<uint64_t>(b) * static_cast<uint64_t>(this->inner);
+
+            // tile along inner dimension
+            for (uint32_t start = 0; start < this->inner; start += this->tileInner) {
+                uint32_t currLen = AscendC::Min(this->tileInner, this->inner - start);
+
+                // local tensors
+                AscendC::LocalTensor<DTYPE_X> minValLocal = bufMinVal.AllocTensor<DTYPE_X>();
+                AscendC::LocalTensor<DTYPE_X> curValLocal = bufCurVal.AllocTensor<DTYPE_X>();
+                AscendC::LocalTensor<DTYPE_INDEX> idxLocal = bufIdx.AllocTensor<DTYPE_INDEX>();
+                AscendC::LocalTensor<DTYPE_INDEX> curIdxLocal = bufCurIdx.AllocTensor<DTYPE_INDEX>();
+
+                // initialize min values from i=0 slice, indices = 0
+                AscendC::DataCopy(minValLocal, xGm[baseSlice + 0ull * this->inner + start], currLen);
+                DTYPE_INDEX zero = 0;
+                AscendC::Duplicate(idxLocal, zero, currLen);
+
+                // iterate i=1..n-1, keep argmin
+                for (uint32_t i = 1; i < this->n; ++i) {
+                    AscendC::DataCopy(curValLocal, xGm[baseSlice + static_cast<uint64_t>(i) * this->inner + start], currLen);
+
+                    // build current index vector
+                    DTYPE_INDEX currIdxScalar = static_cast<DTYPE_INDEX>(i);
+                    AscendC::Duplicate(curIdxLocal, currIdxScalar, currLen);
+
+                    // element-wise compare and select:
+                    // mask = (curVal < minVal)
+                    // minVal = mask ? curVal : minVal
+                    // idx     = mask ? currIdx : idx
+                    // Note: Compare/Select are AscendC vector APIs (see Ascend C API Reference: Compare/Select).
+                    // We set mask by the framework and use it inside Select.
+                    AscendC::SetMaskCount(currLen);
+                    auto cmpMask = AscendC::Compare(curValLocal, minValLocal, AscendC::CMPMODE_LT);
+                    AscendC::Select(minValLocal, curValLocal, minValLocal, cmpMask);
+                    AscendC::Select(idxLocal, curIdxLocal, idxLocal, cmpMask);
+                    AscendC::ResetMask();
+                }
+
+                // write indices to GM
+                AscendC::DataCopy(indexGm[outBase + start], idxLocal, currLen);
+
+                // free locals
+                bufMinVal.FreeTensor(minValLocal);
+                bufCurVal.FreeTensor(curValLocal);
+                bufIdx.FreeTensor(idxLocal);
+                bufCurIdx.FreeTensor(curIdxLocal);
+            }
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_INDEX> indexGm;
+
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> bufMinVal;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> bufCurVal;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> bufIdx;
+    AscendC::TQue<AscendC::QuePosition::VECCALC, 1> bufCurIdx;
+
+    uint32_t outter;
+    uint32_t n;
+    uint32_t inner;
+    uint32_t tileInner;
+
+    uint32_t coreNum;
+    uint32_t coreIdx;
+    uint32_t outterPerCore;
+    uint32_t outterStart;
+};
+
+extern "C" __global__ __aicore__ void argmin_over_a_dimension_custom(GM_ADDR x, GM_ADDR index, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelArgmin op;
+    op.Init(x, index, tiling_data.outter, tiling_data.n, tiling_data.inner, tiling_data.tileInner);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline int64_t normalize_dim(int64_t dim, int64_t rank) {
+    if (dim < 0) dim += rank;
+    if (dim < 0) dim = 0;
+    if (dim >= rank) dim = rank - 1;
+    return dim;
+}
+
+at::Tensor argmin_over_a_dimension_custom_impl_npu(const at::Tensor& x, int64_t dim) {
+    TORCH_CHECK(x.dim() >= 1, \"input must have at least 1 dimension\");
+    int64_t rank = x.dim();
+    int64_t d = normalize_dim(dim, rank);
+
+    // build output shape: remove dimension d
+    std::vector<int64_t> outSizes;
+    outSizes.reserve(static_cast<size_t>(rank > 0 ? rank - 1 : 0));
+    for (int64_t i = 0; i < rank; ++i) {
+        if (i == d) continue;
+        outSizes.push_back(x.size(i));
+    }
+    if (outSizes.empty()) outSizes.push_back(1);
+
+    at::Tensor result = at::empty(outSizes, x.options().dtype(at::kInt));
+
+    // call custom operator runtime (attributes passed as scalars)
+    EXEC_NPU_CMD(aclnnArgminOverADimensionCustom, x, dim, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"argmin_over_a_dimension_custom\", &argmin_over_a_dimension_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"argmin_over_a_dimension_custom\", &argmin_over_a_dimension_custom_impl_npu, \"argmin over a dimension\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Custom NPU kernel version of argmin along a specified dimension.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.argmin_over_a_dimension_custom(x, self.dim)
+'''

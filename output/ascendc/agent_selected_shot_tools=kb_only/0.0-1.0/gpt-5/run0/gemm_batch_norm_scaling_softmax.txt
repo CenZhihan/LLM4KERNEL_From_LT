@@ -1,0 +1,386 @@
+project_json_src='''
+[
+    {
+        "op": "GemmBatchNormScalingSoftmaxCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "weight_t",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "bias",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "z",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(GemmBatchNormScalingSoftmaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, M);
+  TILING_DATA_FIELD_DEF(uint32_t, K);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, axpyTmpSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(GemmBatchNormScalingSoftmaxCustom, GemmBatchNormScalingSoftmaxCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "gemm_batch_norm_scaling_softmax_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // Input 0: x of shape [M, K]
+    const auto *x_shape = context->GetInputShape(0);
+    // Input 1: weight_t of shape [K, N]
+    const auto *wt_shape = context->GetInputShape(1);
+    // Input 2: bias of shape [N]
+    const auto *b_shape = context->GetInputShape(2);
+
+    uint64_t x_rank = x_shape->GetOriginShape().GetDimNum();
+    uint64_t wt_rank = wt_shape->GetOriginShape().GetDimNum();
+    (void)x_rank; (void)wt_rank;
+
+    uint32_t M = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(0));
+    uint32_t K = static_cast<uint32_t>(x_shape->GetOriginShape().GetDim(1));
+    uint32_t K_w = static_cast<uint32_t>(wt_shape->GetOriginShape().GetDim(0));
+    uint32_t N = static_cast<uint32_t>(wt_shape->GetOriginShape().GetDim(1));
+    (void)K_w;
+
+    GemmBatchNormScalingSoftmaxCustomTilingData tiling;
+    tiling.set_M(M);
+    tiling.set_K(K);
+    tiling.set_N(N);
+    // For demo purpose, set axpyTmpSize to 0. In real kernels, query GetAxpyMaxMinTmpSize on host to fill this.
+    tiling.set_axpyTmpSize(0);
+
+    context->SetBlockDim(1); // simple single-block launch for demo
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);     // [M, K]
+    const gert::Shape* wt_shape = context->GetInputShape(1);    // [K, N]
+    gert::Shape* z_shape = context->GetOutputShape(0);          // [M, N]
+    gert::Shape out_shape;
+    out_shape.SetDimNum(2);
+    out_shape.SetDim(0, x_shape->GetOriginShape().GetDim(0));
+    out_shape.SetDim(1, wt_shape->GetOriginShape().GetDim(1));
+    *z_shape = out_shape;
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class GemmBatchNormScalingSoftmaxCustom : public OpDef {
+public:
+    explicit GemmBatchNormScalingSoftmaxCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight_t")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("z")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(GemmBatchNormScalingSoftmaxCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+using dtype = float;
+
+class KernelGemmBnScaleSoftmax {
+public:
+    __aicore__ inline KernelGemmBnScaleSoftmax() {}
+
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR weight_t, GM_ADDR bias, GM_ADDR z,
+                                uint32_t M, uint32_t K, uint32_t N, uint32_t axpyTmpSize) {
+        this->M = M;
+        this->K = K;
+        this->N = N;
+        xGm.SetGlobalBuffer((__gm__ dtype*)x, static_cast<uint64_t>(M) * K);
+        wTGm.SetGlobalBuffer((__gm__ dtype*)weight_t, static_cast<uint64_t>(K) * N);
+        bGm.SetGlobalBuffer((__gm__ dtype*)bias, N);
+        zGm.SetGlobalBuffer((__gm__ dtype*)z, static_cast<uint64_t>(M) * N);
+
+        // Queues for one row processing
+        pipe.InitBuffer(inQueueXRow, 1, K * sizeof(dtype));
+        pipe.InitBuffer(inQueueWRow, 1, N * sizeof(dtype));
+        pipe.InitBuffer(outQueueZRow, 1, N * sizeof(dtype));
+        if (axpyTmpSize > 0) {
+            pipe.InitBuffer(tmpQue, 1, axpyTmpSize);
+            hasTmpBuf = true;
+        } else {
+            hasTmpBuf = false;
+        }
+    }
+
+    __aicore__ inline void Process() {
+        for (uint32_t i = 0; i < M; ++i) {
+            ComputeRow(i);
+        }
+    }
+
+private:
+    __aicore__ inline void ComputeRow(uint32_t rowIdx) {
+        // Load x row [K]
+        AscendC::LocalTensor<dtype> xRowLocal = inQueueXRow.AllocTensor<dtype>();
+        AscendC::DataCopy(xRowLocal, xGm[rowIdx * K], K);
+        inQueueXRow.EnQue(xRowLocal);
+
+        // Allocate z row buffer and initialize with bias
+        AscendC::LocalTensor<dtype> zRowLocal = outQueueZRow.AllocTensor<dtype>();
+        AscendC::DataCopy(zRowLocal, bGm, N);
+
+        // temp buffer for AXPY if available
+        AscendC::LocalTensor<uint8_t> sharedTmp;
+        if (hasTmpBuf) {
+            sharedTmp = tmpQue.AllocTensor<uint8_t>();
+        }
+
+        // GEMM using AXPY: z_row += x[row,k] * weight_t[k,:]
+        AscendC::LocalTensor<dtype> xRow = inQueueXRow.DeQue<dtype>();
+        for (uint32_t k = 0; k < K; ++k) {
+            dtype scalar = xRow.GetValue(k);
+            AscendC::LocalTensor<dtype> wRowLocal = inQueueWRow.AllocTensor<dtype>();
+            AscendC::DataCopy(wRowLocal, wTGm[k * N], N);
+            if (hasTmpBuf) {
+                AscendC::Axpy(zRowLocal, wRowLocal, scalar, sharedTmp, N);
+            } else {
+                // Fallback: zRowLocal += scalar * wRowLocal using two ops
+                // zRowLocal = zRowLocal + scalar * wRowLocal
+                AscendC::LocalTensor<dtype> tmpLocal = inQueueWRow.AllocTensor<dtype>();
+                // Muls (vector * scalar) then Add. If Muls is unavailable, Axpy path should be used.
+                AscendC::Muls(tmpLocal, wRowLocal, scalar, N);
+                AscendC::Add(zRowLocal, zRowLocal, tmpLocal, N);
+                inQueueWRow.FreeTensor(tmpLocal);
+            }
+            inQueueWRow.FreeTensor(wRowLocal);
+        }
+        inQueueXRow.FreeTensor(xRow);
+
+        // Softmax along last axis for this row
+        AscendC::SoftMax(zRowLocal, zRowLocal, softmaxTiling);
+
+        // Write back
+        outQueueZRow.EnQue<dtype>(zRowLocal);
+        AscendC::LocalTensor<dtype> zLocal = outQueueZRow.DeQue<dtype>();
+        AscendC::DataCopy(zGm[rowIdx * N], zLocal, N);
+        outQueueZRow.FreeTensor(zLocal);
+
+        if (hasTmpBuf) {
+            tmpQue.FreeTensor(sharedTmp);
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueXRow;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> inQueueWRow;
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueueZRow;
+    AscendC::TQue<AscendC::TPosition::VECCALC, 1> tmpQue;
+
+    AscendC::GlobalTensor<dtype> xGm;
+    AscendC::GlobalTensor<dtype> wTGm;
+    AscendC::GlobalTensor<dtype> bGm;
+    AscendC::GlobalTensor<dtype> zGm;
+
+    AscendC::SoftMaxTiling softmaxTiling;
+    uint32_t M = 0, K = 0, N = 0;
+    bool hasTmpBuf = false;
+};
+
+extern "C" __global__ __aicore__ void gemm_batch_norm_scaling_softmax_custom(GM_ADDR x,
+                                                                              GM_ADDR weight_t,
+                                                                              GM_ADDR bias,
+                                                                              GM_ADDR z,
+                                                                              GM_ADDR workspace,
+                                                                              GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelGemmBnScaleSoftmax op;
+    op.Init(x, weight_t, bias, z,
+            tiling_data.M(), tiling_data.K(), tiling_data.N(),
+            tiling_data.axpyTmpSize());
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor gemm_batch_norm_scaling_softmax_custom_impl_npu(const at::Tensor& x,
+                                                           const at::Tensor& weight_t,
+                                                           const at::Tensor& bias) {
+    TORCH_CHECK(x.dim() == 2, "x should be 2D [M, K]");
+    TORCH_CHECK(weight_t.dim() == 2, "weight_t should be 2D [K, N]");
+    TORCH_CHECK(bias.dim() == 1, "bias should be 1D [N]");
+    TORCH_CHECK(x.size(1) == weight_t.size(0), "K mismatch between x and weight_t");
+    TORCH_CHECK(weight_t.size(1) == bias.size(0), "N mismatch between weight_t and bias");
+
+    auto M = x.size(0);
+    auto N = weight_t.size(1);
+    at::Tensor result = at::empty({M, N}, x.options());
+
+    EXEC_NPU_CMD(aclnnGemmBatchNormScalingSoftmaxCustom, x, weight_t, bias, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("gemm_batch_norm_scaling_softmax_custom", &gemm_batch_norm_scaling_softmax_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gemm_batch_norm_scaling_softmax_custom", &gemm_batch_norm_scaling_softmax_custom_impl_npu,
+          "Fused GEMM + BN affine + scale + softmax");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Fused: GEMM (Linear) + BatchNorm (inference affine via running stats) + scale + Softmax.
+    The BN and scaling are pre-fused into weight and bias on host; the custom kernel performs GEMM + Softmax.
+    """
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, scale_shape=(1,)):
+        super().__init__()
+        self.gemm = torch.nn.Linear(in_features, out_features)
+        self.bn = torch.nn.BatchNorm1d(out_features, eps=bn_eps, momentum=bn_momentum)
+        self.scale = torch.nn.Parameter(torch.ones(scale_shape))
+        self.softmax_dim = 1
+
+    def _fuse_bn_and_scale(self):
+        # Compute A and B for BN+scale: y = A * x + B, where x is pre-BN activation per feature.
+        # A = scale * (gamma / sqrt(running_var + eps))
+        # B = scale * (beta - running_mean * gamma / sqrt(running_var + eps))
+        running_mean = self.bn.running_mean
+        running_var = self.bn.running_var
+        gamma = self.bn.weight
+        beta = self.bn.bias
+        eps = self.bn.eps
+
+        inv_std = torch.rsqrt(running_var + eps)
+        scale_val = self.scale
+        if scale_val.numel() == 1:
+            scale_val = scale_val.expand_as(gamma)
+        scale_val = scale_val.reshape_as(gamma)
+
+        A = scale_val * (gamma * inv_std)
+        B = scale_val * (beta - running_mean * gamma * inv_std)
+
+        # Fuse into Linear: y = A * (x W^T + b) + B = x (A * W)^T + (A * b + B)
+        W = self.gemm.weight        # [out, in]
+        b = self.gemm.bias          # [out]
+        W_fused = W * A.unsqueeze(1)            # [out, in]
+        b_fused = A * b + B                     # [out]
+        # Kernel expects weight transposed to [K, N] with contiguous last dimension
+        W_fused_t = W_fused.t().contiguous()    # [in, out]
+        return W_fused_t, b_fused
+
+    def forward(self, x):
+        # Prepare fused parameters on host
+        weight_t, bias = self._fuse_bn_and_scale()
+        # Call fused custom op (GEMM + Softmax)
+        z = custom_ops_lib.gemm_batch_norm_scaling_softmax_custom(x, weight_t, bias)
+        return z
+
+def get_inputs():
+    batch_size = 1024
+    in_features = 8192
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    batch_size = 1024
+    in_features = 8192
+    out_features = 8192
+    bn_eps = 1e-5
+    bn_momentum = 0.1
+    scale_shape = (1,)
+    return [in_features, out_features, bn_eps, bn_momentum, scale_shape]
+'''

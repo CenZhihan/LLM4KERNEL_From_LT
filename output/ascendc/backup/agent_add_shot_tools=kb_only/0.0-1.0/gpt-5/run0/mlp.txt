@@ -1,0 +1,352 @@
+project_json_src='''
+[
+    {
+        "op": "MlpCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float",
+                    "float16"
+                ]
+            },
+            {
+                "name": "weight",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float",
+                    "float16"
+                ]
+            },
+            {
+                "name": "bias",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float",
+                    "float16"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float",
+                    "float16"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+// 该定义仅用于注册占位，真实的Matmul tiling将直接以TCubeTiling二进制形式写入RawTilingData。
+BEGIN_TILING_DATA_DEF(MlpCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, dummy);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MlpCustom, MlpCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "mlp_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+// Matmul tiling接口（依据CANN文档的示例接口名）
+#include "matmul_tiling_intf.h"
+#include "tiling/platform/platform_ascendc.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+
+    // 输入输出形状
+    const auto* xShape = context->GetInputShape(0);
+    const auto* wShape = context->GetInputShape(1);
+    if (xShape == nullptr || wShape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    auto xOrigin = xShape->GetOriginShape();
+    auto wOrigin = wShape->GetOriginShape();
+
+    // A(M,K) x B(K,N) => C(M,N)
+    // x: [M, K], weight: [N, K]（PyTorch Linear权重默认[N, K]）
+    int64_t M = xOrigin.GetDimNum() > 0 ? xOrigin.GetDim(0) : 0;
+    int64_t K = xOrigin.GetDimNum() > 1 ? xOrigin.GetDim(1) : 0;
+    int64_t N = wOrigin.GetDimNum() > 0 ? wOrigin.GetDim(0) : 0;
+
+    if (M <= 0 || N <= 0 || K <= 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 根据文档构建Matmul tiling（参考：MatmulApiTiling/EnableBias/SetBatchInfoForNormal）
+    matmul_tiling::MatmulApiTiling tiling(ascendcPlatform);
+    tiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    tiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+
+    // NORMAL布局
+    tiling.SetShape((int32_t)M, (int32_t)N, (int32_t)K);
+    tiling.SetOrgShape((int32_t)M, (int32_t)N, (int32_t)K);
+
+    // 启用bias（参考EnableBias）
+    tiling.EnableBias(true);
+    tiling.SetBufferSpace(-1, -1, -1);
+
+    optiling::TCubeTiling tilingData;
+    int ret = tiling.GetTiling(tilingData);
+    if (ret != 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // 将TCubeTiling原样写入RawTilingData（参考文档中kernel读取示例）
+    auto raw = context->GetRawTilingData();
+    if (raw->GetCapacity() < sizeof(optiling::TCubeTiling)) {
+        return ge::GRAPH_FAILED;
+    }
+    std::memcpy(raw->GetData(), &tilingData, sizeof(optiling::TCubeTiling));
+    raw->SetDataSize(sizeof(optiling::TCubeTiling));
+
+    // 设置block dim
+    context->SetBlockDim(1);
+
+    // workspace
+    size_t* ws = context->GetWorkspaceSizes(1);
+    ws[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // y: [M, N] = x:[M,K] * weight:[N,K]^T
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) return GRAPH_FAILED;
+    auto xo = x_shape->GetOriginShape();
+    auto wo = w_shape->GetOriginShape();
+    if (xo.GetDimNum() != 2 || wo.GetDimNum() != 2) return GRAPH_FAILED;
+
+    int64_t M = xo.GetDim(0);
+    int64_t N = wo.GetDim(0);
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    gert::Shape y;
+    y.SetDimNum(2);
+    y.SetDim(0, M);
+    y.SetDim(1, N);
+    *y_shape = y;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MlpCustom : public OpDef {
+public:
+    explicit MlpCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("weight")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("bias")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_FLOAT16})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(MlpCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+// 参考CANN文档中NORMAL布局的Matmul用法，结合bias（EnableBias）
+
+extern "C" __global__ __aicore__ void mlp_custom(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR biasGM, GM_ADDR cGM, GM_ADDR workspaceGM, GM_ADDR tilingGM) {
+    // 读取host侧生成的TCubeTiling（文档示例）
+    TCubeTiling tiling;
+    auto tempTilingGM = (__gm__ uint32_t*)tilingGM;
+    auto tempTiling = (uint32_t*)&tiling;
+    for (int i = 0; i < (int)(sizeof(TCubeTiling) / sizeof(uint32_t)); ++i, ++tempTilingGM, ++tempTiling) {
+        *tempTiling = *tempTilingGM;
+    }
+
+    // 定义Matmul类型（NORMAL布局，A/B/C均ND），B按PyTorch权重转置使用（isTransposeBIn = true）
+    typedef float A_T;
+    typedef float B_T;
+    typedef float C_T;
+    typedef float BiasT;
+
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL> bType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, BiasT> biasType;
+
+    // 初始化GM张量（参考文档NORMAL示例）
+    AscendC::GlobalTensor<A_T> aGlobal;
+    AscendC::GlobalTensor<B_T> bGlobal;
+    AscendC::GlobalTensor<C_T> cGlobal;
+    AscendC::GlobalTensor<BiasT> biasGlobal;
+
+    int32_t sizeA = tiling.ALayoutInfoB * tiling.singleCoreM * tiling.singleCoreK * sizeof(A_T);
+    int32_t sizeB = tiling.BLayoutInfoB * tiling.singleCoreK * tiling.singleCoreN * sizeof(B_T);
+    int32_t sizeC = tiling.CLayoutInfoB * tiling.singleCoreM * tiling.singleCoreN * sizeof(C_T);
+    int32_t sizeBias = tiling.CLayoutInfoB * tiling.singleCoreN * sizeof(C_T);
+
+    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(aGM), sizeA);
+    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(bGM), sizeB);
+    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(cGM), sizeC);
+    biasGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ BiasT*>(biasGM), sizeBias);
+
+    tiling.shareMode = 0;
+    tiling.shareL1Size = 512 * 1024;
+    tiling.shareL0CSize = 128 * 1024;
+    tiling.shareUbSize = 0;
+
+    int offset_a = 0, offset_b = 0, offset_c = 0, offset_bias = 0;
+
+    AscendC::GlobalTensor<A_T> gm_a;
+    gm_a.SetGlobalBuffer(const_cast<__gm__ A_T*>(aGlobal[offset_a].GetPhyAddr()),
+                         tiling.singleCoreM * tiling.singleCoreK);
+    AscendC::GlobalTensor<B_T> gm_b;
+    gm_b.SetGlobalBuffer(const_cast<__gm__ B_T*>(bGlobal[offset_b].GetPhyAddr()),
+                         tiling.singleCoreK * tiling.singleCoreN);
+    AscendC::GlobalTensor<C_T> gm_c;
+    gm_c.SetGlobalBuffer(const_cast<__gm__ C_T*>(cGlobal[offset_c].GetPhyAddr()),
+                         tiling.singleCoreM * tiling.singleCoreN);
+    AscendC::GlobalTensor<BiasT> gm_bias;
+    gm_bias.SetGlobalBuffer(const_cast<__gm__ BiasT*>(biasGlobal[offset_bias].GetPhyAddr()),
+                            tiling.singleCoreN);
+
+    // Matmul实例（参考NORMAL示例）
+    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+    matmul::Matmul<aType, bType, cType, biasType, MM_CFG> mm1;
+    TPipe pipe;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm1);
+
+    mm1.Init(&tiling);
+    mm1.SetTensorA(gm_a, false); // A不转置
+    mm1.SetTensorB(gm_b, true);  // B按[N,K]输入，在算子内转置为[K,N]
+    mm1.SetWorkspace(workspaceGM, 0);
+    if (tiling.isBias) {
+        mm1.SetBias(gm_bias);
+    }
+
+    // 单次batch计算
+    mm1.IterateBatch(gm_c, 1, 1, false);
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor mlp_custom_impl_npu(const at::Tensor& x, const at::Tensor& weight, const at::Tensor& bias) {
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [M, K]");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D [N, K]");
+    TORCH_CHECK(bias.dim() == 1, "bias must be 1D [N]");
+
+    auto M = x.size(0);
+    auto N = weight.size(0);
+    at::Tensor y = at::empty({M, N}, x.options());
+    EXEC_NPU_CMD(aclnnMlpCustom, x, weight, bias, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("mlp_custom", &mlp_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("mlp_custom", &mlp_custom_impl_npu, "Linear (GEMM + Bias)");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, layer_sizes, output_size):
+        super(ModelNew, self).__init__()
+        layers = []
+        current_input_size = input_size
+        self.linears = nn.ModuleList()
+        self.activations = nn.ModuleList()
+
+        for layer_size in layer_sizes:
+            lin = nn.Linear(current_input_size, layer_size)
+            self.linears.append(lin)
+            self.activations.append(nn.ReLU())
+            current_input_size = layer_size
+
+        self.final = nn.Linear(current_input_size, output_size)
+
+    def forward(self, x):
+        out = x
+        for lin, act in zip(self.linears, self.activations):
+            # custom GEMM + bias
+            out = custom_ops_lib.mlp_custom(out, lin.weight, lin.bias)
+            # ReLU
+            out = act(out)
+        # last layer (no activation here)
+        out = custom_ops_lib.mlp_custom(out, self.final.weight, self.final.bias)
+        return out
+'''

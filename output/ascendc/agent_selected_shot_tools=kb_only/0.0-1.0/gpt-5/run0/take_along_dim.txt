@@ -1,0 +1,318 @@
+project_json_src='''
+[
+    {
+        "op": "TakeAlongDimCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "idx",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["int32"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(TakeAlongDimCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, b);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(TakeAlongDimCustom, TakeAlongDimCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "take_along_dim_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    TakeAlongDimCustomTilingData tiling;
+
+    // 获取形状：x:[B, N], idx:[B, M]
+    auto xShape = context->GetInputShape(0)->GetOriginShape();
+    auto idxShape = context->GetInputShape(1)->GetOriginShape();
+
+    uint32_t b = static_cast<uint32_t>(xShape.GetDim(0));
+    uint32_t n = static_cast<uint32_t>(xShape.GetDim(1));
+    uint32_t m = static_cast<uint32_t>(idxShape.GetDim(1));
+
+    // 基本并行与分块策略
+    const uint32_t BLOCK_DIM = 8;
+    const uint32_t TILE_NUM = 8;
+
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_b(b);
+    tiling.set_n(n);
+    tiling.set_m(m);
+    tiling.set_tileNum(TILE_NUM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    // 本算子不额外申请workspace
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // 输出形状与idx形状一致
+    const gert::Shape* idx_shape = context->GetInputShape(1);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *idx_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // 输出与x的数据类型一致
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class TakeAlongDimCustom : public OpDef {
+public:
+    explicit TakeAlongDimCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("idx")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore()
+            .SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(TakeAlongDimCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+constexpr int32_t BUFFER_NUM = 2;
+
+class KernelTakeAlongDim {
+public:
+    __aicore__ inline KernelTakeAlongDim() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR idx, GM_ADDR y,
+                                uint32_t b, uint32_t n, uint32_t m, uint32_t tileNum)
+    {
+        this->B = b;
+        this->N = n;
+        this->M = m;
+        this->tileNum = tileNum;
+
+        // 每个core处理的行数
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        this->rowsPerBlock = (B + blockNum - 1) / blockNum;  // 向上取整
+        this->rowStart = blockIdx * this->rowsPerBlock;
+        this->rowEnd = AscendC::Min(this->rowStart + this->rowsPerBlock, B);
+
+        // GM缓冲区设置：x:[B*N], idx:[B*M], y:[B*M]
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, B * N);
+        idxGm.SetGlobalBuffer((__gm__ int32_t *)idx, B * M);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Z *)y, B * M);
+
+        // 列方向分块
+        this->tileLen = AscendC::Max((uint32_t)1, (M / tileNum / BUFFER_NUM));
+        if (this->tileLen == 0) { this->tileLen = 1; }
+
+        pipe.InitBuffer(inQueueIdx, BUFFER_NUM, this->tileLen * sizeof(int32_t));
+        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->tileLen * sizeof(DTYPE_Z));
+    }
+
+    __aicore__ inline void Process()
+    {
+        for (uint32_t r = this->rowStart; r < this->rowEnd; ++r) {
+            uint32_t tilesPerRow = (M + this->tileLen - 1) / this->tileLen;
+            int32_t loopCount = tilesPerRow * BUFFER_NUM;
+            for (int32_t p = 0; p < loopCount; ++p) {
+                if (p < loopCount) { CopyIn(r, p); }
+                if (p > 0) { Compute(r, p - 1); }
+                if (p > 1) { CopyOut(r, p - 2); }
+            }
+            // 处理尾部两次未落盘的阶段
+            if (loopCount >= 2) {
+                Compute(r, loopCount - 1);
+                CopyOut(r, loopCount - 2);
+                CopyOut(r, loopCount - 1);
+            } else if (loopCount == 1) {
+                Compute(r, 0);
+                CopyOut(r, 0);
+            }
+        }
+    }
+
+private:
+    __aicore__ inline uint32_t TileStart(uint32_t tileIdx) const
+    {
+        return tileIdx * this->tileLen;
+    }
+
+    __aicore__ inline uint32_t TileLen(uint32_t tileIdx) const
+    {
+        uint32_t start = TileStart(tileIdx);
+        return start + this->tileLen <= M ? this->tileLen : (M - start);
+    }
+
+    __aicore__ inline void CopyIn(uint32_t row, int32_t progress)
+    {
+        uint32_t tileIdx = progress % ((M + this->tileLen - 1) / this->tileLen);
+        uint32_t curLen = TileLen(tileIdx);
+        if (curLen == 0) return;
+
+        AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.AllocTensor<int32_t>();
+        uint32_t gmOffsetIdx = row * M + TileStart(tileIdx);
+        AscendC::DataCopy(idxLocal, idxGm[gmOffsetIdx], curLen);
+        inQueueIdx.EnQue(idxLocal);
+    }
+
+    __aicore__ inline void Compute(uint32_t row, int32_t progress)
+    {
+        uint32_t tileIdx = progress % ((M + this->tileLen - 1) / this->tileLen);
+        uint32_t curLen = TileLen(tileIdx);
+        if (curLen == 0) return;
+
+        AscendC::LocalTensor<int32_t> idxLocal = inQueueIdx.DeQue<int32_t>();
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.AllocTensor<DTYPE_Z>();
+
+        // 对当前tile内的每个位置执行按列gather
+        // y[row, j] = x[row, idx[row, j]]
+        uint32_t rowBaseX = row * N;
+        for (uint32_t i = 0; i < curLen; ++i) {
+            // 从UB读取索引值
+            int32_t col = idxLocal.GetValue(i);
+            // 边界保护
+            if (col < 0) col = 0;
+            if ((uint32_t)col >= N) col = (int32_t)(N - 1);
+
+            // 将x的单元素复制到y的对应位置（均在UB内）
+            AscendC::DataCopy(yLocal[i], xGm[rowBaseX + (uint32_t)col], 1);
+        }
+
+        outQueueY.EnQue<DTYPE_Z>(yLocal);
+        inQueueIdx.FreeTensor(idxLocal);
+    }
+
+    __aicore__ inline void CopyOut(uint32_t row, int32_t progress)
+    {
+        uint32_t tileIdx = progress % ((M + this->tileLen - 1) / this->tileLen);
+        uint32_t curLen = TileLen(tileIdx);
+        if (curLen == 0) return;
+
+        AscendC::LocalTensor<DTYPE_Z> yLocal = outQueueY.DeQue<DTYPE_Z>();
+        uint32_t gmOffsetY = row * M + TileStart(tileIdx);
+        AscendC::DataCopy(yGm[gmOffsetY], yLocal, curLen);
+        outQueueY.FreeTensor(yLocal);
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueIdx;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueY;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<int32_t> idxGm;
+    AscendC::GlobalTensor<DTYPE_Z> yGm;
+
+    uint32_t B, N, M;
+    uint32_t tileNum;
+    uint32_t tileLen;
+    uint32_t rowsPerBlock;
+    uint32_t rowStart, rowEnd;
+};
+
+extern "C" __global__ __aicore__ void take_along_dim_custom(GM_ADDR x, GM_ADDR idx, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelTakeAlongDim op;
+    op.Init(x, idx, y, tiling_data.b, tiling_data.n, tiling_data.m, tiling_data.tileNum);
+    op.Process();
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor take_along_dim_custom_impl_npu(const at::Tensor& x, const at::Tensor& idx) {
+    // 输出形状与idx一致
+    at::Tensor result = at::empty_like(idx, x.options());
+    EXEC_NPU_CMD(aclnnTakeAlongDimCustom, x, idx, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("take_along_dim_custom", &take_along_dim_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("take_along_dim_custom", &take_along_dim_custom_impl_npu, "take_along_dim along dim=1");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, idx):
+        # 内核实现支持dim=1，且idx为int32
+        return custom_ops_lib.take_along_dim_custom(x, idx.to(torch.int32))
+'''

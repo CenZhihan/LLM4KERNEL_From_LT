@@ -1,0 +1,437 @@
+project_json_src='''
+[
+    {
+        "op": "ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            },
+            {
+                "name": "w",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, cin);
+  TILING_DATA_FIELD_DEF(uint32_t, cout);
+  TILING_DATA_FIELD_DEF(uint32_t, din);
+  TILING_DATA_FIELD_DEF(uint32_t, hin);
+  TILING_DATA_FIELD_DEF(uint32_t, win);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, stride);
+  TILING_DATA_FIELD_DEF(uint32_t, padding);
+  TILING_DATA_FIELD_DEF(uint32_t, groups);
+  TILING_DATA_FIELD_DEF(uint32_t, dout);
+  TILING_DATA_FIELD_DEF(uint32_t, hout);
+  TILING_DATA_FIELD_DEF(uint32_t, wout);
+  TILING_DATA_FIELD_DEF(uint64_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom, ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom_tiling.h"
+#include "register/op_def_registry.h"
+
+namespace {
+inline int64_t safe_div(int64_t a, int64_t b) { return b == 0 ? 0 : (a / b); }
+}
+
+namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustomTilingData tiling;
+
+    // Input shapes
+    auto* x_shape = context->GetInputShape(0);
+    auto* w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+
+    int64_t N   = x_shape->GetOriginShape().GetDim(0);
+    int64_t Cin = x_shape->GetOriginShape().GetDim(1);
+    int64_t Din = x_shape->GetOriginShape().GetDim(2);
+    int64_t Hin = x_shape->GetOriginShape().GetDim(3);
+    int64_t Win = x_shape->GetOriginShape().GetDim(4);
+
+    // Weight layout for ConvTranspose3d in PyTorch: [Cin, Cout_per_group, K, K, K]
+    int64_t K   = w_shape->GetOriginShape().GetDim(2);
+    int64_t CoutPerG = w_shape->GetOriginShape().GetDim(1);
+
+    // Attributes
+    int64_t stride = 1;
+    int64_t padding = 0;
+    int64_t groups = 1;
+    (void)context->GetAttr("stride", stride);
+    (void)context->GetAttr("padding", padding);
+    (void)context->GetAttr("groups", groups);
+    if (groups <= 0) groups = 1;
+
+    int64_t Cout = CoutPerG * groups;
+
+    // Output dims: (Din-1)*S - 2P + K
+    int64_t Dout = (Din - 1) * stride - 2 * padding + K;
+    int64_t Hout = (Hin - 1) * stride - 2 * padding + K;
+    int64_t Wout = (Win - 1) * stride - 2 * padding + K;
+
+    tiling.set_n(static_cast<uint32_t>(N));
+    tiling.set_cin(static_cast<uint32_t>(Cin));
+    tiling.set_cout(static_cast<uint32_t>(Cout));
+    tiling.set_din(static_cast<uint32_t>(Din));
+    tiling.set_hin(static_cast<uint32_t>(Hin));
+    tiling.set_win(static_cast<uint32_t>(Win));
+    tiling.set_k(static_cast<uint32_t>(K));
+    tiling.set_stride(static_cast<uint32_t>(stride));
+    tiling.set_padding(static_cast<uint32_t>(padding));
+    tiling.set_groups(static_cast<uint32_t>(groups));
+    tiling.set_dout(static_cast<uint32_t>(Dout));
+    tiling.set_hout(static_cast<uint32_t>(Hout));
+    tiling.set_wout(static_cast<uint32_t>(Wout));
+
+    uint64_t totalLen = static_cast<uint64_t>(N) * static_cast<uint64_t>(Cout) * static_cast<uint64_t>(Dout) * static_cast<uint64_t>(Hout) * static_cast<uint64_t>(Wout);
+    tiling.set_totalLength(totalLen);
+    tiling.set_tileNum(TILE_NUM);
+
+    context->SetBlockDim(BLOCK_DIM);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    const gert::Shape* w_shape = context->GetInputShape(1);
+    if (x_shape == nullptr || w_shape == nullptr) {
+        return GRAPH_FAILED;
+    }
+
+    int64_t N   = x_shape->GetDim(0);
+    int64_t Cin = x_shape->GetDim(1);
+    int64_t Din = x_shape->GetDim(2);
+    int64_t Hin = x_shape->GetDim(3);
+    int64_t Win = x_shape->GetDim(4);
+
+    int64_t K   = w_shape->GetDim(2);
+    int64_t CoutPerG = w_shape->GetDim(1);
+
+    int64_t stride = 1;
+    int64_t padding = 0;
+    int64_t groups = 1;
+    (void)context->GetAttr("stride", stride);
+    (void)context->GetAttr("padding", padding);
+    (void)context->GetAttr("groups", groups);
+    if (groups <= 0) groups = 1;
+
+    int64_t Cout = CoutPerG * groups;
+    int64_t Dout = (Din - 1) * stride - 2 * padding + K;
+    int64_t Hout = (Hin - 1) * stride - 2 * padding + K;
+    int64_t Wout = (Win - 1) * stride - 2 * padding + K;
+
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    y_shape->SetDimNum(5);
+    y_shape->SetDim(0, N);
+    y_shape->SetDim(1, Cout);
+    y_shape->SetDim(2, Dout);
+    y_shape->SetDim(3, Hout);
+    y_shape->SetDim(4, Wout);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom : public OpDef {
+public:
+    explicit ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("w")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        // Attributes
+        this->Attr("stride").Int(1);
+        this->Attr("padding").Int(0);
+        this->Attr("groups").Int(1);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+
+extern \"C\" __global__ __aicore__ void conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom(GM_ADDR x, GM_ADDR w, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+
+    // Types
+    using DTYPE = float;
+
+    // Dimensions
+    const int N      = static_cast<int>(tiling_data.n);
+    const int Cin    = static_cast<int>(tiling_data.cin);
+    const int Cout   = static_cast<int>(tiling_data.cout);
+    const int Din    = static_cast<int>(tiling_data.din);
+    const int Hin    = static_cast<int>(tiling_data.hin);
+    const int Win    = static_cast<int>(tiling_data.win);
+    const int K      = static_cast<int>(tiling_data.k);
+    const int S      = static_cast<int>(tiling_data.stride);
+    const int P      = static_cast<int>(tiling_data.padding);
+    const int G      = static_cast<int>(tiling_data.groups);
+    const int Dout   = static_cast<int>(tiling_data.dout);
+    const int Hout   = static_cast<int>(tiling_data.hout);
+    const int Wout   = static_cast<int>(tiling_data.wout);
+    const long long total = static_cast<long long>(tiling_data.totalLength);
+
+    const int CoutPerG = (G > 0) ? (Cout / G) : Cout;
+    const int CinPerG  = (G > 0) ? (Cin / G) : Cin;
+
+    DTYPE* x_ptr = reinterpret_cast<DTYPE*>(x);
+    DTYPE* w_ptr = reinterpret_cast<DTYPE*>(w);
+    DTYPE* y_ptr = reinterpret_cast<DTYPE*>(y);
+
+    // Parallelize by blocks over output elements
+    int block_num = AscendC::GetBlockNum();
+    int block_idx = AscendC::GetBlockIdx();
+    long long block_len = (total + block_num - 1) / block_num;
+    long long start = static_cast<long long>(block_idx) * block_len;
+    long long end = start + block_len;
+    if (end > total) end = total;
+
+    // Strides for indexing
+    const long long x_c_stride = static_cast<long long>(Din) * Hin * Win;
+    const long long x_n_stride = static_cast<long long>(Cin) * x_c_stride;
+
+    const long long y_c_stride = static_cast<long long>(Dout) * Hout * Wout;
+    const long long y_n_stride = static_cast<long long>(Cout) * y_c_stride;
+
+    const long long w_co_stride = static_cast<long long>(K) * K * K;
+    const long long w_ci_stride = static_cast<long long>(CoutPerG) * w_co_stride;
+
+    for (long long idx = start; idx < end; ++idx) {
+        // Decode linear index to (n, co, od, oh, ow)
+        long long tmp = idx;
+        int ow = static_cast<int>(tmp % Wout); tmp /= Wout;
+        int oh = static_cast<int>(tmp % Hout); tmp /= Hout;
+        int od = static_cast<int>(tmp % Dout); tmp /= Dout;
+        int co = static_cast<int>(tmp % Cout); tmp /= Cout;
+        int n  = static_cast<int>(tmp);
+
+        int g = (CoutPerG > 0) ? (co / CoutPerG) : 0;
+        int co_in_group = (CoutPerG > 0) ? (co % CoutPerG) : co;
+
+        DTYPE acc = static_cast<DTYPE>(0);
+
+        // Gather-based computation to avoid atomic writes
+        // For each input channel in the same group
+        int ci_start = g * CinPerG;
+        int ci_end   = ci_start + CinPerG;
+
+        // Precompute padded coordinates
+        int td = od + P;
+        int th = oh + P;
+        int tw = ow + P;
+
+        for (int ci = ci_start; ci < ci_end; ++ci) {
+            // For each kernel position
+            for (int kd = 0; kd < K; ++kd) {
+                int id_t = td - kd;
+                if (id_t < 0) continue;
+                if (S != 0 && (id_t % S) != 0) continue;
+                int id = (S == 0) ? 0 : (id_t / S);
+                if (id < 0 || id >= Din) continue;
+
+                for (int kh = 0; kh < K; ++kh) {
+                    int ih_t = th - kh;
+                    if (ih_t < 0) continue;
+                    if (S != 0 && (ih_t % S) != 0) continue;
+                    int ih = (S == 0) ? 0 : (ih_t / S);
+                    if (ih < 0 || ih >= Hin) continue;
+
+                    for (int kw = 0; kw < K; ++kw) {
+                        int iw_t = tw - kw;
+                        if (iw_t < 0) continue;
+                        if (S != 0 && (iw_t % S) != 0) continue;
+                        int iw = (S == 0) ? 0 : (iw_t / S);
+                        if (iw < 0 || iw >= Win) continue;
+
+                        long long x_offset = static_cast<long long>(n) * x_n_stride
+                                           + static_cast<long long>(ci) * x_c_stride
+                                           + static_cast<long long>(id) * (Hin * Win)
+                                           + static_cast<long long>(ih) * Win
+                                           + static_cast<long long>(iw);
+
+                        long long w_offset = static_cast<long long>(ci) * w_ci_stride
+                                           + static_cast<long long>(co_in_group) * w_co_stride
+                                           + static_cast<long long>(kd) * (K * K)
+                                           + static_cast<long long>(kh) * K
+                                           + static_cast<long long>(kw);
+
+                        acc += x_ptr[x_offset] * w_ptr[w_offset];
+                    }
+                }
+            }
+        }
+
+        long long y_offset = static_cast<long long>(n) * y_n_stride
+                           + static_cast<long long>(co) * y_c_stride
+                           + static_cast<long long>(od) * (Hout * Wout)
+                           + static_cast<long long>(oh) * Wout
+                           + static_cast<long long>(ow);
+
+        y_ptr[y_offset] = acc;
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+static inline std::vector<int64_t> infer_deconv3d_output_shape(const at::Tensor& x, const at::Tensor& w, int64_t stride, int64_t padding, int64_t groups) {
+    // x: [N, Cin, Din, Hin, Win]
+    // w: [Cin, Cout_per_group, K, K, K]
+    TORCH_CHECK(x.dim() == 5, \"x must be 5D\");
+    TORCH_CHECK(w.dim() == 5, \"w must be 5D\");
+    int64_t N = x.size(0);
+    int64_t Cin = x.size(1);
+    int64_t Din = x.size(2);
+    int64_t Hin = x.size(3);
+    int64_t Win = x.size(4);
+    int64_t K = w.size(2);
+    int64_t CoutPerG = w.size(1);
+    TORCH_CHECK(groups > 0, \"groups must be > 0\");
+    TORCH_CHECK(Cin % groups == 0, \"Cin must be divisible by groups\");
+    int64_t Cout = CoutPerG * groups;
+
+    int64_t Dout = (Din - 1) * stride - 2 * padding + K;
+    int64_t Hout = (Hin - 1) * stride - 2 * padding + K;
+    int64_t Wout = (Win - 1) * stride - 2 * padding + K;
+    return {N, Cout, Dout, Hout, Wout};
+}
+
+at::Tensor conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom_impl_npu(
+    const at::Tensor& x, const at::Tensor& w, int64_t stride, int64_t padding, int64_t groups) {
+
+    auto out_sizes = infer_deconv3d_output_shape(x, w, stride, padding, groups);
+    at::Tensor y = at::empty(out_sizes, x.options());
+    EXEC_NPU_CMD(aclnnConvTransposed3dAsymmetricInputSquareKernelStridedPaddedGroupedCustom, x, w, stride, padding, groups, y);
+    return y;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl(\"conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom\", &conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def(\"conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom\",
+          &conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom_impl_npu,
+          \"ConvTranspose3D custom kernel\");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Custom 3D transposed convolution using AscendC kernel.
+    Weight layout follows PyTorch ConvTranspose3d: [Cin, Cout_per_group, K, K, K]
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, groups: int = 1, bias: bool = False):
+        super().__init__()
+        assert out_channels % groups == 0, "out_channels must be divisible by groups"
+        assert in_channels % groups == 0, "in_channels must be divisible by groups"
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = int(stride)
+        self.padding = int(padding)
+        self.groups = int(groups)
+        self.bias = None
+        # Weight shape: [Cin, Cout_per_group, K, K, K]
+        cout_per_g = out_channels // groups
+        self.weight = torch.nn.Parameter(torch.empty(in_channels, cout_per_g, kernel_size, kernel_size, kernel_size))
+        torch.nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.conv_transposed_3d_asymmetric_input_square_kernel_strided_padded_grouped_custom(
+            x, self.weight, int(self.stride), int(self.padding), int(self.groups)
+        )
+'''

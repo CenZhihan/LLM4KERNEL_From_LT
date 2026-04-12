@@ -15,27 +15,7 @@ project_json_src='''
                 ]
             },
             {
-                "name": "gx",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "beta",
-                "param_type": "required",
-                "format": [
-                    "ND"
-                ],
-                "type": [
-                    "float"
-                ]
-            },
-            {
-                "name": "gamma",
+                "name": "y",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -47,7 +27,7 @@ project_json_src='''
         ],
         "output_desc": [
             {
-                "name": "y",
+                "name": "z",
                 "param_type": "required",
                 "format": [
                     "ND"
@@ -66,9 +46,8 @@ host_tiling_src="""
 
 namespace optiling {
 BEGIN_TILING_DATA_DEF(VisionAttentionCustomTilingData)
-  TILING_DATA_FIELD_DEF(DeepNormTiling, tiling);
-  TILING_DATA_FIELD_DEF(float, alpha);
-  TILING_DATA_FIELD_DEF(float, epsilon);
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF(uint32_t, tileNum);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(VisionAttentionCustom, VisionAttentionCustomTilingData)
@@ -78,33 +57,20 @@ REGISTER_TILING_DATA_CLASS(VisionAttentionCustom, VisionAttentionCustomTilingDat
 host_operator_src="""
 #include "vision_attention_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/tiling_api.h"
 
 namespace optiling {
+const uint32_t BLOCK_DIM = 8;
+const uint32_t TILE_NUM = 8;
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    VisionAttentionCustomTilingData tilingData;
-
-    const gert::StorageShape *x_shape = context->GetInputShape(0);
-    // Expect ND shape [B, S, H]
-    uint32_t B = x_shape->GetStorageShape().GetDim(0);
-    uint32_t S = x_shape->GetStorageShape().GetDim(1);
-    uint32_t H = x_shape->GetStorageShape().GetDim(2);
-
-    DeepNormTiling dtiling;
-    dtiling.bLength = B;
-    dtiling.sLength = S;
-    dtiling.hLength = H;
-
-    tilingData.set_tiling(dtiling);
-    tilingData.set_alpha(1.0f);          // residual alpha = 1.0
-    tilingData.set_epsilon(1e-5f);       // typical LayerNorm epsilon
-
-    context->SetBlockDim(1);
-    tilingData.SaveToBuffer(context->GetRawTilingData()->GetData(),
-                            context->GetRawTilingData()->GetCapacity());
-    context->GetRawTilingData()->SetDataSize(tilingData.GetDataSize());
-
+    VisionAttentionCustomTilingData tiling;
+    uint32_t totalLength = context->GetInputShape(0)->GetOriginShape().GetShapeSize();
+    context->SetBlockDim(BLOCK_DIM);
+    tiling.set_totalLength(totalLength);
+    tiling.set_tileNum(TILE_NUM);
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = 0;
     return ge::GRAPH_SUCCESS;
@@ -114,12 +80,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 namespace ge {
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* in_shape = context->GetInputShape(0);
-    gert::Shape* out_shape = context->GetOutputShape(0);
-    *out_shape = *in_shape;
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* z_shape = context->GetOutputShape(0);
+    *z_shape = *x_shape;
     return GRAPH_SUCCESS;
 }
-
 static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
 {
     const auto inputDataType = context->GetInputDataType(0);
@@ -138,23 +103,12 @@ public:
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("gx")
+        this->Input("y")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("beta")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-        this->Input("gamma")
-            .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND})
-            .UnknownShapeFormat({ge::FORMAT_ND});
-
-        this->Output("y")
+        this->Output("z")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
             .Format({ge::FORMAT_ND})
@@ -174,155 +128,79 @@ OP_ADD(VisionAttentionCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#define __NPU_TILING__
-#include "vision_attention_custom_tiling_data.h"
 
-namespace MyKernel {
-template <typename T>
+constexpr int32_t BUFFER_NUM = 2; // tensor num for each queue
+
 class KernelVisionAttention {
 public:
     __aicore__ inline KernelVisionAttention() {}
-
-    __aicore__ inline void Init(GM_ADDR xGm, GM_ADDR gxGm, GM_ADDR betaGm, GM_ADDR gammaGm,
-                                GM_ADDR yGm, const optiling::VisionAttentionCustomTilingData &t)
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR z, uint32_t totalLength, uint32_t tileNum)
     {
-        tiling_ = t.tiling();
-        alpha_ = t.alpha();
-        epsilon_ = t.epsilon();
+        this->blockLength = totalLength / AscendC::GetBlockNum();
+        this->tileNum = tileNum;
+        this->tileLength = this->blockLength / tileNum / BUFFER_NUM;
 
-        bLength_ = tiling_.bLength;
-        sLength_ = tiling_.sLength;
-        hLength_ = tiling_.hLength;
-        bshLength_ = bLength_ * sLength_ * hLength_;
-        bsLength_ = bLength_ * sLength_;
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
+        zGm.SetGlobalBuffer((__gm__ DTYPE_Z *)z + this->blockLength * AscendC::GetBlockIdx(), this->blockLength);
 
-        xGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(xGm), bshLength_);
-        gxGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(gxGm), bshLength_);
-        betaGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(betaGm), hLength_);
-        gammaGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(gammaGm), hLength_);
-        yGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(yGm), bshLength_);
-
-        pipe_.InitBuffer(inQueueX_, 1, sizeof(T) * bshLength_);
-        pipe_.InitBuffer(inQueueGx_, 1, sizeof(T) * bshLength_);
-        pipe_.InitBuffer(inQueueBeta_, 1, sizeof(T) * hLength_);
-        pipe_.InitBuffer(inQueueGamma_, 1, sizeof(T) * hLength_);
-        pipe_.InitBuffer(outQueueY_, 1, sizeof(T) * bshLength_);
-        pipe_.InitBuffer(outMeanQueue_, 1, sizeof(T) * bsLength_);
-        pipe_.InitBuffer(outRstdQueue_, 1, sizeof(T) * bsLength_);
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->tileLength * sizeof(DTYPE_X));
+        pipe.InitBuffer(inQueueY, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Y));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, this->tileLength * sizeof(DTYPE_Z));
     }
-
     __aicore__ inline void Process()
     {
-        CopyIn();
-        Compute();
-        CopyOut();
+        int32_t loopCount = this->tileNum * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
     }
 
 private:
-    __aicore__ inline void CopyIn()
+    __aicore__ inline void CopyIn(int32_t progress)
     {
-        AscendC::LocalTensor<T> xLocal = inQueueX_.AllocTensor<T>();
-        AscendC::LocalTensor<T> gxLocal = inQueueGx_.AllocTensor<T>();
-        AscendC::LocalTensor<T> betaLocal = inQueueBeta_.AllocTensor<T>();
-        AscendC::LocalTensor<T> gammaLocal = inQueueGamma_.AllocTensor<T>();
-
-        AscendC::DataCopy(xLocal, xGlobal_, bshLength_);
-        AscendC::DataCopy(gxLocal, gxGlobal_, bshLength_);
-        AscendC::DataCopy(betaLocal, betaGlobal_, hLength_);
-        AscendC::DataCopy(gammaLocal, gammaGlobal_, hLength_);
-
-        inQueueX_.EnQue(xLocal);
-        inQueueGx_.EnQue(gxLocal);
-        inQueueBeta_.EnQue(betaLocal);
-        inQueueGamma_.EnQue(gammaLocal);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.AllocTensor<DTYPE_Y>();
+        AscendC::DataCopy(xLocal, xGm[progress * this->tileLength], this->tileLength);
+        AscendC::DataCopy(yLocal, yGm[progress * this->tileLength], this->tileLength);
+        inQueueX.EnQue(xLocal);
+        inQueueY.EnQue(yLocal);
     }
-
-    __aicore__ inline void Compute()
+    __aicore__ inline void Compute(int32_t /*progress*/)
     {
-        AscendC::LocalTensor<T> xLocal = inQueueX_.DeQue<T>();
-        AscendC::LocalTensor<T> gxLocal = inQueueGx_.DeQue<T>();
-        AscendC::LocalTensor<T> betaLocal = inQueueBeta_.DeQue<T>();
-        AscendC::LocalTensor<T> gammaLocal = inQueueGamma_.DeQue<T>();
-
-        AscendC::LocalTensor<T> yLocal = outQueueY_.AllocTensor<T>();
-        AscendC::LocalTensor<T> meanLocal = outMeanQueue_.AllocTensor<T>();
-        AscendC::LocalTensor<T> rstdLocal = outRstdQueue_.AllocTensor<T>();
-
-        // Use DeepNorm: y = LayerNorm(alpha * x + gx)
-        AscendC::DeepNorm<T, false, false>(yLocal,
-                                           meanLocal,
-                                           rstdLocal,
-                                           xLocal,
-                                           gxLocal,
-                                           betaLocal,
-                                           gammaLocal,
-                                           static_cast<T>(alpha_),
-                                           static_cast<T>(epsilon_),
-                                           tiling_);
-
-        // enqueue outputs
-        outQueueY_.EnQue(yLocal);
-        outMeanQueue_.EnQue(meanLocal);
-        outRstdQueue_.EnQue(rstdLocal);
-
-        inQueueX_.FreeTensor(xLocal);
-        inQueueGx_.FreeTensor(gxLocal);
-        inQueueBeta_.FreeTensor(betaLocal);
-        inQueueGamma_.FreeTensor(gammaLocal);
+        AscendC::LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        AscendC::LocalTensor<DTYPE_Y> yLocal = inQueueY.DeQue<DTYPE_Y>();
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.AllocTensor<DTYPE_Z>();
+        AscendC::Add(zLocal, xLocal, yLocal, this->tileLength);
+        outQueueZ.EnQue<DTYPE_Z>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueY.FreeTensor(yLocal);
     }
-
-    __aicore__ inline void CopyOut()
+    __aicore__ inline void CopyOut(int32_t progress)
     {
-        AscendC::LocalTensor<T> yLocal = outQueueY_.DeQue<T>();
-        AscendC::LocalTensor<T> meanLocal = outMeanQueue_.DeQue<T>();
-        AscendC::LocalTensor<T> rstdLocal = outRstdQueue_.DeQue<T>();
-
-        AscendC::DataCopy(yGlobal_, yLocal, bshLength_);
-
-        outQueueY_.FreeTensor(yLocal);
-        outMeanQueue_.FreeTensor(meanLocal);
-        outRstdQueue_.FreeTensor(rstdLocal);
+        AscendC::LocalTensor<DTYPE_Z> zLocal = outQueueZ.DeQue<DTYPE_Z>();
+        AscendC::DataCopy(zGm[progress * this->tileLength], zLocal, this->tileLength);
+        outQueueZ.FreeTensor(zLocal);
     }
 
 private:
-    AscendC::TPipe pipe_;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueX_;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueGx_;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueBeta_;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQueueGamma_;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueueY_;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outMeanQueue_;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outRstdQueue_;
-
-    AscendC::GlobalTensor<T> xGlobal_;
-    AscendC::GlobalTensor<T> gxGlobal_;
-    AscendC::GlobalTensor<T> betaGlobal_;
-    AscendC::GlobalTensor<T> gammaGlobal_;
-    AscendC::GlobalTensor<T> yGlobal_;
-
-    uint32_t bLength_;
-    uint32_t sLength_;
-    uint32_t hLength_;
-    uint32_t bshLength_;
-    uint32_t bsLength_;
-    DeepNormTiling tiling_;
-    float alpha_;
-    float epsilon_;
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, BUFFER_NUM> inQueueX, inQueueY;
+    AscendC::TQue<AscendC::TPosition::VECOUT, BUFFER_NUM> outQueueZ;
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    AscendC::GlobalTensor<DTYPE_Z> zGm;
+    uint32_t blockLength;
+    uint32_t tileNum;
+    uint32_t tileLength;
 };
-}
 
-extern "C" __global__ __aicore__ void vision_attention_custom(GM_ADDR x, GM_ADDR gx, GM_ADDR beta,
-                                                              GM_ADDR gamma, GM_ADDR y,
-                                                              GM_ADDR workspace, GM_ADDR tiling)
-{
-    if ASCEND_IS_AIC {
-        return;
-    }
-    optiling::VisionAttentionCustomTilingData tilingData;
-    CopyTiling(&tilingData, tiling);
-
-    MyKernel::KernelVisionAttention<float> op;
-    op.Init(x, gx, beta, gamma, y, tilingData);
+extern "C" __global__ __aicore__ void vision_attention_custom(GM_ADDR x, GM_ADDR y, GM_ADDR z, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelVisionAttention op;
+    op.Init(x, y, z, tiling_data.totalLength, tiling_data.tileNum);
     op.Process();
 }
 """
@@ -333,13 +211,10 @@ python_bind_src="""
 #include "pytorch_npu_helper.hpp"
 #include <torch/extension.h>
 
-at::Tensor vision_attention_custom_impl_npu(const at::Tensor& x,
-                                            const at::Tensor& gx,
-                                            const at::Tensor& beta,
-                                            const at::Tensor& gamma) {
-    at::Tensor y = at::empty_like(x);
-    EXEC_NPU_CMD(aclnnVisionAttentionCustom, x, gx, beta, gamma, y);
-    return y;
+at::Tensor vision_attention_custom_impl_npu(const at::Tensor& self, const at::Tensor& other) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnVisionAttentionCustom, self, other, result);
+    return result;
 }
 
 TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
@@ -347,7 +222,7 @@ TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("vision_attention_custom", &vision_attention_custom_impl_npu, "Residual+LayerNorm via DeepNorm");
+    m.def("vision_attention_custom", &vision_attention_custom_impl_npu, "residual add for attention");
 }
 """
 
@@ -358,23 +233,17 @@ import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
     def __init__(self, embed_dim, num_heads):
-        super().__init__()
+        super(ModelNew, self).__init__()
         self.attn = torch.nn.MultiheadAttention(embed_dim, num_heads)
         self.norm = torch.nn.LayerNorm(embed_dim)
 
     def forward(self, x):
-        # x: [B, C, H, W]
         B, C, H, W = x.shape
-        # Prepare sequence for MHA: [S, B, C]
-        x_seq = x.view(B, C, H * W).permute(2, 0, 1).contiguous()
-        attn_output, _ = self.attn(x_seq, x_seq, x_seq)  # [S, B, C]
-        # Convert to [B, S, C] for custom kernel
-        x_bsc = x_seq.permute(1, 0, 2).contiguous()
-        gx_bsc = attn_output.permute(1, 0, 2).contiguous()
-        # Fused residual (+) and LayerNorm using AscendC DeepNorm: y = LN(x + gx)
-        y_bsc = custom_ops_lib.vision_attention_custom(x_bsc, gx_bsc, self.norm.bias, self.norm.weight)
-        # Back to image layout
-        y_seq = y_bsc.permute(1, 0, 2).contiguous()        # [S, B, C]
-        y = y_seq.permute(1, 2, 0).contiguous().view(B, C, H, W)
+        x_seq = x.view(B, C, H * W).permute(2, 0, 1)  # (S, B, E)
+        attn_output, _ = self.attn(x_seq, x_seq, x_seq)
+        # Replace residual addition with custom AscendC kernel
+        fused = custom_ops_lib.vision_attention_custom(attn_output, x_seq)
+        y = self.norm(fused)
+        y = y.permute(1, 2, 0).view(B, C, H, W)
         return y
 '''

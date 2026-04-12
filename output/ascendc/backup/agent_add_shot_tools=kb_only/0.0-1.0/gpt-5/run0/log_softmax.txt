@@ -1,0 +1,207 @@
+project_json_src='''
+[
+    {
+        "op": "LogSoftmaxCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(LogSoftmaxCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, totalLength);
+  TILING_DATA_FIELD_DEF_STRUCT(LogSoftMaxTiling, logSoftmaxTilingData);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(LogSoftmaxCustom, LogSoftmaxCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "log_softmax_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    LogSoftmaxCustomTilingData tiling;
+
+    // 输入形状
+    const gert::Shape* in_shape_desc = context->GetInputShape(0);
+    ge::Shape srcShape = in_shape_desc->GetOriginShape();
+
+    // 数据类型大小：float32 -> 4 bytes
+    const uint32_t dtypeSize = 4;
+
+    // 选择满足正确性的最小临时空间
+    const uint32_t localWorkSpaceSize = AscendC::GetLogSoftMaxMinTmpSize(srcShape, dtypeSize, false);
+
+    // 获取LogSoftMax所需的tiling参数
+    AscendC::LogSoftMaxTilingFunc(srcShape, dtypeSize, localWorkSpaceSize, tiling.logSoftmaxTilingData);
+
+    // 为了内核GM张量设置长度（元素数）
+    uint32_t totalLength = in_shape_desc->GetOriginShape().GetShapeSize();
+    tiling.set_totalLength(totalLength);
+
+    // 设置BlockDim（示例值）
+    context->SetBlockDim(8);
+
+    // 无需额外workspace
+    size_t *workspaceSizes = context->GetWorkspaceSizes(1);
+    workspaceSizes[0] = 0;
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    context->SetTilingKey(1);
+    return ge::GRAPH_SUCCESS;
+}
+
+} // namespace optiling
+
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* x_shape = context->GetInputShape(0);
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    *y_shape = *x_shape;
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+} // namespace ge
+
+
+namespace ops {
+class LogSoftmaxCustom : public OpDef {
+public:
+    explicit LogSoftmaxCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->Output("y")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(LogSoftmaxCustom);
+} // namespace ops
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#define __NPU_TILING__
+#include "log_softmax_custom_tiling_data.h"
+
+class KernelLogSoftmax {
+public:
+    __aicore__ inline KernelLogSoftmax() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, uint32_t totalLen)
+    {
+        xGm.SetGlobalBuffer((__gm__ DTYPE_X *)x, totalLen);
+        yGm.SetGlobalBuffer((__gm__ DTYPE_Y *)y, totalLen);
+        totalLength = totalLen;
+    }
+
+    __aicore__ inline void Process(const LogSoftMaxTiling &tilingParam)
+    {
+        // 直接调用高阶API，使用Tiling参数完成整张量的LogSoftMax计算
+        // 假设LogSoftMax默认沿最后一维（与Host传入的shape一致）
+        AscendC::LogSoftMax<DTYPE_X, false>(yGm, xGm, tilingParam);
+    }
+
+private:
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_Y> yGm;
+    uint32_t totalLength = 0;
+};
+
+extern "C" __global__ __aicore__ void log_softmax_custom(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+    KernelLogSoftmax op;
+    op.Init(x, y, tilingData.totalLength);
+    op.Process(tilingData.logSoftmaxTilingData);
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor log_softmax_custom_impl_npu(const at::Tensor& self) {
+    at::Tensor result = at::empty_like(self);
+    EXEC_NPU_CMD(aclnnLogSoftmaxCustom, self, result);
+    return result;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("log_softmax_custom", &log_softmax_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("log_softmax_custom", &log_softmax_custom_impl_npu, "log_softmax(x)");
+}
+"""
+
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, dim: int = 1):
+        super().__init__()
+        self.dim = dim  # 当前自定义算子按最后一维处理，要求输入为 (N, D) 且 dim=1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_ops_lib.log_softmax_custom(x)
+'''

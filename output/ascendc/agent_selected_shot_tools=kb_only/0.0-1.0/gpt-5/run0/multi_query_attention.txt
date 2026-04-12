@@ -1,0 +1,458 @@
+project_json_src='''
+[
+    {
+        "op": "MultiQueryAttentionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "q",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "k",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            },
+            {
+                "name": "v",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "o",
+                "param_type": "required",
+                "format": ["ND"],
+                "type": ["float"]
+            }
+        ]
+    }
+]
+'''
+
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(MultiQueryAttentionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, B);
+  TILING_DATA_FIELD_DEF(uint32_t, N);
+  TILING_DATA_FIELD_DEF(uint32_t, H);
+  TILING_DATA_FIELD_DEF(uint32_t, Dh);
+  TILING_DATA_FIELD_DEF(uint32_t, Klen);
+  TILING_DATA_FIELD_DEF(float, scale);
+  // Offsets (in bytes) of the two TCubeTiling blocks appended in raw buffer
+  TILING_DATA_FIELD_DEF(uint32_t, qkTilingOffset);
+  TILING_DATA_FIELD_DEF(uint32_t, pvTilingOffset);
+  TILING_DATA_FIELD_DEF(uint32_t, qkTilingSize);
+  TILING_DATA_FIELD_DEF(uint32_t, pvTilingSize);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(MultiQueryAttentionCustom, MultiQueryAttentionCustomTilingData)
+}
+"""
+
+host_operator_src="""
+#include "multi_query_attention_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/matmul_tiling.h"
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    // Shapes
+    // q: [B, N, H, Dh]
+    // k: [B, Klen, Dh]
+    // v: [B, Klen, Dh]
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    const gert::Shape* k_shape = context->GetInputShape(1);
+    // const gert::Shape* v_shape = context->GetInputShape(2);
+
+    // Read original shapes
+    auto q_dims = q_shape->GetOriginShape().GetDims();
+    auto k_dims = k_shape->GetOriginShape().GetDims();
+    if (q_dims.size() != 4 || k_dims.size() != 3) {
+        return ge::GRAPH_FAILED;
+    }
+
+    uint32_t B = static_cast<uint32_t>(q_dims[0]);
+    uint32_t N = static_cast<uint32_t>(q_dims[1]);
+    uint32_t H = static_cast<uint32_t>(q_dims[2]);
+    uint32_t Dh = static_cast<uint32_t>(q_dims[3]);
+    uint32_t Klen = static_cast<uint32_t>(k_dims[1]);
+
+    float scale = 1.0f / std::sqrt(static_cast<float>(Dh));
+
+    // Prepare Matmul tiling for Q @ K^T: [N, Dh] x [Klen, Dh]^T -> [N, Klen]
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    matmul_tiling::MatmulApiTiling qkTiling(ascendcPlatform);
+    qkTiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    qkTiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    qkTiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    qkTiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    qkTiling.SetShape(N, Klen, Dh);
+    qkTiling.SetOrgShape(N, Klen, Dh, Dh);
+    qkTiling.SetBias(false);
+    qkTiling.SetBufferSpace(-1, -1, -1);
+    optiling::TCubeTiling qkTilingData;
+    int qkRet = qkTiling.GetTiling(qkTilingData);
+    if (qkRet != 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Prepare Matmul tiling for P @ V: [N, Klen] x [Klen, Dh] -> [N, Dh]
+    matmul_tiling::MatmulApiTiling pvTiling(ascendcPlatform);
+    pvTiling.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    pvTiling.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    pvTiling.SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    pvTiling.SetBiasType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
+    pvTiling.SetShape(N, Dh, Klen);
+    pvTiling.SetOrgShape(N, Dh, Klen, Klen);
+    pvTiling.SetBias(false);
+    pvTiling.SetBufferSpace(-1, -1, -1);
+    optiling::TCubeTiling pvTilingData;
+    int pvRet = pvTiling.GetTiling(pvTilingData);
+    if (pvRet != 0) {
+        return ge::GRAPH_FAILED;
+    }
+
+    // Set block dim (can be tuned)
+    context->SetBlockDim(1);
+
+    // Pack our tiling data header
+    MultiQueryAttentionCustomTilingData tilingHeader;
+    tilingHeader.set_B(B);
+    tilingHeader.set_N(N);
+    tilingHeader.set_H(H);
+    tilingHeader.set_Dh(Dh);
+    tilingHeader.set_Klen(Klen);
+    tilingHeader.set_scale(scale);
+
+    // Write header then two TCubeTiling into raw tiling buffer
+    auto* raw = context->GetRawTilingData();
+    uint8_t* buf = reinterpret_cast<uint8_t*>(raw->GetData());
+    size_t cap = raw->GetCapacity();
+
+    // First write header
+    size_t hdrSize = tilingHeader.GetDataSize();
+    if (cap < hdrSize + sizeof(optiling::TCubeTiling) * 2) {
+        return ge::GRAPH_FAILED;
+    }
+    tilingHeader.SaveToBuffer(buf, cap);
+    // Offsets
+    uint32_t qkOff = static_cast<uint32_t>(hdrSize);
+    uint32_t pvOff = static_cast<uint32_t>(hdrSize + sizeof(optiling::TCubeTiling));
+    // Copy qk tiling
+    std::memcpy(buf + qkOff, &qkTilingData, sizeof(optiling::TCubeTiling));
+    // Copy pv tiling
+    std::memcpy(buf + pvOff, &pvTilingData, sizeof(optiling::TCubeTiling));
+
+    // Update header fields for offsets and sizes
+    tilingHeader.set_qkTilingOffset(qkOff);
+    tilingHeader.set_pvTilingOffset(pvOff);
+    tilingHeader.set_qkTilingSize(sizeof(optiling::TCubeTiling));
+    tilingHeader.set_pvTilingSize(sizeof(optiling::TCubeTiling));
+    tilingHeader.SaveToBuffer(buf, cap);
+
+    raw->SetDataSize(hdrSize + sizeof(optiling::TCubeTiling) * 2);
+
+    // No extra workspace size required from host-side planning (kernel may use runtime workspace)
+    size_t* workspaces = context->GetWorkspaceSizes(1);
+    workspaces[0] = 0;
+
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    // q: [B, N, H, Dh], k: [B, Klen, Dh], v: [B, Klen, Dh]
+    const gert::Shape* q_shape = context->GetInputShape(0);
+    auto q_dims = q_shape->GetOriginShape().GetDims();
+    if (q_dims.size() != 4) return GRAPH_FAILED;
+    gert::Shape* y_shape = context->GetOutputShape(0);
+    // output o: [B, N, H, Dh] -> reshape to [B, N, H*Dh] will be done in python; here we keep [B,N,H,Dh] flattened as [B,N,H*Dh]
+    std::vector<int64_t> out_dims = q_dims;
+    *y_shape = gert::Shape(out_dims);
+    return GRAPH_SUCCESS;
+}
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    const auto inputDataType = context->GetInputDataType(0);
+    context->SetOutputDataType(0, inputDataType);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class MultiQueryAttentionCustom : public OpDef {
+public:
+    explicit MultiQueryAttentionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("q")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("k")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Input("v")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("o")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+OP_ADD(MultiQueryAttentionCustom);
+}
+"""
+
+kernel_src="""
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+
+using A_T = float;
+using B_T = float;
+using C_T = float;
+using BiasT = float;
+
+extern "C" __global__ __aicore__ void multi_query_attention_custom(
+    GM_ADDR qGM, GM_ADDR kGM, GM_ADDR vGM, GM_ADDR oGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+{
+    // Parse header
+    auto bufU32 = reinterpret_cast<__gm__ uint32_t*>(tilingGM);
+    // Header is generated by TILING_DATA macros; read it as raw bytes first
+    // We know the order we set in host: B,N,H,Dh,Klen,scale, qkOff, pvOff, qkSize, pvSize
+    uint32_t B = bufU32[0];
+    uint32_t N = bufU32[1];
+    uint32_t H = bufU32[2];
+    uint32_t Dh = bufU32[3];
+    uint32_t Klen = bufU32[4];
+    // scale stored as float at index 5
+    float scale = *reinterpret_cast<__gm__ float*>(reinterpret_cast<__gm__ void*>(bufU32 + 5));
+    uint32_t qkOff = bufU32[6];
+    uint32_t pvOff = bufU32[7];
+    // sizes not used in device side
+    // uint32_t qkSize = bufU32[8];
+    // uint32_t pvSize = bufU32[9];
+
+    // Load TCubeTiling objects from tilingGM by offsets
+    TCubeTiling qkTiling;
+    TCubeTiling pvTiling;
+    {
+        auto tilingBaseU8 = reinterpret_cast<__gm__ uint8_t*>(tilingGM);
+        auto srcQK = reinterpret_cast<__gm__ uint32_t*>(tilingBaseU8 + qkOff);
+        auto dstQK = reinterpret_cast<uint32_t*>(&qkTiling);
+        for (int i = 0; i < (int)(sizeof(TCubeTiling)/sizeof(uint32_t)); ++i) {
+            dstQK[i] = srcQK[i];
+        }
+        auto srcPV = reinterpret_cast<__gm__ uint32_t*>(tilingBaseU8 + pvOff);
+        auto dstPV = reinterpret_cast<uint32_t*>(&pvTiling);
+        for (int i = 0; i < (int)(sizeof(TCubeTiling)/sizeof(uint32_t)); ++i) {
+            dstPV[i] = srcPV[i];
+        }
+    }
+
+    // Define Matmul types (NORMAL layout)
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, A_T, false, LayoutMode::NORMAL> aType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, B_T, true,  LayoutMode::NORMAL> bTypeT; // B with transpose flag configurable
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, C_T, false, LayoutMode::NORMAL> cType;
+    typedef matmul::MatmulType <AscendC::TPosition::GM, CubeFormat::ND, BiasT> biasType;
+    constexpr static MatmulConfig MM_CFG = GetNormalConfig(false, false, false, BatchMode::BATCH_LESS_THAN_L1);
+
+    matmul::Matmul<aType, bTypeT, cType, biasType, MM_CFG> mm_qk;
+    matmul::Matmul<aType, bTypeT, cType, biasType, MM_CFG> mm_pv;
+
+    // Register to pipeline
+    TPipe pipe;
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm_qk);
+    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm_pv);
+
+    mm_qk.Init(&qkTiling);
+    mm_pv.Init(&pvTiling);
+
+    // Global tensors
+    AscendC::GlobalTensor<A_T> qGlobal; qGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(qGM), (int64_t)B*N*H*Dh);
+    AscendC::GlobalTensor<B_T> kGlobal; kGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(kGM), (int64_t)B*Klen*Dh);
+    AscendC::GlobalTensor<B_T> vGlobal; vGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(vGM), (int64_t)B*Klen*Dh);
+    AscendC::GlobalTensor<C_T> oGlobal; oGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(oGM), (int64_t)B*N*H*Dh);
+
+    // Workspace for scores/probabilities (reuse oGM if no workspace provided)
+    __gm__ C_T* scoreBase = reinterpret_cast<__gm__ C_T*>(workspaceGM);
+    bool hasWorkspace = (workspaceGM != nullptr);
+    // Fallback to oGM (temporary) if no workspace
+    if (!hasWorkspace) {
+        scoreBase = reinterpret_cast<__gm__ C_T*>(oGM);
+    }
+
+    // Strides (in elements)
+    int64_t q_stride_b = (int64_t)N*H*Dh;
+    int64_t q_stride_h = (int64_t)Dh;
+    int64_t k_stride_b = (int64_t)Klen*Dh;
+    int64_t v_stride_b = (int64_t)Klen*Dh;
+    int64_t o_stride_b = (int64_t)N*H*Dh;
+    int64_t o_stride_h = (int64_t)Dh;
+
+    // Per (b,h), compute:
+    // 1) S = Q[b,:,h,:] @ K[b,:,:]^T  -> [N, Klen]
+    // 2) scale and softmax over Klen for each N row
+    // 3) O = S @ V[b,:,:] -> [N, Dh]
+    for (uint32_t b = 0; b < B; ++b) {
+        // Prepare K and V sub-tensors
+        AscendC::GlobalTensor<B_T> gm_k_b;
+        gm_k_b.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(kGlobal[b * k_stride_b].GetPhyAddr()), Klen * Dh);
+        AscendC::GlobalTensor<B_T> gm_v_b;
+        gm_v_b.SetGlobalBuffer(reinterpret_cast<__gm__ B_T*>(vGlobal[b * v_stride_b].GetPhyAddr()), Klen * Dh);
+
+        for (uint32_t h = 0; h < H; ++h) {
+            // Q slice [N, Dh]
+            AscendC::GlobalTensor<A_T> gm_q_bh;
+            gm_q_bh.SetGlobalBuffer(reinterpret_cast<__gm__ A_T*>(qGlobal[b * q_stride_b + h * (int64_t)Dh].GetPhyAddr()),
+                                    (int64_t)N * Dh);
+
+            // Scores buffer [N, Klen]
+            AscendC::GlobalTensor<C_T> gm_s;
+            gm_s.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(scoreBase), (int64_t)N * Klen);
+
+            // Output slice [N, Dh]
+            AscendC::GlobalTensor<C_T> gm_o_bh;
+            gm_o_bh.SetGlobalBuffer(reinterpret_cast<__gm__ C_T*>(oGlobal[b * o_stride_b + h * (int64_t)Dh].GetPhyAddr()),
+                                    (int64_t)N * Dh);
+
+            // Set inputs for QK^T
+            mm_qk.SetTensorA(gm_q_bh, false);
+            mm_qk.SetTensorB(gm_k_b, true);
+            mm_qk.SetWorkspace(workspaceGM, 0);
+            // Compute S
+            mm_qk.IterateBatch(gm_s, 1, 1, false);
+
+            // Scale and SoftMax row-wise on S, in-place into S
+            // Process each row independently to control buffer
+            for (uint32_t n = 0; n < N; ++n) {
+                // Copy row into local
+                AscendC::LocalTensor<C_T> rowLocal = pipe.AllocTmpBuffer<C_T>(Klen);
+                AscendC::DataCopy(rowLocal, gm_s[n * Klen], Klen);
+
+                // scale
+                // z = z * scale
+                AscendC::Scalar<C_T> alpha(scale);
+                AscendC::Mul(rowLocal, rowLocal, alpha, Klen);
+
+                // SoftMax over length Klen
+                // Allocate auxiliary out buffers (sum/max) as vectors of 32-byte aligned length; SoftMax API handles internally.
+                // Using framework-managed temporary buffer mode.
+                SoftMaxTiling smTiling;
+                SoftMaxShapeInfo shapeInfo;
+                // dst,sum,max share rowLocal buffer sizes
+                AscendC::LocalTensor<C_T> sumLocal = pipe.AllocTmpBuffer<C_T>(64); // minimal placeholder; API will manage internally
+                AscendC::LocalTensor<C_T> maxLocal = pipe.AllocTmpBuffer<C_T>(64);
+                AscendC::LocalTensor<C_T> dstLocal = pipe.AllocTmpBuffer<C_T>(Klen);
+
+                SoftMax<C_T>(dstLocal, sumLocal, maxLocal, rowLocal, smTiling, shapeInfo);
+
+                // Write back
+                AscendC::DataCopy(gm_s[n * Klen], dstLocal, Klen);
+
+                pipe.FreeTmpBuffer(dstLocal);
+                pipe.FreeTmpBuffer(maxLocal);
+                pipe.FreeTmpBuffer(sumLocal);
+                pipe.FreeTmpBuffer(rowLocal);
+            }
+
+            // O = P @ V
+            mm_pv.SetTensorA(gm_s, false);
+            mm_pv.SetTensorB(gm_v_b, false); // [Klen, Dh]
+            mm_pv.SetWorkspace(workspaceGM, 0);
+            mm_pv.IterateBatch(gm_o_bh, 1, 1, false);
+        }
+    }
+}
+"""
+
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor multi_query_attention_custom_impl_npu(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+    // q: [B,N,H,Dh], k: [B,Klen,Dh], v:[B,Klen,Dh]
+    TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
+    TORCH_CHECK(k.is_contiguous(), "k must be contiguous");
+    TORCH_CHECK(v.is_contiguous(), "v must be contiguous");
+    auto out = at::empty_like(q);
+    EXEC_NPU_CMD(aclnnMultiQueryAttentionCustom, q, k, v, out);
+    return out;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("multi_query_attention_custom", &multi_query_attention_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("multi_query_attention_custom", &multi_query_attention_custom_impl_npu, "MQA(Q,K,V)->O");
+}
+"""
+
+model_src='''
+import torch
+import torch.nn as nn
+import math
+import custom_ops_lib
+
+class ModelNew(nn.Module):
+    """
+    Multi-Query Attention (MQA) with custom AscendC kernel for attention core
+    - Multiple query heads
+    - Single shared key/value head
+    """
+    def __init__(self, d_model=4096, num_heads=32):
+        super().__init__()
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model // num_heads)  # shared across heads
+        self.v_proj = nn.Linear(d_model, d_model // num_heads)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.num_heads = num_heads
+
+    def forward(self, x):
+        B, N, D = x.shape
+        H = self.num_heads
+        d_h = D // H
+
+        # Q: [B,N,H,d_h], K/V (shared across heads): [B,N,d_h]
+        Q = self.q_proj(x).view(B, N, H, d_h).contiguous()
+        K = self.k_proj(x).contiguous()  # [B,N,d_h]
+        V = self.v_proj(x).contiguous()  # [B,N,d_h]
+
+        # Custom kernel computes: O = softmax(Q @ K^T / sqrt(d_h)) @ V
+        O = custom_ops_lib.multi_query_attention_custom(Q, K, V)  # [B,N,H,d_h]
+        O = O.view(B, N, D).contiguous()
+        return self.out_proj(O)
+
+def get_inputs():
+    batch_size, seq_len, d_model, num_heads = 2, 4096, 4096, 32
+    x = torch.rand(batch_size, seq_len, d_model)
+    return [x]
+
+def get_init_inputs():
+    return [4096, 32]
+'''

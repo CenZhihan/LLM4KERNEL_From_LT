@@ -1,0 +1,342 @@
+project_json_src='''
+[
+    {
+        "op": "ArgmaxOverADimensionCustom",
+        "language": "cpp",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "float"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "index",
+                "param_type": "required",
+                "format": [
+                    "ND"
+                ],
+                "type": [
+                    "int32"
+                ]
+            }
+        ]
+    }
+]
+'''
+host_tiling_src="""
+#include "register/tilingdata_base.h"
+#include "tiling/tiling_api.h"
+
+namespace optiling {
+BEGIN_TILING_DATA_DEF(ArgmaxOverADimensionCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, outter);
+  TILING_DATA_FIELD_DEF(uint32_t, inner);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, tmpsize);
+  TILING_DATA_FIELD_DEF(bool, islargest);
+  TILING_DATA_FIELD_DEF(bool, isinitindex);
+  TILING_DATA_FIELD_DEF_STRUCT(TopkTiling, topkTilingData);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(ArgmaxOverADimensionCustom, ArgmaxOverADimensionCustomTilingData)
+}
+"""
+host_operator_src="""
+#include "argmax_over_a_dimension_custom_tiling.h"
+#include "register/op_def_registry.h"
+#include "tiling/tiling_api.h"
+#include <algorithm>
+
+namespace optiling {
+static ge::graphStatus TilingFunc(gert::TilingContext* context)
+{
+    ArgmaxOverADimensionCustomTilingData tiling;
+
+    const gert::StorageShape *in_shape = context->GetInputShape(0);
+    uint32_t dims = in_shape->GetStorageShape().GetDimNum();
+    uint64_t outter64 = 1;
+    uint32_t n = 1;
+    if (dims == 0) {
+        outter64 = 1;
+        n = 1;
+    } else {
+        for (uint32_t i = 0; i + 1 < dims; ++i) {
+            outter64 *= static_cast<uint64_t>(in_shape->GetStorageShape().GetDim(i));
+        }
+        n = static_cast<uint32_t>(in_shape->GetStorageShape().GetDim(dims - 1));
+    }
+    uint32_t outter = static_cast<uint32_t>(outter64);
+    // inner should be padded to multiple of 32 for TopK
+    uint32_t inner = ((n + 31) / 32) * 32;
+
+    const uint32_t k = 1;
+    const bool isLargest = true;
+    const bool isInitIndex = false;
+    const uint32_t dtypesize = 4; // float
+
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+
+    // Obtain tiling parameters for TopK
+    AscendC::TopKTilingFunc(ascendcPlatform, inner, outter, static_cast<int32_t>(k), dtypesize, isInitIndex,
+                            AscendC::TopKMode::TOPK_NORMAL, isLargest, tiling.topkTilingData);
+
+    // Get min/max tmp size and choose minimum to ensure correctness
+    uint32_t maxsize = 0;
+    uint32_t minsize = 0;
+    AscendC::GetTopKMaxMinTmpSize(ascendcPlatform, inner, outter, false, isInitIndex,
+                                  AscendC::TopKMode::TOPK_NORMAL, isLargest, dtypesize, maxsize, minsize);
+
+    tiling.set_outter(outter);
+    tiling.set_inner(inner);
+    tiling.set_n(n);
+    tiling.set_k(k);
+    tiling.set_tmpsize(minsize);
+    tiling.set_islargest(isLargest);
+    tiling.set_isinitindex(isInitIndex);
+
+    uint32_t blockDim = std::min<uint32_t>(outter == 0 ? 1 : outter, 8u);
+    context->SetBlockDim(blockDim);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+    currentWorkspace[0] = 0;
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ge {
+static ge::graphStatus InferShape(gert::InferShapeContext* context)
+{
+    const gert::Shape* in_shape = context->GetInputShape(0);
+    gert::Shape* out_shape = context->GetOutputShape(0);
+
+    // Reduce over the last dimension
+    std::vector<int64_t> dims;
+    for (size_t i = 0; i + 1 < in_shape->GetOriginShape().GetDimNum(); ++i) {
+        dims.push_back(in_shape->GetOriginShape().GetDim(i));
+    }
+    if (dims.empty()) {
+        dims.push_back(1);
+    }
+    out_shape->SetDimNum(dims.size());
+    for (size_t i = 0; i < dims.size(); ++i) {
+        out_shape->SetDim(i, dims[i]);
+    }
+    return GRAPH_SUCCESS;
+}
+
+static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+{
+    // argmax output indices: int32
+    context->SetOutputDataType(0, ge::DT_INT32);
+    return ge::GRAPH_SUCCESS;
+}
+}
+
+namespace ops {
+class ArgmaxOverADimensionCustom : public OpDef {
+public:
+    explicit ArgmaxOverADimensionCustom(const char* name) : OpDef(name)
+    {
+        this->Input("x")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("index")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .Format({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
+
+        this->SetInferShape(ge::InferShape).SetInferDataType(ge::InferDataType);
+
+        this->AICore().SetTiling(optiling::TilingFunc);
+        this->AICore().AddConfig("ascend910b");
+    }
+};
+
+OP_ADD(ArgmaxOverADimensionCustom);
+}
+"""
+kernel_src="""
+#include "kernel_operator.h"
+
+using DTYPE_X = float;
+using DTYPE_IDX = int32_t;
+
+class KernelArgmaxLastDim {
+public:
+    __aicore__ inline KernelArgmaxLastDim() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR index,
+                                uint32_t outterIn, uint32_t innerIn, uint32_t nIn,
+                                uint32_t kIn, uint32_t tmpSizeIn,
+                                const optiling::TopkTiling &topkTilingIn)
+    {
+        outter = outterIn;
+        inner = innerIn;
+        n = nIn;
+        k = kIn;
+        tmpSize = tmpSizeIn;
+        topkTiling = topkTilingIn;
+
+        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_X*>(x), static_cast<uint32_t>(outter) * n);
+        idxGm.SetGlobalBuffer(reinterpret_cast<__gm__ DTYPE_IDX*>(index), outter);
+
+        // Initialize buffers: one row buffer, tmp buffer, index/value buffers and auxiliaries
+        pipe.InitBuffer(srcBuf, inner * sizeof(DTYPE_X));
+        pipe.InitBuffer(tmpBuf, tmpSize);
+        pipe.InitBuffer(dstIdxBuf, k * sizeof(DTYPE_IDX));
+        pipe.InitBuffer(dstValBuf, k * sizeof(DTYPE_X));
+        pipe.InitBuffer(srcIndexBuf, inner * sizeof(int32_t));
+        pipe.InitBuffer(finishBuf, sizeof(bool));
+    }
+
+    __aicore__ inline void Process()
+    {
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+        uint32_t blockNum = AscendC::GetBlockNum();
+        uint32_t rowsPerBlock = (outter + blockNum - 1) / blockNum;
+        uint32_t start = blockIdx * rowsPerBlock;
+        uint32_t end = start + rowsPerBlock;
+        if (end > outter) end = outter;
+
+        // Prepare constant for padding
+        AscendC::LocalTensor<DTYPE_X> srcLocal = srcBuf.Get<DTYPE_X>();
+        AscendC::LocalTensor<uint8_t> tmpLocal = tmpBuf.Get<uint8_t>();
+        AscendC::LocalTensor<DTYPE_IDX> dstIndexLocal = dstIdxBuf.Get<DTYPE_IDX>();
+        AscendC::LocalTensor<DTYPE_X> dstValLocal = dstValBuf.Get<DTYPE_X>();
+        AscendC::LocalTensor<int32_t> srcIndexLocal = srcIndexBuf.Get<int32_t>();
+        AscendC::LocalTensor<bool> finishLocal = finishBuf.Get<bool>();
+
+        bool fval = false;
+        AscendC::Duplicate(finishLocal, fval, 1);
+
+        // Info for TopK
+        AscendC::TopKInfo topKInfo;
+        topKInfo.outter = 1;
+        topKInfo.inner = static_cast<int32_t>(inner);
+        topKInfo.n = static_cast<int32_t>(n);
+
+        for (uint32_t r = start; r < end; ++r) {
+            // Pad entire row with very small number to avoid padded part affecting argmax
+            DTYPE_X negLarge = static_cast<DTYPE_X>(-3.402823e+38F);
+            AscendC::Duplicate(srcLocal, negLarge, inner);
+            // Copy valid n elements from GM
+            AscendC::DataCopy(srcLocal, xGm[r * n], n);
+
+            // k = 1, find max index along last dim
+            AscendC::TopK<DTYPE_X, false, false, false, AscendC::TopKMode::TOPK_NORMAL>(
+                dstValLocal,
+                dstIndexLocal,
+                srcLocal,
+                srcIndexLocal,
+                finishLocal,
+                tmpLocal,
+                static_cast<int32_t>(k),
+                topkTiling,
+                topKInfo,
+                true  // isLargest
+            );
+
+            // Write index result to GM
+            AscendC::DataCopy(idxGm[r], dstIndexLocal, 1);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+    }
+
+private:
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> srcBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> tmpBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> dstIdxBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> dstValBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> srcIndexBuf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> finishBuf;
+
+    AscendC::GlobalTensor<DTYPE_X> xGm;
+    AscendC::GlobalTensor<DTYPE_IDX> idxGm;
+
+    uint32_t outter;
+    uint32_t inner;
+    uint32_t n;
+    uint32_t k;
+    uint32_t tmpSize;
+    optiling::TopkTiling topkTiling;
+};
+
+extern "C" __global__ __aicore__ void argmax_over_a_dimension_custom(GM_ADDR x, GM_ADDR index, GM_ADDR workspace, GM_ADDR tiling)
+{
+    GET_TILING_DATA(tilingData, tiling);
+
+    KernelArgmaxLastDim op;
+    op.Init(x, index,
+            tilingData.outter, tilingData.inner, tilingData.n,
+            tilingData.k, tilingData.tmpsize,
+            tilingData.topkTilingData);
+    op.Process();
+}
+"""
+python_bind_src="""
+#include <torch/library.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include "pytorch_npu_helper.hpp"
+#include <torch/extension.h>
+
+at::Tensor argmax_over_a_dimension_custom_impl_npu(const at::Tensor& x) {
+    // Output indices tensor, reduced over last dimension
+    std::vector<int64_t> out_sizes;
+    out_sizes.reserve(x.dim() > 0 ? x.dim() - 1 : 1);
+    for (int i = 0; i + 1 < x.dim(); ++i) {
+        out_sizes.push_back(x.size(i));
+    }
+    if (out_sizes.empty()) {
+        out_sizes.push_back(1);
+    }
+    at::Tensor index = at::empty(out_sizes, x.options().dtype(at::kInt));
+    EXEC_NPU_CMD(aclnnArgmaxOverADimensionCustom, x, index);
+    return index;
+}
+
+TORCH_LIBRARY_IMPL(myops, PrivateUse1, m) {
+    m.impl("argmax_over_a_dimension_custom", &argmax_over_a_dimension_custom_impl_npu);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("argmax_over_a_dimension_custom", &argmax_over_a_dimension_custom_impl_npu, "Argmax over last dim (indices)");
+}
+"""
+model_src='''
+import torch
+import torch_npu
+import custom_ops_lib
+
+class ModelNew(torch.nn.Module):
+    """
+    Argmax over a specified dimension using custom AscendC TopK-based kernel over the last dim.
+    If the target dimension is not the last, the input is permuted so that the target dim becomes the last.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dim = self.dim if self.dim >= 0 else (x.dim() + self.dim)
+        if dim != x.dim() - 1:
+            # Move target dim to last
+            perm = list(range(x.dim()))
+            perm[dim], perm[-1] = perm[-1], perm[dim]
+            x = x.permute(perm).contiguous()
+        # Call custom op that reduces over last dim
+        return custom_ops_lib.argmax_over_a_dimension_custom(x)
+'''

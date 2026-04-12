@@ -43,123 +43,87 @@ project_json_src='''
 
 host_tiling_src="""
 #include "register/tilingdata_base.h"
-// 本算子采用 Matmul 的 TCubeTiling 原生结构传递，不需要自定义 TilingData。
+
 namespace optiling {
-// 空文件占位
+BEGIN_TILING_DATA_DEF(BatchedMatrixMultiplicationCustomTilingData)
+  TILING_DATA_FIELD_DEF(uint32_t, m);
+  TILING_DATA_FIELD_DEF(uint32_t, n);
+  TILING_DATA_FIELD_DEF(uint32_t, k);
+  TILING_DATA_FIELD_DEF(uint32_t, batch);
+END_TILING_DATA_DEF;
+
+REGISTER_TILING_DATA_CLASS(BatchedMatrixMultiplicationCustom, BatchedMatrixMultiplicationCustomTilingData)
 }
 """
 
 host_operator_src="""
+#include "batched_matrix_multiplication_custom_tiling.h"
 #include "register/op_def_registry.h"
-#include "graph/tensor.h"
-#include "graph/utils/type_utils.h"
-#include "matmul_tiling.h"
-#include "platform/platform_ascendc.h"
-
-namespace {
-inline int64_t GetDimSafe(const gert::Shape& s, size_t idx) {
-    if (idx >= s.GetDimNum()) return 0;
-    return static_cast<int64_t>(s.GetDim(idx));
-}
-}
 
 namespace optiling {
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    // 读取输入形状: A[B, M, K], B[B, K, N]
-    const gert::Shape* a_shape = context->GetInputShape(0);
-    const gert::Shape* b_shape = context->GetInputShape(1);
-    const auto a_origin = a_shape->GetOriginShape();
-    const auto b_origin = b_shape->GetOriginShape();
-
-    int64_t B = GetDimSafe(a_origin, 0);
-    int64_t M = GetDimSafe(a_origin, 1);
-    int64_t K = GetDimSafe(a_origin, 2);
-    int64_t N = GetDimSafe(b_origin, 2);
-
-    // 平台与tiler初始化
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    matmul_tiling::MultiCoreMatmulTiling tiling(ascendcPlatform);
-
-    tiling->SetDim(1);
-    tiling->SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling->SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-    tiling->SetCType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_FLOAT);
-
-    tiling->SetShape((int32_t)M, (int32_t)N, (int32_t)K);
-    tiling->SetOrgShape((int32_t)M, (int32_t)N, (int32_t)K);
-    tiling->SetBufferSpace(-1, -1, -1);
-
-    // NORMAL(BMNK)布局下设置批次与轴信息
-    tiling->SetBatchInfoForNormal((int32_t)B, (int32_t)B, (int32_t)M, (int32_t)N, (int32_t)K);
-
-    tiling->SetBufferSpace(-1, -1, -1);
-
-    optiling::TCubeTiling tilingData;
-    int ret = tiling.GetTiling(tilingData);
-    if (ret != 0) {
+    // 输入形状：(batch, m, k) 和 (batch, k, n)
+    const auto* A_shape = context->GetInputShape(0);
+    const auto* B_shape = context->GetInputShape(1);
+    if (A_shape == nullptr || B_shape == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    auto A_origin = A_shape->GetOriginShape();
+    auto B_origin = B_shape->GetOriginShape();
+    if (A_origin.GetDimNum() != 3 || B_origin.GetDimNum() != 3) {
         return ge::GRAPH_FAILED;
     }
 
-    // block dim 选择固定值或依据平台设置。这里使用8
-    const uint32_t BLOCK_DIM = 8;
-    context->SetBlockDim(BLOCK_DIM);
+    uint32_t batch = static_cast<uint32_t>(A_origin.GetDim(0));
+    uint32_t m = static_cast<uint32_t>(A_origin.GetDim(1));
+    uint32_t k = static_cast<uint32_t>(A_origin.GetDim(2));
+    uint32_t n = static_cast<uint32_t>(B_origin.GetDim(2));
 
-    // workspace 设为0
-    size_t* ws = context->GetWorkspaceSizes(1);
-    ws[0] = 0;
+    // 设置Block数量（简化为单核，确保正确性；可按需调优）
+    context->SetBlockDim(1);
 
-    // 将TCubeTiling直接写入raw tiling buffer
-    auto* raw = context->GetRawTilingData();
-    auto* buf = raw->GetData();
-    auto cap = raw->GetCapacity();
-    if (cap < sizeof(optiling::TCubeTiling)) {
-        return ge::GRAPH_FAILED;
-    }
-    // 以内存形式保存
-    auto* src = reinterpret_cast<const uint8_t*>(&tilingData);
-    for (size_t i = 0; i < sizeof(optiling::TCubeTiling); ++i) {
-        buf[i] = src[i];
-    }
-    raw->SetDataSize(sizeof(optiling::TCubeTiling));
+    BatchedMatrixMultiplicationCustomTilingData tiling;
+    tiling.set_m(m);
+    tiling.set_n(n);
+    tiling.set_k(k);
+    tiling.set_batch(batch);
+
+    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(),
+                        context->GetRawTilingData()->GetCapacity());
+    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+
+    size_t* workspace = context->GetWorkspaceSizes(1);
+    workspace[0] = 0;
     return ge::GRAPH_SUCCESS;
 }
 }
 
 namespace ge {
+
 static ge::graphStatus InferShape(gert::InferShapeContext* context)
 {
-    const gert::Shape* a_shape = context->GetInputShape(0);
-    const gert::Shape* b_shape = context->GetInputShape(1);
-    const auto a_origin = a_shape->GetOriginShape();
-    const auto b_origin = b_shape->GetOriginShape();
-
-    int64_t B = (int64_t)a_origin.GetDim(0);
-    int64_t M = (int64_t)a_origin.GetDim(1);
-    int64_t K1 = (int64_t)a_origin.GetDim(2);
-    int64_t B2 = (int64_t)b_origin.GetDim(0);
-    int64_t K2 = (int64_t)b_origin.GetDim(1);
-    int64_t N = (int64_t)b_origin.GetDim(2);
-
-    if (B != B2 || K1 != K2) {
+    const gert::Shape* A_shape = context->GetInputShape(0);
+    const gert::Shape* B_shape = context->GetInputShape(1);
+    if (A_shape == nullptr || B_shape == nullptr) {
         return GRAPH_FAILED;
     }
-
-    gert::Shape* c_shape = context->GetOutputShape(0);
-    gert::Shape out;
-    out.SetDimNum(3);
-    out.SetDim(0, B);
-    out.SetDim(1, M);
-    out.SetDim(2, N);
-    *c_shape = out;
+    // 输出形状：(batch, m, n)
+    gert::Shape* C_shape = context->GetOutputShape(0);
+    gert::Shape out_shape;
+    out_shape.SetDimNum(3);
+    out_shape.SetDim(0, A_shape->GetDim(0));
+    out_shape.SetDim(1, A_shape->GetDim(1));
+    out_shape.SetDim(2, B_shape->GetDim(2));
+    *C_shape = out_shape;
     return GRAPH_SUCCESS;
 }
 
-static ge::graphStatus InferDataType(gert::InferDataTypeContext *context)
+static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
 {
-    const auto inputDataType = context->GetInputDataType(0);
-    context->SetOutputDataType(0, inputDataType);
-    return ge::GRAPH_SUCCESS;
+    const auto dtypeA = context->GetInputDataType(0);
+    context->SetOutputDataType(0, dtypeA);
+    return GRAPH_SUCCESS;
 }
 }
 
@@ -197,71 +161,58 @@ OP_ADD(BatchedMatrixMultiplicationCustom);
 
 kernel_src="""
 #include "kernel_operator.h"
-#include "lib/matmul_intf.h"
 
-extern "C" __global__ __aicore__ void batched_matrix_multiplication_custom(GM_ADDR aGM, GM_ADDR bGM, GM_ADDR cGM, GM_ADDR workspaceGM, GM_ADDR tilingGM)
-{
-    // 读取TCubeTiling
-    optiling::TCubeTiling tiling;
-    {
-        auto tempTilingGM = (__gm__ uint32_t*)tilingGM;
-        auto tempTiling = (uint32_t*)&tiling;
-        for (int i = 0; i < (int)(sizeof(optiling::TCubeTiling) / sizeof(uint32_t)); ++i, ++tempTilingGM, ++tempTiling) {
-            *tempTiling = *tempTilingGM;
+constexpr int32_t BUFFER_NUM = 1;
+
+class KernelBMM {
+public:
+    __aicore__ inline KernelBMM() {}
+
+    __aicore__ inline void Init(GM_ADDR A, GM_ADDR B, GM_ADDR C, uint32_t m, uint32_t n, uint32_t k, uint32_t batch) {
+        this->m_ = m;
+        this->n_ = n;
+        this->k_ = k;
+        this->batch_ = batch;
+        A_ptr_ = reinterpret_cast<__gm__ float*>(A);
+        B_ptr_ = reinterpret_cast<__gm__ float*>(B);
+        C_ptr_ = reinterpret_cast<__gm__ float*>(C);
+    }
+
+    __aicore__ inline void Process() {
+        // 朴素实现：C[b, i, j] = sum_k A[b, i, k] * B[b, k, j]
+        for (uint32_t b = 0; b < batch_; ++b) {
+            uint64_t baseA = static_cast<uint64_t>(b) * m_ * k_;
+            uint64_t baseB = static_cast<uint64_t>(b) * k_ * n_;
+            uint64_t baseC = static_cast<uint64_t>(b) * m_ * n_;
+            for (uint32_t i = 0; i < m_; ++i) {
+                for (uint32_t j = 0; j < n_; ++j) {
+                    float acc = 0.0f;
+                    for (uint32_t kk = 0; kk < k_; ++kk) {
+                        float a_val = A_ptr_[baseA + static_cast<uint64_t>(i) * k_ + kk];
+                        float b_val = B_ptr_[baseB + static_cast<uint64_t>(kk) * n_ + j];
+                        acc += a_val * b_val;
+                    }
+                    C_ptr_[baseC + static_cast<uint64_t>(i) * n_ + j] = acc;
+                }
+            }
         }
     }
 
-    // 定义Matmul类型：NORMAL(BMNK)布局，GM-ND，float
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> aType;
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> bType;
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float, false, LayoutMode::NORMAL> cType;
-    typedef matmul::MatmulType<AscendC::TPosition::GM, CubeFormat::ND, float> biasType;
+private:
+    uint32_t m_;
+    uint32_t n_;
+    uint32_t k_;
+    uint32_t batch_;
+    __gm__ float* A_ptr_;
+    __gm__ float* B_ptr_;
+    __gm__ float* C_ptr_;
+};
 
-    set_atomic_none();
-
-    // GM张量包装
-    AscendC::GlobalTensor<float> aGlobal;
-    AscendC::GlobalTensor<float> bGlobal;
-    AscendC::GlobalTensor<float> cGlobal;
-
-    // 从tiling中获取 NORMAL 模式的基本轴信息（示意使用，具体字段由TCubeTiling内部定义）
-    // 假设已通过SetBatchInfoForNormal设置了batchA/batchB与m/n/k
-    int32_t batchA = tiling.batchA;
-    int32_t batchB = tiling.batchB;
-    int32_t M = tiling.m;
-    int32_t N = tiling.n;
-    int32_t K = tiling.k;
-
-    int64_t sizeA = (int64_t)batchA * M * K;
-    int64_t sizeB = (int64_t)batchB * K * N;
-    int64_t sizeC = (int64_t)batchA * M * N;
-
-    aGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(aGM), (uint32_t)sizeA);
-    bGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(bGM), (uint32_t)sizeB);
-    cGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(cGM), (uint32_t)sizeC);
-
-    // 创建Matmul实例
-    matmul::Matmul<aType, bType, cType, biasType> mm;
-    AscendC::TPipe pipe;
-    g_cubeTPipePtr = &pipe;
-    REGIST_MATMUL_OBJ(&pipe, GetSysWorkSpacePtr(), mm);
-    mm.Init(&tiling);
-
-    // 设置A, B, C
-    mm.SetTensorA(aGlobal[0], false);
-    mm.SetTensorB(bGlobal[0], false);
-    mm.SetTensorC(cGlobal[0]);
-    mm.SetWorkspace(workspaceGM, 0);
-
-    // 计算跨批次的步长（相邻nd矩阵起始地址偏移，单位：元素）
-    uint32_t matrixStrideA = (uint32_t)(M * K);
-    uint32_t matrixStrideB = (uint32_t)(K * N);
-    uint32_t matrixStrideC = (uint32_t)(M * N);
-
-    // 批计算：一次调用内部执行N次IterateBatch
-    // batchLoop设为1，按传入的batchA/batchB跨批迭代
-    bool enSequentialWrite = true;
-    mm.IterateNBatch(1, (uint32_t)batchA, (uint32_t)batchB, enSequentialWrite, matrixStrideA, matrixStrideB, matrixStrideC);
+extern "C" __global__ __aicore__ void batched_matrix_multiplication_custom(GM_ADDR A, GM_ADDR B, GM_ADDR C, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    KernelBMM op;
+    op.Init(A, B, C, tiling_data.m, tiling_data.n, tiling_data.k, tiling_data.batch);
+    op.Process();
 }
 """
 
@@ -272,11 +223,12 @@ python_bind_src="""
 #include <torch/extension.h>
 
 at::Tensor batched_matrix_multiplication_custom_impl_npu(const at::Tensor& A, const at::Tensor& B) {
-    // 输出形状 (B, M, N)
-    auto Bdim = A.size(0);
-    auto M = A.size(1);
-    auto N = B.size(2);
-    at::Tensor C = at::empty({Bdim, M, N}, A.options());
+    TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "Inputs must be 3D: (batch, m, k) and (batch, k, n)");
+    TORCH_CHECK(A.size(0) == B.size(0), "Batch size must match between A and B");
+    TORCH_CHECK(A.size(2) == B.size(1), "Inner dimensions (k) must match between A and B");
+
+    auto options = A.options();
+    at::Tensor C = at::empty({A.size(0), A.size(1), B.size(2)}, options);
     EXEC_NPU_CMD(aclnnBatchedMatrixMultiplicationCustom, A, B, C);
     return C;
 }
@@ -296,9 +248,9 @@ import torch_npu
 import custom_ops_lib
 
 class ModelNew(torch.nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
-    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    def forward(self, A, B):
         return custom_ops_lib.batched_matrix_multiplication_custom(A, B)
 '''
